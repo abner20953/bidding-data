@@ -1,3 +1,12 @@
+---
+title: Bidding Data Monitor
+emoji: 📊
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+pinned: false
+---
+
 # 山西省信息化项目采集监控系统
 
 针对 [中国政府采购网](http://www.ccgp.gov.cn/) 的自动化数据采集与监控工具，专用于筛选**山西省**范围内的**信息化建设**相关项目。
