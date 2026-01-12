@@ -23,7 +23,12 @@ cd bidding-data
 
 # Install dependencies
 echo "📦 Installing dependencies..."
-pip install --no-cache-dir -r requirements.txt || { echo "❌ Pip install failed"; exit 1; }
+# Install heavy dependencies first
+echo "📦 Installing Torch & Transformers..."
+pip install --no-cache-dir sentence-transformers || { echo "❌ Heavy install failed"; exit 1; }
+
+echo "📦 Installing other dependencies..."
+pip install --no-cache-dir -r requirements.txt || { echo "❌ Other install failed"; exit 1; }
 
 # Start application
 echo "🚀 Starting Gunicorn..."
