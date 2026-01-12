@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>山西信息化项目监控大屏</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+</head>
+
+<body>
+    <div class="app-container">
+        <!-- 顶部导航 -->
+        <header class="glass-header">
+            <div class="logo">
+                <span class="logo-icon">🔮</span>
+                <h1>信息化项目查询</h1>
+            </div>
+
+            <div class="controls">
+                <!-- 地区筛选 -->
+                <select id="region-selector" class="glass-select">
+                    <option value="all" selected>全部地区</option>
+                </select>
+
+                <!-- 日期筛选 -->
+                <select id="date-selector" class="glass-select">
+                    <option value="" disabled selected>加载日期...</option>
+                </select>
+
+                <button id="auto-fetch-btn" class="glass-btn primary-btn" title="采集数据">
+                    <span style="font-size: 14px; margin-right: 4px;">📦</span> 采集数据
+                </button>
+
+                <button id="refresh-btn" class="glass-btn" title="刷新数据">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M23 4v6h-6"></path>
+                        <path d="M1 20v-6h6"></path>
+                        <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+                    </svg>
+                </button>
+            </div>
+        </header>
+
+        <!-- 主要内容区域 -->
+        <main>
+            <!-- 统计指标已移除 -->
+
+            <!-- 按地区分组展示 -->
+            <div id="regions-container" class="regions-grid">
+                <!-- 动态内容将插入此处 -->
+                <div class="loading-state">
+                    <div class="spinner"></div>
+                    <p>正在加载数据...</p>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- 地区详情模态框 -->
+    <div id="region-detail-modal" class="modal hidden">
+        <div class="modal-content">
+            <div class="modal-header">
+                <div class="modal-title-group">
+                    <h2 id="modal-region-title">地区详情</h2>
+                    <span id="modal-project-count" class="region-count">0</span>
+                    <!-- 新增时间筛选 -->
+                    <select id="modal-time-filter" class="glass-select" style="margin-left: 16px; min-width: 120px;">
+                        <option value="all">全部时间</option>
+                    </select>
+                </div>
+                <button class="close-modal-btn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="table-container">
+                    <table class="detail-table">
+                        <thead>
+                            <tr>
+                                <th style="width: 25%">标题</th>
+                                <th style="width: 10%">开标时间</th>
+                                <th style="width: 15%">开标地点</th>
+                                <th style="width: 10%">预算</th>
+                                <th style="width: 15%">代理机构</th>
+                                <th style="width: 15%">采购人</th>
+                                <th style="width: 10%">类型</th>
+                            </tr>
+                        </thead>
+                        <tbody id="modal-table-body">
+                            <!-- 动态插入 -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 采集进度模态框 -->
+    <div id="progress-modal" class="modal hidden" style="z-index: 2000;">
+        <div class="modal-content" style="max-width: 600px; height: auto; max-height: 80vh;">
+            <div class="modal-header">
+                <h2>全自动采集任务</h2>
+                <!-- 采集时禁止关闭，或者提供最小化功能 -->
+            </div>
+            <div class="modal-body" style="padding: 24px;">
+                <div class="progress-status">
+                    <p id="progress-text">准备就绪...</p>
+                    <div class="progress-track">
+                        <div id="progress-bar" class="progress-fill" style="width: 0%"></div>
+                    </div>
+                    <div class="progress-meta">
+                        <span id="progress-count">0/0</span>
+                    </div>
+                </div>
+
+                <div class="log-container" id="log-container">
+                    <!-- 日志输出 -->
+                </div>
+            </div>
+            <!-- 任务完成后显示关闭按钮 -->
+            <div class="modal-footer hidden" id="progress-modal-footer"
+                style="padding: 16px 24px; border-top: 1px solid rgba(0,0,0,0.05); text-align: right;">
+                <button class="glass-btn primary-btn close-progress-btn">完成关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Date Selection Modal -->
+    <div id="date-modal" class="modal hidden" style="z-index: 2001;">
+        <div class="modal-content" style="max-width: 400px;">
+            <div class="modal-header">
+                <h3>选择采集日期</h3>
+                <span class="close-date-btn">&times;</span>
+            </div>
+            <div class="modal-body">
+                <div class="calendar-header">
+                    <button id="prev-month" class="glass-btn icon-btn">&lt;</button>
+                    <span id="current-month-label">2026年 1月</span>
+                    <button id="next-month" class="glass-btn icon-btn">&gt;</button>
+                </div>
+                <div class="calendar-grid">
+                    <div class="weekday">日</div>
+                    <div class="weekday">一</div>
+                    <div class="weekday">二</div>
+                    <div class="weekday">三</div>
+                    <div class="weekday">四</div>
+                    <div class="weekday">五</div>
+                    <div class="weekday">六</div>
+                    <!-- Days will be populated by JS -->
+                </div>
+                <div id="date-selection-msg" class="info-msg">请选择日期 (最多5天)</div>
+            </div>
+            <div class="modal-footer" style="flex-direction: column; gap: 10px; align-items: stretch;">
+                <div class="selected-count" style="text-align: center; margin-bottom: 5px;">已选: <span
+                        id="selected-num">0</span>/5</div>
+
+                <button id="start-scrape-btn" class="glass-btn primary-btn large-btn" disabled>🚀 开始采集</button>
+
+                <div class="footer-actions"
+                    style="display: flex; flex-direction: column; gap: 8px; margin-top: 15px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 15px;">
+                    <div style="display: flex; gap: 10px;">
+                        <button id="delete-selected-btn" class="glass-btn danger-btn" style="flex: 1;" disabled
+                            title="需先选中包含数据的日期">
+                            🗑️ 删除选中
+                        </button>
+                        <button id="clear-history-btn" class="glass-btn danger-btn" style="flex: 1;" title="危险：清空所有数据">
+                            ⚠️ 清空历史
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/script.js"></script>
+</body>
+
+</html>
