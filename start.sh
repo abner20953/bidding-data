@@ -23,7 +23,7 @@ cd bidding-data
 
 # Install dependencies
 echo "📦 Installing dependencies..."
-pip install -r requirements.txt || { echo "❌ Pip install failed"; exit 1; }
+pip install --no-cache-dir -r requirements.txt || { echo "❌ Pip install failed"; exit 1; }
 
 # Start application
 echo "🚀 Starting Gunicorn..."
