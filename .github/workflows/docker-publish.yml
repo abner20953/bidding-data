@@ -36,9 +36,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=main
-            type=ref,event=branch,suffix=-{{sha}}
-        env:
-          IMAGE_NAME: ${{ github.repository }} # This might be mixed case
+            type=sha
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v4
