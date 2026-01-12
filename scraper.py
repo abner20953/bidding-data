@@ -466,25 +466,44 @@ def scrape():
 # 全局模型实例
 MODEL = None
 
-def get_model():
-    global MODEL
     if MODEL is None:
         try:
             from sentence_transformers import SentenceTransformer
-            print("正在加载语义模型...")
             
-            # 优先尝试加载 Docker 镜像里预置的本地模型
-            local_model_path = '/app/model_data'
-            if os.path.exists(local_model_path):
-                 print(f"从本地路径加载模型: {local_model_path}")
-                 MODEL = SentenceTransformer(local_model_path)
+            # 定义模型搜索路径优先级
+            # 1. Docker 容器内固定路径
+            # 2. 当前项目目录下的 model_data (本地开发用)
+            search_paths = [
+                '/app/model_data',
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), 'model_data'),
+                'model_data'
+            ]
+            
+            model_path = None
+            for path in search_paths:
+                if os.path.exists(path):
+                    model_path = path
+                    break
+            
+            if model_path:
+                print(f"正在加载本地语义模型: {model_path}")
+                MODEL = SentenceTransformer(model_path)
             else:
-                 # 本地开发回退模式
-                 print("本地路径不存在，尝试从 Hugging Face 加载...")
-                 MODEL = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+                # 严格禁止自动联网下载，抛出错误提示用户手动准备
+                error_msg = (
+                    "错误: 未找到本地模型文件！\n"
+                    "应用程序已配置为严格离线模式，禁止运行时下载。\n"
+                    "请运行 'python download_model.py' 手动下载模型到 'model_data' 目录，"
+                    "或者确保 Docker 镜像构建时已包含 '/app/model_data'。"
+                )
+                print(error_msg)
+                raise RuntimeError(error_msg)
                  
         except ImportError:
             print("错误: 未找到 sentence-transformers 库")
+            return None
+        except Exception as e:
+            print(f"模型加载失败: {e}")
             return None
     return MODEL
 
