@@ -6,7 +6,6 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build-and-push-image:
@@ -18,6 +17,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
+
+      - name: Downcase Image Name
+        run: |
+          echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> ${GITHUB_ENV}
 
       - name: Log in to the Container registry
         uses: docker/login-action@v2
@@ -33,7 +36,9 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=main
-            type=ref,event=branch
+            type=ref,event=branch,suffix=-{{sha}}
+        env:
+          IMAGE_NAME: ${{ github.repository }} # This might be mixed case
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v4
