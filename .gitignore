@@ -8,3 +8,4 @@ results/
 .idea/
 .vscode/
 logs/
+model_data/
