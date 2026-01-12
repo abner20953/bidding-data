@@ -472,7 +472,7 @@ def get_model():
         try:
             from sentence_transformers import SentenceTransformer
             print("正在加载语义模型...")
-            MODEL = SentenceTransformer('shibing624/text2vec-base-chinese')
+            MODEL = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
         except ImportError:
             print("错误: 未找到 sentence-transformers 库")
             return None
