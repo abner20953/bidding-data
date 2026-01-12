@@ -23,6 +23,9 @@ COPY . .
 # 创建必要的目录
 RUN mkdir -p results logs cache
 
+# 预下载 AI 模型（避免运行时联网下载）
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')"
+
 # 赋予权限 (Hugging Face Spaces 需要非 root 用户权限 1000)
 RUN chown -R 1000:1000 /app
 
