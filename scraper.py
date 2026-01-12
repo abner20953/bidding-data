@@ -472,7 +472,17 @@ def get_model():
         try:
             from sentence_transformers import SentenceTransformer
             print("正在加载语义模型...")
-            MODEL = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+            
+            # 优先尝试加载 Docker 镜像里预置的本地模型
+            local_model_path = '/app/model_data'
+            if os.path.exists(local_model_path):
+                 print(f"从本地路径加载模型: {local_model_path}")
+                 MODEL = SentenceTransformer(local_model_path)
+            else:
+                 # 本地开发回退模式
+                 print("本地路径不存在，尝试从 Hugging Face 加载...")
+                 MODEL = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+                 
         except ImportError:
             print("错误: 未找到 sentence-transformers 库")
             return None
