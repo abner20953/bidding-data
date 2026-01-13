@@ -48,7 +48,71 @@ docker run -d \
 
 ---
 
-## 方案二：源码构建 (国内网络优化版)
+## 方案二：Gitee 极速构建 (推荐，最快最稳)
+
+由于 GitHub 在国内访问不稳定，我们可以利用 **Gitee (码云)** 作为中转站。这是解决"速度慢"最彻底的方法。
+
+### 1. 准备 Gitee 仓库 (在您的电脑上)
+1.  登录 [Gitee](https://gitee.com/)，点击右上角 "+" -> "新建仓库"。
+2.  仓库名填 `bidding-data`，设为**公开**或**私有**均可，点击创建。
+3.  在您的本地项目目录，添加 Gitee 为远程仓库：
+
+```bash
+# 请将 <您的Gitee用户名> 替换为您真实的用户名
+git remote add gitee https://gitee.com/<您的Gitee用户名>/bidding-data.git
+
+# 推送代码到 Gitee
+git push -u gitee main
+```
+
+### 2. 在服务器上拉取代码
+登录腾讯云服务器：
+
+```bash
+# 安装 git (通常已安装)
+sudo apt update && sudo apt install -y git
+
+# 克隆代码 (速度飞快)
+git clone https://gitee.com/<您的Gitee用户名>/bidding-data.git
+cd bidding-data
+```
+
+### 3. 一键初始化环境
+我们利用国内镜像源和本地计算来构建，无需下载 500MB 的模型文件（因为使用的是 BGE-Small，且我们会用国内源安装依赖）。
+
+**关键优化**：
+为了让构建更快，我们修改 `Dockerfile` 使用清华源（您可以直接在服务器上编辑，或者在本地改好再 push 到 Gitee）。
+
+**推荐：直接在服务器上修改 Dockerfile**
+```bash
+nano Dockerfile
+```
+修改 `pip install` 行，增加清华源：
+```dockerfile
+# 原来的
+RUN pip install --no-cache-dir -r requirements.txt --timeout 100
+
+# 修改为
+RUN pip install --no-cache-dir -r requirements.txt --timeout 100 -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+### 4. 构建并启动
+```bash
+# 1. 构建镜像 (因为模型只有 95MB，且走了国内源，这步会很快)
+docker build -t bidding-app .
+
+# 2. 启动容器
+docker run -d \
+  --name bidding-app \
+  --restart always \
+  -p 80:7860 \
+  -v $(pwd)/results:/app/results \
+  bidding-app
+```
+
+---
+
+## 方案三：手动上传 (兜底方案)
 
 如果直接拉取镜像失败，可以使用"传输代码 + 本地构建"的方式。此方案利用了您本地已经下好的模型文件，**无需服务器联网下载模型**，非常适合国内环境。
 
