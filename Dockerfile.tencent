@@ -18,9 +18,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
     pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-# 【核心优化 3】使用本地上传的模型
-# 这一步也放在代码复制之前。只要模型文件不改，这一层也会走缓存。
-COPY model_data /app/model_data
+# 【核心优化 3】使用国内镜像下载模型 (适配 Gitee 部署)
+# 由于 model_data 被 gitignore 了，我们不能 COPY。
+# 必须使用国内镜像 (hf-mirror.com) 在构建时下载。
+ENV HF_ENDPOINT=https://hf-mirror.com
+RUN python -c "from sentence_transformers import SentenceTransformer; m = SentenceTransformer('BAAI/bge-small-zh-v1.5'); m.save('/app/model_data')"
 
 # 【最后】才复制频繁变动的业务代码
 # 这样每次改代码发布时，上面所有步骤都会被跳过，只有这一步会重做
