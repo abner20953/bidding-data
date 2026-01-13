@@ -78,30 +78,15 @@ cd bidding-data
 ```
 
 ### 3. 一键初始化环境
-我们利用国内镜像源和本地计算来构建，无需下载 500MB 的模型文件（因为使用的是 BGE-Small，且我们会用国内源安装依赖）。
+我们为您准备了专门的 `Dockerfile.tencent`，内置了所有优化（清华源、CPU版PyTorch、分层缓存）。
 
-**关键优化**：
-为了让构建更快，我们修改 `Dockerfile` 使用清华源（您可以直接在服务器上编辑，或者在本地改好再 push 到 Gitee）。
-
-**推荐：直接在服务器上修改 Dockerfile**
-```bash
-nano Dockerfile
-```
-修改 `pip install` 行，增加清华源：
-```dockerfile
-# 原来的
-RUN pip install --no-cache-dir -r requirements.txt --timeout 100
-
-# 修改为
-RUN pip install --no-cache-dir -r requirements.txt --timeout 100 -i https://pypi.tuna.tsinghua.edu.cn/simple
-```
-
-# ctrl+x 保存
+**无需手动修改任何文件**，直接构建即可。
 
 ### 4. 构建并启动
 ```bash
-# 1. 构建镜像 (因为模型只有 95MB，且走了国内源，这步会很快)
-docker build -t bidding-app .
+# 1. 使用优化版 Dockerfile 构建镜像 (-f 指定文件)
+# 第一次构建可能需要几分钟，以后修改代码构建仅需几秒
+docker build -f Dockerfile.tencent -t bidding-app .
 
 # 2. 启动容器
 docker run -d \
