@@ -96,6 +96,8 @@ RUN pip install --no-cache-dir -r requirements.txt --timeout 100
 RUN pip install --no-cache-dir -r requirements.txt --timeout 100 -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
+# ctrl+x 保存
+
 ### 4. 构建并启动
 ```bash
 # 1. 构建镜像 (因为模型只有 95MB，且走了国内源，这步会很快)
@@ -203,3 +205,35 @@ docker rm bidding-app
 1. 上传新代码。
 2. 重新执行 `docker build`。
 3. 停止并删除旧容器，启动新容器。
+
+---
+
+## 怎么更新代码 (Gitee)
+
+如果您修改了代码并推送到了 Gitee，在服务器上更新非常简单：
+
+### 1. 拉取最新代码
+```bash
+cd ~/bidding-data
+git pull
+```
+
+### 2. 重新构建镜像
+```bash
+docker build -t bidding-app .
+```
+
+### 3. 重启服务
+```bash
+# 停止旧容器
+docker stop bidding-app
+docker rm bidding-app
+
+# 启动新容器
+docker run -d \
+  --name bidding-app \
+  --restart always \
+  -p 80:7860 \
+  -v $(pwd)/results:/app/results \
+  bidding-app
+```
