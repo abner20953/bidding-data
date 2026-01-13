@@ -220,7 +220,7 @@ git pull
 
 ### 2. 重新构建镜像
 ```bash
-docker build -t bidding-app .
+docker build -f Dockerfile.tencent -t bidding-app .
 ```
 
 ### 3. 重启服务

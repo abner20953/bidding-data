@@ -1,0 +1,42 @@
+# 使用轻量级 Python 基础镜像
+FROM python:3.9-slim
+
+# 设置工作目录
+WORKDIR /app
+
+# 设置时区
+ENV TZ=Asia/Shanghai
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+# 【核心优化 1】利用 Docker 缓存机制
+# 先只复制 requirements.txt，不复制代码
+# 这样只要依赖包列表没变，下面这步庞大的 pip install 就会直接使用缓存，瞬间完成
+COPY requirements.txt .
+
+# 【核心优化 2】使用清华源加速 + 预先安装 CPU 版 PyTorch (节省 700MB+)
+# 腾讯云内网拉清华源极快；指定 CPU 版本避免下载庞大的显卡驱动
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 【核心优化 3】使用本地上传的模型
+# 这一步也放在代码复制之前。只要模型文件不改，这一层也会走缓存。
+COPY model_data /app/model_data
+
+# 【最后】才复制频繁变动的业务代码
+# 这样每次改代码发布时，上面所有步骤都会被跳过，只有这一步会重做
+COPY . .
+
+# 创建必要的目录
+RUN mkdir -p results logs cache
+
+# 赋予权限
+RUN chown -R 1000:1000 /app
+
+# 切换到非 root 用户
+USER 1000
+
+# 暴露端口
+EXPOSE 7860
+
+# 启动命令
+CMD ["gunicorn", "-b", "0.0.0.0:7860", "app:app", "--timeout", "120"]
