@@ -64,7 +64,7 @@ python run.py
 │   └── app.py          # Flask 应用入口
 ├── results/            # 采集结果 (Excel) 存放目录 (自动忽略)
 ├── scraper.py          # 核心爬虫逻辑
-├── recover_details.py  # 数据修复工具脚本
+
 ├── run.py              # 项目启动脚本
 ├── requirements.txt    # 项目依赖
 └── README.md           # 项目说明
