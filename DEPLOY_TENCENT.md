@@ -59,7 +59,7 @@ docker run -d \
 
 ```bash
 # 请将 <您的Gitee用户名> 替换为您真实的用户名
-git remote add gitee https://gitee.com/<您的Gitee用户名>/bidding-data.git
+git remote add gitee https://gitee.com/lilac111/bidding-data.git
 
 # 推送代码到 Gitee
 git push -u gitee main
@@ -73,7 +73,7 @@ git push -u gitee main
 sudo apt update && sudo apt install -y git
 
 # 克隆代码 (速度飞快)
-git clone https://gitee.com/<您的Gitee用户名>/bidding-data.git
+git clone https://gitee.com/lilac111/bidding-data.git
 cd bidding-data
 ```
 
