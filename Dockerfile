@@ -24,7 +24,7 @@ COPY . .
 RUN mkdir -p results logs cache
 
 # 预下载 AI 模型并保存到固定目录 (彻底避开缓存机制)
-RUN python -c "from sentence_transformers import SentenceTransformer; m = SentenceTransformer('shibing624/text2vec-base-chinese'); m.save('/app/model_data')"
+RUN python -c "from sentence_transformers import SentenceTransformer; m = SentenceTransformer('BAAI/bge-small-zh-v1.5'); m.save('/app/model_data')"
 
 # 赋予权限 (Hugging Face Spaces 需要非 root 用户权限 1000)
 RUN chown -R 1000:1000 /app
