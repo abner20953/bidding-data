@@ -466,6 +466,8 @@ def scrape():
 # 全局模型实例
 MODEL = None
 
+def get_model():
+    global MODEL
     if MODEL is None:
         try:
             from sentence_transformers import SentenceTransformer
