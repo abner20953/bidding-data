@@ -495,7 +495,7 @@ def get_model():
                 error_msg = (
                     "错误: 未找到本地模型文件！\n"
                     "应用程序已配置为严格离线模式，禁止运行时下载。\n"
-                    "请运行 'python download_model.py' 手动下载模型到 'model_data' 目录，"
+                    "请运行 'python download_model.py' 手动下载模型 (shibing624/text2vec-base-chinese) 到 'model_data' 目录，"
                     "或者确保 Docker 镜像构建时已包含 '/app/model_data'。"
                 )
                 print(error_msg)

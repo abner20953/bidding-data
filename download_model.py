@@ -4,7 +4,7 @@ from sentence_transformers import SentenceTransformer
 
 def download_and_save_model():
     # 模型名称
-    model_name = 'paraphrase-multilingual-MiniLM-L12-v2'
+    model_name = 'shibing624/text2vec-base-chinese'
     # 保存目标路径
     save_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'model_data')
     
