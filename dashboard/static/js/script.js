@@ -165,6 +165,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // --- 数据加载与渲染 ---
 
+    // 获取明天日期的字符串 (格式：YYYY年MM月DD日)
+    function getTomorrowDateStr() {
+        const d = new Date();
+        d.setDate(d.getDate() + 1);
+        const y = d.getFullYear();
+        const m = String(d.getMonth() + 1).padStart(2, '0');
+        const day = String(d.getDate()).padStart(2, '0');
+        return `${y}年${m}月${day}日`;
+    }
+
     // 1. 加载可用日期
     async function loadDates() {
         try {
@@ -187,8 +197,17 @@ document.addEventListener('DOMContentLoaded', () => {
                 dateSelector.add(option);
             });
 
-            // 默认加载最新日期的数据
-            loadData(dates[0]);
+            // 智能选择日期：如果存在明天的数据，则优先选中；否则选中最新
+            const tomorrowStr = getTomorrowDateStr();
+            let targetDate = dates[0]; // 默认最新
+
+            if (dates.includes(tomorrowStr)) {
+                targetDate = tomorrowStr;
+            }
+
+            // 更新下拉框选中状态
+            dateSelector.value = targetDate;
+            loadData(targetDate);
 
         } catch (error) {
             console.error('Failed to load dates:', error);
