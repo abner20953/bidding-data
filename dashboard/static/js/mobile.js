@@ -204,7 +204,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         <span>${item['开标具体时间'] || '-'}</span>
                     </div>
                     <div class="detail-row" title="预算">
-                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20v-8"></path><path d="M6 20h12"></path><path d="M6 16h12"></path><path d="M6 4l6 8 6-8"></path></svg>
+                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="20" height="12" rx="2"></rect><circle cx="12" cy="12" r="2"></circle><path d="M6 12h.01M18 12h.01"></path></svg>
                         <span class="budget">${(item['预算限价项目'] && item['预算限价项目'] !== '-' && item['预算限价项目'] !== '待采集') ? '¥' + item['预算限价项目'] : (item['预算限价项目'] || '-')}</span>
                     </div>
                     <div class="detail-row full-width" title="开标地点">
