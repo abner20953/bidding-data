@@ -797,6 +797,74 @@ document.addEventListener('DOMContentLoaded', () => {
         }, 300);
     });
 
+    // --- 新版定时任务日志模态框逻辑 ---
+    const openSchedulerBtn = document.getElementById('open-scheduler-btn');
+    const schedulerModal = document.getElementById('scheduler-modal');
+    const closeSchedulerBtn = document.querySelector('.close-scheduler-btn');
+    const refreshSchedulerLogsMain = document.getElementById('refresh-scheduler-logs-main');
+    const schedulerLogsLargeContainer = document.getElementById('scheduler-logs-large-container');
+
+    // 打开日志模态框
+    if (openSchedulerBtn) {
+        openSchedulerBtn.addEventListener('click', () => {
+            schedulerModal.classList.remove('hidden');
+            void schedulerModal.offsetWidth;
+            schedulerModal.classList.add('visible');
+            loadSchedulerLogsLarge();
+        });
+    }
+
+    // 关闭日志模态框
+    if (closeSchedulerBtn) {
+        closeSchedulerBtn.addEventListener('click', () => {
+            schedulerModal.classList.remove('visible');
+            setTimeout(() => {
+                schedulerModal.classList.add('hidden');
+            }, 300);
+        });
+    }
+
+    // 刷新日志
+    if (refreshSchedulerLogsMain) {
+        refreshSchedulerLogsMain.addEventListener('click', loadSchedulerLogsLarge);
+    }
+
+    // 点击遮罩关闭 (仅针对 schedulerModal)
+    if (schedulerModal) {
+        schedulerModal.addEventListener('click', (e) => {
+            if (e.target === schedulerModal) {
+                schedulerModal.classList.remove('visible');
+                setTimeout(() => {
+                    schedulerModal.classList.add('hidden');
+                }, 300);
+            }
+        });
+    }
+
+    async function loadSchedulerLogsLarge() {
+        if (!schedulerLogsLargeContainer) return;
+
+        const originalText = refreshSchedulerLogsMain ? refreshSchedulerLogsMain.innerHTML : 'Refresh';
+        if (refreshSchedulerLogsMain) refreshSchedulerLogsMain.innerHTML = '⏳ 加载中...';
+
+        try {
+            const resp = await fetch('/api/scheduler/logs');
+            const data = await resp.json();
+
+            if (data.logs && data.logs.length > 0) {
+                schedulerLogsLargeContainer.innerHTML = data.logs.map(log =>
+                    `<div style="margin-bottom: 6px; border-bottom: 1px solid rgba(255,255,255,0.03); padding-bottom: 4px;">${log}</div>`
+                ).join('');
+            } else {
+                schedulerLogsLargeContainer.innerHTML = '<div style="text-align: center; padding-top: 100px; color: rgba(255,255,255,0.3);">暂无日志记录</div>';
+            }
+        } catch (e) {
+            schedulerLogsLargeContainer.innerHTML = '<div style="text-align: center; color: #ef4444; padding-top: 100px;">日志加载失败</div>';
+        } finally {
+            if (refreshSchedulerLogsMain) refreshSchedulerLogsMain.innerHTML = originalText;
+        }
+    }
+
     // 初始化
     loadDates();
 });
