@@ -571,24 +571,9 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         }
 
-        // 3. 清理之前数据逻辑 (仅允许单选)
-        if (selectedDates.size === 1) {
-            const dateStr = [...selectedDates][0];
-            cleanBeforeBtn.disabled = false;
-            cleanBeforeBtn.innerHTML = `🗑️ 清理 [${dateStr}] 之前的数据`;
-            cleanHintMsg.textContent = `(将保留 ${dateStr} 及之后的记录)`;
-            cleanHintMsg.style.color = "var(--text-secondary)";
-        } else if (selectedDates.size > 1) {
-            cleanBeforeBtn.disabled = true;
-            cleanBeforeBtn.innerHTML = `🗑️ 请只选择一个参考日期`;
-            cleanHintMsg.textContent = "(清理功能需要指定唯一的截止日期)";
-            cleanHintMsg.style.color = "#ef4444";
-        } else {
-            cleanBeforeBtn.disabled = true;
-            cleanBeforeBtn.innerHTML = `🗑️ 请先在日历中选择参考日期...`;
-            cleanHintMsg.textContent = "(用于清理该日期之前的老旧数据)";
-            cleanHintMsg.style.color = "var(--text-secondary)";
-        }
+        // 3. 清理之前数据逻辑 - 按钮状态不再动态变化，逻辑后移到点击事件
+        // 保持按钮一直可用，或者仅当有选择时可用？
+        // 用户习惯可能是一直可用，点击后报错。这里我们设为一直可用。
     }
 
     function showMsg(text, type = 'info') {
@@ -677,9 +662,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // 清除指定日期前数据
     cleanBeforeBtn.addEventListener('click', async () => {
-        // 从当前选中获取日期 (因为 UI 已经保证了 selectedDates.size === 1)
-        if (selectedDates.size !== 1) {
-            alert("请先在日历中选择唯一的参考日期！");
+        // Validation Logic
+        if (selectedDates.size === 0) {
+            alert("请先在日历中选择一个日期作为参考！");
+            return;
+        }
+
+        if (selectedDates.size > 1) {
+            alert("只能选择一个日期作为参考！\n请取消其他选择，只保留一个日期。");
             return;
         }
 
