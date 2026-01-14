@@ -470,6 +470,22 @@ document.addEventListener('DOMContentLoaded', () => {
     // I will use multi_replace for safer edits.
 
 
+    // 打开日历模态框
+    autoFetchBtn.addEventListener('click', async () => {
+        dateModal.classList.remove('hidden');
+        void dateModal.offsetWidth;
+        dateModal.classList.add('visible');
+
+        // 重置状态
+        selectedDates.clear();
+        updateSelectionUI();
+        currentDateCursor = new Date(); // Reset to current month
+
+        await refreshExistingDates();
+        renderCalendar(currentDateCursor);
+    });
+
+
     closeDateBtn.addEventListener('click', () => {
         closeModalInternal(dateModal);
     });
