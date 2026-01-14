@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>项目监控(M)</title>
+    <link rel="stylesheet" href="/static/css/mobile.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="mobile-app">
+        <!-- 顶部固定栏 -->
+        <header class="mobile-header">
+            <div class="header-row">
+                <span class="logo">🔮 监控日报</span>
+                <select id="date-selector" class="mobile-select date-select">
+                    <option value="" disabled selected>加载...</option>
+                </select>
+            </div>
+            <div class="header-row filters">
+                <select id="region-selector" class="mobile-select region-select">
+                    <option value="all">全部地区</option>
+                </select>
+                <div class="count-badge" id="total-count">0</div>
+            </div>
+        </header>
+
+        <!-- 内容滚动区 -->
+        <main id="content-area">
+            <div class="loading-state">
+                <div class="spinner"></div>
+                <p>正在加载数据...</p>
+            </div>
+        </main>
+    </div>
+
+    <script src="/static/js/mobile.js"></script>
+</body>
+</html>
