@@ -20,7 +20,8 @@ body {
     background-color: var(--bg-color);
     color: var(--text-primary);
     font-size: 14px;
-    padding-top: 100px; /* Space for fixed header */
+    padding-top: 100px;
+    /* Space for fixed header */
 }
 
 /* Header */
@@ -71,10 +72,21 @@ body {
     width: 140px;
 }
 
+
 .region-select {
     flex: 1;
-    margin-right: 12px;
+    /* region takes remaining space */
+    margin-right: 8px;
+    min-width: 0;
+    /* prevent overflow */
 }
+
+.time-select {
+    width: 100px;
+    /* fixed width for time */
+    margin-right: 8px;
+}
+
 
 .count-badge {
     background: #e5e7eb;
@@ -190,5 +202,7 @@ body {
 }
 
 @keyframes spin {
-    to { transform: rotate(360deg); }
+    to {
+        transform: rotate(360deg);
+    }
 }

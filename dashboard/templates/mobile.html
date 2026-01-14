@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
@@ -7,6 +8,7 @@
     <link rel="stylesheet" href="/static/css/mobile.css">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 </head>
+
 <body>
     <div class="mobile-app">
         <!-- 顶部固定栏 -->
@@ -20,6 +22,9 @@
             <div class="header-row filters">
                 <select id="region-selector" class="mobile-select region-select">
                     <option value="all">全部地区</option>
+                </select>
+                <select id="time-selector" class="mobile-select time-select">
+                    <option value="all">全部时间</option>
                 </select>
                 <div class="count-badge" id="total-count">0</div>
             </div>
@@ -36,4 +41,5 @@
 
     <script src="/static/js/mobile.js"></script>
 </body>
+
 </html>

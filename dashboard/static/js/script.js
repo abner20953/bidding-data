@@ -424,13 +424,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // --- 日历功能实现 ---
     const deleteSelectedBtn = document.getElementById('delete-selected-btn');
-    const cleanBeforeDateInput = document.getElementById('clean-before-date');
     const cleanBeforeBtn = document.getElementById('clean-before-btn');
+    const cleanHintMsg = document.getElementById('clean-hint-msg');
 
-    // 初始化清理日期为一个月前
-    const oneMonthAgo = new Date();
-    oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
-    cleanBeforeDateInput.valueAsDate = oneMonthAgo;
+    // Helper function for closing modals
 
     // Helper function for closing modals
     function closeModalInternal(modalElement) {
@@ -553,9 +550,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function updateSelectionUI() {
         selectedNumSpan.textContent = selectedDates.size;
+
+        // 1. 采集按钮逻辑
         startScrapeBtn.disabled = selectedDates.size === 0;
 
-        // 检查是否覆盖
+        // 2. 删除选中逻辑
         const overwrites = [...selectedDates].filter(d => existingDates.has(d));
         if (overwrites.length > 0) {
             showMsg(`注意：${overwrites.length} 个日期将覆盖现有数据`, 'warning');
@@ -570,6 +569,25 @@ document.addEventListener('DOMContentLoaded', () => {
             } else {
                 showMsg('请选择日期 (最多5天)', 'info');
             }
+        }
+
+        // 3. 清理之前数据逻辑 (仅允许单选)
+        if (selectedDates.size === 1) {
+            const dateStr = [...selectedDates][0];
+            cleanBeforeBtn.disabled = false;
+            cleanBeforeBtn.innerHTML = `🗑️ 清理 [${dateStr}] 之前的数据`;
+            cleanHintMsg.textContent = `(将保留 ${dateStr} 及之后的记录)`;
+            cleanHintMsg.style.color = "var(--text-secondary)";
+        } else if (selectedDates.size > 1) {
+            cleanBeforeBtn.disabled = true;
+            cleanBeforeBtn.innerHTML = `🗑️ 请只选择一个参考日期`;
+            cleanHintMsg.textContent = "(清理功能需要指定唯一的截止日期)";
+            cleanHintMsg.style.color = "#ef4444";
+        } else {
+            cleanBeforeBtn.disabled = true;
+            cleanBeforeBtn.innerHTML = `🗑️ 请先在日历中选择参考日期...`;
+            cleanHintMsg.textContent = "(用于清理该日期之前的老旧数据)";
+            cleanHintMsg.style.color = "var(--text-secondary)";
         }
     }
 
@@ -659,13 +677,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // 清除指定日期前数据
     cleanBeforeBtn.addEventListener('click', async () => {
-        const dateStr = cleanBeforeDateInput.value;
-        if (!dateStr) {
-            alert("请先选择参考日期");
+        // 从当前选中获取日期 (因为 UI 已经保证了 selectedDates.size === 1)
+        if (selectedDates.size !== 1) {
+            alert("请先在日历中选择唯一的参考日期！");
             return;
         }
 
-        if (!confirm(`⚠️ 警告：确定要彻底删除 [${dateStr}] 之前的所有已采集文件吗？\n此操作不可恢复！`)) return;
+        const dateStr = [...selectedDates][0];
+
+        if (!confirm(`⚠️ 警告：确定要删除 [${dateStr}] 之前的所有历史数据吗？\n（保留 ${dateStr} 当天及之后的数据）\n此操作不可恢复！`)) return;
 
         try {
             const resp = await fetch(`/api/data?before_date=${dateStr}`, { method: 'DELETE' });

@@ -165,16 +165,14 @@
                         </button>
                     </div>
 
-                    <!-- 新增：按日期清理 -->
-                    <div
-                        style="display: flex; gap: 8px; align-items: center; background: rgba(220, 38, 38, 0.05); padding: 8px; border-radius: 8px;">
-                        <label style="font-size: 12px; color: var(--text-secondary); white-space: nowrap;">清理早于:</label>
-                        <input type="date" id="clean-before-date" class="glass-select"
-                            style="padding: 4px; font-size: 12px;">
-                        <button id="clean-before-btn" class="glass-btn danger-btn"
-                            style="font-size: 12px; padding: 4px 8px;">
-                            🗑️ 清除
-                        </button>
+                    <!-- 优化：复用外部日期，简化界面 -->
+                    <button id="clean-before-btn" class="glass-btn danger-btn" style="width: 100%; font-size: 13px;"
+                        disabled>
+                        🗑️ 请先在日历中选择一个参考日期...
+                    </button>
+                    <div id="clean-hint-msg"
+                        style="font-size: 11px; color: var(--text-secondary); text-align: center; margin-top: -4px; min-height: 16px;">
+                        (用于清理该日期之前的老旧数据)
                     </div>
                 </div>
             </div>

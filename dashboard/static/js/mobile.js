@@ -2,6 +2,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // UI Elements
     const dateSelector = document.getElementById('date-selector');
     const regionSelector = document.getElementById('region-selector');
+    const timeSelector = document.getElementById('time-selector');
     const totalCountBadge = document.getElementById('total-count');
     const contentArea = document.getElementById('content-area');
 
@@ -72,7 +73,7 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             const response = await fetch(`/api/data?date=${date}`);
             const data = await response.json();
-            
+
             if (data.error) {
                 contentArea.innerHTML = `<div class="loading-state"><p>${data.error}</p></div>`;
                 return;
@@ -80,7 +81,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
             currentData = data;
             initRegionSelector(data);
-            
+            initRegionSelector(data);
+            updateTimeSelector(data, 'all'); // Init Time with all data
+
             // Mobile Optimization: Automatically select the first region that has data
             // But 'All' is also fine. Let's stick to 'All' but sorted smartly.
             renderList(data);
@@ -95,7 +98,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const regions = new Set();
         data.forEach(item => regions.add(item['地区（市）'] || '未知'));
         const sorted = Array.from(regions).sort();
-        
+
         regionSelector.innerHTML = '<option value="all">全部地区</option>';
         sorted.forEach(r => {
             const opt = document.createElement('option');
@@ -105,11 +108,59 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // 4. Render List
-    function renderList(data, filterRegion = 'all') {
+    // New: Init Time Selector (Linked to Region)
+    function updateTimeSelector(data, filterRegion) {
         let items = data;
-        if (filterRegion !== 'all') {
+        if (filterRegion && filterRegion !== 'all') {
             items = data.filter(item => (item['地区（市）'] || '未知') === filterRegion);
+        }
+
+        const times = new Set();
+        items.forEach(item => {
+            const t = item['开标具体时间'];
+            if (t && t !== '待采集' && t !== '未找到' && t !== '-') {
+                times.add(t);
+            }
+        });
+
+        // Sort times
+        const sorted = Array.from(times).sort((a, b) => parseTime(a) - parseTime(b));
+
+        // Save current selection if possible
+        const currentSelection = timeSelector.value;
+
+        timeSelector.innerHTML = '<option value="all">全部时间</option>';
+        sorted.forEach(t => {
+            const opt = document.createElement('option');
+            opt.value = t;
+            opt.text = t;
+            timeSelector.add(opt);
+        });
+
+        // Restore selection if valid, else reset
+        if (currentSelection && Array.from(times).includes(currentSelection)) {
+            timeSelector.value = currentSelection;
+        } else {
+            timeSelector.value = 'all';
+        }
+    }
+
+    // 4. Render List
+    function renderList(data, filterRegion = null, filterTime = null) {
+        // Get current values if not provided
+        if (filterRegion === null) filterRegion = regionSelector.value;
+        if (filterTime === null) filterTime = timeSelector.value;
+
+        let items = data;
+
+        // Filter Region
+        if (filterRegion !== 'all') {
+            items = items.filter(item => (item['地区（市）'] || '未知') === filterRegion);
+        }
+
+        // Filter Time
+        if (filterTime !== 'all') {
+            items = items.filter(item => item['开标具体时间'] === filterTime);
         }
 
         // Sort: Info > Time
@@ -117,7 +168,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const isInfoA = a['是否信息化'] === '是';
             const isInfoB = b['是否信息化'] === '是';
             if (isInfoA !== isInfoB) return isInfoB ? 1 : -1;
-            
+
             return parseTime(a['开标具体时间']) - parseTime(b['开标具体时间']);
         });
 
@@ -134,8 +185,8 @@ document.addEventListener('DOMContentLoaded', () => {
     function createCard(item) {
         const isInfo = item['是否信息化'] === '是';
         const cardClass = isInfo ? 'project-card is-info' : 'project-card';
-        const tagHtml = isInfo 
-            ? '<span class="tag info">信息化</span>' 
+        const tagHtml = isInfo
+            ? '<span class="tag info">信息化</span>'
             : '<span class="tag">普通</span>';
 
         return `
@@ -171,7 +222,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Events
     dateSelector.addEventListener('change', (e) => loadData(e.target.value));
-    regionSelector.addEventListener('change', (e) => renderList(currentData, e.target.value));
+
+    regionSelector.addEventListener('change', (e) => {
+        const region = e.target.value;
+        updateTimeSelector(currentData, region); // Linkage: Update times based on region
+        renderList(currentData);
+    });
+
+    timeSelector.addEventListener('change', (e) => renderList(currentData));
 
     // Init
     loadDates();
