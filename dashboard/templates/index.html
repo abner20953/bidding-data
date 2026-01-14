@@ -163,8 +163,17 @@
                             title="需先选中包含数据的日期">
                             🗑️ 删除选中
                         </button>
-                        <button id="clear-history-btn" class="glass-btn danger-btn" style="flex: 1;" title="危险：清空所有数据">
-                            ⚠️ 清空历史
+                    </div>
+
+                    <!-- 新增：按日期清理 -->
+                    <div
+                        style="display: flex; gap: 8px; align-items: center; background: rgba(220, 38, 38, 0.05); padding: 8px; border-radius: 8px;">
+                        <label style="font-size: 12px; color: var(--text-secondary); white-space: nowrap;">清理早于:</label>
+                        <input type="date" id="clean-before-date" class="glass-select"
+                            style="padding: 4px; font-size: 12px;">
+                        <button id="clean-before-btn" class="glass-btn danger-btn"
+                            style="font-size: 12px; padding: 4px 8px;">
+                            🗑️ 清除
                         </button>
                     </div>
                 </div>

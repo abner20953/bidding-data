@@ -424,7 +424,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // --- 日历功能实现 ---
     const deleteSelectedBtn = document.getElementById('delete-selected-btn');
-    const clearHistoryBtn = document.getElementById('clear-history-btn');
+    const cleanBeforeDateInput = document.getElementById('clean-before-date');
+    const cleanBeforeBtn = document.getElementById('clean-before-btn');
+
+    // 初始化清理日期为一个月前
+    const oneMonthAgo = new Date();
+    oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
+    cleanBeforeDateInput.valueAsDate = oneMonthAgo;
 
     // Helper function for closing modals
     function closeModalInternal(modalElement) {
@@ -651,25 +657,33 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    // 清空历史
-    clearHistoryBtn.addEventListener('click', async () => {
-        if (!confirm("⚠️ 警告：确定要删除所有历史数据吗？此操作不可恢复！")) return;
+    // 清除指定日期前数据
+    cleanBeforeBtn.addEventListener('click', async () => {
+        const dateStr = cleanBeforeDateInput.value;
+        if (!dateStr) {
+            alert("请先选择参考日期");
+            return;
+        }
+
+        if (!confirm(`⚠️ 警告：确定要彻底删除 [${dateStr}] 之前的所有已采集文件吗？\n此操作不可恢复！`)) return;
 
         try {
-            const resp = await fetch('/api/data?all=true', { method: 'DELETE' });
+            const resp = await fetch(`/api/data?before_date=${dateStr}`, { method: 'DELETE' });
             const result = await resp.json();
+
             if (result.status === 'success') {
                 alert(result.message);
+                // 刷新状态
                 existingDates.clear();
                 selectedDates.clear();
                 renderCalendar(currentDateCursor);
                 updateSelectionUI();
                 loadDates();
             } else {
-                alert("清除失败: " + result.message);
+                alert("清理失败: " + result.message);
             }
         } catch (e) {
-            alert("清除失败: " + e.message);
+            alert("请求异常: " + e.message);
         }
     });
 
