@@ -41,6 +41,13 @@ docker run -d \
   bidding-app
 ```
 
+# 修改归属权 (最稳妥的方式)
+# 1000:1000 是容器内用户的 ID
+sudo chown -R 1000:1000 results
+
+# dcoker ps  查看运行状态
+# docker logs -f bidding-app 看日志
+
 ### 3. 如何更新代码 (日常维护)
 当您本地修改代码并 `git push` 后，在服务器上操作：
 
@@ -53,8 +60,7 @@ git pull
 docker build -f Dockerfile.tencent -t bidding-app .
 
 # 重启容器
-docker stop bidding-app
-docker rm bidding-app
+docker stop bidding-app && docker rm bidding-app
 docker run -d \
   --name bidding-app \
   --restart always \
@@ -62,6 +68,15 @@ docker run -d \
   -v $(pwd)/results:/app/results \
   bidding-app
 ```
+
+#### ✨ 极速方式 (推荐)
+项目已内置一键更新脚本，您只需执行：
+```bash
+cd ~/bidding-data
+chmod +x redeploy.sh
+./redeploy.sh
+```
+此脚本会自动执行 `git pull`, `docker build`, 和 `docker run` 等所有步骤。
 
 ---
 
