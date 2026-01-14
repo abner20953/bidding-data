@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, redirect, url_for
 import pandas as pd
 import os
 import glob
@@ -28,7 +28,21 @@ def get_available_dates():
 
 @app.route('/')
 def index():
+    """智能路由：根据 User-Agent 分流"""
+    user_agent = request.user_agent.string.lower()
+    if 'mobile' in user_agent or 'android' in user_agent or 'iphone' in user_agent:
+        return redirect(url_for('mobile_view'))
+    return redirect(url_for('console_view'))
+
+@app.route('/console')
+def console_view():
+    """电脑端控制台 (原首页)"""
     return render_template('index.html')
+
+@app.route('/mobile')
+def mobile_view():
+    """移动端专属界面"""
+    return render_template('mobile.html')
 
 @app.route('/api/dates')
 def api_dates():
@@ -54,6 +68,38 @@ def api_data():
                     except Exception as e:
                         print(f"Error deleting {f}: {e}")
                 return jsonify({"status": "success", "message": f"已清除所有历史数据 (共{deleted_count}个文件)"})
+
+            # 新增: 清除指定日期前的数据
+            before_date_str = request.args.get('before_date')
+            if before_date_str:
+                try:
+                    target_date = datetime.datetime.strptime(before_date_str, "%Y-%m-%d").date()
+                    pattern = os.path.join(RESULTS_DIR, "shanxi_informatization_*.xlsx")
+                    files = glob.glob(pattern)
+                    deleted_count = 0
+                    
+                    for f in files:
+                        basename = os.path.basename(f)
+                        # Extract date from filename (e.g., ..._2026年01月01日.xlsx)
+                        match = re.search(r"shanxi_informatization_(.*)\.xlsx", basename)
+                        if match:
+                            file_date_str = match.group(1)
+                            # Convert Chinese date to date object
+                            try:
+                                # Replace Chinese chars with hyphens for parsing
+                                std_date_str = file_date_str.replace('年', '-').replace('月', '-').replace('日', '')
+                                file_date = datetime.datetime.strptime(std_date_str, "%Y-%m-%d").date()
+                                
+                                if file_date < target_date:
+                                    os.remove(f)
+                                    deleted_count += 1
+                            except Exception as e:
+                                print(f"Skipping file {basename}: {e}")
+                                continue
+                                
+                    return jsonify({"status": "success", "message": f"已清除 {before_date_str} 之前的数据 (共{deleted_count}个文件)"})
+                except ValueError:
+                    return jsonify({"status": "error", "message": "日期格式错误，应为 YYYY-MM-DD"}), 400
             
             if date_str:
                 # 尝试多种文件名格式
