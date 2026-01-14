@@ -231,20 +231,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    // 打开日历模态框
-    autoFetchBtn.addEventListener('click', async () => {
-        dateModal.classList.remove('hidden');
-        void dateModal.offsetWidth;
-        dateModal.classList.add('visible');
-
-        // 重置状态
-        selectedDates.clear();
-        updateSelectionUI();
-        currentDateCursor = new Date(); // Reset to current month
-
-        await refreshExistingDates();
-        renderCalendar(currentDateCursor);
-    });
+    // 打开日历模态框 (Moved to bottom with other listeners to ensuring 'autoFetchBtn' is defined)
     // 2. 加载数据
     async function loadData(date) {
         if (!date) return;
