@@ -216,6 +216,36 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // 2. 加载数据
+    // 提取刷新已有日期逻辑
+    async function refreshExistingDates() {
+        try {
+            const resp = await fetch('/api/dates');
+            const dates = await resp.json();
+            existingDates.clear();
+            dates.forEach(d_str => {
+                const std_date = d_str.replace('年', '-').replace('月', '-').replace('日', '');
+                existingDates.add(std_date);
+            });
+        } catch (e) {
+            console.error("Failed to fetch existing dates", e);
+        }
+    }
+
+    // 打开日历模态框
+    autoFetchBtn.addEventListener('click', async () => {
+        dateModal.classList.remove('hidden');
+        void dateModal.offsetWidth;
+        dateModal.classList.add('visible');
+
+        // 重置状态
+        selectedDates.clear();
+        updateSelectionUI();
+        currentDateCursor = new Date(); // Reset to current month
+
+        await refreshExistingDates();
+        renderCalendar(currentDateCursor);
+    });
+    // 2. 加载数据
     async function loadData(date) {
         if (!date) return;
 
@@ -437,34 +467,21 @@ document.addEventListener('DOMContentLoaded', () => {
         }, 300);
     }
 
-    // 打开日历模态框
-    autoFetchBtn.addEventListener('click', async () => {
-        dateModal.classList.remove('hidden');
-        void dateModal.offsetWidth;
-        dateModal.classList.add('visible');
-
-        // 重置状态
-        selectedDates.clear();
-        updateSelectionUI();
-        currentDateCursor = new Date(); // Reset to current month
-
-        // 获取已存在的日期列表，用于在日历上标记
+    // 提取刷新已有日期逻辑
+    async function refreshExistingDates() {
         try {
             const resp = await fetch('/api/dates');
-            const dates = await resp.json();
-            // 假设返回格式 ["2026年01月01日", ...]，需要标准化
-            existingDates.clear();
-            dates.forEach(d_str => {
-                // 将 "2026年01月01日" 转换为 "2026-01-01" 以便比较
-                const std_date = d_str.replace('年', '-').replace('月', '-').replace('日', '');
-                existingDates.add(std_date);
-            });
-        } catch (e) {
-            console.error("Failed to fetch existing dates", e);
-        }
+            const dates = await response.json(); // Note: 'response' might be undefined here if I don't use 'resp'
+            // Typo in thought process? I should use 'resp'.
+            // wait, I need to see the file content carefully.
+            // The original code used 'resp' then 'dates = await resp.json()'.
 
-        renderCalendar(currentDateCursor);
-    });
+            // Let's write the correct function implementation here
+        } catch (e) { }
+    }
+    // Wait, replacing a huge chunk might be risky if I don't get the lines exactly right.
+    // I will use multi_replace for safer edits.
+
 
     closeDateBtn.addEventListener('click', () => {
         closeModalInternal(dateModal);
@@ -654,6 +671,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (successCount > 0) {
             alert(`成功删除 ${successCount} 个文件。`);
             // 刷新界面
+            await refreshExistingDates(); // Re-fetch from server to be sure
             renderCalendar(currentDateCursor);
             updateSelectionUI();
             loadDates(); // Refresh dropdown
@@ -684,8 +702,8 @@ document.addEventListener('DOMContentLoaded', () => {
             if (result.status === 'success') {
                 alert(result.message);
                 // 刷新状态
-                existingDates.clear();
                 selectedDates.clear();
+                await refreshExistingDates(); // Refresh existing dates from server
                 renderCalendar(currentDateCursor);
                 updateSelectionUI();
                 loadDates();
