@@ -176,26 +176,46 @@
                 </div>
             </div>
 
-            <div style="border-top: 1px solid rgba(255,255,255,0.1); margin-top: 15px; padding: 15px;">
-                <div class="scheduler-header"
-                    style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                    <h4 style="margin: 0; font-size: 14px; opacity: 0.8;">⏰ 定时任务监控 (每日 02:00)</h4>
-                    <button id="refresh-scheduler-logs" class="glass-btn icon-btn"
-                        style="width: 20px; height: 20px; min-width: 20px; display: flex; align-items: center; justify-content: center;"
-                        title="刷新日志">↻</button>
+        </div>
+
+        <div style="border-top: 1px solid rgba(255,255,255,0.1); margin-top: 15px; padding-top: 15px;">
+            <button id="open-scheduler-btn" class="glass-btn"
+                style="width: 100%; margin-top: 5px; opacity: 0.8; font-size: 12px;">
+                ⏰ 查看定时任务日志
+            </button>
+        </div>
+    </div>
+    </div>
+
+    <!-- Scheduler Logs Modal (Newly Added) -->
+    <div id="scheduler-modal" class="modal hidden" style="z-index: 2005;">
+        <div class="modal-content" style="max-width: 800px; height: 80vh; display: flex; flex-direction: column;">
+            <div class="modal-header">
+                <h3>⏰ 定时任务监控日志</h3>
+                <span class="close-scheduler-btn close-modal-btn">&times;</span>
+            </div>
+            <div class="modal-body"
+                style="flex: 1; display: flex; flex-direction: column; padding: 20px; overflow: hidden;">
+                <div class="toolbar"
+                    style="margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center;">
+                    <span style="font-size: 12px; color: var(--text-secondary);">记录每日 02:00 的自动采集与清理任务</span>
+                    <button id="refresh-scheduler-logs-main" class="glass-btn primary-btn is-small"
+                        style="padding: 4px 12px; font-size: 12px;">↻ 刷新日志</button>
                 </div>
-                <div id="scheduler-logs-container" style="
-                    background: rgba(0,0,0,0.05); 
+                <div id="scheduler-logs-large-container" style="
+                    background: rgba(0,0,0,0.2); 
+                    border: 1px solid rgba(255,255,255,0.05);
                     border-radius: 8px; 
-                    padding: 10px; 
-                    height: 120px; 
+                    padding: 15px; 
+                    flex: 1;
                     overflow-y: auto; 
-                    font-size: 11px; 
-                    font-family: monospace; 
-                    color: var(--text-secondary);
+                    font-size: 13px; 
+                    font-family: 'Consolas', 'Monaco', monospace; 
+                    color: var(--text-primary);
                     white-space: pre-wrap;
+                    line-height: 1.6;
                 ">
-                    <div style="text-align: center; padding-top: 40px;">加载中...</div>
+                    <div style="text-align: center; padding-top: 100px; color: var(--text-secondary);">点击刷新加载日志...</div>
                 </div>
             </div>
         </div>
