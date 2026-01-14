@@ -5,3 +5,4 @@ openpyxl
 sentence-transformers
 flask
 gunicorn
+Flask-APScheduler

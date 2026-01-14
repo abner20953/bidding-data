@@ -484,7 +484,41 @@ document.addEventListener('DOMContentLoaded', () => {
 
         await refreshExistingDates();
         renderCalendar(currentDateCursor);
+        await refreshExistingDates();
+        renderCalendar(currentDateCursor);
+
+        // Load Scheduler Logs
+        loadSchedulerLogs();
     });
+
+    // 定时任务日志逻辑
+    const schedulerLogsContainer = document.getElementById('scheduler-logs-container');
+    const refreshSchedulerLogsBtn = document.getElementById('refresh-scheduler-logs');
+
+    if (refreshSchedulerLogsBtn) {
+        refreshSchedulerLogsBtn.addEventListener('click', loadSchedulerLogs);
+    }
+
+    async function loadSchedulerLogs() {
+        if (!schedulerLogsContainer) return;
+
+        schedulerLogsContainer.innerHTML = '<div style="text-align: center; padding-top: 40px;">刷新中...</div>';
+
+        try {
+            const resp = await fetch('/api/scheduler/logs');
+            const data = await resp.json();
+
+            if (data.logs && data.logs.length > 0) {
+                schedulerLogsContainer.innerHTML = data.logs.map(log =>
+                    `<div style="margin-bottom: 4px; border-bottom: 1px solid rgba(0,0,0,0.02); padding-bottom: 2px;">${log}</div>`
+                ).join('');
+            } else {
+                schedulerLogsContainer.innerHTML = '<div style="text-align: center; padding-top: 40px;">暂无日志记录</div>';
+            }
+        } catch (e) {
+            schedulerLogsContainer.innerHTML = '<div style="text-align: center; color: var(--danger-color); padding-top: 40px;">加载失败</div>';
+        }
+    }
 
 
     closeDateBtn.addEventListener('click', () => {

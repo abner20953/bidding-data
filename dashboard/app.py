@@ -4,7 +4,8 @@ import os
 import glob
 import re
 
-app = Flask(__name__)
+from flask import Flask, jsonify, render_template, request, redirect, url_for
+from flask_apscheduler import APScheduler
 
 # 配置结果目录 (相对于 app.py 所在的 dashboard 目录，results 在上一级)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -32,10 +33,10 @@ def index():
     user_agent = request.user_agent.string.lower()
     if 'mobile' in user_agent or 'android' in user_agent or 'iphone' in user_agent:
         return redirect(url_for('mobile_view'))
-    return redirect(url_for('console_view'))
+    return redirect(url_for('dashboard_view'))
 
-@app.route('/console')
-def console_view():
+@app.route('/dashboard')
+def dashboard_view():
     """电脑端控制台 (原首页)"""
     return render_template('index.html')
 
@@ -302,6 +303,191 @@ def api_scrape_start():
 @app.route('/api/scrape/status')
 def api_scrape_status():
     return jsonify(SCRAPER_STATUS)
+
+# --- 定时任务日志存储 ---
+SCHEDULER_LOGS = []
+
+def log_scheduler(msg):
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_entry = f"[{timestamp}] {msg}"
+    SCHEDULER_LOGS.append(log_entry)
+    # 保留最近 100 条日志
+    if len(SCHEDULER_LOGS) > 100:
+        SCHEDULER_LOGS.pop(0)
+
+@app.route('/api/scheduler/logs')
+def api_scheduler_logs():
+    return jsonify({
+        "logs": sorted(SCHEDULER_LOGS, reverse=True), # 最新的在前面
+        "server_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    })
+
+# --- 定时任务配置 ---
+class Config:
+    SCHEDULER_API_ENABLED = True
+
+app.config.from_object(Config())
+
+scheduler = APScheduler()
+scheduler.init_app(app)
+
+def scheduled_job():
+    """
+    每天凌晨 02:00 执行的任务:
+    1. 自动采集 [今天, 明天, 后天] 的数据 (如果文件不存在)。
+    2. 清理 [前一天之前] 的数据 (保留前一天及以后)。
+    """
+    log_scheduler("⏰ 定时任务触发: 开始每日采集与清理...")
+    print(f"[{datetime.datetime.now()}] ⏰ 定时任务触发: 开始每日采集与清理...")
+    
+    today = date.today()
+    
+    # --- 1. 自动采集逻辑 (今天、明天、后天) ---
+    scrape_targets = []
+    for i in range(3):
+        target_date = today + timedelta(days=i) # 0=今天, 1=明天, 2=后天
+        
+        # 检查文件是否已存在
+        date_str_iso = target_date.strftime("%Y年%m月%d日")
+        filename = f"shanxi_informatization_{date_str_iso}.xlsx"
+        filepath = os.path.join(RESULTS_DIR, filename)
+        
+        if os.path.exists(filepath):
+            log_scheduler(f"   [跳过] {date_str_iso} 数据已存在。")
+        else:
+            log_scheduler(f"   [计划] {date_str_iso} 加入采集队列。")
+            scrape_targets.append(target_date)
+            
+    if scrape_targets:
+        if SCRAPER_STATUS["is_running"]:
+            log_scheduler("   [跳过] 爬虫正在运行中，本次定时任务取消采集。")
+        else:
+            # 启动采集线程
+            thread = threading.Thread(target=run_auto_scrape_thread, args=(scrape_targets,))
+            thread.daemon = True
+            thread.start()
+            log_scheduler(f"   [启动] 已启动后台采集线程，目标: {len(scrape_targets)} 天")
+    else:
+        log_scheduler("   [完成] 所有目标日期数据均已就绪，无需采集。")
+
+    # --- 2. 自动清理逻辑 (清理 前一天之前 的数据) ---
+    # 定义: 
+    #   今天 = T
+    #   前一天 = T-1
+    #   保留 >= T-1 的数据
+    #   删除 < T-1 的数据
+    cutoff_date = today - timedelta(days=1)
+    log_scheduler(f"   [清理] 正在清理 {cutoff_date} 之前的数据...")
+    
+    pattern = os.path.join(RESULTS_DIR, "shanxi_informatization_*.xlsx")
+    files = glob.glob(pattern)
+    deleted_count = 0
+    
+    for f in files:
+        basename = os.path.basename(f)
+        match = re.search(r"shanxi_informatization_(.*)\.xlsx", basename)
+        if match:
+            file_date_str = match.group(1)
+            try:
+                # 转换中文日期: 2026年01月01日 -> 2026-01-01
+                std_date_str = file_date_str.replace('年', '-').replace('月', '-').replace('日', '')
+                file_date = datetime.datetime.strptime(std_date_str, "%Y-%m-%d").date()
+                
+                # 如果文件日期 < 文档保留日期 (前一天)
+                if file_date < cutoff_date:
+                    os.remove(f)
+                    log_scheduler(f"      [删除] {basename} (早于 {cutoff_date})")
+                    deleted_count += 1
+            except Exception as e:
+                log_scheduler(f"      [错误] 解析 {basename} 失败: {e}")
+                
+    log_scheduler(f"   [清理完成] 共删除了 {deleted_count} 个过期文件。")
+
+# --- 定时任务配置 ---
+class Config:
+    SCHEDULER_API_ENABLED = True
+
+app.config.from_object(Config())
+
+scheduler = APScheduler()
+scheduler.init_app(app)
+
+def scheduled_job():
+    """
+    每天凌晨 02:00 执行的任务:
+    1. 自动采集 [今天, 明天, 后天] 的数据 (如果文件不存在)。
+    2. 清理 [前一天之前] 的数据 (保留前一天及以后)。
+    """
+    print(f"[{datetime.datetime.now()}] ⏰ 定时任务触发: 开始每日采集与清理...")
+    
+    today = date.today()
+    
+    # --- 1. 自动采集逻辑 (今天、明天、后天) ---
+    scrape_targets = []
+    for i in range(3):
+        target_date = today + timedelta(days=i) # 0=今天, 1=明天, 2=后天
+        
+        # 检查文件是否已存在
+        date_str_iso = target_date.strftime("%Y年%m月%d日")
+        filename = f"shanxi_informatization_{date_str_iso}.xlsx"
+        filepath = os.path.join(RESULTS_DIR, filename)
+        
+        if os.path.exists(filepath):
+            print(f"   [跳过] {date_str_iso} 数据已存在。")
+        else:
+            print(f"   [计划] {date_str_iso} 加入采集队列。")
+            scrape_targets.append(target_date)
+            
+    if scrape_targets:
+        if SCRAPER_STATUS["is_running"]:
+            print("   [跳过] 爬虫正在运行中，本次定时任务取消采集。")
+        else:
+            # 启动采集线程
+            thread = threading.Thread(target=run_auto_scrape_thread, args=(scrape_targets,))
+            thread.daemon = True
+            thread.start()
+            print(f"   [启动] 已启动后台采集线程，目标: {len(scrape_targets)} 天")
+    else:
+        print("   [完成] 所有目标日期数据均已就绪，无需采集。")
+
+    # --- 2. 自动清理逻辑 (清理 前一天之前 的数据) ---
+    # 定义: 
+    #   今天 = T
+    #   前一天 = T-1
+    #   保留 >= T-1 的数据
+    #   删除 < T-1 的数据
+    cutoff_date = today - timedelta(days=1)
+    print(f"   [清理] 正在清理 {cutoff_date} 之前的数据...")
+    
+    pattern = os.path.join(RESULTS_DIR, "shanxi_informatization_*.xlsx")
+    files = glob.glob(pattern)
+    deleted_count = 0
+    
+    for f in files:
+        basename = os.path.basename(f)
+        match = re.search(r"shanxi_informatization_(.*)\.xlsx", basename)
+        if match:
+            file_date_str = match.group(1)
+            try:
+                # 转换中文日期: 2026年01月01日 -> 2026-01-01
+                std_date_str = file_date_str.replace('年', '-').replace('月', '-').replace('日', '')
+                file_date = datetime.datetime.strptime(std_date_str, "%Y-%m-%d").date()
+                
+                # 如果文件日期 < 文档保留日期 (前一天)
+                if file_date < cutoff_date:
+                    os.remove(f)
+                    print(f"      [删除] {basename} (早于 {cutoff_date})")
+                    deleted_count += 1
+            except Exception as e:
+                print(f"      [错误] 解析 {basename} 失败: {e}")
+                
+    print(f"   [清理完成] 共删除了 {deleted_count} 个过期文件。")
+
+# 添加定时任务: 每天 02:00 执行
+scheduler.add_job(id='daily_task', func=scheduled_job, trigger='cron', hour=2, minute=0)
+scheduler.start()
+print("✅ 定时任务调度器已启动 (每天 02:00 执行)")
+
 
 if __name__ == '__main__':
     import os
