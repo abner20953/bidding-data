@@ -175,6 +175,29 @@
                     </div>
                 </div>
             </div>
+
+            <div style="border-top: 1px solid rgba(255,255,255,0.1); margin-top: 15px; padding: 15px;">
+                <div class="scheduler-header"
+                    style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                    <h4 style="margin: 0; font-size: 14px; opacity: 0.8;">⏰ 定时任务监控 (每日 02:00)</h4>
+                    <button id="refresh-scheduler-logs" class="glass-btn icon-btn"
+                        style="width: 20px; height: 20px; min-width: 20px; display: flex; align-items: center; justify-content: center;"
+                        title="刷新日志">↻</button>
+                </div>
+                <div id="scheduler-logs-container" style="
+                    background: rgba(0,0,0,0.05); 
+                    border-radius: 8px; 
+                    padding: 10px; 
+                    height: 120px; 
+                    overflow-y: auto; 
+                    font-size: 11px; 
+                    font-family: monospace; 
+                    color: var(--text-secondary);
+                    white-space: pre-wrap;
+                ">
+                    <div style="text-align: center; padding-top: 40px;">加载中...</div>
+                </div>
+            </div>
         </div>
     </div>
 
