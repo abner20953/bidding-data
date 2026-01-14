@@ -458,16 +458,17 @@ document.addEventListener('DOMContentLoaded', () => {
     async function refreshExistingDates() {
         try {
             const resp = await fetch('/api/dates');
-            const dates = await response.json(); // Note: 'response' might be undefined here if I don't use 'resp'
-            // Typo in thought process? I should use 'resp'.
-            // wait, I need to see the file content carefully.
-            // The original code used 'resp' then 'dates = await resp.json()'.
-
-            // Let's write the correct function implementation here
-        } catch (e) { }
+            const dates = await resp.json();
+            existingDates.clear();
+            dates.forEach(d_str => {
+                // 将 "2026年01月01日" 转换为 "2026-01-01" 以便比较
+                const std_date = d_str.replace('年', '-').replace('月', '-').replace('日', '');
+                existingDates.add(std_date);
+            });
+        } catch (e) {
+            console.error("Failed to fetch existing dates", e);
+        }
     }
-    // Wait, replacing a huge chunk might be risky if I don't get the lines exactly right.
-    // I will use multi_replace for safer edits.
 
 
     // 打开日历模态框
