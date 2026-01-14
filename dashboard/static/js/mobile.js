@@ -205,7 +205,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     </div>
                     <div class="detail-row" title="预算">
                         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1v22M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg>
-                        <span class="budget">${item['预算限价项目'] || '-'}</span>
+                        <span class="budget">${(item['预算限价项目'] && item['预算限价项目'] !== '-' && item['预算限价项目'] !== '待采集') ? '¥' + item['预算限价项目'] : (item['预算限价项目'] || '-')}</span>
                     </div>
                     <div class="detail-row full-width" title="开标地点">
                         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path><circle cx="12" cy="10" r="3"></circle></svg>
