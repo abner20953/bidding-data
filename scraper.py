@@ -816,18 +816,49 @@ def run_scraper_for_date(target_date_str, callback=None):
             item['地区（市）'] = city
             item['地区（县）'] = district
 
-    # 4.1 日期一致性过滤 (处理更正公告导致日期变更的情况)
-    # 用户要求：回退过滤逻辑，保留所有结果，但在结果中显示实际开标日期
-    # 因此这里不再剔除日期不符的项目，仅打印日志作为提示
+    # 4.1 日期一致性过滤 (关联剔除模式)
+    # 策略：如果发现有项目的开标日期与目标日期不符（如更正公告改期），
+    # 则记录该项目的“项目编号”，并剔除列表中所有该编号的项目（包括原公告）。
     
     target_date_norm = extract_date_str(target_date_str)
     
     if target_date_norm:
-        for item in final_list:
+        # 第一步：识别需要剔除的项目编号
+        excluded_codes = set()
+        items_to_drop_indices = set() # Store indices of items to drop explicitly (e.g. if no code)
+        
+        for i, item in enumerate(final_list):
             item_date = item.get("开标日期")
+            # 如果日期明确存在，且不等于目标日期
             if item_date and item_date != "未找到" and item_date != target_date_norm:
-                print(f"    [提示] 日期变更: {item['标题'][:15]}... (目标: {target_date_norm}, 实际: {item_date}) - 已保留")
-    
+                p_code = item.get("项目编号")
+                if p_code and p_code != "未找到":
+                    excluded_codes.add(p_code)
+                    print(f"    [检测到变更] 编号 {p_code} 日期变更 ({item_date})，将剔除相关记录。")
+                else:
+                    # 如果没有编号，只能剔除自己
+                    items_to_drop_indices.add(i)
+        
+        # 第二步：执行剔除
+        filtered_list = []
+        dropped_count = 0
+        
+        for i, item in enumerate(final_list):
+            # 如果索引在待剔除列表，或者编号在黑名单中
+            p_code = item.get("项目编号")
+            if i in items_to_drop_indices or (p_code and p_code in excluded_codes):
+                print(f"    [剔除] 关联剔除: {item['标题'][:20]}... (编号: {p_code})")
+                dropped_count += 1
+                continue
+            filtered_list.append(item)
+            
+        if dropped_count > 0:
+            print(f"    共剔除 {dropped_count} 条关联记录。")
+        else:
+            print("    无记录被剔除。")
+            
+        final_list = filtered_list
+
     # 5. 排序与保存
     if final_list:
         df_temp = pd.DataFrame(final_list)
