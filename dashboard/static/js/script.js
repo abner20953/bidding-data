@@ -104,6 +104,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 <td class="cell-budget">${formatBudget(item['预算限价项目'])}</td>
                 <td>${item['代理机构'] || '-'}</td>
                 <td>${item['采购人名称'] || '-'}</td>
+                <td>${item['采购方式'] || '公开招标'}</td>
                 <td>
                     ${item['是否信息化'] === '是'
                 ? '<span class="tag is-info">信息化</span>'
@@ -318,6 +319,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 <div class="project-meta">
                     <span class="project-agency" title="${agency}">${agency}${district}</span>
+                    <span class="tag is-method">${item['采购方式'] || '公开招标'}</span>
                     <span class="project-budget">${budget}</span>
                 </div>
             </a>

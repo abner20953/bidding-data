@@ -155,6 +155,11 @@ body {
     font-weight: 500;
 }
 
+.tag.method {
+    background: #fdf2f8; /* Pinkish background */
+    color: #db2777;      /* Pink text */
+}
+
 .card-body {
     display: grid;
     grid-template-columns: 1fr 1fr;

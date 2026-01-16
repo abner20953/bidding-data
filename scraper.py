@@ -262,7 +262,8 @@ def parse_project_details(html_content):
         "开标地点": "未找到",
         "采购人名称": "未找到",
         "代理机构": "未找到",
-        "项目编号": "未找到"
+        "项目编号": "未找到",
+        "采购方式": "公开招标"  # 默认为公开招标
     }
 
     # 策略 1：尝试从结构化的“公告概要”中提取（最准确）
@@ -303,6 +304,12 @@ def parse_project_details(html_content):
                     details["代理机构"] = field_value
                 elif "预算金额" in label_clean or "最高限价" in label_clean:
                     details["预算限价项目"] = normalize_budget(field_value)
+                elif "采购方式" in label_clean:
+                    if "谈判" in field_value: details["采购方式"] = "竞争性谈判"
+                    elif "磋商" in field_value: details["采购方式"] = "竞争性磋商"
+                    elif "询价" in field_value: details["采购方式"] = "询价"
+                    elif "单一来源" in field_value: details["采购方式"] = "单一来源"
+                    elif "公开招标" in field_value: details["采购方式"] = "公开招标"
 
     # 策略 2：正则兜底（如果表格不存在或字段缺失）
     # 移除脚本和样式
@@ -421,6 +428,25 @@ def parse_project_details(html_content):
         pid_match = re.search(r"(?:项目编号|编号)[:：]\s*([A-Za-z0-9\-\_]+)", text)
         if pid_match:
              details["项目编号"] = pid_match.group(1).strip()
+             
+    # 7. 采购方式提取 (Regex Fallback)
+    # 如果默认为公开招标，尝试从文中提取明确的“采购方式”
+    if details["采购方式"] == "公开招标":
+        pm_match = re.search(r"采购方式[:：]\s*(.*?)(?=\n|；|。|$|（|注：)", text)
+        if pm_match:
+            val = pm_match.group(1)
+            if "谈判" in val: details["采购方式"] = "竞争性谈判"
+            elif "磋商" in val: details["采购方式"] = "竞争性磋商"
+            elif "询价" in val: details["采购方式"] = "询价"
+            elif "单一来源" in val: details["采购方式"] = "单一来源"
+        
+        # 补充：如果全文标题含“谈判”、“磋商”，也可辅助判定
+        elif "竞争性谈判" in details.get("标题", "") or "竞争性谈判" in soup.title.string:
+             details["采购方式"] = "竞争性谈判"
+        elif "竞争性磋商" in details.get("标题", "") or "竞争性磋商" in soup.title.string:
+             details["采购方式"] = "竞争性磋商"
+        elif "询价" in details.get("标题", "") or "询价" in soup.title.string:
+             details["采购方式"] = "询价"
 
     return details
 
@@ -617,7 +643,8 @@ def scrape():
                         "开标具体时间": "待采集",
                         "开标地点": "待采集",
                         "采购人名称": "待采集",
-                        "代理机构": "待采集"
+                        "代理机构": "待采集",
+                        "采购方式": "待采集"
                     }
                     has_new_data = True
             
@@ -752,7 +779,8 @@ def run_scraper_for_date(target_date_str, callback=None):
                             "开标具体时间": "待采集",
                             "开标地点": "待采集",
                             "采购人名称": "待采集",
-                            "代理机构": "待采集"
+                            "代理机构": "待采集",
+                            "采购方式": "待采集"
                         }
                         has_new_data = True
                 

@@ -329,6 +329,27 @@ body {
     text-overflow: ellipsis;
 }
 
+/* 采购方式标签 */
+.tag {
+    display: inline-block;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 500;
+}
+
+.tag.is-method {
+    background: #f3e8ff;
+    color: #7e22ce;
+}
+
+.detail-table .tag.is-method {
+    background: #f3e8ff;
+    color: #7e22ce;
+    font-size: 12px;
+    padding: 4px 8px;
+}
+
 /* Loading 状态 */
 .loading-state {
     grid-column: 1 / -1;

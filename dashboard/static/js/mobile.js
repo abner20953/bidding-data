@@ -195,6 +195,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     <div class="card-title">${item['标题']}</div>
                     <div class="card-tags">
                         ${tagHtml}
+                        <span class="tag method">${item['采购方式'] || '公开招标'}</span>
                         <span class="tag">${item['地区（市）'] || '未知'}</span>
                     </div>
                 </div>
