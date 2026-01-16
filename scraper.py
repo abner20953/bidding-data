@@ -329,19 +329,25 @@ def parse_project_details(html_content):
                     print(f"    [更正模式] 提取时间: {details['开标具体时间']} 日期: {details['开标日期']}")
 
     # 1. 预算限价
+    # 1. 预算限价
     if details["预算限价项目"] == "未找到":
         budget_patterns = [
-            r"(?:预算金额|最高限价|项目概况|预算金额（元）).*?[:：]\s*([\d,，\.]+)\s*(?:元|万元)?",
+            r"(?:预算金额|最高限价|预算金额（元）).*?[:：]\s*([\d,，\.]+)\s*(?:元|万元)?",
             r"预算金额.*?([\d,，\.]+)\s*万元",
             r"项目预算.*?([\d,，\.]+)\s*元"
         ]
         for p in budget_patterns:
             match = re.search(p, text, re.S)
             if match:
-                num_match = re.search(r"([\d,，\.]+)", match.group(0))
+                val_str = match.group(1)
+                # 修复BUG：必须包含至少一个数字，防止匹配到 ", " 或 "."
+                if not re.search(r"\d", val_str):
+                    continue
+                    
+                num_match = re.search(r"([\d,，\.]+)", val_str)
                 if num_match:
-                    val_str = num_match.group(1).replace("，", ",")
-                    raw_val = f"{val_str} 万元" if "万元" in match.group(0) else f"{val_str} 元"
+                    clean_val = num_match.group(1).replace("，", ",")
+                    raw_val = f"{clean_val} 万元" if "万元" in match.group(0) else f"{clean_val} 元"
                     details["预算限价项目"] = normalize_budget(raw_val)
                     break
 
@@ -373,7 +379,11 @@ def parse_project_details(html_content):
             location_match = re.search(p, text, re.S)
             if location_match:
                 loc = location_match.group(1).strip()
-                if loc and "线上" not in loc and "网上" not in loc:
+                # 修复BUG：增加黑名单过滤
+                # 1. 过滤包含“时间”的（误抓取了时间行）
+                # 2. 过滤以“和”、“及”开头的（误抓了“地点和方式”中的“和方式”）
+                if (loc and "线上" not in loc and "网上" not in loc and 
+                    "时间" not in loc and not loc.startswith("和") and not loc.startswith("及")):
                      details["开标地点"] = loc
                      break
 
