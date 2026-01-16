@@ -244,7 +244,8 @@ def parse_project_details(html_content):
         "开标具体时间": "未找到",
         "开标地点": "未找到",
         "采购人名称": "未找到",
-        "代理机构": "未找到"
+        "代理机构": "未找到",
+        "项目编号": "未找到"
     }
 
     # 策略 1：尝试从结构化的“公告概要”中提取（最准确）
@@ -356,7 +357,85 @@ def parse_project_details(html_content):
             if name_match:
                 details["代理机构"] = name_match.group(1).strip()
 
+    # 6. 项目编号提取
+    if details["项目编号"] == "未找到":
+        # 常见格式：项目编号：xxxx
+        pid_match = re.search(r"(?:项目编号|编号)[:：]\s*([A-Za-z0-9\-\_]+)", text)
+        if pid_match:
+             details["项目编号"] = pid_match.group(1).strip()
+
     return details
+
+def find_original_project(project_code, current_url):
+    """
+    根据项目编号搜索并尝试找到最早的原始公告（倾向于招标公告）
+    """
+    if not project_code or project_code == "未找到":
+        return None
+        
+    print(f"    正在回溯搜索项目编号: {project_code} ...")
+    start_time, end_time = get_date_range()
+    
+    # 扩大搜索范围，防止原始公告太久远（比如半年前）
+    # 这里简单起见，使用更宽的时间范围或多次尝试，目前先沿用全局的时间配置，
+    # 但实际场景中原始公告可能早于 90 天，这里可能需要调整 DAYS_AGO 或单独传参
+    # 暂时先用当前配置
+    
+    params = build_search_url(1, start_time, end_time, project_code)
+    html = fetch_page(BASE_URL, params=params)
+    
+    if not html: return None
+    
+    soup = BeautifulSoup(html, 'html.parser')
+    list_items = soup.select('ul.vT-srch-result-list-bid li')
+    if not list_items:
+        list_items = soup.select('.v9-search-result-list li')
+        
+    candidates = []
+    for item in list_items:
+        link_tag = item.find('a')
+        if not link_tag: continue
+        
+        href = link_tag.get('href', '').strip()
+        if not href.startswith('http'):
+             href = "http://www.ccgp.gov.cn" + href if href.startswith('/') else "http://www.ccgp.gov.cn/" + href
+             
+        if href == current_url:
+            continue
+            
+        title = link_tag.get_text().strip()
+        
+        # 提取发布时间用于排序
+        pub_date = "0000-00-00"
+        date_match = re.search(r'\d{4}\.\d{2}\.\d{2}', item.get_text())
+        if date_match:
+            pub_date = date_match.group(0)
+            
+        candidates.append({
+            "url": href,
+            "title": title,
+            "date": pub_date
+        })
+    
+    if not candidates:
+        return None
+        
+    # 按日期排序，取最早的
+    candidates.sort(key=lambda x: x['date'])
+    
+    # 优先找标题里不带“更正”、“结果”、“变更”的
+    original_candidates = [c for c in candidates if not any(k in c['title'] for k in ['更正', '变更', '结果', '终止'])]
+    
+    target_project = None
+    if original_candidates:
+        target_project = original_candidates[0]
+    else:
+        # 如果都是更正，那取最早的那个更正可能也没用，但也试一试
+        target_project = candidates[0]
+        
+    print(f"    -> 找到疑似原始公告: {target_project['title']} ({target_project['date']})")
+    return target_project['url']
+
 
 def fetch_and_parse_details(item):
     """多线程调用的包装函数"""
@@ -368,6 +447,28 @@ def fetch_and_parse_details(item):
     if html:
         detail_data = parse_project_details(html)
         item.update(detail_data)
+        
+        # --- 更正公告回填逻辑 ---
+        if item.get('标题', '').endswith("更正公告") and \
+           (item.get("预算限价项目") == "未找到" or item.get("开标地点") == "未找到"):
+            
+            project_code = item.get("项目编号")
+            if project_code and project_code != "未找到":
+                original_url = find_original_project(project_code, url)
+                if original_url:
+                    original_html = fetch_page(original_url)
+                    if original_html:
+                        original_details = parse_project_details(original_html)
+                        
+                        if item.get("预算限价项目") == "未找到" and original_details.get("预算限价项目") != "未找到":
+                            item["预算限价项目"] = original_details["预算限价项目"] + " (来自原始公告)"
+                            print(f"    [回填成功] 预算: {item['预算限价项目']}")
+                            
+                        if item.get("开标地点") == "未找到" and original_details.get("开标地点") != "未找到":
+                            item["开标地点"] = original_details["开标地点"] + " (来自原始公告)"
+                            print(f"    [回填成功] 地点: {item['开标地点']}")
+        # ------------------------
+
         if detail_data.get("预算限价项目") != "未找到":
              print(f"    成功提取详情: {item['标题'][:20]}...")
     else:
