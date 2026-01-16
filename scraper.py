@@ -315,10 +315,15 @@ def parse_project_details(html_content):
         if correction_section:
             section_text = correction_section.group(0)
             # 提取所有完整的时间点
-            all_times = re.findall(r"(?:20\d{2}年\d{1,2}月\d{1,2}日\s*[\d:：点分]{4,8})", section_text)
+            # 修复：增加 (?:\s*(?:上午|下午))? 以匹配 “2026年1月28日上午10:00” 这种格式
+            # 修复：增加 '时' 以匹配 "9时00分"
+            all_times = re.findall(r"(?:20\d{2}年\d{1,2}月\d{1,2}日\s*(?:上午|下午)?\s*[\d:：点分时]{4,8})", section_text)
+            
             if all_times:
                 # 取最后一个，假设为最新更正的时间
-                raw_time = all_times[-1].replace("点", ":").replace("分", "").replace("：", ":")
+                # 需清洗掉“上午”“下午”字样，以便 extract_time_only 处理
+                raw_match = all_times[-1].replace("上午", "").replace("下午", "")
+                raw_time = raw_match.replace("点", ":").replace("分", "").replace("：", ":").replace("时", ":") # Handle '时' replacement too
                 extracted = extract_time_only(raw_time)
                 if extracted and extracted != "未找到":
                     details["开标具体时间"] = extracted
