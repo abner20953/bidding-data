@@ -325,11 +325,18 @@ def parse_project_details(html_content):
 
     # 3. 开标地点 (强制要求“开标”、“投标”或“提交投标文件”前缀，防止误抓“获取招标文件地点”)
     if details["开标地点"] == "未找到" or "线上" in details["开标地点"] or "网上" in details["开标地点"]:
-        location_match = re.search(r"(?:开标|投标|提交投标文件|响应文件开启)地\s*点[:：]?\s*(.*?)(?=\n|；|。|$|（|注：)", text)
-        if location_match:
-            loc = location_match.group(1).strip()
-            if "线上" not in loc and "网上" not in loc:
-                 details["开标地点"] = loc
+        location_patterns = [
+            r"(?:开标|投标|提交投标文件|响应文件开启)地\s*点[:：]?\s*(.*?)(?=\n|；|。|$|（|注：)",
+            r"(?:响应文件开启|开标信息|开标).{0,200}?地\s*点[:：]?\s*(.*?)(?=\n|；|。|$|（|注：)"
+        ]
+        
+        for p in location_patterns:
+            location_match = re.search(p, text, re.S)
+            if location_match:
+                loc = location_match.group(1).strip()
+                if loc and "线上" not in loc and "网上" not in loc:
+                     details["开标地点"] = loc
+                     break
 
     # 4. 采购人名称
     if details["采购人名称"] == "未找到":
