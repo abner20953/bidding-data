@@ -308,7 +308,10 @@ def parse_project_details(html_content):
     # 0. 特殊处理：更正公告的时间提取 (High Priority)
     # 如果是更正公告，优先从“更正信息”段落提取时间，并取最后一个（通常是更正后的）
     if "更正" in soup.title.string or "变更" in soup.title.string or "更正" in details.get("标题", ""):
-        correction_section = re.search(r"(?:更正信息|变更信息).*?(?=三、|其他补充事宜|四、|$)", text, re.S)
+        # 修正正则：
+        # 1. 移除 '四、' 以防止表格内容中引用 '四、响应文件提交' 时导致截断
+        # 2. 增加 \n\s* 前缀，确保匹配的是章节标题而非行内文本
+        correction_section = re.search(r"(?:更正信息|变更信息).*?(?=\n\s*三[、\.]|\n\s*其他补充事宜|$)", text, re.S)
         if correction_section:
             section_text = correction_section.group(0)
             # 提取所有完整的时间点
@@ -814,32 +817,17 @@ def run_scraper_for_date(target_date_str, callback=None):
             item['地区（县）'] = district
 
     # 4.1 日期一致性过滤 (处理更正公告导致日期变更的情况)
-    # 标准化目标日期
-    target_date_norm = extract_date_str(target_date_str)
+    # 用户要求：回退过滤逻辑，保留所有结果，但在结果中显示实际开标日期
+    # 因此这里不再剔除日期不符的项目，仅打印日志作为提示
     
-    filtered_list = []
-    dropped_count = 0
+    target_date_norm = extract_date_str(target_date_str)
     
     if target_date_norm:
         for item in final_list:
             item_date = item.get("开标日期")
-            # 如果提取到了具体日期，且与目标日期不符，则剔除
-            # 注意：如果没提取到日期("未找到")，则保留，避免误删
             if item_date and item_date != "未找到" and item_date != target_date_norm:
-                print(f"    [剔除] 日期不符: {item['标题'][:15]}... (目标: {target_date_norm}, 实际: {item_date})")
-                dropped_count += 1
-                continue
-            filtered_list.append(item)
-    else:
-        filtered_list = final_list
-        
-    if dropped_count > 0:
-        print(f"    已剔除 {dropped_count} 条日期不符的记录（如更正后改期）。")
-    else:
-        print(f"    日期校验通过 (目标: {target_date_norm})。")
-        
-    final_list = filtered_list
-
+                print(f"    [提示] 日期变更: {item['标题'][:15]}... (目标: {target_date_norm}, 实际: {item_date}) - 已保留")
+    
     # 5. 排序与保存
     if final_list:
         df_temp = pd.DataFrame(final_list)
