@@ -985,7 +985,7 @@ def run_scraper_for_date(target_date_str, callback=None):
 
         df = pd.DataFrame(final_list)
         columns_order = [
-            "标题", "是否信息化", "语义匹配度", "地区（市）", "地区（县）", "预算限价项目", 
+            "标题", "是否信息化", "采购方式", "语义匹配度", "地区（市）", "地区（县）", "预算限价项目", 
             "开标具体时间", "开标地点", "发布时间", "代理机构", 
             "采购人名称", "链接"
         ]
