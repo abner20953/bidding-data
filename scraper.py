@@ -159,6 +159,17 @@ def extract_time_only(text):
     h, m = match.group(1), match.group(2)
     return f"{int(h):02d}:{int(m):02d}"
 
+def extract_date_str(text):
+    """
+    提取日期字符串并标准化为 YYYY-MM-DD
+    """
+    if not text: return None
+    match = re.search(r"(\d{4})[年.-](\d{1,2})[月.-](\d{1,2})", text)
+    if match:
+        y, m, d = match.groups()
+        return f"{y}-{int(m):02d}-{int(d):02d}"
+    return None
+
 def extract_region(location, title, purchaser, agency):
     """
     智能识别所属市、县（区）。
@@ -242,6 +253,7 @@ def parse_project_details(html_content):
     details = {
         "预算限价项目": "未找到",
         "开标具体时间": "未找到",
+        "开标日期": "未找到",
         "开标地点": "未找到",
         "采购人名称": "未找到",
         "代理机构": "未找到",
@@ -307,7 +319,11 @@ def parse_project_details(html_content):
                 extracted = extract_time_only(raw_time)
                 if extracted and extracted != "未找到":
                     details["开标具体时间"] = extracted
-                    print(f"    [更正模式] 提取时间: {details['开标具体时间']}")
+                    # extract date as well
+                    date_val = extract_date_str(raw_time)
+                    if date_val:
+                        details["开标日期"] = date_val
+                    print(f"    [更正模式] 提取时间: {details['开标具体时间']} 日期: {details['开标日期']}")
 
     # 1. 预算限价
     if details["预算限价项目"] == "未找到":
@@ -338,6 +354,9 @@ def parse_project_details(html_content):
             if match:
                 raw_time = match.group(1).replace("点", ":").replace("分", "").replace("：", ":")
                 details["开标具体时间"] = extract_time_only(raw_time)
+                # 顺便提取日期
+                d_val = extract_date_str(raw_time)
+                if d_val: details["开标日期"] = d_val
                 break
 
     # 3. 开标地点 (强制要求“开标”、“投标”或“提交投标文件”前缀，防止误抓“获取招标文件地点”)
@@ -793,6 +812,33 @@ def run_scraper_for_date(target_date_str, callback=None):
             )
             item['地区（市）'] = city
             item['地区（县）'] = district
+
+    # 4.1 日期一致性过滤 (处理更正公告导致日期变更的情况)
+    # 标准化目标日期
+    target_date_norm = extract_date_str(target_date_str)
+    
+    filtered_list = []
+    dropped_count = 0
+    
+    if target_date_norm:
+        for item in final_list:
+            item_date = item.get("开标日期")
+            # 如果提取到了具体日期，且与目标日期不符，则剔除
+            # 注意：如果没提取到日期("未找到")，则保留，避免误删
+            if item_date and item_date != "未找到" and item_date != target_date_norm:
+                print(f"    [剔除] 日期不符: {item['标题'][:15]}... (目标: {target_date_norm}, 实际: {item_date})")
+                dropped_count += 1
+                continue
+            filtered_list.append(item)
+    else:
+        filtered_list = final_list
+        
+    if dropped_count > 0:
+        print(f"    已剔除 {dropped_count} 条日期不符的记录（如更正后改期）。")
+    else:
+        print(f"    日期校验通过 (目标: {target_date_norm})。")
+        
+    final_list = filtered_list
 
     # 5. 排序与保存
     if final_list:
