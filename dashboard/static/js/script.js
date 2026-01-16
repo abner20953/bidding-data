@@ -104,8 +104,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 <td class="cell-budget">${formatBudget(item['预算限价项目'])}</td>
                 <td>${item['代理机构'] || '-'}</td>
                 <td>${item['采购人名称'] || '-'}</td>
-                <td>${item['采购方式'] || '公开招标'}</td>
                 <td>
+                    <span class="tag is-method" style="margin-bottom: 4px;">${item['采购方式'] || '公开招标'}</span>
+                    <br>
                     ${item['是否信息化'] === '是'
                 ? '<span class="tag is-info">信息化</span>'
                 : '<span class="tag is-normal">普通</span>'}
