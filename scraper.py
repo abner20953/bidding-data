@@ -293,6 +293,22 @@ def parse_project_details(html_content):
         script_or_style.decompose()
     text = soup.get_text(separator='\n')
 
+    # 0. 特殊处理：更正公告的时间提取 (High Priority)
+    # 如果是更正公告，优先从“更正信息”段落提取时间，并取最后一个（通常是更正后的）
+    if "更正" in soup.title.string or "变更" in soup.title.string or "更正" in details.get("标题", ""):
+        correction_section = re.search(r"(?:更正信息|变更信息).*?(?=三、|其他补充事宜|四、|$)", text, re.S)
+        if correction_section:
+            section_text = correction_section.group(0)
+            # 提取所有完整的时间点
+            all_times = re.findall(r"(?:20\d{2}年\d{1,2}月\d{1,2}日\s*[\d:：点分]{4,8})", section_text)
+            if all_times:
+                # 取最后一个，假设为最新更正的时间
+                raw_time = all_times[-1].replace("点", ":").replace("分", "").replace("：", ":")
+                extracted = extract_time_only(raw_time)
+                if extracted and extracted != "未找到":
+                    details["开标具体时间"] = extracted
+                    print(f"    [更正模式] 提取时间: {details['开标具体时间']}")
+
     # 1. 预算限价
     if details["预算限价项目"] == "未找到":
         budget_patterns = [
