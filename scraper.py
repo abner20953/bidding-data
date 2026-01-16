@@ -431,22 +431,85 @@ def parse_project_details(html_content):
              
     # 7. 采购方式提取 (Regex Fallback)
     # 如果默认为公开招标，尝试从文中提取明确的“采购方式”
+    # 优先检查标题 (最强信号)
+    if "竞争性谈判" in details.get("标题", "") or (soup.title and "竞争性谈判" in soup.title.string):
+         details["采购方式"] = "竞争性谈判"
+    elif "竞争性磋商" in details.get("标题", "") or (soup.title and "竞争性磋商" in soup.title.string):
+         details["采购方式"] = "竞争性磋商"
+    elif "询价" in details.get("标题", "") or (soup.title and "询价" in soup.title.string):
+         details["采购方式"] = "询价"
+    elif "单一来源" in details.get("标题", "") or (soup.title and "单一来源" in soup.title.string):
+         details["采购方式"] = "单一来源"
+    
+    # 如果标题没找到，再找正文
     if details["采购方式"] == "公开招标":
-        pm_match = re.search(r"采购方式[:：]\s*(.*?)(?=\n|；|。|$|（|注：)", text)
+        # 移除 lookahead 中的 strict constraint，改用更宽松的非贪婪匹配
+        pm_match = re.search(r"采购方式[:：]\s*(\S{2,10})", text)
         if pm_match:
             val = pm_match.group(1)
             if "谈判" in val: details["采购方式"] = "竞争性谈判"
             elif "磋商" in val: details["采购方式"] = "竞争性磋商"
             elif "询价" in val: details["采购方式"] = "询价"
             elif "单一来源" in val: details["采购方式"] = "单一来源"
+            elif "单一来源" in val: details["采购方式"] = "单一来源"
+            elif "公开招标" in val: details["采购方式"] = "公开招标"
+
+    # 8. 更正公告特殊处理：回溯原始公告 (Backfill Logic)
+    # 如果是更正公告且采购方式未提取成功（或为默认），尝试寻找原公告链接
+    is_correction = "更正" in details.get("标题", "") or "变更" in details.get("标题", "") or (soup.title and ("更正" in soup.title.string or "变更" in soup.title.string))
+    
+    if is_correction and details["采购方式"] == "公开招标":
+        # 寻找原公告链接
+        # 常见文本： "原公告地址" 或 "首次公告"
+        origin_link = None
+        for a in soup.find_all('a', href=True):
+            if "原公告" in a.get_text() or "首次公告" in a.get_text():
+                origin_link = a['href']
+                break
         
-        # 补充：如果全文标题含“谈判”、“磋商”，也可辅助判定
-        elif "竞争性谈判" in details.get("标题", "") or "竞争性谈判" in soup.title.string:
-             details["采购方式"] = "竞争性谈判"
-        elif "竞争性磋商" in details.get("标题", "") or "竞争性磋商" in soup.title.string:
-             details["采购方式"] = "竞争性磋商"
-        elif "询价" in details.get("标题", "") or "询价" in soup.title.string:
-             details["采购方式"] = "询价"
+        if origin_link:
+            print(f"    [更正回溯] 发现原公告链接: {origin_link}，尝试回溯采集采购方式...")
+            try:
+                # 处理相对路径 (如果需要) - CCGP 通常是绝对路径或同级相对
+                # 简单起见，假设是绝对路径或完整URL, 实际情况如果出错则忽略
+                if not origin_link.startswith("http"):
+                    # 尝试简单的拼接，或者忽略
+                    pass 
+                
+                # Fetch original content
+                # 注意：这里调用 fetch_page 会产生额外的网络请求
+                # 为防止递归死循环，只做一层回溯，且不完全递归 parse_project_details
+                resp = fetch_page(origin_link)
+                if resp and resp.status_code == 200:
+                    orig_html = resp.content.decode("utf-8", errors="ignore")
+                    orig_soup = BeautifulSoup(orig_html, 'html.parser')
+                    orig_text = orig_soup.get_text(separator='\n')
+                    
+                    # 使用相同的逻辑提取
+                    found_pm = None
+                    # 1. Title
+                    if orig_soup.title:
+                        t = orig_soup.title.string
+                        if "竞争性谈判" in t: found_pm = "竞争性谈判"
+                        elif "竞争性磋商" in t: found_pm = "竞争性磋商"
+                        elif "询价" in t: found_pm = "询价"
+                        elif "单一来源" in t: found_pm = "单一来源"
+                    
+                    # 2. Regex
+                    if not found_pm:
+                         pm_match = re.search(r"采购方式[:：]\s*(\S{2,10})", orig_text)
+                         if pm_match:
+                            val = pm_match.group(1)
+                            if "谈判" in val: found_pm = "竞争性谈判"
+                            elif "磋商" in val: found_pm = "竞争性磋商"
+                            elif "询价" in val: found_pm = "询价"
+                            elif "单一来源" in val: found_pm = "单一来源"
+                    
+                    if found_pm:
+                        details["采购方式"] = found_pm
+                        print(f"    [更正回溯] 成功从原公告提取采购方式: {found_pm}")
+            except Exception as e:
+                print(f"    [更正回溯] 失败: {e}")
 
     return details
 

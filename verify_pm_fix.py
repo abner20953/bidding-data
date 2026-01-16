@@ -1,8 +1,8 @@
 from scraper import parse_project_details
 
-files = ["debug_pm_neg.html", "debug_pm_consult.html"]
+files = ["debug_pm_fail.html"]
 
-print("--- Testing Extraction Logic ---")
+print("--- Testing Extraction Logic (Fix Verification) ---")
 for fname in files:
     try:
         with open(fname, "r", encoding="utf-8") as f:
