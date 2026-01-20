@@ -35,7 +35,7 @@ STRONG_IT_KEYWORDS = [
     # 新增补漏 (Step 1069)
     '视频会议', '会议系统', '考核平台', '信息采集',
     # 新增补漏 (Step 1088)
-    '虚拟化', '沉浸式', '智慧医院'
+    '虚拟化', '智慧医院'
 ]
 
 
@@ -257,6 +257,42 @@ def extract_region(location, title, purchaser, agency):
 
     return city_found, district_found
 
+def extract_requirements(soup, text):
+    """
+    辅助函数：从页面中提取采购需求（简要规格描述）
+    """
+    req_text = "未找到"
+    
+    # 方式1：尝试从 bookmark-item 提取（政采云模板常见结构）
+    try:
+        brief_spec_samp = soup.find('samp', class_=re.compile(r'.*briefSpecificationDesc.*'))
+        if brief_spec_samp:
+            val = brief_spec_samp.get_text(strip=True)
+            if val and len(val) > 10:
+                req_text = val[:500]
+    except:
+        pass
+            
+    # 方式2：正则兜底
+    if req_text == "未找到":
+        req_patterns = [
+            r"简要规格描述[:：]\s*(.{10,800})",
+            r"采购需求[:：]\s*(.{10,800})"
+        ]
+        for pattern in req_patterns:
+            try:
+                match = re.search(pattern, text, re.S)
+                if match:
+                    raw_text = match.group(1).strip()
+                    raw_text = re.sub(r'<[^>]+>', '', raw_text)
+                    if raw_text and len(raw_text) > 10:
+                        req_text = raw_text[:500]
+                        break
+            except:
+                continue
+    
+    return req_text
+
 def parse_project_details(html_content):
     """从详情页 HTML 中提取详细信息，优先从公告概要中提取"""
     soup = BeautifulSoup(html_content, 'html.parser')
@@ -269,7 +305,8 @@ def parse_project_details(html_content):
         "采购人名称": "未找到",
         "代理机构": "未找到",
         "项目编号": "未找到",
-        "采购方式": "公开招标"  # 默认为公开招标
+        "采购方式": "公开招标",  # 默认为公开招标
+        "采购需求": "未找到"  # 新增字段
     }
 
     # 策略 1：尝试从结构化的“公告概要”中提取（最准确）
@@ -509,15 +546,36 @@ def parse_project_details(html_content):
                             if "谈判" in val: found_pm = "竞争性谈判"
                             elif "磋商" in val: found_pm = "竞争性磋商"
                             elif "询价" in val: found_pm = "询价"
-                            elif "单一来源" in val: found_pm = "单一来源"
+
+                    elif "单一来源" in val: found_pm = "单一来源"
                     
                     if found_pm:
                         details["采购方式"] = found_pm
                         print(f"    [更正回溯] 成功从原公告提取采购方式: {found_pm}")
+                    
+                    # 同时回溯提取采购需求 (Step 1309)
+                    backfill_req = extract_requirements(orig_soup, orig_text)
+                    if backfill_req != "未找到":
+                         details["采购需求"] = backfill_req
+                         print(f"    [更正回溯] 成功从原公告提取采购需求")
+
             except Exception as e:
                 print(f"    [更正回溯] 失败: {e}")
 
+    # 9. 提取"采购需求" (简要规格描述) - 如果回溯没有填补的话
+    if details["采购需求"] == "未找到":
+        details["采购需求"] = extract_requirements(soup, text)
+
     return details
+
+
+
+# Actual plan:
+# 1. Insert `extract_requirements` function before `parse_project_details`.
+# 2. Modify `parse_project_details`:
+#    - Inside the "Correction Backfill" block (around line 517), add logic to extract requirements from `orig_soup`/`orig_text`.
+#    - At the end of function, use `extract_requirements` for the current page details.
+
 
 def find_original_project(project_code, current_url):
     """
@@ -602,8 +660,14 @@ def fetch_and_parse_details(item):
         item.update(detail_data)
         
         # --- 更正公告回填逻辑 ---
-        if item.get('标题', '').endswith("更正公告") and \
-           (item.get("预算限价项目") == "未找到" or item.get("开标地点") == "未找到"):
+        # 只要是更正公告，且缺任意一项关键信息（预算、地点、采购需求），都尝试回溯
+        is_correction = "更正" in item.get('标题', '') or "变更" in item.get('标题', '')
+        
+        needs_backfill = (item.get("预算限价项目") == "未找到" or 
+                          item.get("开标地点") == "未找到" or
+                          item.get("采购需求") == "未找到")
+
+        if is_correction and needs_backfill:
             
             project_code = item.get("项目编号")
             if project_code and project_code != "未找到":
@@ -620,6 +684,11 @@ def fetch_and_parse_details(item):
                         if item.get("开标地点") == "未找到" and original_details.get("开标地点") != "未找到":
                             item["开标地点"] = original_details["开标地点"] + " (来自原始公告)"
                             print(f"    [回填成功] 地点: {item['开标地点']}")
+                            
+                        if item.get("采购需求") == "未找到" and original_details.get("采购需求") != "未找到":
+                            item["采购需求"] = original_details["采购需求"]
+                            print(f"    [回填成功] 需求: 已获取")
+        # ------------------------
         # ------------------------
 
         if detail_data.get("预算限价项目") != "未找到":
@@ -868,20 +937,20 @@ def run_scraper_for_date(target_date_str, callback=None):
     
     anchor_sentences = [
             # 第一类：软件与应用系统（核心特征）
-            "软件系统开发与定制", "应用平台建设运营", "业务信息系统升级", "电子政务", "公立医院绩效考核平台",
+            "软件系统开发与定制", "应用平台建设运营", "业务信息系统升级", "电子政务管理系统", "医务绩效考核软件系统",
             # 第二类：数据与计算（现代IT核心）
-            "大数据平台与数据分析", "云计算服务与云平台", "数据库与数据治理", "算法模型与人工智能应用", "文书档案整理及电子化",
+            "大数据平台与数据分析", "云计算服务与云平台", "数据库与数据治理", "算法模型与人工智能应用", "文书档案数字化管理系统",
             # 第三类：智能化应用（具体场景）
-            "智能监管执法平台", "指挥调度中心系统", "物联网感知与智能控制", "智慧应用与数字化服务",
-            "智慧信息平台", "智慧监管平台", "信息化建设", "视频督察与视频会议系统", "智慧医院改造",
+            "智能监管执法平台", "指挥调度信息管理平台", "物联网感知与智能控制", "智慧应用与数字化平台",
+            "智慧信息平台", "智慧监管平台", "信息化系统建设", "视频督察与视频会议系统", "医院核心业务信息系统HIS",
             # 第四类：IT基础设施（硬件范畴）
-            "信息化机房与数据中心", "计算机网络与服务器设备", "弱电智能化系统工程", "信息安全防护设备", "高性能虚拟化平台",
+            "机房智能化建设工程", "计算机网络系统集成", "弱电智能化系统工程", "网络信息安全防护系统", "高性能虚拟化平台",
             # 第五类：IT专业服务（技术服务）
-            "系统集成实施服务", "软件运维技术支持", "信息系统测评监理", "网络安全等级保护", "沉浸式数字显影服务", "信息采集公共服务",
+            "系统集成实施服务", "软件运维技术支持", "信息化项目测评与监理", "网络安全等级保护", "沉浸式数字展厅体验系统", "城市运行数据采集系统",
             # 第六类：数字化服务（新增）
-            "档案数字化加工服务","电子政务外网建设","远程会诊系统建设","在线教学平台建设",
+            "档案数字化加工系统","电子政务外网建设","远程会诊平台软件","在线教学平台",
             # 第七类：监控与安防（新增）
-            "视频监控联网项目","雪亮工程建设", "智能安防系统"
+            "视频监控联网系统","雪亮工程信息化", "智能安防系统"
     ]
     
     final_list = []
@@ -907,7 +976,7 @@ def run_scraper_for_date(target_date_str, callback=None):
                 max_score = float(scores.max())
                 item['语义匹配度'] = max_score
                 
-                if max_score > 0.53: 
+                if max_score > 0.61: 
                     item['是否信息化'] = "是"
                 else:
                     item['是否信息化'] = "否"
@@ -996,7 +1065,7 @@ def run_scraper_for_date(target_date_str, callback=None):
         df = pd.DataFrame(final_list)
         columns_order = [
             "标题", "是否信息化", "采购方式", "语义匹配度", "地区（市）", "地区（县）", "预算限价项目", 
-            "开标具体时间", "开标地点", "发布时间", "代理机构", 
+            "开标具体时间", "开标地点", "采购需求", "发布时间", "代理机构", 
             "采购人名称", "链接"
         ]
         existing_cols = [col for col in columns_order if col in df.columns]

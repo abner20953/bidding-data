@@ -93,7 +93,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // 填充表格
         modalTableBody.innerHTML = items.map(item => `
-            <tr>
+            <tr title="${(item['采购需求'] || '').replace(/"/g, '&quot;')}">
                 <td>
                     <a href="${item['链接']}" target="_blank" class="project-link" title="${item['标题']}">
                         ${item['标题']}
