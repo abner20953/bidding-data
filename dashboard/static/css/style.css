@@ -127,6 +127,13 @@ body {
     background: #fff;
 }
 
+.glass-btn.has-text {
+    width: auto;
+    height: 36px; /* Keep height consistent but allow width to grow */
+    padding: 0 12px;
+    gap: 6px;
+}
+
 /* 地区网格布局 */
 .regions-grid {
     display: grid;
