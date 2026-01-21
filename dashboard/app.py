@@ -1,4 +1,4 @@
-﻿from flask import Flask, jsonify, render_template, request, redirect, url_for
+﻿from flask import Flask, jsonify, render_template, request, redirect, url_for, send_from_directory
 from flask_apscheduler import APScheduler
 import pandas as pd
 import threading
@@ -158,6 +158,26 @@ def dashboard_view():
 @app.route('/mobile')
 def mobile_view():
     return render_template('mobile.html')
+
+@app.route('/api/tools/download')
+def download_tools():
+    # File is in the project root (../ relative to dashboard/app.py)
+    # But wait, app.py runs from project root in Docker? 
+    # In Dockerfile: WORKDIR /app. CMD python dashboard/app.py? No, CMD gunicorn dashboard.app:app. 
+    # So CWD is /app.
+    # The file is in /app (project root).
+    filename = "Beyond-Compare-Pro-5.0.4.30422-x64.7z"
+    directory = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) # This gets D:\ai_project\1 if __file__ is D:\ai_project\1\dashboard\app.py
+    
+    # In Docker, __file__ is /app/dashboard/app.py. dirname is /app/dashboard. dirname(dirname) is /app.
+    # So this logic holds.
+    
+    # Safety: Ensure file exists
+    file_path = os.path.join(directory, filename)
+    if not os.path.exists(file_path):
+        return jsonify({"error": f"File not found: {filename}"}), 404
+        
+    return send_from_directory(directory, filename, as_attachment=True)
 
 @app.route('/api/dates')
 def api_dates():
