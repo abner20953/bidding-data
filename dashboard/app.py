@@ -161,21 +161,37 @@ def mobile_view():
 
 @app.route('/api/tools/download')
 def download_tools():
-    # File is in the project root (../ relative to dashboard/app.py)
-    # But wait, app.py runs from project root in Docker? 
-    # In Dockerfile: WORKDIR /app. CMD python dashboard/app.py? No, CMD gunicorn dashboard.app:app. 
-    # So CWD is /app.
-    # The file is in /app (project root).
+    # 保留此路由用于首页按钮 (只下载 Beyond Compare)
     filename = "Beyond-Compare-Pro-5.0.4.30422-x64.7z"
-    directory = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) # This gets D:\ai_project\1 if __file__ is D:\ai_project\1\dashboard\app.py
+    directory = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     
-    # In Docker, __file__ is /app/dashboard/app.py. dirname is /app/dashboard. dirname(dirname) is /app.
-    # So this logic holds.
-    
-    # Safety: Ensure file exists
     file_path = os.path.join(directory, filename)
     if not os.path.exists(file_path):
         return jsonify({"error": f"File not found: {filename}"}), 404
+        
+    return send_from_directory(directory, filename, as_attachment=True)
+
+# --- 白老师工具箱相关路由 ---
+
+ALLOWED_TOOLS = {
+    'Beyond-Compare-Pro-5.0.4.30422-x64.7z',
+    'WPS2016单文件极简版.7z'
+}
+
+@app.route('/bai')
+def tools_view():
+    return render_template('tools.html')
+
+@app.route('/api/file/<filename>')
+def download_specific_file(filename):
+    if filename not in ALLOWED_TOOLS:
+        return jsonify({"error": "File not found or access denied"}), 404
+        
+    directory = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    
+    file_path = os.path.join(directory, filename)
+    if not os.path.exists(file_path):
+        return jsonify({"error": f"File not found on server: {filename}"}), 404
         
     return send_from_directory(directory, filename, as_attachment=True)
 
