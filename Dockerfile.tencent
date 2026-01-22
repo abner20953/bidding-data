@@ -8,6 +8,9 @@ WORKDIR /app
 ENV TZ=Asia/Shanghai
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
+# 确保日志即时输出
+ENV PYTHONUNBUFFERED=1
+
 # 安装系统依赖 (antiword 用于 .doc, libreoffice 用于 .docx 转 .pdf)
 RUN apt-get update && \
     apt-get install -y antiword libreoffice-writer default-jre && \

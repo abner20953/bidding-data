@@ -39,6 +39,13 @@ try:
 except Exception as e:
     print(f"DEBUG: Failed to init log file: {e}")
 
+# Version Print (Visible in Docker Logs)
+print("="*50)
+print(f"🚀 SYSTEM STARTUP: VERSION 2026-01-22-LIBREOFFICE-PATCH")
+print(f"🚀 TIME: {datetime.datetime.now()}")
+print("="*50)
+sys.stdout.flush()
+
 def log_scheduler(msg):
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_entry = f"[{timestamp}] {msg}"
