@@ -193,7 +193,7 @@
             font-size: 0.95rem;
         }
 
-        /* Loading Spinner */
+        /* Loading Spinner - Kept for fallback although we use bar now */
         .loader {
             display: none;
             border: 4px solid #f3f3f3;
@@ -221,7 +221,7 @@
 <body>
     <div class="container">
         <header>
-            <h1>🕵️‍♂️ 串标风险检测</h1>
+            <h1>🕵️‍♂️ 文件对比</h1>
             <p class="subtitle">上传两份投标文件，检测是否存在雷同段落（已自动排除招标文件内容）</p>
         </header>
 
@@ -312,7 +312,7 @@
             // Reset
             list.innerHTML = '';
             resultsArea.classList.remove('visible');
-            btn.disabled = true;
+
             // Progress Bar simulation
             btn.disabled = true;
             btn.textContent = '比对中...';
@@ -376,8 +376,6 @@
                 }
 
                 // Parse New Response Structure
-                // Support both old (list) and new (dict) for backward compatibility if helpful, 
-                // but we updated backend so assume new.
                 let suspicious_paras = [];
                 let metadata = null;
 
