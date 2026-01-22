@@ -1,3 +1,6 @@
+import re
+from .text_extractor import extract_text
+
 def get_fingerprint(text):
     """
     Generate a fingerprint for text comparison by removing all whitespace.
