@@ -312,8 +312,50 @@
             list.innerHTML = '';
             resultsArea.classList.remove('visible');
             btn.disabled = true;
-            btn.textContent = '正在分析文档...';
-            loader.style.display = 'block';
+            // Progress Bar simulation
+            btn.disabled = true;
+            btn.textContent = '比对中...';
+
+            // Create progress bar if not exists
+            let progressContainer = document.getElementById('progress-container');
+            if (!progressContainer) {
+                progressContainer = document.createElement('div');
+                progressContainer.id = 'progress-container';
+                progressContainer.style.cssText = `
+                    width: 100%;
+                    background-color: #f3f4f6;
+                    border-radius: 9999px;
+                    height: 8px;
+                    margin-top: 15px;
+                    overflow: hidden;
+                    display: none;
+                `;
+                const bar = document.createElement('div');
+                bar.id = 'progress-bar';
+                bar.style.cssText = `
+                    width: 0%;
+                    height: 100%;
+                    background-color: #ef4444; 
+                    border-radius: 9999px;
+                    transition: width 0.3s ease;
+                `;
+                progressContainer.appendChild(bar);
+                document.querySelector('.action-area').appendChild(progressContainer);
+            }
+
+            const progressBar = document.getElementById('progress-bar');
+            progressContainer.style.display = 'block';
+
+            // Simulate progress (fake) because backend is synchronous
+            let progress = 0;
+            const interval = setInterval(() => {
+                if (progress < 90) {
+                    progress += Math.random() * 5;
+                    progressBar.style.width = progress + '%';
+                }
+            }, 300);
+
+            loader.style.display = 'none'; // Use bar instead of spinner
 
             const formData = new FormData(this);
 
@@ -322,6 +364,9 @@
                     method: 'POST',
                     body: formData
                 });
+
+                clearInterval(interval);
+                progressBar.style.width = '100%';
 
                 const result = await response.json();
 
@@ -349,10 +394,18 @@
                     data.forEach(item => {
                         const div = document.createElement('div');
                         div.className = 'paragraph-card';
+
+                        // Show Pages
+                        const pageA = item.page_a ? `第 ${item.page_a} 页` : '未知页';
+                        const pageB = item.page_b ? `第 ${item.page_b} 页` : '未知页';
+
                         div.innerHTML = `
                             <div class="para-meta">
-                                <span>位置索引: 第 ${item.index_a} 段</span>
-                                <span style="color: #ef4444;">完全匹配</span>
+                                <div>
+                                    <span style="font-weight:600; margin-right:15px;">📄 投标单位A: <span style="color:#ef4444;">${pageA}</span></span>
+                                    <span style="font-weight:600;">📄 投标单位B: <span style="color:#ef4444;">${pageB}</span></span>
+                                </div>
+                                <span style="color: #ef4444; background: #fee2e2; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">完全匹配</span>
                             </div>
                             <div class="para-text">${escapeHtml(item.text)}</div>
                         `;
@@ -367,7 +420,11 @@
             } finally {
                 btn.disabled = false;
                 btn.textContent = '开始比对';
-                loader.style.display = 'none';
+                // Hide progress bar after delay
+                setTimeout(() => {
+                    if (progressContainer) progressContainer.style.display = 'none';
+                    if (progressBar) progressBar.style.width = '0%';
+                }, 2000);
             }
         });
 

@@ -1,132 +1,112 @@
 import re
-from .text_extractor import extract_text
+from .text_extractor import extract_content
 
 def get_fingerprint(text):
     """
     Generate a fingerprint for text comparison by removing all whitespace.
-    This handles issues where PDF extraction adds extra spaces or newlines.
     """
     return re.sub(r'\s+', '', text)
 
-def segment_paragraphs(raw_text):
+def segment_paragraphs_with_page(content_list):
     """
-    Smartly segment text into paragraphs.
-    Specifically handles PDF hard-wraps by merging lines that don't look like paragraph ends.
+    Smartly segment text into paragraphs while tracking page numbers.
+    Args:
+        content_list: List[{"text": str, "page": int}]
+    Returns:
+        List[{"text": str, "page": int}]
     """
-    lines = [line.strip() for line in raw_text.split('\n')]
     paragraphs = []
-    current_para = []
     
-    # Sentence ending punctuation (Chinese & English)
-    # stops = set(['。', '！', '？', '!', '?', '；', ';', ':', '：']) 
-    # Actually, using a regex is better
+    # Flatten all lines with their page numbers
+    all_lines = []
+    for item in content_list:
+        page_lines = item['text'].split('\n')
+        page_num = item['page']
+        for line in page_lines:
+            stripped = line.strip()
+            if stripped:
+                all_lines.append({"text": stripped, "page": page_num})
+    
+    current_para_text = []
+    current_para_start_page = -1
+    
     stop_pattern = re.compile(r'[。！？!?;；：:]$')
     
-    for line in lines:
-        if not line:
-            # Empty line usually means paragraph break in Markdown/Text
-            if current_para:
-                paragraphs.append("".join(current_para))
-                current_para = []
-            continue
-            
-        current_para.append(line)
-        
-        # Heuristic: If line ends with stop punctuation, it *might* be end of paragraph.
-        # But in many docs, headers don't end in punctuation.
-        # However, for "collusion detection", we care about long text blocks mostly.
-        # If we merge too much, we might miss match. If we merge too little, we get fragments.
-        # A safer heuristic for PDF is:
-        # If the line is "short" relative to page width (hard to know), it's end.
-        # Simple heuristic: If it matches stop_pattern, treat as segment end.
-        # OR: Just treat every non-empty block of text separated by empty lines as a paragraph?
-        # PDFPlumber extraction usually preserves layout. 
-        # Let's try merging lines unless they end with explicit stops.
-        # But this risks merging headers with body.
-        # User complaint: "同段落拆分的过于散" -> Suggests split happened where it shouldn't.
-        # User complaint: "点上下墙、轮巡控制操作" -> This sounds like a bullet point.
-        
-        # Refined Strategy:
-        # Just return the lines as is? No, user said they are too fragmented.
-        # That means "点上下墙..." was treated as a separated paragraph but user thinks it shouldn't be?
-        # Or maybe it WAS a separate line in PDF but user ignores it?
-        # "点上下墙..." sounds like a fragment.
-        
-        # Let's stick to the "Exclude" logic improvement first (Fingerprint).
-        # For segmentation, let's try to merge generic lines.
-    
-    # Re-reading user: "同段落拆分的过于散" (Paragraphs are split too scattered)
-    # This strongly suggests standard `split('\n')` on PDF output is bad because PDF wraps lines.
-    # So we MUST merge lines.
-    
-    # Clean implementation of merge:
-    normalized_paras = []
     buffer = ""
+    buffer_start_page = -1
     
-    for line in lines:
-        if not line:
-            if buffer:
-                normalized_paras.append(buffer)
-                buffer = ""
-            continue
+    for item in all_lines:
+        line = item['text']
+        page = item['page']
         
-        # If buffer exists, we decide whether to join or start new
-        if buffer:
-            # If previous line ended with stop char, usually implies end of para?
-            if stop_pattern.search(buffer):
-                normalized_paras.append(buffer)
-                buffer = line
-            else:
-                # Merge (assuming visual wrap)
-                buffer += line
-        else:
+        if not buffer:
             buffer = line
-            
+            buffer_start_page = page
+        else:
+            # Check if we should merge with buffer
+            if stop_pattern.search(buffer):
+                # Previous sentence ended. Commit buffer.
+                paragraphs.append({"text": buffer, "page": buffer_start_page})
+                buffer = line
+                buffer_start_page = page
+            else:
+                # Merge
+                buffer += line
+                # Keep start page of the paragraph
+                
     if buffer:
-        normalized_paras.append(buffer)
+        paragraphs.append({"text": buffer, "page": buffer_start_page})
         
-    return normalized_paras
+    return paragraphs
 
 def compare_documents(file_a_path, file_b_path, tender_path):
     """
     Compares three documents using fingerprinting.
+    Returns list of items with page numbers.
     """
-    # 1. Extract and Segment
-    text_a = extract_text(file_a_path)
-    text_b = extract_text(file_b_path)
+    # 1. Extract content with pages
+    content_a = extract_content(file_a_path)
+    content_b = extract_content(file_b_path)
     
-    paras_a = segment_paragraphs(text_a)
-    paras_b = segment_paragraphs(text_b) # We need segments to show result
+    # 2. Segment
+    paras_a = segment_paragraphs_with_page(content_a)
+    paras_b = segment_paragraphs_with_page(content_b)
     
-    # Build Fingerprint Maps
-    # Map fingerprint -> original text (for display)
-    # Note: Collisions possible if two diff paras have same fingerprint (unlikely unless identical content)
+    # 3. Build Fingerprint Maps for B
+    # Map fingerprint -> Info dict (include page)
+    # Note: If multiple occurrences in B, we might want all? For now take first.
+    fp_map_b = {}
+    for p in paras_b:
+        if len(p['text']) > 15:
+            fp = get_fingerprint(p['text'])
+            if fp not in fp_map_b:
+                fp_map_b[fp] = p
     
-    fp_map_b = {get_fingerprint(p): p for p in paras_b if len(p) > 15} # Threshold: 15 chars
-    
-    # 2. Process Tender Exclusion
+    # 4. Process Tender Exclusion
     tender_fps = set()
     if tender_path:
-        text_tender = extract_text(tender_path)
-        # For tender, we just want fingerprints to exclude
-        # We should use same segmentation logic to ensure fingerprints match
-        paras_tender = segment_paragraphs(text_tender)
-        tender_fps = set(get_fingerprint(p) for p in paras_tender)
+        content_tender = extract_content(tender_path)
+        paras_tender = segment_paragraphs_with_page(content_tender)
+        tender_fps = set(get_fingerprint(p['text']) for p in paras_tender)
 
-    # 3. Find Suspicious
+    # 5. Find Suspicious
     suspicious_paragraphs = []
     
     for i, p_a in enumerate(paras_a):
-        if len(p_a) < 15: # Ignore short fragments
+        text_a = p_a['text']
+        if len(text_a) < 15: 
             continue
             
-        fp_a = get_fingerprint(p_a)
+        fp_a = get_fingerprint(text_a)
         
         if fp_a in fp_map_b:
             if fp_a not in tender_fps:
+                item_b = fp_map_b[fp_a]
                 suspicious_paragraphs.append({
-                    "text": p_a, # Display text from A
-                    "index_a": i + 1,
+                    "text": text_a,
+                    "index_a": i + 1, # Keep sequential index just in case
+                    "page_a": p_a['page'],
+                    "page_b": item_b['page'],
                     "matches_in_b": True
                 })
 
