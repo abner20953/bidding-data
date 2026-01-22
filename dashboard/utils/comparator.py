@@ -73,18 +73,39 @@ def segment_paragraphs_with_page(content_list):
         
     return paragraphs
 
+def is_significant(text, fingerprint):
+    """
+    Determines if a short text is significant enough to report as a match.
+    Strategy:
+    1. Base Threshold: Fingerprint length >= 6.
+       (Rejects '项目名称'-4, '法定代表人'-5, '技术参数'-4)
+       (Accepts '黄老师爱cj'-6)
+    
+    2. Numeric Filter: If purely numeric/symbols (price, date, page num), threshold >= 10.
+       (Rejects '100.00'-6, '2023.01'-7)
+       (Accepts '13934518882'-11, ID Card-18)
+    """
+    f_len = len(fingerprint)
+    
+    # 0. High Priority Regex (Phone, Email, ID) - Always Accept if match found?
+    # Actually, length check usually covers these (Phone=11, ID=18).
+    # Email might be short? "a@b.c" (5). But rare in bidding risk.
+    
+    # 1. Absolute Minimum
+    if f_len < 6:
+        return False
+        
+    # 2. Pure Numeric/Symbol Check
+    # Regex: Only digits, dots, commas, parens, dashes
+    if re.match(r'^[\d\.,\-\(\)]+$', fingerprint):
+        if f_len < 10:
+            return False
+            
+    return True
+
 def compare_documents(file_a_path, file_b_path, tender_path):
     """
     Compares three documents using fingerprinting.
-    Returns:
-    {
-        "paragraphs": [ ... ],
-        "metadata": {
-            "file_a": {...},
-            "file_b": {...},
-            "tender": {...}
-        }
-    }
     """
     # 0. Extract Metadata
     meta_a = extract_metadata(file_a_path)
@@ -102,8 +123,9 @@ def compare_documents(file_a_path, file_b_path, tender_path):
     # 3. Build Fingerprint Maps for B
     fp_map_b = {}
     for p in paras_b:
-        if len(p['text']) >= 5:
-            fp = get_fingerprint(p['text'])
+        fp = get_fingerprint(p['text'])
+        # Optimize: Only index significant paragraphs from B
+        if is_significant(p['text'], fp):
             if fp not in fp_map_b:
                 fp_map_b[fp] = p
     
@@ -112,18 +134,20 @@ def compare_documents(file_a_path, file_b_path, tender_path):
     if tender_path:
         content_tender = extract_content(tender_path)
         paras_tender = segment_paragraphs_with_page(content_tender)
-        tender_fps = set(get_fingerprint(p['text']) for p in paras_tender)
+        for p in paras_tender:
+            fp = get_fingerprint(p['text'])
+            tender_fps.add(fp)
 
     # 5. Find Suspicious
     suspicious_paragraphs = []
     
     for i, p_a in enumerate(paras_a):
         text_a = p_a['text']
-        # Relaxed length check to detect short phrases/phone numbers
-        if len(text_a) < 5: 
-            continue
-            
         fp_a = get_fingerprint(text_a)
+        
+        # Check significance BEFORE lookup
+        if not is_significant(text_a, fp_a):
+            continue
         
         if fp_a in fp_map_b:
             if fp_a not in tender_fps:
