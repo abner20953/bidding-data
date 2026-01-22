@@ -73,6 +73,8 @@ def extract_docx(filepath):
         # This is the error user saw. Print detailed path for debugging.
         raise FileNotFoundError(f"文件不存在: {filepath}")
 
+    import tempfile
+
     # Try converting to PDF first for pagination
     # Only if libreoffice is available
     soffice_bin = shutil.which('soffice') or shutil.which('libreoffice')
@@ -80,13 +82,17 @@ def extract_docx(filepath):
     
     if soffice_bin:
         pdf_path = filepath.replace('.docx', '.pdf').replace('.DOCX', '.pdf')
+        temp_home = None
         try:
             out_dir = os.path.dirname(filepath)
-            # Ensure HOME env is set (LibreOffice needs it)
+            
+            # Create a dedicated temporary HOME directory for LibreOffice
+            # This solves "User installation could not be completed" and permission errors
+            temp_home = tempfile.mkdtemp()
+            print(f"DEBUG: Created temp HOME for LibreOffice: {temp_home}")
+            
             env = os.environ.copy()
-            if 'HOME' not in env:
-                env['HOME'] = '/tmp'
-                print("DEBUG: Set HOME=/tmp for LibreOffice")
+            env['HOME'] = temp_home
                 
             # Command: soffice --headless --convert-to pdf --outdir <dir> <file>
             cmd = [soffice_bin, '--headless', '--convert-to', 'pdf', '--outdir', out_dir, filepath]
@@ -119,6 +125,14 @@ def extract_docx(filepath):
                  print("DEBUG: PDF file not found after conversion (or return code non-zero)")
         except Exception as e:
             print(f"DEBUG: LibreOffice conversion failed with exception: {e}")
+        finally:
+            # Clean up temp HOME
+            if temp_home and os.path.exists(temp_home):
+                try:
+                    shutil.rmtree(temp_home)
+                    print(f"DEBUG: Removed temp HOME: {temp_home}")
+                except Exception as cleanup_err:
+                    print(f"DEBUG: Failed to remove temp HOME: {cleanup_err}")
     else:
         print("DEBUG: LibreOffice not found. Using XML fallback.")
     
