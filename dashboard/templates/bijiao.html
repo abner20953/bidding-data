@@ -229,32 +229,31 @@
             <div class="upload-grid">
                 <!-- Bidder A -->
                 <div class="upload-card">
-                    <input type="file" name="file_a" id="file_a" class="file-input" accept=".docx,.pdf,.doc" required>
+                    <input type="file" name="file_a" id="file_a" class="file-input" accept=".pdf" required>
                     <label for="file_a" class="file-label">
                         <span class="icon">📄</span>
                         <span style="font-weight: 600;">投标单位 A</span>
-                        <span class="filename-display" id="name_a">点击选择文件<br><small>(docx/pdf/doc)</small></span>
+                        <span class="filename-display" id="name_a">点击选择文件<br><small>(仅支持 PDF)</small></span>
                     </label>
                 </div>
 
                 <!-- Bidder B -->
                 <div class="upload-card">
-                    <input type="file" name="file_b" id="file_b" class="file-input" accept=".docx,.pdf,.doc" required>
+                    <input type="file" name="file_b" id="file_b" class="file-input" accept=".pdf" required>
                     <label for="file_b" class="file-label">
                         <span class="icon">📄</span>
                         <span style="font-weight: 600;">投标单位 B</span>
-                        <span class="filename-display" id="name_b">点击选择文件<br><small>(docx/pdf/doc)</small></span>
+                        <span class="filename-display" id="name_b">点击选择文件<br><small>(仅支持 PDF)</small></span>
                     </label>
                 </div>
 
                 <!-- Tender Doc (Optional but likely used) -->
                 <div class="upload-card" style="border-style: solid; border-color: #93c5fd;">
-                    <input type="file" name="file_tender" id="file_tender" class="file-input" accept=".docx,.pdf,.doc">
+                    <input type="file" name="file_tender" id="file_tender" class="file-input" accept=".pdf">
                     <label for="file_tender" class="file-label">
                         <span class="icon">📘</span>
                         <span style="font-weight: 600;">招标文件 (排除项)</span>
-                        <span class="filename-display" id="name_tender">点击选择文件<br><small>(可选,
-                                用于排除)</small></span>
+                        <span class="filename-display" id="name_tender">点击选择文件<br><small>(可选，仅支持 PDF)</small></span>
                     </label>
                 </div>
             </div>
@@ -289,7 +288,7 @@
                     document.getElementById(displayId).textContent = fileName;
                     card.classList.add('filled');
                 } else {
-                    document.getElementById(displayId).innerHTML = '点击选择文件<br><small>(docx/pdf/doc)</small>';
+                    document.getElementById(displayId).innerHTML = '点击选择文件<br><small>(仅支持 PDF)</small>';
                     card.classList.remove('filled');
                 }
             });

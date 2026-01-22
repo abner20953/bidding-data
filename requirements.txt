@@ -6,5 +6,4 @@ sentence-transformers
 flask
 gunicorn
 Flask-APScheduler
-python-docx
 pdfplumber
