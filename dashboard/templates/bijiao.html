@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>串标风险检测</title>
+    <title>文件对比</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -253,7 +253,8 @@
                     <label for="file_tender" class="file-label">
                         <span class="icon">📘</span>
                         <span style="font-weight: 600;">招标文件 (排除项)</span>
-                        <span class="filename-display" id="name_tender">点击选择文件<br><small>(可选, 用于排除)</small></span>
+                        <span class="filename-display" id="name_tender">点击选择文件<br><small>(可选,
+                                用于排除)</small></span>
                     </label>
                 </div>
             </div>
@@ -374,9 +375,20 @@
                     throw new Error(result.error || '上传失败');
                 }
 
-                // Render Results
-                const data = result.data;
-                countDisplay.textContent = data.length;
+                // Parse New Response Structure
+                // Support both old (list) and new (dict) for backward compatibility if helpful, 
+                // but we updated backend so assume new.
+                let suspicious_paras = [];
+                let metadata = null;
+
+                if (Array.isArray(result.data)) {
+                    suspicious_paras = result.data;
+                } else {
+                    suspicious_paras = result.data.paragraphs;
+                    metadata = result.data.metadata;
+                }
+
+                countDisplay.textContent = suspicious_paras.length;
 
                 const tenderInput = document.getElementById('file_tender');
                 const hasTender = tenderInput.files.length > 0;
@@ -388,10 +400,40 @@
                     resultMsg.textContent = "（未提供招标文件，仅比对两者共同点）";
                 }
 
-                if (data.length === 0) {
+                // Render Metadata if available
+                const metadataDiv = document.getElementById('metadata-area');
+                if (metadataDiv) metadataDiv.remove(); // Clean up previous
+
+                if (metadata) {
+                    const metaA = metadata.file_a.author;
+                    const metaB = metadata.file_b.author;
+                    const metaTender = metadata.tender ? metadata.tender.author : 'N/A';
+
+                    const isSame = (metaA !== 'Unknown' && metaB !== 'Unknown' && metaA === metaB);
+                    const sameWarn = isSame ? `<div style="margin-top:10px; color:#ef4444; font-weight:bold;">⚠️ 警告：两份投标文件作者/创建者相同！</div>` : '';
+
+                    const div = document.createElement('div');
+                    div.id = 'metadata-area';
+                    div.className = 'summary-card';
+                    div.style.borderLeftColor = '#3b82f6';
+                    div.style.background = 'linear-gradient(to right, #eff6ff, #fff)';
+                    div.innerHTML = `
+                        <h3 style="margin-top: 0; color: #1e3a8a;">文档属性对比</h3>
+                        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; font-size: 0.9rem;">
+                            <div>📄 投标单位 A 作者: <strong>${escapeHtml(metaA)}</strong></div>
+                            <div>📄 投标单位 B 作者: <strong>${escapeHtml(metaB)}</strong></div>
+                            ${hasTender ? `<div>📘 招标文件 作者: <span style="color:#6b7280">${escapeHtml(metaTender)}</span></div>` : ''}
+                        </div>
+                        ${sameWarn}
+                    `;
+                    // Insert after the main summary card
+                    document.querySelector('.summary-card').after(div);
+                }
+
+                if (suspicious_paras.length === 0) {
                     list.innerHTML = '<p style="text-align:center; color:#6b7280; padding: 20px;">未发现可疑的雷同段落 🎉</p>';
                 } else {
-                    data.forEach(item => {
+                    suspicious_paras.forEach(item => {
                         const div = document.createElement('div');
                         div.className = 'paragraph-card';
 

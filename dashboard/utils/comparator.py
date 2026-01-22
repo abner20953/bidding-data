@@ -1,9 +1,10 @@
 import re
-from .text_extractor import extract_content
+from .text_extractor import extract_content, extract_metadata
 
 def get_fingerprint(text):
     """
     Generate a fingerprint for text comparison by removing all whitespace.
+    This handles issues where PDF extraction adds extra spaces or newlines.
     """
     return re.sub(r'\s+', '', text)
 
@@ -27,6 +28,10 @@ def segment_paragraphs_with_page(content_list):
             if stripped:
                 all_lines.append({"text": stripped, "page": page_num})
     
+    # Check if all_lines empty
+    if not all_lines:
+        return []
+
     current_para_text = []
     current_para_start_page = -1
     
@@ -62,8 +67,21 @@ def segment_paragraphs_with_page(content_list):
 def compare_documents(file_a_path, file_b_path, tender_path):
     """
     Compares three documents using fingerprinting.
-    Returns list of items with page numbers.
+    Returns:
+    {
+        "paragraphs": [ ... ],
+        "metadata": {
+            "file_a": {...},
+            "file_b": {...},
+            "tender": {...}
+        }
+    }
     """
+    # 0. Extract Metadata
+    meta_a = extract_metadata(file_a_path)
+    meta_b = extract_metadata(file_b_path)
+    meta_tender = extract_metadata(tender_path) if tender_path else None
+
     # 1. Extract content with pages
     content_a = extract_content(file_a_path)
     content_b = extract_content(file_b_path)
@@ -73,8 +91,6 @@ def compare_documents(file_a_path, file_b_path, tender_path):
     paras_b = segment_paragraphs_with_page(content_b)
     
     # 3. Build Fingerprint Maps for B
-    # Map fingerprint -> Info dict (include page)
-    # Note: If multiple occurrences in B, we might want all? For now take first.
     fp_map_b = {}
     for p in paras_b:
         if len(p['text']) > 15:
@@ -104,18 +120,17 @@ def compare_documents(file_a_path, file_b_path, tender_path):
                 item_b = fp_map_b[fp_a]
                 suspicious_paragraphs.append({
                     "text": text_a,
-                    "index_a": i + 1, # Keep sequential index just in case
+                    "index_a": i + 1,
                     "page_a": p_a['page'],
                     "page_b": item_b['page'],
                     "matches_in_b": True
                 })
 
-    return suspicious_paragraphs
-
-def extract_text_with_index(filepath):
-    """
-    Legacy helper, not used in new logic but kept if referenced elsewhere (unlikely).
-    Actually, we can remove it or keep it for compatibility if I imported it elsewhere.
-    I didn't export it in __init__, so safe to remove or ignore.
-    """
-    pass
+    return {
+        "paragraphs": suspicious_paragraphs,
+        "metadata": {
+            "file_a": meta_a,
+            "file_b": meta_b,
+            "tender": meta_tender
+        }
+    }

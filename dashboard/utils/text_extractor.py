@@ -3,6 +3,39 @@ import docx
 import pdfplumber
 import subprocess
 
+def extract_metadata(filepath):
+    """
+    Extracts metadata from the file (Author, Creator, etc.)
+    Returns: Dict {"author": str, "last_modified_by": str, "creator": str, ...}
+    """
+    ext = os.path.splitext(filepath)[1].lower()
+    metadata = {"author": "Unknown", "creator": "Unknown"}
+    
+    try:
+        if ext == '.docx':
+            doc = docx.Document(filepath)
+            prop = doc.core_properties
+            metadata["author"] = prop.author or "Unknown"
+            metadata["last_modified_by"] = prop.last_modified_by or "Unknown"
+            metadata["creator"] = "Microsoft Word (Implied)"
+            
+        elif ext == '.pdf':
+            with pdfplumber.open(filepath) as pdf:
+                # pdf.metadata is a dict
+                raw_meta = pdf.metadata
+                if raw_meta:
+                    metadata["author"] = raw_meta.get("Author", "Unknown")
+                    metadata["creator"] = raw_meta.get("Creator", "Unknown")
+                    metadata["producer"] = raw_meta.get("Producer", "Unknown")
+                    
+        elif ext == '.doc':
+            metadata["author"] = "Unknown (Legacy .doc)"
+            
+    except Exception as e:
+        print(f"Error extracting metadata from {filepath}: {e}")
+        
+    return metadata
+
 def extract_content(filepath):
     """
     Factory function to extract text with page metadata.
