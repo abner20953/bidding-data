@@ -1,6 +1,7 @@
 import os
 import docx
 import pdfplumber
+import subprocess
 
 def extract_text(filepath):
     """
@@ -12,9 +13,9 @@ def extract_text(filepath):
     elif ext == '.pdf':
         return extract_pdf(filepath)
     elif ext == '.doc':
-        raise ValueError("暂不支持旧版 Word (.doc) 格式，请将文件另存为 .docx 格式后重试。")
+        return extract_doc(filepath)
     else:
-        raise ValueError(f"不支持的文件格式: {ext} (仅支持 .docx 和 .pdf)")
+        raise ValueError(f"不支持的文件格式: {ext} (仅支持 .docx, .doc, .pdf)")
 
 def extract_docx(filepath):
     """
@@ -26,6 +27,34 @@ def extract_docx(filepath):
         if para.text.strip():
             text.append(para.text.strip())
     return "\n".join(text)
+
+def extract_doc(filepath):
+    """
+    Extracts text from a .doc (legacy Word) file using antiword.
+    REQUIRES: antiword installed on the system (run `apt-get install antiword`).
+    """
+    try:
+        # Run antiword
+        result = subprocess.run(
+            ['antiword', filepath], 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE,
+            text=True # Return string instead of bytes
+        )
+        
+        if result.returncode != 0:
+            error_msg = result.stderr.strip()
+            # If antiword is not found
+            if "No such file or directory" in str(result.stderr):
+                 raise RuntimeError("服务器未安装 antiword 工具，无法解析 .doc 文件。")
+            raise RuntimeError(f"antiword 解析失败: {error_msg}")
+            
+        return result.stdout.strip()
+        
+    except FileNotFoundError:
+        raise RuntimeError("服务器未安装 antiword 工具，无法解析 .doc 文件。")
+    except Exception as e:
+        raise RuntimeError(f"解析 .doc 文件出错: {str(e)}")
 
 def extract_pdf(filepath):
     """

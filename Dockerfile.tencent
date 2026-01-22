@@ -8,6 +8,9 @@ WORKDIR /app
 ENV TZ=Asia/Shanghai
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
+# 安装系统依赖 (antiword 用于解析 .doc 文件)
+RUN apt-get update && apt-get install -y antiword && rm -rf /var/lib/apt/lists/*
+
 # 【核心优化 1】利用 Docker 缓存机制
 # 先只复制 requirements.txt，不复制代码
 # 这样只要依赖包列表没变，下面这步庞大的 pip install 就会直接使用缓存，瞬间完成
