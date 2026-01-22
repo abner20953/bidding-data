@@ -46,13 +46,15 @@ def extract_doc(filepath):
             error_msg = result.stderr.strip()
             # If antiword is not found
             if "No such file or directory" in str(result.stderr):
-                 raise RuntimeError("服务器未安装 antiword 工具，无法解析 .doc 文件。")
+                 raise RuntimeError("系统未安装 antiword 工具。")
             raise RuntimeError(f"antiword 解析失败: {error_msg}")
             
         return result.stdout.strip()
         
     except FileNotFoundError:
-        raise RuntimeError("服务器未安装 antiword 工具，无法解析 .doc 文件。")
+        if os.name == 'nt':
+             raise RuntimeError("Windows 本地环境需手动安装 Antiword 或将文件转换为 .docx。\n服务器端(Docker)会自动安装支持。")
+        raise RuntimeError("服务器未安装 antiword 工具，请运行 apt-get install antiword")
     except Exception as e:
         raise RuntimeError(f"解析 .doc 文件出错: {str(e)}")
 
