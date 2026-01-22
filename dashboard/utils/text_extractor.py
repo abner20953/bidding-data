@@ -91,16 +91,26 @@ def extract_docx(filepath):
             temp_home = tempfile.mkdtemp()
             print(f"DEBUG: Created temp HOME for LibreOffice: {temp_home}")
             
+            # Prepare env (keep XDG just in case, but UserInstallation is key)
             env = os.environ.copy()
             env['HOME'] = temp_home
-            # Critical: Set XDG variables to prevent dconf from trying to write to /
-            env['XDG_CACHE_HOME'] = os.path.join(temp_home, '.cache')
-            env['XDG_CONFIG_HOME'] = os.path.join(temp_home, '.config')
-            env['XDG_DATA_HOME'] = os.path.join(temp_home, '.local', 'share')
-            env['XDG_RUNTIME_DIR'] = temp_home
-                
-            # Command: soffice --headless --convert-to pdf --outdir <dir> <file>
-            cmd = [soffice_bin, '--headless', '--convert-to', 'pdf', '--outdir', out_dir, filepath]
+            
+            # Construct UserInstallation URI
+            # Must be absolute path with file:// protocol
+            user_inst_uri = f"file://{temp_home}"
+            
+            # Command: soffice -env:UserInstallation=file://... --headless --convert-to pdf --outdir <dir> <file>
+            # Added --norestore --writer --nologo for safety
+            cmd = [
+                soffice_bin, 
+                f"-env:UserInstallation={user_inst_uri}", 
+                '--headless', 
+                '--norestore',
+                '--writer',
+                '--convert-to', 'pdf', 
+                '--outdir', out_dir, 
+                filepath
+            ]
             
             print(f"DEBUG: Executing command: {' '.join(cmd)}")
             
