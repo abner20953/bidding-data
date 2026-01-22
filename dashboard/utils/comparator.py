@@ -3,10 +3,18 @@ from .text_extractor import extract_content, extract_metadata
 
 def get_fingerprint(text):
     """
-    Generate a fingerprint for text comparison by removing all whitespace.
-    This handles issues where PDF extraction adds extra spaces or newlines.
+    Generate a fingerprint for text comparison by removing all non-alphanumeric characters.
+    This handles issues where PDF extraction adds extra spaces, newlines, or inconsistent punctuation.
+    Using stricter fingerprinting (removing punctuation) improves match rate for data fields.
     """
-    return re.sub(r'\s+', '', text)
+    # Remove all whitespace
+    text = re.sub(r'\s+', '', text)
+    # Remove generic punctuation (Keep only word chars and unicode ranges for Chinese)
+    # \w matches [a-zA-Z0-9_] and various unicode word chars.
+    # We want to STRIP punctuation like , . ; : etc.
+    # Simple way: keep only alnum (and Chinese).
+    # Regex: [^\w] removes punctuation.
+    return re.sub(r'[^\w\u4e00-\u9fa5]', '', text)
 
 def segment_paragraphs_with_page(content_list):
     """
@@ -28,13 +36,9 @@ def segment_paragraphs_with_page(content_list):
             if stripped:
                 all_lines.append({"text": stripped, "page": page_num})
     
-    # Check if all_lines empty
     if not all_lines:
         return []
 
-    current_para_text = []
-    current_para_start_page = -1
-    
     stop_pattern = re.compile(r'[。！？!?;；：:]$')
     
     buffer = ""
@@ -49,13 +53,18 @@ def segment_paragraphs_with_page(content_list):
             buffer_start_page = page
         else:
             # Check if we should merge with buffer
-            if stop_pattern.search(buffer):
-                # Previous sentence ended. Commit buffer.
+            # Do NOT merge if buffer is short (<40 chars) and has no punctuation 
+            # - this likely indicates a Header, Title, or Data Field (Phone num).
+            is_short_line = len(buffer) < 40
+            has_stop = stop_pattern.search(buffer)
+            
+            if has_stop or is_short_line:
+                # Previous sentence ended OR it was a short header. Commit buffer.
                 paragraphs.append({"text": buffer, "page": buffer_start_page})
                 buffer = line
                 buffer_start_page = page
             else:
-                # Merge
+                # Merge (Long text flow)
                 buffer += line
                 # Keep start page of the paragraph
                 
@@ -93,7 +102,7 @@ def compare_documents(file_a_path, file_b_path, tender_path):
     # 3. Build Fingerprint Maps for B
     fp_map_b = {}
     for p in paras_b:
-        if len(p['text']) > 15:
+        if len(p['text']) >= 5:
             fp = get_fingerprint(p['text'])
             if fp not in fp_map_b:
                 fp_map_b[fp] = p
@@ -110,7 +119,8 @@ def compare_documents(file_a_path, file_b_path, tender_path):
     
     for i, p_a in enumerate(paras_a):
         text_a = p_a['text']
-        if len(text_a) < 15: 
+        # Relaxed length check to detect short phrases/phone numbers
+        if len(text_a) < 5: 
             continue
             
         fp_a = get_fingerprint(text_a)
