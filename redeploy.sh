@@ -17,8 +17,8 @@ if [ $? -ne 0 ]; then
 fi
 
 # 3. 重新构建镜像
-echo "🔨 正在重新构建 Docker 镜像 (强制不使用缓存)..."
-docker build --no-cache -f Dockerfile.tencent -t bidding-app .
+echo "🔨 正在重新构建 Docker 镜像..."
+docker build -f Dockerfile.tencent -t bidding-app .
 if [ $? -ne 0 ]; then
     echo "❌ 镜像构建失败！"
     exit 1
