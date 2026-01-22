@@ -11,8 +11,10 @@ def extract_text(filepath):
         return extract_docx(filepath)
     elif ext == '.pdf':
         return extract_pdf(filepath)
+    elif ext == '.doc':
+        raise ValueError("暂不支持旧版 Word (.doc) 格式，请将文件另存为 .docx 格式后重试。")
     else:
-        raise ValueError(f"Unsupported file format: {ext}")
+        raise ValueError(f"不支持的文件格式: {ext} (仅支持 .docx 和 .pdf)")
 
 def extract_docx(filepath):
     """
