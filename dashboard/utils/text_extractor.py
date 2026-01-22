@@ -76,18 +76,33 @@ def extract_docx(filepath):
     # Try converting to PDF first for pagination
     # Only if libreoffice is available
     soffice_bin = shutil.which('soffice') or shutil.which('libreoffice')
+    print(f"DEBUG: Checking for LibreOffice... Found: {soffice_bin}")
     
     if soffice_bin:
         pdf_path = filepath.replace('.docx', '.pdf').replace('.DOCX', '.pdf')
         try:
             out_dir = os.path.dirname(filepath)
+            # Ensure HOME env is set (LibreOffice needs it)
+            env = os.environ.copy()
+            if 'HOME' not in env:
+                env['HOME'] = '/tmp'
+                print("DEBUG: Set HOME=/tmp for LibreOffice")
+                
             # Command: soffice --headless --convert-to pdf --outdir <dir> <file>
             cmd = [soffice_bin, '--headless', '--convert-to', 'pdf', '--outdir', out_dir, filepath]
             
+            print(f"DEBUG: Executing command: {' '.join(cmd)}")
+            
             # Run with timeout
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, env=env)
+            
+            print(f"DEBUG: LibreOffice Return Code: {proc.returncode}")
+            if proc.returncode != 0:
+                 print(f"DEBUG: LibreOffice Stderr: {proc.stderr.decode('utf-8', errors='ignore')}")
+                 print(f"DEBUG: LibreOffice Stdout: {proc.stdout.decode('utf-8', errors='ignore')}")
             
             if proc.returncode == 0 and os.path.exists(pdf_path):
+                print(f"DEBUG: PDF created successfully at {pdf_path}")
                 # Success! Extract using PDF extractor logic
                 try:
                     content = extract_pdf(pdf_path)
@@ -98,10 +113,14 @@ def extract_docx(filepath):
                         pass
                     return content
                 except Exception as e:
-                    print(f"PDF Extraction failed after conversion: {e}")
+                    print(f"DEBUG: PDF Extraction failed after conversion: {e}")
                     # Change to fallback
+            else:
+                 print("DEBUG: PDF file not found after conversion (or return code non-zero)")
         except Exception as e:
-            print(f"LibreOffice conversion failed: {e}")
+            print(f"DEBUG: LibreOffice conversion failed with exception: {e}")
+    else:
+        print("DEBUG: LibreOffice not found. Using XML fallback.")
     
     # Fallback to python-docx
     if not os.path.exists(filepath):
