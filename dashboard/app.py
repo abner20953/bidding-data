@@ -208,6 +208,8 @@ def download_specific_file(filename):
 def bijiao_view():
     return render_template('bijiao.html')
 
+import uuid
+
 @app.route('/api/compare', methods=['POST'])
 def api_compare():
     # 1. Check files
@@ -216,35 +218,44 @@ def api_compare():
         
     file_a = request.files['file_a']
     file_b = request.files['file_b']
-    file_tender = request.files.get('file_tender') # Optional? Implied required by user req.
+    file_tender = request.files.get('file_tender') # Optional
     
     if file_a.filename == '' or file_b.filename == '':
         return jsonify({"error": "未选择文件"}), 400
 
-    # 2. Save temporarily
+    # 2. Save temporarily using UUID to avoid Chinese filename issues
     try:
-        path_a = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(file_a.filename))
-        path_b = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(file_b.filename))
-        file_a.save(path_a)
-        file_b.save(path_b)
+        def save_temp_file(file_obj):
+            ext = os.path.splitext(file_obj.filename)[1].lower()
+            if not ext:
+                # If no extension, try to guess from mimetype or just assume something?
+                # But user usually has extension. If secure_filename destroyed it, we use original filename here.
+                # If original filename has no extension, that's a user error, but we can't do much.
+                pass
+            
+            temp_filename = f"{uuid.uuid4()}{ext}"
+            temp_path = os.path.join(app.config['UPLOAD_FOLDER'], temp_filename)
+            file_obj.save(temp_path)
+            return temp_path
+
+        path_a = save_temp_file(file_a)
+        path_b = save_temp_file(file_b)
         
         path_tender = None
         if file_tender and file_tender.filename != '':
-            path_tender = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(file_tender.filename))
-            file_tender.save(path_tender)
+            path_tender = save_temp_file(file_tender)
             
         # 3. Process
         results = compare_documents(path_a, path_b, path_tender)
         
-        # 4. Clean up (Optional: clean up immediately or via cron? For now, clean up immediately to save space)
-        # But maybe we want to keep them for debug? Let's clean up A/B/Tender.
+        # 4. Clean up
         try:
             os.remove(path_a)
             os.remove(path_b)
             if path_tender:
                 os.remove(path_tender)
         except Exception:
-            pass # Ignore cleanup errors
+            pass 
             
         return jsonify({"status": "success", "data": results})
         
