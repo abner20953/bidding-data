@@ -267,7 +267,8 @@
         <div class="results-area" id="results-area">
             <div class="summary-card">
                 <h3 style="margin-top: 0; color: #991b1b;">检测报告</h3>
-                <p>共发现 <strong id="count-display" style="font-size: 1.25rem;">0</strong> 处完全一致的段落（已排除招标文件原文）。</p>
+                <p>共发现 <strong id="count-display" style="font-size: 1.25rem;">0</strong> 处完全一致的段落<span
+                        id="result-msg-suffix">（已排除招标文件原文）</span>。</p>
             </div>
 
             <div id="paragraphs-list">
@@ -331,6 +332,16 @@
                 // Render Results
                 const data = result.data;
                 countDisplay.textContent = data.length;
+
+                const tenderInput = document.getElementById('file_tender');
+                const hasTender = tenderInput.files.length > 0;
+                const resultMsg = document.getElementById('result-msg-suffix');
+
+                if (hasTender) {
+                    resultMsg.textContent = "（已排除招标文件原文）";
+                } else {
+                    resultMsg.textContent = "（未提供招标文件，仅比对两者共同点）";
+                }
 
                 if (data.length === 0) {
                     list.innerHTML = '<p style="text-align:center; color:#6b7280; padding: 20px;">未发现可疑的雷同段落 🎉</p>';
