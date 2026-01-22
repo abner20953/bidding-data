@@ -73,30 +73,70 @@ def segment_paragraphs_with_page(content_list):
         
     return paragraphs
 
+COMMON_HEADERS = {
+    "招标文件", "投标文件", "目录", "前言", "附录", 
+    "技术参数", "技术规格", "商务条款", "评分标准",
+    "投标人须知", "特别提示", "申明", "声明", "承诺书",
+    "格式", "页码", "正文", "第一章", "第二章", "第三章",
+    "第四章", "第五章", "第六章", "第七章", "第八章",
+    "一、", "二、", "三、", "四、", "五、", "六、",
+    "招标公告", "投标邀请", "法定代表人", "委托代理人",
+    "单位名称", "日期", "盖章", "签字", "地址", "电话",
+    "传真", "邮箱", "邮编", "年份", "月份", "金额", "备注"
+}
+
+def extract_entities(content_list):
+    """
+    Extracts high-value entities (Phones, ID Cards) from the entire document content.
+    Returns: Dict { "fingerprint": { "text": original, "page": page_num } }
+    """
+    entities = {}
+    
+    # Regex for Phone (Mobile 11 digits)
+    # 1[3-9]\d{9} - simple mobile regex
+    phone_pattern = re.compile(r'(?<!\d)1[3-9]\d{9}(?!\d)')
+    
+    # Regex for ID Card (18 digits or 17+X)
+    id_pattern = re.compile(r'(?<!\d)\d{17}[\dXx](?!\d)')
+    
+    for item in content_list:
+        text = item['text']
+        page = item['page']
+        
+        # Phones
+        for match in phone_pattern.findall(text):
+            fp = match # Phone num is its own fingerprint
+            if fp not in entities:
+                entities[fp] = {"text": match, "page": page}
+                
+        # IDs
+        for match in id_pattern.findall(text):
+            fp = match.upper()
+            if fp not in entities:
+                entities[fp] = {"text": match, "page": page}
+                
+    return entities
+
 def is_significant(text, fingerprint):
     """
     Determines if a short text is significant enough to report as a match.
-    Strategy:
-    1. Base Threshold: Fingerprint length >= 6.
-       (Rejects '项目名称'-4, '法定代表人'-5, '技术参数'-4)
-       (Accepts '黄老师爱cj'-6)
-    
-    2. Numeric Filter: If purely numeric/symbols (price, date, page num), threshold >= 10.
-       (Rejects '100.00'-6, '2023.01'-7)
-       (Accepts '13934518882'-11, ID Card-18)
     """
     f_len = len(fingerprint)
     
-    # 0. High Priority Regex (Phone, Email, ID) - Always Accept if match found?
-    # Actually, length check usually covers these (Phone=11, ID=18).
-    # Email might be short? "a@b.c" (5). But rare in bidding risk.
+    # 0. Global Blacklist Check (Noise Filter)
+    # Check if text roughly matches a common header
+    clean_text = text.replace(" ", "").replace(":", "").replace("：", "")
+    if clean_text in COMMON_HEADERS:
+        return False
+    # Partial match for very short headers? 
+    # E.g. "第一章 招标公告" -> clean "第一章招标公告".
+    # If fingerprint is short and contains blocked words?
     
     # 1. Absolute Minimum
-    if f_len < 6:
+    if f_len < 4: # Lowered to 4 to catch short names if not blacklisted
         return False
         
     # 2. Pure Numeric/Symbol Check
-    # Regex: Only digits, dots, commas, parens, dashes
     if re.match(r'^[\d\.,\-\(\)]+$', fingerprint):
         if f_len < 10:
             return False
@@ -105,47 +145,70 @@ def is_significant(text, fingerprint):
 
 def compare_documents(file_a_path, file_b_path, tender_path):
     """
-    Compares three documents using fingerprinting.
+    Compares three documents using fingerprinting AND entity extraction.
     """
     # 0. Extract Metadata
     meta_a = extract_metadata(file_a_path)
     meta_b = extract_metadata(file_b_path)
     meta_tender = extract_metadata(tender_path) if tender_path else None
 
-    # 1. Extract content with pages
+    # 1. Extract content
     content_a = extract_content(file_a_path)
     content_b = extract_content(file_b_path)
+    content_tender = extract_content(tender_path) if tender_path else []
     
-    # 2. Segment
+    # 2. Segment Paragraphs
     paras_a = segment_paragraphs_with_page(content_a)
     paras_b = segment_paragraphs_with_page(content_b)
+    paras_tender = segment_paragraphs_with_page(content_tender)
     
-    # 3. Build Fingerprint Maps for B
+    # 3. Build Maps (Paragraphs)
     fp_map_b = {}
     for p in paras_b:
         fp = get_fingerprint(p['text'])
-        # Optimize: Only index significant paragraphs from B
         if is_significant(p['text'], fp):
             if fp not in fp_map_b:
                 fp_map_b[fp] = p
-    
-    # 4. Process Tender Exclusion
+                
+    # 4. Tender Exclusion (Paragraphs)
     tender_fps = set()
-    if tender_path:
-        content_tender = extract_content(tender_path)
-        paras_tender = segment_paragraphs_with_page(content_tender)
-        for p in paras_tender:
-            fp = get_fingerprint(p['text'])
-            tender_fps.add(fp)
+    for p in paras_tender:
+        tender_fps.add(get_fingerprint(p['text']))
 
-    # 5. Find Suspicious
+    # 5. Extract Entities (Independent of Paragraphs)
+    entities_a = extract_entities(content_a)
+    entities_b = extract_entities(content_b)
+    # Tender entities for exclusion?
+    entities_tender = extract_entities(content_tender)
+    tender_entity_fps = set(entities_tender.keys())
+
+    # 6. Find Suspicious Items
     suspicious_paragraphs = []
-    
+    seen_fps = set()
+
+    # A. Check Entities first (High Priority)
+    for fp, item_a in entities_a.items():
+        if fp in entities_b:
+            if fp not in tender_entity_fps:
+                if fp not in seen_fps:
+                    item_b = entities_b[fp]
+                    suspicious_paragraphs.append({
+                        "text": f"[敏感数据] {item_a['text']}",
+                        "index_a": -1, # Special index
+                        "page_a": item_a['page'],
+                        "page_b": item_b['page'],
+                        "matches_in_b": True
+                    })
+                    seen_fps.add(fp)
+
+    # B. Check Paragraphs
     for i, p_a in enumerate(paras_a):
         text_a = p_a['text']
         fp_a = get_fingerprint(text_a)
         
-        # Check significance BEFORE lookup
+        if fp_a in seen_fps: continue # Skip if already found as entity
+        
+        # Check significance
         if not is_significant(text_a, fp_a):
             continue
         
@@ -159,6 +222,7 @@ def compare_documents(file_a_path, file_b_path, tender_path):
                     "page_b": item_b['page'],
                     "matches_in_b": True
                 })
+                seen_fps.add(fp_a)
 
     return {
         "paragraphs": suspicious_paragraphs,
