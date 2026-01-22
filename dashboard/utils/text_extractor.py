@@ -115,7 +115,7 @@ def extract_docx(filepath):
             print(f"DEBUG: Executing command: {' '.join(cmd)}")
             
             # Run with timeout
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, env=env)
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, env=env)
             
             print(f"DEBUG: LibreOffice Return Code: {proc.returncode}")
             if proc.returncode != 0:

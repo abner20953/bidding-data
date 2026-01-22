@@ -12,8 +12,10 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 ENV PYTHONUNBUFFERED=1
 
 # 安装系统依赖 (antiword 用于 .doc, libreoffice 用于 .docx 转 .pdf)
+# 增加中文类字体 (fonts-wqy-zenhei) 防止转换中文文档时卡死或乱码
+# 增加 libreoffice-java-common 修复 javaldx 警告
 RUN apt-get update && \
-    apt-get install -y antiword libreoffice-writer default-jre && \
+    apt-get install -y antiword libreoffice-writer libreoffice-java-common default-jre fonts-wqy-zenhei fonts-wqy-microhei && \
     rm -rf /var/lib/apt/lists/*
 
 # 【核心优化 1】利用 Docker 缓存机制
