@@ -44,3 +44,44 @@
 [2026-01-21 13:11:29.914271] System Started
 [2026-01-21 13:11:33.669606] System Started
 [2026-01-21 13:11:34.724882] System Started
+[2026-01-22 02:00:00] ⏰ 定时任务触发: 开始每日采集与清理...
+[2026-01-22 02:00:00] ⏰ 定时任务触发: 开始每日采集与清理...
+[2026-01-22 02:00:00] ⏰ 定时任务触发: 开始每日采集与清理...
+[2026-01-22 02:00:00]    [计划] 2026年01月22日 加入采集队列。
+[2026-01-22 02:00:00]    [计划] 2026年01月23日 加入采集队列。
+[2026-01-22 02:00:00]    [计划] 2026年01月22日 加入采集队列。
+[2026-01-22 02:00:00]    [计划] 2026年01月24日 加入采集队列。
+[2026-01-22 02:00:00]    [计划] 2026年01月23日 加入采集队列。
+[2026-01-22 02:00:00]    [启动] 已启动后台采集线程，目标: 3 天
+[2026-01-22 02:00:00]    [启动] 已启动后台采集线程，目标: 3 天
+[2026-01-22 02:00:00]    [启动] 已启动后台采集线程，目标: 3 天
+[2026-01-22 02:00:00]    [清理] 正在清理 2026-01-21 之前的数据...
+[2026-01-22 02:00:00]    [清理] 正在清理 2026-01-21 之前的数据...
+[2026-01-22 02:00:00]    [启动] 已启动后台采集线程，目标: 3 天
+[2026-01-22 02:00:00]    [清理] 正在清理 2026-01-21 之前的数据...
+[2026-01-22 02:00:00]    [清理] 正在清理 2026-01-21 之前的数据...
+[2026-01-22 02:00:00]       [删除] shanxi_informatization_2026年01月12日.xlsx (早于 2026-01-21)
+[2026-01-22 02:00:00]       [错误] 解析 shanxi_informatization_2026年01月12日.xlsx 失败: [WinError 2] 系统找不到指定的文件。: 'D:\\ai_project\\1\\dashboard\\..\\results\\shanxi_informatization_2026年01月12日.xlsx'
+[2026-01-22 02:00:00]       [删除] shanxi_informatization_2026年01月13日.xlsx (早于 2026-01-21)
+[2026-01-22 02:00:00]       [错误] 解析 shanxi_informatization_2026年01月13日.xlsx 失败: [WinError 2] 系统找不到指定的文件。: 'D:\\ai_project\\1\\dashboard\\..\\results\\shanxi_informatization_2026年01月13日.xlsx'
+[2026-01-22 02:00:00]       [错误] 解析 shanxi_informatization_2026年01月13日.xlsx 失败: [WinError 2] 系统找不到指定的文件。: 'D:\\ai_project\\1\\dashboard\\..\\results\\shanxi_informatization_2026年01月13日.xlsx'
+[2026-01-22 02:00:00]       [错误] 解析 shanxi_informatization_2026年01月14日.xlsx 失败: [WinError 2] 系统找不到指定的文件。: 'D:\\ai_project\\1\\dashboard\\..\\results\\shanxi_informatization_2026年01月14日.xlsx'
+[2026-01-22 02:00:00]       [删除] shanxi_informatization_2026年01月15日.xlsx (早于 2026-01-21)
+[2026-01-22 02:00:00]       [错误] 解析 shanxi_informatization_2026年01月14日.xlsx 失败: [WinError 2] 系统找不到指定的文件。: 'D:\\ai_project\\1\\dashboard\\..\\results\\shanxi_informatization_2026年01月14日.xlsx'
+[2026-01-22 02:00:00]       [错误] 解析 shanxi_informatization_2026年01月15日.xlsx 失败: [WinError 2] 系统找不到指定的文件。: 'D:\\ai_project\\1\\dashboard\\..\\results\\shanxi_informatization_2026年01月15日.xlsx'
+[2026-01-22 02:00:00]       [删除] shanxi_informatization_2026年01月16日.xlsx (早于 2026-01-21)
+ror 2] 系统找不到指定的文件。: 'D:\\ai_project\\1\\dashboard\\..\\results\\shanxi_informatization_2026年01月16日.xlsx'
+[2026-01-22 02:00:00]       [错误] 解析 shanxi_informatization_2026年01月15日.xlsx 失败: [WinError 2] 系统找不到指定的文件。: 'D:\\ai_project\\1\\dashboard\\..\\results\\shanxi_informatization_2026年01月15日.xlsx'
+[2026-01-22 02:00:00]    [清理完成] 共删除了 3 个过期文件。
+1月16日.xlsx 失败: [WinError 2] 系统找不到指定的文件。: 'D:\\ai_project\\1\\dashboard\\..\\results\\shanxi_informatization_2026年01月16日.xlsx'
+[2026-01-22 02:00:00]    [清理完成] 共删除了 1 个过期文件。
+[2026-01-22 02:00:00]       [错误] 解析 shanxi_informatization_2026年01月16日.xlsx 失败: [WinError 2] 系统找不到指定的文件。: 'D:\\ai_project\\1\\dashboard\\..\\results\\shanxi_informatization_2026年01月16日.xlsx'
+[2026-01-22 02:00:00]    [清理完成] 共删除了 0 个过期文件。
+[2026-01-22 02:01:41]    [报告] 后台采集任务完成。新增 2 个文件。
+[2026-01-22 02:01:51]    [报告] 后台采集任务完成。新增 2 个文件。
+[2026-01-22 09:35:06.306793] System Started
+[2026-01-22 09:35:16.338403] System Started
+[2026-01-22 09:35:31.925525] System Started
+[2026-01-22 09:35:31.925625] System Started
+[2026-01-22 09:36:21.640531] System Started
+[2026-01-22 09:36:22.882927] System Started

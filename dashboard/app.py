@@ -8,16 +8,23 @@ import sys
 import os
 import glob
 import re
+from werkzeug.utils import secure_filename
 
 # 配置目录
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(BASE_DIR, '..', 'results')
+# 临时上传目录
+UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# 添加上级目录到 path 以导入 scraper
+# 添加上级目录到 path 以导入 scraper 和 utils
 sys.path.append(os.path.join(BASE_DIR, '..'))
 import scraper
+from dashboard.utils.comparator import compare_documents
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 300 * 1024 * 1024 # 300MB Limit
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 # --- 定时任务日志存储 (改为文件存储以解决多进程/线程问题) ---
 # --- 定时任务日志存储 (改为文件存储以解决多进程/线程问题) ---
@@ -194,6 +201,56 @@ def download_specific_file(filename):
         return jsonify({"error": f"File not found on server: {filename}"}), 404
         
     return send_from_directory(directory, filename, as_attachment=True)
+
+# --- 投标文件对比功能 ---
+
+@app.route('/bijiao')
+def bijiao_view():
+    return render_template('bijiao.html')
+
+@app.route('/api/compare', methods=['POST'])
+def api_compare():
+    # 1. Check files
+    if 'file_a' not in request.files or 'file_b' not in request.files:
+        return jsonify({"error": "请至少上传两个投标文件 (A和B)"}), 400
+        
+    file_a = request.files['file_a']
+    file_b = request.files['file_b']
+    file_tender = request.files.get('file_tender') # Optional? Implied required by user req.
+    
+    if file_a.filename == '' or file_b.filename == '':
+        return jsonify({"error": "未选择文件"}), 400
+
+    # 2. Save temporarily
+    try:
+        path_a = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(file_a.filename))
+        path_b = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(file_b.filename))
+        file_a.save(path_a)
+        file_b.save(path_b)
+        
+        path_tender = None
+        if file_tender and file_tender.filename != '':
+            path_tender = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(file_tender.filename))
+            file_tender.save(path_tender)
+            
+        # 3. Process
+        results = compare_documents(path_a, path_b, path_tender)
+        
+        # 4. Clean up (Optional: clean up immediately or via cron? For now, clean up immediately to save space)
+        # But maybe we want to keep them for debug? Let's clean up A/B/Tender.
+        try:
+            os.remove(path_a)
+            os.remove(path_b)
+            if path_tender:
+                os.remove(path_tender)
+        except Exception:
+            pass # Ignore cleanup errors
+            
+        return jsonify({"status": "success", "data": results})
+        
+    except Exception as e:
+        print(f"Error during comparison: {e}")
+        return jsonify({"error": f"处理出错: {str(e)}"}), 500
 
 @app.route('/api/dates')
 def api_dates():

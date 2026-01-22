@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>串标风险检测</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-gradient: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            --glass-bg: rgba(255, 255, 255, 0.7);
+            --glass-border: rgba(255, 255, 255, 0.5);
+            --shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.15);
+            --text-primary: #1f2937;
+            --text-secondary: #4b5563;
+            --accent-color: #ef4444;
+            /* Use red for warning/risk */
+            --accent-hover: #dc2626;
+        }
+
+        body {
+            margin: 0;
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            background: var(--bg-gradient);
+            min-height: 100vh;
+            color: var(--text-primary);
+            padding: 40px 20px;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            background: var(--glass-bg);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid var(--glass-border);
+            border-radius: 24px;
+            padding: 40px;
+            box-shadow: var(--shadow);
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+
+        h1 {
+            font-size: 2rem;
+            margin-bottom: 10px;
+            font-weight: 700;
+            color: #111827;
+        }
+
+        .subtitle {
+            color: var(--text-secondary);
+        }
+
+        .upload-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 24px;
+            margin-bottom: 30px;
+        }
+
+        .upload-card {
+            background: rgba(255, 255, 255, 0.5);
+            border: 2px dashed #cbd5e1;
+            border-radius: 16px;
+            padding: 24px;
+            text-align: center;
+            transition: all 0.2s;
+            position: relative;
+        }
+
+        .upload-card:hover {
+            border-color: var(--accent-color);
+            background: rgba(255, 255, 255, 0.8);
+        }
+
+        .upload-card.filled {
+            border-style: solid;
+            border-color: #10b981;
+            /* Green check */
+            background: rgba(240, 253, 244, 0.8);
+        }
+
+        .file-input {
+            width: 0.1px;
+            height: 0.1px;
+            opacity: 0;
+            overflow: hidden;
+            position: absolute;
+            z-index: -1;
+        }
+
+        .file-label {
+            cursor: pointer;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 12px;
+            width: 100%;
+            height: 100%;
+        }
+
+        .icon {
+            font-size: 32px;
+        }
+
+        .filename-display {
+            font-size: 0.9rem;
+            word-break: break-all;
+            margin-top: 8px;
+            color: var(--text-secondary);
+            font-weight: 500;
+        }
+
+        .action-area {
+            text-align: center;
+            margin-top: 20px;
+        }
+
+        .compare-btn {
+            background: var(--accent-color);
+            color: white;
+            border: none;
+            padding: 14px 40px;
+            border-radius: 12px;
+            font-size: 1.1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+
+        .compare-btn:hover {
+            background: var(--accent-hover);
+            transform: translateY(-2px);
+        }
+
+        .compare-btn:disabled {
+            background: #9ca3af;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        /* Results */
+        .results-area {
+            margin-top: 40px;
+            border-top: 1px solid rgba(0, 0, 0, 0.1);
+            padding-top: 40px;
+            display: none;
+            /* Hidden by default */
+        }
+
+        .results-area.visible {
+            display: block;
+        }
+
+        .summary-card {
+            background: linear-gradient(to right, #fff1f2, #fff);
+            border-left: 4px solid var(--accent-color);
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 30px;
+        }
+
+        .paragraph-card {
+            background: #fff;
+            padding: 20px;
+            border-radius: 12px;
+            margin-bottom: 16px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+            border: 1px solid #e5e7eb;
+        }
+
+        .para-meta {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .para-text {
+            line-height: 1.6;
+            color: #374151;
+            background: #fef2f2;
+            /* Light red bg for text */
+            padding: 12px;
+            border-radius: 6px;
+            font-size: 0.95rem;
+        }
+
+        /* Loading Spinner */
+        .loader {
+            display: none;
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid var(--accent-color);
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto;
+            margin-top: 20px;
+        }
+
+        @keyframes spin {
+            0% {
+                transform: rotate(0deg);
+            }
+
+            100% {
+                transform: rotate(360deg);
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>🕵️‍♂️ 串标风险检测</h1>
+            <p class="subtitle">上传两份投标文件，检测是否存在雷同段落（已自动排除招标文件内容）</p>
+        </header>
+
+        <form id="compare-form">
+            <div class="upload-grid">
+                <!-- Bidder A -->
+                <div class="upload-card">
+                    <input type="file" name="file_a" id="file_a" class="file-input" accept=".docx,.pdf" required>
+                    <label for="file_a" class="file-label">
+                        <span class="icon">📄</span>
+                        <span style="font-weight: 600;">投标单位 A</span>
+                        <span class="filename-display" id="name_a">点击选择文件<br><small>(docx/pdf)</small></span>
+                    </label>
+                </div>
+
+                <!-- Bidder B -->
+                <div class="upload-card">
+                    <input type="file" name="file_b" id="file_b" class="file-input" accept=".docx,.pdf" required>
+                    <label for="file_b" class="file-label">
+                        <span class="icon">📄</span>
+                        <span style="font-weight: 600;">投标单位 B</span>
+                        <span class="filename-display" id="name_b">点击选择文件<br><small>(docx/pdf)</small></span>
+                    </label>
+                </div>
+
+                <!-- Tender Doc (Optional but likely used) -->
+                <div class="upload-card" style="border-style: solid; border-color: #93c5fd;">
+                    <input type="file" name="file_tender" id="file_tender" class="file-input" accept=".docx,.pdf">
+                    <label for="file_tender" class="file-label">
+                        <span class="icon">📘</span>
+                        <span style="font-weight: 600;">招标文件 (排除项)</span>
+                        <span class="filename-display" id="name_tender">点击选择文件<br><small>(可选, 用于排除)</small></span>
+                    </label>
+                </div>
+            </div>
+
+            <div class="action-area">
+                <button type="submit" class="compare-btn" id="submit-btn">开始比对</button>
+                <div class="loader" id="loader"></div>
+            </div>
+        </form>
+
+        <div class="results-area" id="results-area">
+            <div class="summary-card">
+                <h3 style="margin-top: 0; color: #991b1b;">检测报告</h3>
+                <p>共发现 <strong id="count-display" style="font-size: 1.25rem;">0</strong> 处完全一致的段落（已排除招标文件原文）。</p>
+            </div>
+
+            <div id="paragraphs-list">
+                <!-- Items will be injected here -->
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // File Input Handling
+        function setupFileInput(id, displayId) {
+            document.getElementById(id).addEventListener('change', function (e) {
+                const fileName = e.target.files[0]?.name;
+                const card = e.target.parentElement;
+
+                if (fileName) {
+                    document.getElementById(displayId).textContent = fileName;
+                    card.classList.add('filled');
+                } else {
+                    document.getElementById(displayId).innerHTML = '点击选择文件<br><small>(docx/pdf)</small>';
+                    card.classList.remove('filled');
+                }
+            });
+        }
+
+        setupFileInput('file_a', 'name_a');
+        setupFileInput('file_b', 'name_b');
+        setupFileInput('file_tender', 'name_tender');
+
+        // Form Submission
+        document.getElementById('compare-form').addEventListener('submit', async function (e) {
+            e.preventDefault();
+
+            const btn = document.getElementById('submit-btn');
+            const loader = document.getElementById('loader');
+            const resultsArea = document.getElementById('results-area');
+            const list = document.getElementById('paragraphs-list');
+            const countDisplay = document.getElementById('count-display');
+
+            // Reset
+            list.innerHTML = '';
+            resultsArea.classList.remove('visible');
+            btn.disabled = true;
+            btn.textContent = '正在分析文档...';
+            loader.style.display = 'block';
+
+            const formData = new FormData(this);
+
+            try {
+                const response = await fetch('/api/compare', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const result = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(result.error || '上传失败');
+                }
+
+                // Render Results
+                const data = result.data;
+                countDisplay.textContent = data.length;
+
+                if (data.length === 0) {
+                    list.innerHTML = '<p style="text-align:center; color:#6b7280; padding: 20px;">未发现可疑的雷同段落 🎉</p>';
+                } else {
+                    data.forEach(item => {
+                        const div = document.createElement('div');
+                        div.className = 'paragraph-card';
+                        div.innerHTML = `
+                            <div class="para-meta">
+                                <span>位置索引: 第 ${item.index_a} 段</span>
+                                <span style="color: #ef4444;">完全匹配</span>
+                            </div>
+                            <div class="para-text">${escapeHtml(item.text)}</div>
+                        `;
+                        list.appendChild(div);
+                    });
+                }
+
+                resultsArea.classList.add('visible');
+
+            } catch (err) {
+                alert('检测出错: ' + err.message);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '开始比对';
+                loader.style.display = 'none';
+            }
+        });
+
+        function escapeHtml(text) {
+            const map = {
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#039;'
+            };
+            return text.replace(/[&<>"']/g, function (m) { return map[m]; });
+        }
+    </script>
+</body>
+
+</html>
