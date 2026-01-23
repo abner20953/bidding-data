@@ -34,6 +34,7 @@ docker run -d \
   --restart always \
   -p 80:7860 \
   -v $(pwd)/results:/app/results \
+  -v $(pwd)/file:/app/file \
   bidding-app
 
 if [ $? -eq 0 ]; then
