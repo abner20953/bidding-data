@@ -26,7 +26,7 @@ SSH 登录腾讯云服务器，执行以下命令：
 # 1. 克隆代码
 git clone https://gitee.com/lilac111/bidding-data.git
 cd bidding-data
-
+#也可以用一键脚本 ./redeploy.sh
 # 2. 构建镜像 (使用专用优化配置 Dockerfile.tencent)
 # 内置了清华源和 HF 镜像，构建速度飞快
 docker build -f Dockerfile.tencent -t bidding-app .
