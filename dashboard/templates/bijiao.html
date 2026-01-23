@@ -406,7 +406,14 @@
                     const metaB = metadata.file_b.author;
                     const metaTender = metadata.tender ? metadata.tender.author : 'N/A';
 
-                    const isSame = (metaA !== 'Unknown' && metaB !== 'Unknown' && metaA === metaB);
+                    // Strict check: Ignore if empty, whitespace only, or 'Unknown'
+                    const cleanA = metaA ? metaA.trim() : '';
+                    const cleanB = metaB ? metaB.trim() : '';
+
+                    const isValidA = cleanA !== '' && cleanA !== 'Unknown';
+                    const isValidB = cleanB !== '' && cleanB !== 'Unknown';
+
+                    const isSame = (isValidA && isValidB && cleanA === cleanB);
                     const sameWarn = isSame ? `<div style="margin-top:10px; color:#ef4444; font-weight:bold;">⚠️ 警告：两份投标文件作者/创建者相同！</div>` : '';
 
                     const div = document.createElement('div');
