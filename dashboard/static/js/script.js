@@ -475,24 +475,26 @@ document.addEventListener('DOMContentLoaded', () => {
 
 
     // 打开日历模态框
-    autoFetchBtn.addEventListener('click', async () => {
-        dateModal.classList.remove('hidden');
-        void dateModal.offsetWidth;
-        dateModal.classList.add('visible');
+    if (autoFetchBtn) {
+        autoFetchBtn.addEventListener('click', async () => {
+            dateModal.classList.remove('hidden');
+            void dateModal.offsetWidth;
+            dateModal.classList.add('visible');
 
-        // 重置状态
-        selectedDates.clear();
-        updateSelectionUI();
-        currentDateCursor = new Date(); // Reset to current month
+            // 重置状态
+            selectedDates.clear();
+            updateSelectionUI();
+            currentDateCursor = new Date(); // Reset to current month
 
-        await refreshExistingDates();
-        renderCalendar(currentDateCursor);
-        await refreshExistingDates();
-        renderCalendar(currentDateCursor);
+            await refreshExistingDates();
+            renderCalendar(currentDateCursor);
+            await refreshExistingDates();
+            renderCalendar(currentDateCursor);
 
-        // Load Scheduler Logs
-        loadSchedulerLogs();
-    });
+            // Load Scheduler Logs
+            loadSchedulerLogs();
+        });
+    }
 
     // 定时任务日志逻辑
     const schedulerLogsContainer = document.getElementById('scheduler-logs-container');
