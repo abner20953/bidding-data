@@ -23,8 +23,7 @@ if [ $? -ne 0 ]; then
     echo "❌ 镜像构建失败！"
     exit 1
 fi
-    exit 1
-fi
+
 
 # 3.1 准备挂载目录并修复权限
 # 防止 Docker 以 root 身份自动创建目录导致容器无权限写入
