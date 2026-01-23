@@ -183,6 +183,10 @@ def dashboard_view():
 def mobile_view():
     return render_template('mobile.html')
 
+@app.route('/all')
+def navigation_index():
+    return render_template('nav_index.html')
+
 @app.route('/api/tools/download')
 def download_tools():
     # 保留此路由用于首页按钮 (只下载 Beyond Compare)
