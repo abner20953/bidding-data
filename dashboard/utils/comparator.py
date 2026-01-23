@@ -87,17 +87,19 @@ COMMON_HEADERS = {
 
 def extract_entities(content_list):
     """
-    Extracts high-value entities (Phones, ID Cards) from the entire document content.
+    Extracts high-value entities (Phones, ID Cards, Emails) from the entire document content.
     Returns: Dict { "fingerprint": { "text": original, "page": page_num } }
     """
     entities = {}
     
     # Regex for Phone (Mobile 11 digits)
-    # 1[3-9]\d{9} - simple mobile regex
     phone_pattern = re.compile(r'(?<!\d)1[3-9]\d{9}(?!\d)')
     
     # Regex for ID Card (18 digits or 17+X)
     id_pattern = re.compile(r'(?<!\d)\d{17}[\dXx](?!\d)')
+    
+    # Regex for Email
+    email_pattern = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
     
     for item in content_list:
         text = item['text']
@@ -105,7 +107,7 @@ def extract_entities(content_list):
         
         # Phones
         for match in phone_pattern.findall(text):
-            fp = match # Phone num is its own fingerprint
+            fp = match
             if fp not in entities:
                 entities[fp] = {"text": match, "page": page}
                 
@@ -115,29 +117,38 @@ def extract_entities(content_list):
             if fp not in entities:
                 entities[fp] = {"text": match, "page": page}
                 
+        # Emails
+        for match in email_pattern.findall(text):
+            fp = match.lower() # Email is case insensitive
+            if fp not in entities:
+                entities[fp] = {"text": match, "page": page}
+                
     return entities
 
 def is_significant(text, fingerprint):
     """
     Determines if a short text is significant enough to report as a match.
+    Strategy:
+    1. Base Threshold: Fingerprint length > 10.
+       (Rejects short headers, generic phrases, short sentences)
     """
     f_len = len(fingerprint)
     
-    # 0. Global Blacklist Check (Noise Filter)
-    # Check if text roughly matches a common header
+    # 0. Global Blacklist Check
     clean_text = text.replace(" ", "").replace(":", "").replace("：", "")
     if clean_text in COMMON_HEADERS:
         return False
-    # Partial match for very short headers? 
-    # E.g. "第一章 招标公告" -> clean "第一章招标公告".
-    # If fingerprint is short and contains blocked words?
     
-    # 1. Absolute Minimum
-    if f_len < 4: # Lowered to 4 to catch short names if not blacklisted
+    # 1. Absolute Minimum for Paragraphs
+    # User Request: "At least higher than 10" -> > 10 -> >= 11
+    if f_len <= 10:
         return False
         
     # 2. Pure Numeric/Symbol Check
     if re.match(r'^[\d\.,\-\(\)]+$', fingerprint):
+        # Even stricter for numbers? 
+        # Phone numbers are 11 digits, so they pass > 10.
+        # But generic numbers?
         if f_len < 10:
             return False
             
