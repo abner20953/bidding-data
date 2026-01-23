@@ -177,7 +177,12 @@ def index():
 
 @app.route('/dashboard')
 def dashboard_view():
-    return render_template('index.html')
+    return render_template('index.html', show_collect=False)
+
+@app.route('/caiji')
+def collection_view():
+    """数据采集专用入口"""
+    return render_template('index.html', show_collect=True)
 
 @app.route('/mobile')
 def mobile_view():
