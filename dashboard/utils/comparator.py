@@ -181,17 +181,17 @@ def compare_documents(file_a_path, file_b_path, tender_path):
             if fp not in fp_map_b:
                 fp_map_b[fp] = p
                 
-    # 4. Tender Exclusion (Paragraphs)
-    tender_fps = set()
-    for p in paras_tender:
-        tender_fps.add(get_fingerprint(p['text']))
+    # 4. Tender Exclusion (Full Content Fingerprint)
+    # We construct a single giant string of all Tender content fingerprints.
+    # This allows checking if a phrase (entity or paragraph) exists *anywhere* in the Tender 
+    # document, even if segmented differently (e.g. split across lines).
+    tender_full_fp = ""
+    if paras_tender:
+        tender_full_fp = "".join([get_fingerprint(p['text']) for p in paras_tender])
 
     # 5. Extract Entities (Independent of Paragraphs)
     entities_a = extract_entities(content_a)
     entities_b = extract_entities(content_b)
-    # Tender entities for exclusion?
-    entities_tender = extract_entities(content_tender)
-    tender_entity_fps = set(entities_tender.keys())
 
     # 6. Find Suspicious Items
     suspicious_paragraphs = []
@@ -200,7 +200,14 @@ def compare_documents(file_a_path, file_b_path, tender_path):
     # A. Check Entities first (High Priority)
     for fp, item_a in entities_a.items():
         if fp in entities_b:
-            if fp not in tender_entity_fps:
+            # Check exclusion against full tender content
+            # Must fingerprint the entity string to match the tender_full_fp format (no symbols)
+            entity_check_fp = get_fingerprint(fp)
+            
+            # If tender_full_fp is empty, it means no tender doc provided, so don't exclude.
+            is_excluded = tender_full_fp and (entity_check_fp in tender_full_fp)
+            
+            if not is_excluded:
                 if fp not in seen_fps:
                     item_b = entities_b[fp]
                     suspicious_paragraphs.append({
@@ -224,7 +231,11 @@ def compare_documents(file_a_path, file_b_path, tender_path):
             continue
         
         if fp_a in fp_map_b:
-            if fp_a not in tender_fps:
+            # Check exclusion against full tender content
+            # fp_a is already a fingerprint
+            is_excluded = tender_full_fp and (fp_a in tender_full_fp)
+            
+            if not is_excluded:
                 item_b = fp_map_b[fp_a]
                 suspicious_paragraphs.append({
                     "text": text_a,
