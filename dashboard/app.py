@@ -224,6 +224,7 @@ def download_specific_file(filename):
 def cleanup_file_archive():
     """
     检查归档目录大小，如果超过 1GB，则清理旧文件直到小于 600MB
+    同时清理对应的备注文件 (.txt)
     """
     try:
         total_size = 0
@@ -233,10 +234,23 @@ def cleanup_file_archive():
         with os.scandir(ARCHIVE_FOLDER) as it:
             for entry in it:
                 if entry.is_file():
+                    # Skip remark files themselves from counting logic to simplify, 
+                    # or include them? Let's include everything but handle pairings during deletion.
+                    # Or simpler: just count everything. 
+                    # If we delete "A.pdf", we also delete "A.pdf.txt".
+                    # If we encounter "A.pdf.txt" in the loop, we might accidentally delete it if we sort by time?
+                    # Better strategy: Only track main files for deletion candidates, but add size of remarks to total.
+                    
+                    if entry.name.endswith('.txt') and os.path.exists(os.path.join(ARCHIVE_FOLDER, entry.name[:-4])):
+                         # This is a remark file and the main file exists. skip adding to list to avoid double checking.
+                         # But add size.
+                         total_size += entry.stat().st_size
+                         continue
+                         
                     size = entry.stat().st_size
                     mtime = entry.stat().st_mtime
                     total_size += size
-                    file_list.append({"path": entry.path, "size": size, "mtime": mtime})
+                    file_list.append({"path": entry.path, "name": entry.name, "size": size, "mtime": mtime})
         
         limit_1gb = 1 * 1024 * 1024 * 1024 # 1GB
         target_600mb = 600 * 1024 * 1024   # 600MB
@@ -252,9 +266,20 @@ def cleanup_file_archive():
                     break
                 
                 try:
-                    os.remove(f['path'])
-                    total_size -= f['size']
-                    deleted_size += f['size']
+                    # Delete main file
+                    if os.path.exists(f['path']):
+                        os.remove(f['path'])
+                        total_size -= f['size']
+                        deleted_size += f['size']
+                        
+                    # Delete remark file if exists
+                    remark_path = f['path'] + ".txt"
+                    if os.path.exists(remark_path):
+                        r_size = os.path.getsize(remark_path)
+                        os.remove(remark_path)
+                        total_size -= r_size
+                        deleted_size += r_size
+                        
                 except Exception as e:
                     print(f"Error deleting archived file {f['path']}: {e}")
             
@@ -283,6 +308,40 @@ def archive_file(source_path, original_filename):
 
 # --- 归档页面路由 ---
 
+@app.route('/api/file/remark/<filename>', methods=['GET'])
+def api_get_remark(filename):
+    """获取文件备注"""
+    try:
+        remark_path = os.path.join(ARCHIVE_FOLDER, filename + ".txt")
+        if not os.path.exists(remark_path):
+            return jsonify({"status": "success", "content": ""})
+            
+        with open(remark_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        return jsonify({"status": "success", "content": content})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/file/remark/<filename>', methods=['POST'])
+def api_save_remark(filename):
+    """保存文件备注"""
+    try:
+        data = request.get_json()
+        content = data.get('content', '')
+        
+        # Ensure main file exists
+        file_path = os.path.join(ARCHIVE_FOLDER, filename)
+        if not os.path.exists(file_path):
+             return jsonify({"status": "error", "message": "Original file not found"}), 404
+             
+        remark_path = os.path.join(ARCHIVE_FOLDER, filename + ".txt")
+        with open(remark_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+            
+        return jsonify({"status": "success"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 def format_size(size_bytes):
     if size_bytes == 0: return "0 B"
     size_name = ("B", "KB", "MB", "GB", "TB")
@@ -299,6 +358,9 @@ def file_list_view():
         with os.scandir(ARCHIVE_FOLDER) as it:
             for entry in it:
                 if entry.is_file():
+                    if not entry.name.lower().endswith('.pdf'):
+                        continue
+                        
                     stat = entry.stat()
                     total_size += stat.st_size
                     files.append({

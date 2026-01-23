@@ -166,13 +166,16 @@
                 <tbody>
                     {% for file in files %}
                     <tr>
-                        <td class="filename" title="{{ file.name }}">{{ file.name }}</td>
+                        <td class="filename" title="{{ file.name }}" style="color: #9ca3af;">{{ file.name }}</td>
                         <td><span class="size-badge">{{ file.size }}</span></td>
-                        <td style="color: #6b7280;">{{ file.time }}</td>
-                        <td>
-                            <a href="/bijiao/file/{{ file.name }}" class="download-btn">
-                                ⬇️ 下载
+                        <td style="color: #9ca3af;">{{ file.time }}</td>
+                        <td style="white-space: nowrap;">
+                            <a href="/bijiao/file/{{ file.name }}" class="download-btn" title="下载文件">
+                                ⬇️
                             </a>
+                            <button onclick="openRemark('{{ file.name }}')" class="remark-btn" title="查看/编辑备注">
+                                📝
+                            </button>
                         </td>
                     </tr>
                     {% endfor %}
@@ -191,6 +194,239 @@
             <span>自动清理阈值: <strong>1 GB</strong> (触发后清理至 600 MB)</span>
         </div>
     </div>
+
+    <!-- Remark Modal -->
+    <div id="remarkModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="modalTitle" style="color: #9ca3af;">文件备注</h3>
+                <span class="close" onclick="closeRemark()">&times;</span>
+            </div>
+            <div class="modal-body">
+                <textarea id="remarkText" placeholder="在此输入备注信息..." style="color: #9ca3af;"></textarea>
+            </div>
+            <div class="modal-footer">
+                <button class="cancel-btn" onclick="closeRemark()">取消</button>
+                <button class="save-btn" onclick="saveRemark()">保存备注</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentFilename = null;
+        const modal = document.getElementById("remarkModal");
+        const remarkText = document.getElementById("remarkText");
+        const modalTitle = document.getElementById("modalTitle");
+
+        async function openRemark(filename) {
+            currentFilename = filename;
+            modalTitle.textContent = "备注: " + filename;
+            remarkText.value = "加载中...";
+            modal.style.display = "block";
+
+            try {
+                const response = await fetch(`/api/file/remark/${filename}`);
+                const data = await response.json();
+                if (data.status === 'success') {
+                    remarkText.value = data.content;
+                } else {
+                    remarkText.value = "";
+                    alert("获取备注失败: " + data.message);
+                }
+            } catch (e) {
+                remarkText.value = "";
+                console.error(e);
+                alert("网络错误");
+            }
+        }
+
+        function closeRemark() {
+            modal.style.display = "none";
+            currentFilename = null;
+        }
+
+        async function saveRemark() {
+            if (!currentFilename) return;
+
+            const content = remarkText.value;
+            try {
+                const response = await fetch(`/api/file/remark/${currentFilename}`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ content: content })
+                });
+                const data = await response.json();
+
+                if (data.status === 'success') {
+                    // Show simple feedback
+                    const saveBtn = document.querySelector('.save-btn');
+                    const originalText = saveBtn.textContent;
+                    saveBtn.textContent = "已保存!";
+                    saveBtn.style.backgroundColor = "#059669";
+                    setTimeout(() => {
+                        saveBtn.textContent = originalText;
+                        saveBtn.style.backgroundColor = "";
+                        closeRemark();
+                    }, 800);
+                } else {
+                    alert("保存失败: " + data.message);
+                }
+            } catch (e) {
+                alert("保存失败: 网络错误");
+            }
+        }
+
+        // Close modal when clicking outside
+        window.onclick = function (event) {
+            if (event.target == modal) {
+                closeRemark();
+            }
+        }
+    </script>
+
+    <style>
+        .remark-btn {
+            display: inline-flex;
+            align-items: center;
+            padding: 6px 12px;
+            background-color: #f59e0b;
+            color: white;
+            text-decoration: none;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            transition: background 0.2s;
+            border: none;
+            cursor: pointer;
+            margin-left: 8px;
+        }
+
+        .remark-btn:hover {
+            background-color: #d97706;
+        }
+
+        /* Modal Styles */
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            overflow: auto;
+            background-color: rgba(0, 0, 0, 0.5);
+        }
+
+        .modal-content {
+            background-color: #fefefe;
+            margin: 10% auto;
+            padding: 0;
+            border: 1px solid #888;
+            width: 80%;
+            max-width: 600px;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            animation: modalFadeIn 0.3s;
+        }
+
+        @keyframes modalFadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(-20px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .modal-header {
+            padding: 15px 20px;
+            background-color: #f9fafb;
+            border-bottom: 1px solid #e5e7eb;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-top-left-radius: 8px;
+            border-top-right-radius: 8px;
+        }
+
+        .modal-header h3 {
+            margin: 0;
+            font-size: 1.1rem;
+            color: #111827;
+        }
+
+        .close {
+            color: #aaa;
+            font-size: 28px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+
+        .close:hover {
+            color: black;
+        }
+
+        .modal-body {
+            padding: 20px;
+        }
+
+        textarea {
+            width: 100%;
+            height: 300px;
+            padding: 12px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            font-family: inherit;
+            font-size: 1rem;
+            resize: vertical;
+            box-sizing: border-box;
+        }
+
+        textarea:focus {
+            outline: 2px solid #3b82f6;
+            border-color: transparent;
+        }
+
+        .modal-footer {
+            padding: 15px 20px;
+            border-top: 1px solid #e5e7eb;
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+        }
+
+        .cancel-btn,
+        .save-btn {
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.95rem;
+            border: none;
+        }
+
+        .cancel-btn {
+            background-color: #f3f4f6;
+            color: #374151;
+        }
+
+        .cancel-btn:hover {
+            background-color: #e5e7eb;
+        }
+
+        .save-btn {
+            background-color: #3b82f6;
+            color: white;
+        }
+
+        .save-btn:hover {
+            background-color: #2563eb;
+        }
+    </style>
 </body>
 
 </html>
