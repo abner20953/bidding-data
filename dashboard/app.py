@@ -8,6 +8,9 @@ import sys
 import os
 import glob
 import re
+import shutil
+import time
+import math
 from werkzeug.utils import secure_filename
 
 # 配置目录
@@ -16,6 +19,13 @@ RESULTS_DIR = os.path.join(BASE_DIR, '..', 'results')
 # 临时上传目录
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# 归档目录 (D:/ai_project/1/file)
+ARCHIVE_FOLDER = os.path.join(BASE_DIR, '..', 'file')
+# 如果是绝对路径需求，可以硬编码，但建议相对路径以适应不同部署
+# 用户请求: /file 目录 (可能是 D:/file 或项目根目录/file)
+# 这里假设是项目根目录下的 file 文件夹
+os.makedirs(ARCHIVE_FOLDER, exist_ok=True)
 
 # 添加上级目录到 path 以导入 scraper 和 utils
 sys.path.append(os.path.join(BASE_DIR, '..'))
@@ -209,6 +219,105 @@ def download_specific_file(filename):
         
     return send_from_directory(directory, filename, as_attachment=True)
 
+# --- 归档辅助函数 ---
+
+def cleanup_file_archive():
+    """
+    检查归档目录大小，如果超过 1GB，则清理旧文件直到小于 600MB
+    """
+    try:
+        total_size = 0
+        file_list = []
+        
+        # 扫描所有文件
+        with os.scandir(ARCHIVE_FOLDER) as it:
+            for entry in it:
+                if entry.is_file():
+                    size = entry.stat().st_size
+                    mtime = entry.stat().st_mtime
+                    total_size += size
+                    file_list.append({"path": entry.path, "size": size, "mtime": mtime})
+        
+        limit_1gb = 1 * 1024 * 1024 * 1024 # 1GB
+        target_600mb = 600 * 1024 * 1024   # 600MB
+        
+        if total_size > limit_1gb:
+            print(f"Archive clean up started. Current size: {total_size / (1024*1024):.2f} MB")
+            # 按修改时间排序 (旧文件在前)
+            file_list.sort(key=lambda x: x['mtime'])
+            
+            deleted_size = 0
+            for f in file_list:
+                if total_size <= target_600mb:
+                    break
+                
+                try:
+                    os.remove(f['path'])
+                    total_size -= f['size']
+                    deleted_size += f['size']
+                except Exception as e:
+                    print(f"Error deleting archived file {f['path']}: {e}")
+            
+            print(f"Archive clean up finished. Deleted {deleted_size / (1024*1024):.2f} MB. New size: {total_size / (1024*1024):.2f} MB")
+            
+    except Exception as e:
+        print(f"Error in cleanup_file_archive: {e}")
+
+def archive_file(source_path, original_filename):
+    """
+    将临时文件保存到归档目录
+    """
+    try:
+        if not original_filename:
+            return
+            
+        target_path = os.path.join(ARCHIVE_FOLDER, original_filename)
+        
+        # 如果文件已存在，不覆盖，直接跳过
+        if os.path.exists(target_path):
+            return
+            
+        shutil.copy2(source_path, target_path)
+    except Exception as e:
+        print(f"Error archiving file {original_filename}: {e}")
+
+# --- 归档页面路由 ---
+
+def format_size(size_bytes):
+    if size_bytes == 0: return "0 B"
+    size_name = ("B", "KB", "MB", "GB", "TB")
+    i = int(math.floor(math.log(size_bytes, 1024)))
+    p = math.pow(1024, i)
+    s = round(size_bytes / p, 2)
+    return "%s %s" % (s, size_name[i])
+
+@app.route('/bijiao/file')
+def file_list_view():
+    files = []
+    total_size = 0
+    try:
+        with os.scandir(ARCHIVE_FOLDER) as it:
+            for entry in it:
+                if entry.is_file():
+                    stat = entry.stat()
+                    total_size += stat.st_size
+                    files.append({
+                        "name": entry.name,
+                        "size": format_size(stat.st_size),
+                        "time": datetime.datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
+                        "timestamp": stat.st_mtime
+                    })
+        # Sort by time descend
+        files.sort(key=lambda x: x['timestamp'], reverse=True)
+    except Exception as e:
+        print(f"Error listing archive: {e}")
+        
+    return render_template('file_list.html', files=files, total_size=format_size(total_size))
+
+@app.route('/bijiao/file/<path:filename>')
+def download_archived_file(filename):
+    return send_from_directory(ARCHIVE_FOLDER, filename, as_attachment=True)
+
 # --- 投标文件对比功能 ---
 
 @app.route('/bijiao')
@@ -219,6 +328,9 @@ import uuid
 
 @app.route('/api/compare', methods=['POST'])
 def api_compare():
+    # 0. Auto Cleanup Archive if needed
+    cleanup_file_archive()
+
     # 1. Check files
     if 'file_a' not in request.files or 'file_b' not in request.files:
         return jsonify({"error": "请至少上传两个投标文件 (A和B)"}), 400
@@ -234,15 +346,15 @@ def api_compare():
     try:
         def save_temp_file(file_obj):
             ext = os.path.splitext(file_obj.filename)[1].lower()
-            if not ext:
-                # If no extension, try to guess from mimetype or just assume something?
-                # But user usually has extension. If secure_filename destroyed it, we use original filename here.
-                # If original filename has no extension, that's a user error, but we can't do much.
-                pass
-            
             temp_filename = f"{uuid.uuid4()}{ext}"
             temp_path = os.path.join(app.config['UPLOAD_FOLDER'], temp_filename)
             file_obj.save(temp_path)
+            
+            # --- Archive Hook ---
+            # Save original file to archive folder
+            archive_file(temp_path, file_obj.filename)
+            # --------------------
+            
             return temp_path
 
         path_a = save_temp_file(file_a)
