@@ -266,7 +266,7 @@ def compare_documents(file_a_path, file_b_path, tender_path):
                 continue
             # 2. Fuzzy Match Check (Threshold 0.9)
             # Handle cases like "6." vs "6．" or minor OCR variance
-            close_matches = difflib.get_close_matches(fp_a, tender_fps, n=1, cutoff=0.9)
+            close_matches = difflib.get_close_matches(fp_a, tender_fps, n=1, cutoff=0.8)
             if close_matches:
                 continue
         # ---------------------------------------------------
@@ -322,7 +322,7 @@ def compare_documents(file_a_path, file_b_path, tender_path):
                 # --- Double Check Exclusion for Matched B ---
                 if tender_full_fp:
                     if matched_fp in tender_full_fp: continue
-                    close_tender_matches = difflib.get_close_matches(matched_fp, tender_fps, n=1, cutoff=0.9)
+                    close_tender_matches = difflib.get_close_matches(matched_fp, tender_fps, n=1, cutoff=0.8)
                     if close_tender_matches: continue
                 # --------------------------------------------
                     
