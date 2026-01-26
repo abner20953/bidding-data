@@ -196,8 +196,10 @@ def compare_documents(file_a_path, file_b_path, tender_path):
                 
     # 4. Tender Exclusion
     tender_full_fp = ""
+    tender_fps = []
     if paras_tender:
-        tender_full_fp = "".join([get_fingerprint(p['text']) for p in paras_tender])
+        tender_fps = [get_fingerprint(p['text']) for p in paras_tender]
+        tender_full_fp = "".join(tender_fps)
 
     # 5. Extract Entities
     entities_a = extract_entities(content_a)
@@ -236,7 +238,18 @@ def compare_documents(file_a_path, file_b_path, tender_path):
         
         if fp_a in seen_fps: continue 
         if not is_significant(text_a, fp_a): continue
-        if tender_full_fp and (fp_a in tender_full_fp): continue
+        
+        # --- Exclusion Logic (Enhanced with Fuzzy Match) ---
+        if tender_full_fp:
+            # 1. Exact Match Check
+            if fp_a in tender_full_fp:
+                continue
+            # 2. Fuzzy Match Check (Threshold 0.9)
+            # Handle cases like "6." vs "6．" or minor OCR variance
+            close_matches = difflib.get_close_matches(fp_a, tender_fps, n=1, cutoff=0.9)
+            if close_matches:
+                continue
+        # ---------------------------------------------------
 
         match_type = None
         item_b = None
@@ -267,7 +280,13 @@ def compare_documents(file_a_path, file_b_path, tender_path):
             matches = difflib.get_close_matches(fp_a, b_fingerprints, n=1, cutoff=0.85)
             if matches:
                 matched_fp = matches[0]
-                if tender_full_fp and (matched_fp in tender_full_fp): continue
+                
+                # --- Double Check Exclusion for Matched B ---
+                if tender_full_fp:
+                    if matched_fp in tender_full_fp: continue
+                    close_tender_matches = difflib.get_close_matches(matched_fp, tender_fps, n=1, cutoff=0.9)
+                    if close_tender_matches: continue
+                # --------------------------------------------
                     
                 item_b = fp_map_b[matched_fp]
                 ratio = difflib.SequenceMatcher(None, text_a, item_b['text']).ratio()
