@@ -2,73 +2,32 @@ import difflib
 import re
 import time
 import psutil
-import os
 from .text_extractor import extract_content, extract_metadata
 
-# --- Configuration ---
-SEQ_MATCH_THRESHOLD = 0.85     # Final difflib threshold for "Suspicious"
-TENDER_EXCLUDE_THRESHOLD = 0.8 # Threshold for "Tender Exclusion"
-MEMORY_SAFE_LIMIT_MB = 150     # Min Available RAM in MB to continue
-TIMEOUT_LIMIT = 300            # Seconds per comparison
+# --- Configuration (Added for Memory Safety) ---
+MEMORY_SAFE_LIMIT_MB = 100     # Min Available RAM in MB to continue
 
 def get_fingerprint(text):
+    """
+    Generate a fingerprint for text comparison by removing all non-alphanumeric characters.
+    """
+    # Remove all whitespace
     text = re.sub(r'\s+', '', text)
+    # Remove punctuation, keep word chars and Chinese
     return re.sub(r'[^\w\u4e00-\u9fa5]', '', text)
 
-# --- V4 Low Memory Helper ---
-def quick_check_pass(fp_a, fp_b, min_ratio=0.3):
+def check_resources():
     """
-    Very fast pre-check before running expensive difflib.
-    Returns True if likelihood of match > min_ratio.
+    Interrupt if Available Memory < 100MB.
     """
-    len_a = len(fp_a)
-    len_b = len(fp_b)
-    
-    if len_a == 0 or len_b == 0: return False
-    
-    # 1. Length Check
-    # If length diff is huge, no way they match 85%
-    # e.g. 100 vs 200 -> max Ratio approach 0.66
-    if abs(len_a - len_b) / max(len_a, len_b) > 0.6: 
-        return False
-        
-    # 2. Commons Check (Set Intersection)
-    # This is O(N) but Python sets are optimized in C.
-    # For very short texts, sets overhead might be slightly high but faster than SequenceMatcher
-    # We use simple set(fp)
-    set_a = set(fp_a)
-    set_b = set(fp_b)
-    
-    intersect = len(set_a.intersection(set_b))
-    union = len(set_a.union(set_b))
-    
-    if union == 0: return False
-    jaccard = intersect / union
-    
-    if jaccard < min_ratio:
-        return False
-        
-    return True
-
-def check_resources(start_time):
-    """
-    Interrupt if Available Memory < 150MB or Timeout.
-    """
-    # Timeout check
-    if time.time() - start_time > TIMEOUT_LIMIT:
-        raise TimeoutError("Processing timed out (300s limit).")
-        
-    # Memory check (every N checks called)
     mem = psutil.virtual_memory()
-    # Check absolute available memory instead of percentage
-    # ( Percentage is misleading on machines with high background load )
     if mem.available < MEMORY_SAFE_LIMIT_MB * 1024 * 1024:
-        raise MemoryError(f"Memory critical: Only {mem.available / 1024 / 1024:.1f}MB available.")
-
-def is_exact_match(fp_a, fp_map_b):
-    return fp_a in fp_map_b
+        raise MemoryError(f"System memory too low ({mem.available / 1024 / 1024:.1f}MB < {MEMORY_SAFE_LIMIT_MB}MB). Operation aborted to protect server.")
 
 def segment_paragraphs_with_page(content_list):
+    """
+    Smartly segment text into paragraphs while tracking page numbers.
+    """
     paragraphs = []
     
     # Flatten all lines with their page numbers
@@ -85,6 +44,7 @@ def segment_paragraphs_with_page(content_list):
         return []
 
     stop_pattern = re.compile(r'[。！？!?;；：:]$')
+    # Regex to detect lines starting with numbers like "1.", "2、", "(3)", "（4）"
     bullet_pattern = re.compile(r'^(\d+[.、]|[（(]\d+[)）])')
     
     buffer = ""
@@ -100,6 +60,7 @@ def segment_paragraphs_with_page(content_list):
         else:
             is_short_line = len(buffer) < 40
             has_stop = stop_pattern.search(buffer)
+            # Check if the NEW line is a numbered item (force break)
             is_new_bullet = bullet_pattern.match(line)
             
             if has_stop or is_short_line or is_new_bullet:
@@ -127,6 +88,9 @@ COMMON_HEADERS = {
 }
 
 def extract_entities(content_list):
+    """
+    Extracts high-value entities (Phones, ID Cards, Emails).
+    """
     entities = {}
     phone_pattern = re.compile(r'(?<!\d)1[3-9]\d{9}(?!\d)')
     id_pattern = re.compile(r'(?<!\d)\d{17}[\dXx](?!\d)')
@@ -154,25 +118,49 @@ def is_significant(text, fingerprint):
     if re.match(r'^[\d\.,\-\(\)]+$', fingerprint) and len(fingerprint) < 10: return False
     return True
 
+# --- New Helper Functions for Common Errors ---
+
 def detect_broken_tail(text):
-    if len(text) < 15: return False
+    """
+    Detect if a paragraph ends abnormally (no punctuation) but is long enough to be a sentence.
+    """
+    if len(text) < 15: return False # Ignore short headers
+    # Ends with common punctuation?
     if re.search(r'[。！？.!?”"”’]$', text.strip()):
         return False
     return True
 
 def parse_sequence_number(text):
+    """
+    Extracts sequence number from start of text.
+    Returns: (number_int, type_str) or (None, None)
+    """
+    # 1. format "1." or "1、"
     match = re.match(r'^(\d+)[.、]', text)
     if match: return int(match.group(1)), "digit_dot"
+    
+    # 2. format "(1)" or "（1）"
     match = re.match(r'^[\(（](\d+)[\)）]', text)
     if match: return int(match.group(1)), "paren_digit"
+    
     return None, None
 
 def strip_sequence_number_header(text):
+    """
+    Remove leading sequence numbers like "1.", "2.3", "（1）", "12、" etc.
+    """
     clean_text = text.strip()
+    # Pattern: Digit(s) + optional dots/digits + optional punctuation + whitespace
+    # Matches: "1.", "1.2.", "12、", "（1）", "(1)", "20、", etc.
     return re.sub(r'^(\d+(\.\d+)*|[（(]?\d+[)）]?)\s*[.、:：]?\s*', '', clean_text)
 
 def check_sequence_errors(paragraphs):
+    """
+    Scans a document for missing sequence numbers.
+    Returns list of error dicts: { "missing": int, "context_fp": str, "page": int }
+    """
     errors = []
+    
     current_type = None
     next_num = None
     
@@ -183,6 +171,7 @@ def check_sequence_errors(paragraphs):
         if num is None:
             continue
             
+        # If new type or starting with 1, reset
         if num == 1 or seq_type != current_type:
             current_type = seq_type
             next_num = 2
@@ -191,10 +180,13 @@ def check_sequence_errors(paragraphs):
                 if num == next_num:
                     next_num += 1
                 elif num > next_num:
-                    if next_num > 1:
+                    if next_num > 1: # Only report if we established a sequence
+                         # Check for large gaps (likely widely separated clauses, not missing items)
                         if (num - next_num) > 2:
+                            # Too big a jump (e.g. 1 -> 8), probably unrelated. Reset.
                             next_num = num + 1
                         else:
+                            # Found a jump! Expected 2, got 4. Missing 2, 3.
                             errors.append({
                                 "missing": next_num,
                                 "found": num,
@@ -206,19 +198,18 @@ def check_sequence_errors(paragraphs):
                     else:
                         next_num = num + 1
                 else:
+                     # num < next_num (duplicate or restart), reset
                      next_num = num + 1
 
     return errors
 
 def compare_documents(file_a_path, file_b_path, tender_path):
-    start_time = time.time()
-    
     # 0. Extract Metadata
     meta_a = extract_metadata(file_a_path)
     meta_b = extract_metadata(file_b_path)
     meta_tender = extract_metadata(tender_path) if tender_path else None
 
-    # 1. Extract content (NOW SAFE: flush_cache implemented)
+    # 1. Extract content
     content_a = extract_content(file_a_path)
     content_b = extract_content(file_b_path)
     content_tender = extract_content(tender_path) if tender_path else []
@@ -228,25 +219,19 @@ def compare_documents(file_a_path, file_b_path, tender_path):
     paras_b = segment_paragraphs_with_page(content_b)
     paras_tender = segment_paragraphs_with_page(content_tender)
     
-    # Pre-compute fingerprints for B to avoid recomputing in loop
-    # Storing tuple (fp, item)
-    # Using specific list for efficient iteration
-    fp_b_list = []
+    # 3. Build Maps
     fp_map_b = {}
-    
     for p in paras_b:
         fp = get_fingerprint(p['text'])
         if is_significant(p['text'], fp):
-            fp_b_list.append((fp, p))
-            fp_map_b[fp] = p # Fast exact lookup
-
-    # Tender Prep
-    tender_fps = []
+            if fp not in fp_map_b:
+                fp_map_b[fp] = p
+                
+    # 4. Tender Exclusion
     tender_full_fp = ""
+    tender_fps = []
     if paras_tender:
-        # Just store fingerprints, no heavy index
-        for p in paras_tender:
-            tender_fps.append(get_fingerprint(p['text']))
+        tender_fps = [get_fingerprint(p['text']) for p in paras_tender]
         tender_full_fp = "".join(tender_fps)
 
     # 5. Extract Entities
@@ -260,9 +245,7 @@ def compare_documents(file_a_path, file_b_path, tender_path):
     for fp, item_a in entities_a.items():
         if fp in entities_b:
             entity_check_fp = get_fingerprint(fp)
-            is_excluded = False
-            if tender_full_fp and entity_check_fp in tender_full_fp:
-                is_excluded = True
+            is_excluded = tender_full_fp and (entity_check_fp in tender_full_fp)
             
             if not is_excluded:
                 if fp not in seen_fps:
@@ -279,14 +262,17 @@ def compare_documents(file_a_path, file_b_path, tender_path):
                     })
                     seen_fps.add(fp)
 
-    # --- Phase 2: Paragraph Comparison (V4 Streaming Filter) ---
+    # --- Phase 2: Paragraph Comparison ---
+    b_fingerprints = list(fp_map_b.keys())
+
     check_counter = 0
-    
+
     for i, p_a in enumerate(paras_a):
-        # Resource Guard Check (Periodically)
+        # --- Memory Guard ---
         check_counter += 1
         if check_counter % 50 == 0:
-            check_resources(start_time)
+            check_resources()
+        # --------------------
 
         text_a = p_a['text']
         fp_a = get_fingerprint(text_a)
@@ -294,112 +280,91 @@ def compare_documents(file_a_path, file_b_path, tender_path):
         if fp_a in seen_fps: continue 
         if not is_significant(text_a, fp_a): continue
         
-        # Check Exact Match presence in B (Cached Map)
-        is_exact_in_b = fp_a in fp_map_b
-        
-        # --- Exclusion Logic (Iterative Scan but FAST) ---
-        if tender_fps:
-            # 1. Exact/Substring
-            if tender_full_fp and fp_a in tender_full_fp:
+        # --- Exclusion Logic (Enhanced with Fuzzy Match) ---
+        if tender_full_fp:
+            # 1. Exact Match Check
+            if fp_a in tender_full_fp:
                 continue
-            
-            # 2. Fuzzy Exclusion
-            # Only check loop if exact match failed.
-            # Use quick_check filter against tender lines.
-            is_fuzzy_excluded = False
-            
-            # Optimization: If A matches B (Exact), we apply "Smart Deviation" check.
-            # If A != B, we just want to execute Exclusion normally.
-            
-            # To avoid N*M scan of Tender, we limit check.
-            # But Tender exclusion is critical.
-            # If Tender is HUGE, this loop is slow.
-            # Using quick_check_pass helps.
-            
-            best_tender_ratio = 0.0
-            
-            for t_fp in tender_fps:
-                if quick_check_pass(fp_a, t_fp, min_ratio=0.5):
-                    ratio = difflib.SequenceMatcher(None, fp_a, t_fp).ratio()
-                    if ratio > best_tender_ratio:
-                        best_tender_ratio = ratio
-                        if ratio > TENDER_EXCLUDE_THRESHOLD:
-                            # Early break if high enough
-                            break
-            
-            if best_tender_ratio >= TENDER_EXCLUDE_THRESHOLD:
-                # HIT: A is similar to Tender. Normally Exclude.
-                if is_exact_in_b:
-                     # Smart Deviation: A==B, A!=Tender (Sim > 0.8) -> KEEP
-                     # Note: We already know A!=Tender Exact (checked above)
-                     pass
-                else:
-                    continue # Exclude
-        # -----------------------
+            # 2. Fuzzy Match Check (Threshold 0.9)
+            # Handle cases like "6." vs "6．" or minor OCR variance
+            close_matches = difflib.get_close_matches(fp_a, tender_fps, n=1, cutoff=0.9)
+            if close_matches:
+                continue
+        # ---------------------------------------------------
 
         match_type = None
         item_b = None
         desc = ""
         score = 0
         badges = []
-        
+
         # A. Exact Fingerprint Match
-        if is_exact_in_b:
+        if fp_a in fp_map_b:
             item_b = fp_map_b[fp_a]
             text_b = item_b['text']
+            
+            is_broken_a = detect_broken_tail(text_a)
+            is_broken_b = detect_broken_tail(text_b)
             
             match_type = "exact"
             desc = "雷同段落 (内容一致)"
             score = 100
-             
-            is_broken_a = detect_broken_tail(text_a)
-            is_broken_b = detect_broken_tail(text_b)
+            
             if is_broken_a and is_broken_b:
                 badges.append("共同异常断句")
                 desc += "，且均存在异常断句"
             
-            # Shared Deviation Badge
-            if best_tender_ratio >= TENDER_EXCLUDE_THRESHOLD:
-                 desc += "；检测到与招标文件存在共同差异(疑似错别字/连带修)"
-                 badges.append("疑似共同修改")
-            
+            # --- Shared Deviation Check (New Feature) ---
+            # If A==B, but both differ slightly from Tender (e.g. Shared Typo "蚊件" vs "文件")
+            if tender_fps:
+                 tender_matches = difflib.get_close_matches(fp_a, tender_fps, n=1, cutoff=0.85)
+                 if tender_matches:
+                     # Found a close match in tender, but it wasn't exact (otherwise it would be excluded above)
+                     # Wait, exclusion logic above skips ONLY if match >= 0.9. 
+                     # Here cutoff is 0.85. So if it's between 0.85 and 0.9, OR if exclusion logic was skipped (unlikely if fuzzy is on).
+                     # Actually, exclusion logic uses cutoff=0.9.
+                     # If we find a match here with 0.85, check if it is NOT exact.
+                     
+                     matched_tender_fp = tender_matches[0]
+                     if matched_tender_fp != fp_a:
+                        # Ensure it wasn't excluded (it shouldn't be if we are here)
+                        desc += "；检测到与招标文件存在共同差异(疑似错别字/连带修)"
+                        badges.append("疑似共同修改")
+            # --------------------------------------------
+
             seen_fps.add(fp_a)
 
-        # B. Fuzzy Match (Filtered Iteration)
+        # B. Fuzzy Match (Spelling/Typos)
         else:
-            best_match_item = None
-            best_ratio = 0.0
-            
-            for fp_b, p_b in fp_b_list:
-                # Use Quick Filter (Length + Set Jaccard)
-                if quick_check_pass(fp_a, fp_b, min_ratio=0.3):
-                    
-                    # Double Check Exclusion for B (Simulated)
-                    # If B is basically Tender, skip
-                    if tender_fps:
-                        # Only check if A wasn't excluded (it wasn't)
-                        # We skip heavy check for B for speed, assume if A passed, 
-                        # and A~B, then B is likely fine or we catch it.
-                        pass
-
-                    ratio = difflib.SequenceMatcher(None, fp_a, fp_b).ratio()
-                    if ratio > best_ratio:
-                        best_ratio = ratio
-                        best_match_item = p_b
-            
-            if best_match_item and best_ratio >= SEQ_MATCH_THRESHOLD:
-                item_b = best_match_item
+            matches = difflib.get_close_matches(fp_a, b_fingerprints, n=1, cutoff=0.85)
+            if matches:
+                matched_fp = matches[0]
                 
+                # --- Double Check Exclusion for Matched B ---
+                if tender_full_fp:
+                    if matched_fp in tender_full_fp: continue
+                    close_tender_matches = difflib.get_close_matches(matched_fp, tender_fps, n=1, cutoff=0.9)
+                    if close_tender_matches: continue
+                # --------------------------------------------
+                    
+                item_b = fp_map_b[matched_fp]
+                
+                # --- Check for Renumbering Difference (New Feature) ---
+                # e.g. "2.3 Title" vs "12. Title"
+                # If content is identical after stripping number, and text is short (< 60 chars), ignore it
                 clean_a = strip_sequence_number_header(text_a)
                 clean_b = strip_sequence_number_header(item_b['text'])
                 
+                # Strict check on cleaned content
                 if clean_a == clean_b and len(clean_a) < 60:
-                     continue 
+                     continue # Ignore renumbering differences on headers
+                # ------------------------------------------------------
                 
-                display_ratio = difflib.SequenceMatcher(None, text_a, item_b['text']).ratio()
+                ratio = difflib.SequenceMatcher(None, text_a, item_b['text']).ratio()
+                
                 match_type = "fuzzy"
-                desc = f"疑似修改/拼写错误 (相似度 {int(display_ratio*100)}%)"
-                score = int(display_ratio * 100)
+                desc = f"疑似修改/拼写错误 (相似度 {int(ratio*100)}%)"
+                score = int(ratio * 100)
                 badges.append("拼写/修改痕迹")
 
         if match_type:
@@ -417,11 +382,14 @@ def compare_documents(file_a_path, file_b_path, tender_path):
     # --- Phase 3: Common Sequence Errors ---
     seq_errors_a = check_sequence_errors(paras_a)
     seq_errors_b = check_sequence_errors(paras_b)
+    
     common_seq_errors = []
     
     for err_a in seq_errors_a:
         for err_b in seq_errors_b:
+            # Same missing number?
             if err_a['missing'] == err_b['missing'] and err_a['found'] == err_b['found']:
+                # Same context?
                 ratio = difflib.SequenceMatcher(None, err_a['context_fp'], err_b['context_fp']).ratio()
                 if ratio > 0.8:
                     common_seq_errors.append({
