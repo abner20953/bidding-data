@@ -128,6 +128,15 @@ def parse_sequence_number(text):
     
     return None, None
 
+def strip_sequence_number_header(text):
+    """
+    Remove leading sequence numbers like "1.", "2.3", "（1）", "12、" etc.
+    """
+    clean_text = text.strip()
+    # Pattern: Digit(s) + optional dots/digits + optional punctuation + whitespace
+    # Matches: "1.", "1.2.", "12、", "（1）", "(1)", "20、", etc.
+    return re.sub(r'^(\d+(\.\d+)*|[（(]?\d+[)）]?)\s*[.、:：]?\s*', '', clean_text)
+
 def check_sequence_errors(paragraphs):
     """
     Scans a document for missing sequence numbers.
@@ -289,6 +298,18 @@ def compare_documents(file_a_path, file_b_path, tender_path):
                 # --------------------------------------------
                     
                 item_b = fp_map_b[matched_fp]
+                
+                # --- Check for Renumbering Difference (New Feature) ---
+                # e.g. "2.3 Title" vs "12. Title"
+                # If content is identical after stripping number, and text is short (< 60 chars), ignore it
+                clean_a = strip_sequence_number_header(text_a)
+                clean_b = strip_sequence_number_header(item_b['text'])
+                
+                # Strict check on cleaned content
+                if clean_a == clean_b and len(clean_a) < 60:
+                     continue # Ignore renumbering differences on headers
+                # ------------------------------------------------------
+                
                 ratio = difflib.SequenceMatcher(None, text_a, item_b['text']).ratio()
                 
                 match_type = "fuzzy"
