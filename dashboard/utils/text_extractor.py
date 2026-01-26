@@ -53,12 +53,16 @@ def extract_pdf(filepath):
     try:
         with pdfplumber.open(filepath) as pdf:
             for i, page in enumerate(pdf.pages):
+                if not page: continue
                 text = page.extract_text()
                 if text and text.strip():
                     content.append({
                         "text": text.strip(),
                         "page": i + 1
                     })
+                # CRITICAL: Release page memory immediately
+                page.flush_cache()
+                
     except Exception as e:
         print(f"Error reading PDF {filepath}: {e}")
         return []

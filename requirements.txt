@@ -7,3 +7,5 @@ flask
 gunicorn
 Flask-APScheduler
 pdfplumber
+psutil
+datasketch
