@@ -164,15 +164,22 @@ def check_sequence_errors(paragraphs):
                     next_num += 1
                 elif num > next_num:
                     if next_num > 1: # Only report if we established a sequence
-                         # Found a jump! Expected 2, got 4. Missing 2, 3.
-                        errors.append({
-                            "missing": next_num,
-                            "found": num,
-                            "text": text,
-                            "page": p['page'],
-                            "context_fp": get_fingerprint(text)[:50]
-                        })
-                    next_num = num + 1
+                         # Check for large gaps (likely widely separated clauses, not missing items)
+                        if (num - next_num) > 2:
+                            # Too big a jump (e.g. 1 -> 8), probably unrelated. Reset.
+                            next_num = num + 1
+                        else:
+                            # Found a jump! Expected 2, got 4. Missing 2, 3.
+                            errors.append({
+                                "missing": next_num,
+                                "found": num,
+                                "text": text,
+                                "page": p['page'],
+                                "context_fp": get_fingerprint(text)[:50]
+                            })
+                            next_num = num + 1
+                    else:
+                        next_num = num + 1
                 else:
                      # num < next_num (duplicate or restart), reset
                      next_num = num + 1
