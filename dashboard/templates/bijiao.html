@@ -277,8 +277,54 @@
         </div>
     </div>
 
+
+    <!-- Added Styles for New Features -->
+    <style>
+        .common-error-banner {
+            background: linear-gradient(to right, #fee2e2, #fff);
+            border-left: 4px solid #ef4444;
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .common-error-title {
+            color: #991b1b;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .badge {
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            margin-left: 8px;
+        }
+
+        .badge-error {
+            background: #fee2e2;
+            color: #ef4444;
+        }
+
+        .badge-fuzzy {
+            background: #fef3c7;
+            color: #d97706;
+        }
+
+        .badge-info {
+            background: #dbeafe;
+            color: #2563eb;
+        }
+    </style>
+
     <script>
-        // File Input Handling
+        // File Input Handling (Same as before)
         function setupFileInput(id, displayId) {
             document.getElementById(id).addEventListener('change', function (e) {
                 const fileName = e.target.files[0]?.name;
@@ -312,11 +358,16 @@
             list.innerHTML = '';
             resultsArea.classList.remove('visible');
 
+            // Remove existing cleanups
+            const existingBanners = document.querySelectorAll('.common-error-banner');
+            existingBanners.forEach(b => b.remove());
+            const metaArea = document.getElementById('metadata-area');
+            if (metaArea) metaArea.remove();
+
             // Progress Bar simulation
             btn.disabled = true;
             btn.textContent = '比对中...';
 
-            // Create progress bar if not exists
             let progressContainer = document.getElementById('progress-container');
             if (!progressContainer) {
                 progressContainer = document.createElement('div');
@@ -346,7 +397,6 @@
             const progressBar = document.getElementById('progress-bar');
             progressContainer.style.display = 'block';
 
-            // Simulate progress (fake) because backend is synchronous
             let progress = 0;
             const interval = setInterval(() => {
                 if (progress < 90) {
@@ -355,7 +405,7 @@
                 }
             }, 300);
 
-            loader.style.display = 'none'; // Use bar instead of spinner
+            loader.style.display = 'none';
 
             const formData = new FormData(this);
 
@@ -374,8 +424,8 @@
                     throw new Error(result.error || '上传失败');
                 }
 
-                // Parse New Response Structure
                 let suspicious_paras = [];
+                let common_errors = null;
                 let metadata = null;
 
                 if (Array.isArray(result.data)) {
@@ -383,6 +433,7 @@
                 } else {
                     suspicious_paras = result.data.paragraphs;
                     metadata = result.data.metadata;
+                    common_errors = result.data.common_errors;
                 }
 
                 countDisplay.textContent = suspicious_paras.length;
@@ -397,16 +448,12 @@
                     resultMsg.textContent = "（未提供招标文件，仅比对两者共同点）";
                 }
 
-                // Render Metadata if available
-                const metadataDiv = document.getElementById('metadata-area');
-                if (metadataDiv) metadataDiv.remove(); // Clean up previous
-
+                // Render Metadata
                 if (metadata) {
                     const metaA = metadata.file_a.author;
                     const metaB = metadata.file_b.author;
                     const metaTender = metadata.tender ? metadata.tender.author : 'N/A';
 
-                    // Strict check: Ignore if empty, whitespace only, or 'Unknown'
                     const cleanA = metaA ? metaA.trim() : '';
                     const cleanB = metaB ? metaB.trim() : '';
 
@@ -430,8 +477,28 @@
                         </div>
                         ${sameWarn}
                     `;
-                    // Insert after the main summary card
                     document.querySelector('.summary-card').after(div);
+                }
+
+                // Render Common Errors
+                if (common_errors && common_errors.sequence && common_errors.sequence.length > 0) {
+                    const errDiv = document.createElement('div');
+                    errDiv.className = 'common-error-banner';
+                    const example = common_errors.sequence[0];
+                    errDiv.innerHTML = `
+                        <div>
+                            <div class="common-error-title">
+                                🚨 发现共同的序号逻辑错误 (共 ${common_errors.sequence.length} 处)
+                            </div>
+                            <div style="margin-top:5px; font-size:0.9rem; color:#b91c1c;">
+                                两个文件均在类似位置跳过了序号 <strong>${example.missing}</strong> (期望 ${example.missing}, 实际 ${example.found})。
+                            </div>
+                            <div style="margin-top:5px; font-size:0.8rem; color:#666;">
+                                例：${escapeHtml(example.text_a)}
+                            </div>
+                        </div>
+                    `;
+                    document.querySelector('.summary-card').before(errDiv);
                 }
 
                 if (suspicious_paras.length === 0) {
@@ -441,9 +508,28 @@
                         const div = document.createElement('div');
                         div.className = 'paragraph-card';
 
-                        // Show Pages
                         const pageA = item.page_a ? `第 ${item.page_a} 页` : '未知页';
                         const pageB = item.page_b ? `第 ${item.page_b} 页` : '未知页';
+
+                        // Badges
+                        let badgesHtml = '';
+                        if (item.type === 'fuzzy') {
+                            badgesHtml += `<span class="badge badge-fuzzy">疑似拼写/修改</span>`;
+                        } else if (item.badges && item.badges.includes('共同异常断句')) {
+                            // High priority warning
+                            div.style.borderLeft = '4px solid #ef4444';
+                            badgesHtml += `<span class="badge badge-error">共同异常断句</span>`;
+                        } else {
+                            badgesHtml += `<span class="badge badge-error">完全匹配</span>`;
+                        }
+
+                        if (item.badges) {
+                            item.badges.forEach(b => {
+                                if (b !== '共同异常断句' && b !== '拼写/修改痕迹') {
+                                    badgesHtml += `<span class="badge badge-info">${b}</span>`;
+                                }
+                            });
+                        }
 
                         div.innerHTML = `
                             <div class="para-meta">
@@ -451,9 +537,25 @@
                                     <span style="font-weight:600; margin-right:15px;">📄 投标单位A: <span style="color:#ef4444;">${pageA}</span></span>
                                     <span style="font-weight:600;">📄 投标单位B: <span style="color:#ef4444;">${pageB}</span></span>
                                 </div>
-                                <span style="color: #ef4444; background: #fee2e2; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">完全匹配</span>
+                                <div>${badgesHtml}</div>
                             </div>
-                            <div class="para-text">${escapeHtml(item.text)}</div>
+                            <!-- Diff View for Fuzzy -->
+                            ${item.type === 'fuzzy' ?
+                                `<div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-top:10px;">
+                                    <div style="background:#fff; padding:8px; border:1px solid #ddd; border-radius:4px;">
+                                        <div style="font-size:0.7em; color:#999; margin-bottom:4px;">文件 A</div>
+                                        <div style="font-size:0.9em;">${escapeHtml(item.text_a)}</div>
+                                    </div>
+                                    <div style="background:#fff; padding:8px; border:1px solid #ddd; border-radius:4px;">
+                                        <div style="font-size:0.7em; color:#999; margin-bottom:4px;">文件 B</div>
+                                        <div style="font-size:0.9em;">${escapeHtml(item.text_b)}</div>
+                                    </div>
+                                 </div>
+                                 <div style="margin-top:5px; font-size:0.8em; color:#d97706;">* ${item.desc}</div>
+                                `
+                                :
+                                `<div class="para-text">${escapeHtml(item.text_a)}</div>`
+                            }
                         `;
                         list.appendChild(div);
                     });
@@ -463,10 +565,10 @@
 
             } catch (err) {
                 alert('检测出错: ' + err.message);
+                console.error(err);
             } finally {
                 btn.disabled = false;
                 btn.textContent = '开始比对';
-                // Hide progress bar after delay
                 setTimeout(() => {
                     if (progressContainer) progressContainer.style.display = 'none';
                     if (progressBar) progressBar.style.width = '0%';
@@ -475,6 +577,7 @@
         });
 
         function escapeHtml(text) {
+            if (!text) return "";
             const map = {
                 '&': '&amp;',
                 '<': '&lt;',

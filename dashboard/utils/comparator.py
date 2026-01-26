@@ -1,28 +1,19 @@
+import difflib
 import re
 from .text_extractor import extract_content, extract_metadata
 
 def get_fingerprint(text):
     """
     Generate a fingerprint for text comparison by removing all non-alphanumeric characters.
-    This handles issues where PDF extraction adds extra spaces, newlines, or inconsistent punctuation.
-    Using stricter fingerprinting (removing punctuation) improves match rate for data fields.
     """
     # Remove all whitespace
     text = re.sub(r'\s+', '', text)
-    # Remove generic punctuation (Keep only word chars and unicode ranges for Chinese)
-    # \w matches [a-zA-Z0-9_] and various unicode word chars.
-    # We want to STRIP punctuation like , . ; : etc.
-    # Simple way: keep only alnum (and Chinese).
-    # Regex: [^\w] removes punctuation.
+    # Remove punctuation, keep word chars and Chinese
     return re.sub(r'[^\w\u4e00-\u9fa5]', '', text)
 
 def segment_paragraphs_with_page(content_list):
     """
     Smartly segment text into paragraphs while tracking page numbers.
-    Args:
-        content_list: List[{"text": str, "page": int}]
-    Returns:
-        List[{"text": str, "page": int}]
     """
     paragraphs = []
     
@@ -52,21 +43,15 @@ def segment_paragraphs_with_page(content_list):
             buffer = line
             buffer_start_page = page
         else:
-            # Check if we should merge with buffer
-            # Do NOT merge if buffer is short (<40 chars) and has no punctuation 
-            # - this likely indicates a Header, Title, or Data Field (Phone num).
             is_short_line = len(buffer) < 40
             has_stop = stop_pattern.search(buffer)
             
             if has_stop or is_short_line:
-                # Previous sentence ended OR it was a short header. Commit buffer.
                 paragraphs.append({"text": buffer, "page": buffer_start_page})
                 buffer = line
                 buffer_start_page = page
             else:
-                # Merge (Long text flow)
                 buffer += line
-                # Keep start page of the paragraph
                 
     if buffer:
         paragraphs.append({"text": buffer, "page": buffer_start_page})
@@ -87,77 +72,105 @@ COMMON_HEADERS = {
 
 def extract_entities(content_list):
     """
-    Extracts high-value entities (Phones, ID Cards, Emails) from the entire document content.
-    Returns: Dict { "fingerprint": { "text": original, "page": page_num } }
+    Extracts high-value entities (Phones, ID Cards, Emails).
     """
     entities = {}
-    
-    # Regex for Phone (Mobile 11 digits)
     phone_pattern = re.compile(r'(?<!\d)1[3-9]\d{9}(?!\d)')
-    
-    # Regex for ID Card (18 digits or 17+X)
     id_pattern = re.compile(r'(?<!\d)\d{17}[\dXx](?!\d)')
-    
-    # Regex for Email
     email_pattern = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
     
     for item in content_list:
         text = item['text']
         page = item['page']
         
-        # Phones
         for match in phone_pattern.findall(text):
-            fp = match
-            if fp not in entities:
-                entities[fp] = {"text": match, "page": page}
-                
-        # IDs
+            if match not in entities: entities[match] = {"text": match, "page": page}
         for match in id_pattern.findall(text):
             fp = match.upper()
-            if fp not in entities:
-                entities[fp] = {"text": match, "page": page}
-                
-        # Emails
+            if fp not in entities: entities[fp] = {"text": match, "page": page}
         for match in email_pattern.findall(text):
-            fp = match.lower() # Email is case insensitive
-            if fp not in entities:
-                entities[fp] = {"text": match, "page": page}
+            fp = match.lower()
+            if fp not in entities: entities[fp] = {"text": match, "page": page}
                 
     return entities
 
 def is_significant(text, fingerprint):
-    """
-    Determines if a short text is significant enough to report as a match.
-    Strategy:
-    1. Base Threshold: Fingerprint length > 10.
-       (Rejects short headers, generic phrases, short sentences)
-    """
-    f_len = len(fingerprint)
-    
-    # 0. Global Blacklist Check
     clean_text = text.replace(" ", "").replace(":", "").replace("：", "")
-    if clean_text in COMMON_HEADERS:
-        return False
-    
-    # 1. Absolute Minimum for Paragraphs
-    # User Request: "At least higher than 10" -> > 10 -> >= 11
-    if f_len <= 10:
-        return False
-        
-    # 2. Pure Numeric/Symbol Check
-    if re.match(r'^[\d\.,\-\(\)]+$', fingerprint):
-        # Even stricter for numbers? 
-        # Phone numbers are 11 digits, so they pass > 10.
-        # But generic numbers?
-        if f_len < 10:
-            return False
-            
+    if clean_text in COMMON_HEADERS: return False
+    if len(fingerprint) <= 10: return False
+    if re.match(r'^[\d\.,\-\(\)]+$', fingerprint) and len(fingerprint) < 10: return False
     return True
 
+# --- New Helper Functions for Common Errors ---
+
+def detect_broken_tail(text):
+    """
+    Detect if a paragraph ends abnormally (no punctuation) but is long enough to be a sentence.
+    """
+    if len(text) < 15: return False # Ignore short headers
+    # Ends with common punctuation?
+    if re.search(r'[。！？.!?”"”’]$', text.strip()):
+        return False
+    return True
+
+def parse_sequence_number(text):
+    """
+    Extracts sequence number from start of text.
+    Returns: (number_int, type_str) or (None, None)
+    """
+    # 1. format "1." or "1、"
+    match = re.match(r'^(\d+)[.、]', text)
+    if match: return int(match.group(1)), "digit_dot"
+    
+    # 2. format "(1)" or "（1）"
+    match = re.match(r'^[\(（](\d+)[\)）]', text)
+    if match: return int(match.group(1)), "paren_digit"
+    
+    return None, None
+
+def check_sequence_errors(paragraphs):
+    """
+    Scans a document for missing sequence numbers.
+    Returns list of error dicts: { "missing": int, "context_fp": str, "page": int }
+    """
+    errors = []
+    
+    current_type = None
+    next_num = None
+    
+    for i, p in enumerate(paragraphs):
+        text = p['text'].strip()
+        num, seq_type = parse_sequence_number(text)
+        
+        if num is None:
+            continue
+            
+        # If new type or starting with 1, reset
+        if num == 1 or seq_type != current_type:
+            current_type = seq_type
+            next_num = 2
+        else:
+            if seq_type == current_type:
+                if num == next_num:
+                    next_num += 1
+                elif num > next_num:
+                    if next_num > 1: # Only report if we established a sequence
+                         # Found a jump! Expected 2, got 4. Missing 2, 3.
+                        errors.append({
+                            "missing": next_num,
+                            "found": num,
+                            "text": text,
+                            "page": p['page'],
+                            "context_fp": get_fingerprint(text)[:50]
+                        })
+                    next_num = num + 1
+                else:
+                     # num < next_num (duplicate or restart), reset
+                     next_num = num + 1
+
+    return errors
+
 def compare_documents(file_a_path, file_b_path, tender_path):
-    """
-    Compares three documents using fingerprinting AND entity extraction.
-    """
     # 0. Extract Metadata
     meta_a = extract_metadata(file_a_path)
     meta_b = extract_metadata(file_b_path)
@@ -173,7 +186,7 @@ def compare_documents(file_a_path, file_b_path, tender_path):
     paras_b = segment_paragraphs_with_page(content_b)
     paras_tender = segment_paragraphs_with_page(content_tender)
     
-    # 3. Build Maps (Paragraphs)
+    # 3. Build Maps
     fp_map_b = {}
     for p in paras_b:
         fp = get_fingerprint(p['text'])
@@ -181,73 +194,131 @@ def compare_documents(file_a_path, file_b_path, tender_path):
             if fp not in fp_map_b:
                 fp_map_b[fp] = p
                 
-    # 4. Tender Exclusion (Full Content Fingerprint)
-    # We construct a single giant string of all Tender content fingerprints.
-    # This allows checking if a phrase (entity or paragraph) exists *anywhere* in the Tender 
-    # document, even if segmented differently (e.g. split across lines).
+    # 4. Tender Exclusion
     tender_full_fp = ""
     if paras_tender:
         tender_full_fp = "".join([get_fingerprint(p['text']) for p in paras_tender])
 
-    # 5. Extract Entities (Independent of Paragraphs)
+    # 5. Extract Entities
     entities_a = extract_entities(content_a)
     entities_b = extract_entities(content_b)
 
-    # 6. Find Suspicious Items
     suspicious_paragraphs = []
     seen_fps = set()
 
-    # A. Check Entities first (High Priority)
+    # --- Phase 1: Entity Check ---
     for fp, item_a in entities_a.items():
         if fp in entities_b:
-            # Check exclusion against full tender content
-            # Must fingerprint the entity string to match the tender_full_fp format (no symbols)
             entity_check_fp = get_fingerprint(fp)
-            
-            # If tender_full_fp is empty, it means no tender doc provided, so don't exclude.
             is_excluded = tender_full_fp and (entity_check_fp in tender_full_fp)
             
             if not is_excluded:
                 if fp not in seen_fps:
                     item_b = entities_b[fp]
                     suspicious_paragraphs.append({
-                        "text": f"[敏感数据] {item_a['text']}",
-                        "index_a": -1, # Special index
+                        "type": "entity",
+                        "text_a": f"[敏感数据] {item_a['text']}",
+                        "text_b": f"[敏感数据] {item_b['text']}",
+                        "desc": "完全一致的敏感信息 (手机/身份证/邮箱)",
                         "page_a": item_a['page'],
                         "page_b": item_b['page'],
-                        "matches_in_b": True
+                        "score": 100,
+                        "badges": ["敏感数据"]
                     })
                     seen_fps.add(fp)
 
-    # B. Check Paragraphs
+    # --- Phase 2: Paragraph Comparison ---
+    b_fingerprints = list(fp_map_b.keys())
+
     for i, p_a in enumerate(paras_a):
         text_a = p_a['text']
         fp_a = get_fingerprint(text_a)
         
-        if fp_a in seen_fps: continue # Skip if already found as entity
-        
-        # Check significance
-        if not is_significant(text_a, fp_a):
-            continue
-        
+        if fp_a in seen_fps: continue 
+        if not is_significant(text_a, fp_a): continue
+        if tender_full_fp and (fp_a in tender_full_fp): continue
+
+        match_type = None
+        item_b = None
+        desc = ""
+        score = 0
+        badges = []
+
+        # A. Exact Fingerprint Match
         if fp_a in fp_map_b:
-            # Check exclusion against full tender content
-            # fp_a is already a fingerprint
-            is_excluded = tender_full_fp and (fp_a in tender_full_fp)
+            item_b = fp_map_b[fp_a]
+            text_b = item_b['text']
             
-            if not is_excluded:
-                item_b = fp_map_b[fp_a]
-                suspicious_paragraphs.append({
-                    "text": text_a,
-                    "index_a": i + 1,
-                    "page_a": p_a['page'],
-                    "page_b": item_b['page'],
-                    "matches_in_b": True
-                })
-                seen_fps.add(fp_a)
+            is_broken_a = detect_broken_tail(text_a)
+            is_broken_b = detect_broken_tail(text_b)
+            
+            match_type = "exact"
+            desc = "雷同段落 (内容一致)"
+            score = 100
+            
+            if is_broken_a and is_broken_b:
+                badges.append("共同异常断句")
+                desc += "，且均存在异常断句"
+                
+            seen_fps.add(fp_a)
+
+        # B. Fuzzy Match (Spelling/Typos)
+        else:
+            matches = difflib.get_close_matches(fp_a, b_fingerprints, n=1, cutoff=0.85)
+            if matches:
+                matched_fp = matches[0]
+                if tender_full_fp and (matched_fp in tender_full_fp): continue
+                    
+                item_b = fp_map_b[matched_fp]
+                ratio = difflib.SequenceMatcher(None, text_a, item_b['text']).ratio()
+                
+                match_type = "fuzzy"
+                desc = f"疑似修改/拼写错误 (相似度 {int(ratio*100)}%)"
+                score = int(ratio * 100)
+                badges.append("拼写/修改痕迹")
+
+        if match_type:
+            suspicious_paragraphs.append({
+                "type": match_type,
+                "text_a": text_a,
+                "text_b": item_b['text'],
+                "desc": desc,
+                "page_a": p_a['page'],
+                "page_b": item_b['page'],
+                "score": score,
+                "badges": badges
+            })
+
+    # --- Phase 3: Common Sequence Errors ---
+    seq_errors_a = check_sequence_errors(paras_a)
+    seq_errors_b = check_sequence_errors(paras_b)
+    
+    common_seq_errors = []
+    
+    for err_a in seq_errors_a:
+        for err_b in seq_errors_b:
+            # Same missing number?
+            if err_a['missing'] == err_b['missing'] and err_a['found'] == err_b['found']:
+                # Same context?
+                ratio = difflib.SequenceMatcher(None, err_a['context_fp'], err_b['context_fp']).ratio()
+                if ratio > 0.8:
+                    common_seq_errors.append({
+                        "missing": err_a['missing'],
+                        "found": err_a['found'],
+                        "text_a": err_a['text'],
+                        "text_b": err_b['text'],
+                        "page_a": err_a['page'],
+                        "page_b": err_b['page']
+                    })
+                    break
+
+    suspicious_paragraphs.sort(key=lambda x: x['score'], reverse=True)
 
     return {
         "paragraphs": suspicious_paragraphs,
+        "common_errors": {
+            "sequence": common_seq_errors
+        },
         "metadata": {
             "file_a": meta_a,
             "file_b": meta_b,
