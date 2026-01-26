@@ -292,7 +292,25 @@ def compare_documents(file_a_path, file_b_path, tender_path):
             if is_broken_a and is_broken_b:
                 badges.append("共同异常断句")
                 desc += "，且均存在异常断句"
-                
+            
+            # --- Shared Deviation Check (New Feature) ---
+            # If A==B, but both differ slightly from Tender (e.g. Shared Typo "蚊件" vs "文件")
+            if tender_fps:
+                 tender_matches = difflib.get_close_matches(fp_a, tender_fps, n=1, cutoff=0.85)
+                 if tender_matches:
+                     # Found a close match in tender, but it wasn't exact (otherwise it would be excluded above)
+                     # Wait, exclusion logic above skips ONLY if match >= 0.9. 
+                     # Here cutoff is 0.85. So if it's between 0.85 and 0.9, OR if exclusion logic was skipped (unlikely if fuzzy is on).
+                     # Actually, exclusion logic uses cutoff=0.9.
+                     # If we find a match here with 0.85, check if it is NOT exact.
+                     
+                     matched_tender_fp = tender_matches[0]
+                     if matched_tender_fp != fp_a:
+                        # Ensure it wasn't excluded (it shouldn't be if we are here)
+                        desc += "；检测到与招标文件存在共同差异(疑似错别字/连带修)"
+                        badges.append("疑似共同修改")
+            # --------------------------------------------
+
             seen_fps.add(fp_a)
 
         # B. Fuzzy Match (Spelling/Typos)
