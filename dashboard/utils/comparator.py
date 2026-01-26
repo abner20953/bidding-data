@@ -31,6 +31,8 @@ def segment_paragraphs_with_page(content_list):
         return []
 
     stop_pattern = re.compile(r'[。！？!?;；：:]$')
+    # Regex to detect lines starting with numbers like "1.", "2、", "(3)", "（4）"
+    bullet_pattern = re.compile(r'^(\d+[.、]|[（(]\d+[)）])')
     
     buffer = ""
     buffer_start_page = -1
@@ -45,8 +47,10 @@ def segment_paragraphs_with_page(content_list):
         else:
             is_short_line = len(buffer) < 40
             has_stop = stop_pattern.search(buffer)
+            # Check if the NEW line is a numbered item (force break)
+            is_new_bullet = bullet_pattern.match(line)
             
-            if has_stop or is_short_line:
+            if has_stop or is_short_line or is_new_bullet:
                 paragraphs.append({"text": buffer, "page": buffer_start_page})
                 buffer = line
                 buffer_start_page = page
