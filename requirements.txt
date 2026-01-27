@@ -9,3 +9,4 @@ Flask-APScheduler
 pdfplumber
 psutil
 datasketch
+PyMuPDF
