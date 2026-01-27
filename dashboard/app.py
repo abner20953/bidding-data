@@ -790,6 +790,22 @@ def scheduled_job():
                 
     log_scheduler(f"   [清理完成] 共删除了 {deleted_count} 个过期文件。")
 
+    # --- 3. 访客日志清理逻辑 (保留最近 30 天) ---
+    try:
+        cleanup_date_limit = (today - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+        log_scheduler(f"   [日志维护] 正在清理 {cleanup_date_limit} 之前的访客记录...")
+        
+        conn = sqlite3.connect(VISITOR_DB)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM logs WHERE timestamp < ?", (cleanup_date_limit,))
+        deleted_rows = cursor.rowcount
+        conn.commit()
+        conn.close()
+        
+        log_scheduler(f"   [日志维护] 清理完成，删除了 {deleted_rows} 条旧日志。")
+    except Exception as e:
+        log_scheduler(f"   [日志维护] 错误: {str(e)}")
+
 # 添加定时任务并启动调度器
 try:
     scheduler.add_job(id='daily_task', func=scheduled_job, trigger='cron', hour=2, minute=0)
