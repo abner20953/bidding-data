@@ -19,7 +19,57 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(BASE_DIR, '..', 'results')
 # 临时上传目录
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# --- EMERGENCY STARTUP CLEANUP (Fix for "No space left on device") ---
+def free_up_space():
+    try:
+        print("🧹 Running Emergency Startup Cleanup...")
+        
+        # 1. Clear Uploads (Temp files)
+        if os.path.exists(UPLOAD_FOLDER):
+            try:
+                for f in os.listdir(UPLOAD_FOLDER):
+                    p = os.path.join(UPLOAD_FOLDER, f)
+                    if os.path.isfile(p):
+                        os.remove(p)
+                        print(f"Deleted temp file: {f}")
+            except Exception as e:
+                print(f"Error cleaning uploads: {e}")
+
+        # 2. Truncate Log File if > 50MB
+        LOG_FILE = os.path.join(BASE_DIR, 'scheduler.log')
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 50 * 1024 * 1024:
+            try:
+                with open(LOG_FILE, 'w') as f:
+                    f.write(f"[{datetime.datetime.now()}] Log truncated due to size limit.\n")
+                print("Truncated oversized scheduler.log")
+            except Exception as e:
+                print(f"Error truncating log: {e}")
+                
+    except Exception as e:
+        print(f"Cleanup failed: {e}")
+
+free_up_space()
+
+# Now try to create directory
+try:
+    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+except OSError as e:
+    if e.errno == 28: # No space left on device
+        print("❌ CRITICAL: Disk full even after cleanup. Attempting to delete more...")
+        # Desperate measure: Delete scheduler log entirely
+        try:
+             LOG_FILE = os.path.join(BASE_DIR, 'scheduler.log')
+             if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
+             # Try makedirs again
+             os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+        except Exception:
+             pass
+    if not os.path.exists(UPLOAD_FOLDER):
+        print("❌ FAILED TO CREATE UPLOAD FOLDER - APP MAY CRASH")
+        # Proceed anyway, maybe read-only works
+    else:
+        raise e # Re-raise if it wasn't fixed
 
 # 归档目录 (D:/ai_project/1/file)
 ARCHIVE_FOLDER = os.path.join(BASE_DIR, '..', 'file')
