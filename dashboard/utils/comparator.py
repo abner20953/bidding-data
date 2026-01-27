@@ -75,7 +75,7 @@ class CollusionDetector:
         self.tender_skeletons = set()
         for s in sentences:
             skel = self.get_skeleton(s)
-            if len(skel) > 4: # 只有骨架足够长才索引，防止两字词误杀
+            if len(skel) > 1: # 只有骨架足够长才索引，防止两字词误杀
                 self.tender_skeletons.add(skel)
                 
         gc.collect()
@@ -163,7 +163,7 @@ class CollusionDetector:
             if sent not in self.tender_sentences and sent not in self.tender_full_text:
                  # Check Skeleton (Chinese only) to ignore numeric/symbol differences (User Request)
                  skel = self.get_skeleton(sent)
-                 if len(skel) > 4 and skel in self.tender_skeletons:
+                 if len(skel) > 1 and skel in self.tender_skeletons:
                      continue # Safe exclusion: textual content is identical to tender, only symbols/numbers differ
 
                  if len(sent) > 8: 

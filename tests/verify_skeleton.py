@@ -35,8 +35,29 @@ class TestSkeletonExclusion(unittest.TestCase):
         self.assertTrue(is_skel_match, "Should match skeleton of Tender")
         self.assertFalse(is_exact_match, "Should NOT match exact text")
         
-        # If is_skel_match is True, find_collisions would CONTINUE (Exclude). 
-        # So this verifies the "Exclude" behavior.
+    def test_short_parameters(self):
+        # Case 3: Short Chinese keys (Storage, Memory)
+        # Bid: "存储:32GBeMMC" -> Skel "存储" (Len 2)
+        # Bid: "内存:4GBLPDDR4" -> Skel "内存" (Len 2)
+        
+        # Add to Tender skeletons manually for test
+        self.detector.tender_skeletons.add("存储")
+        self.detector.tender_skeletons.add("内存")
+        self.detector.tender_skeletons.add("刷新率")
+        
+        cases = [
+            ("存储:32GBeMMC", "存储"),
+            ("内存:4GBLPDDR4", "内存"),
+            ("刷新率:144Hz", "刷新率")
+        ]
+        
+        for bid_text, expected_skel in cases:
+            skel = self.detector.get_skeleton(bid_text)
+            print(f"Bid: {bid_text} -> Skel: {skel}")
+            
+            # Now with fix, this should be True (Excluded)
+            is_skel_match = (len(skel) > 1 and skel in self.detector.tender_skeletons)
+            self.assertTrue(is_skel_match, f"Fix should allow exclusion for {skel}")
 
     def test_typo_preservation(self):
         # Case 2: Typo "Mosquito"
