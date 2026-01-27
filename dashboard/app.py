@@ -13,6 +13,7 @@ import time
 import math
 import sqlite3
 from werkzeug.utils import secure_filename
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 # 配置目录
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -84,6 +85,14 @@ import scraper
 from dashboard.utils.comparator import compare_documents
 
 app = Flask(__name__)
+# Apply ProxyFix to handle X-Forwarded-For headers from Nginx/LoadBalancer
+# x_for=1 means trust the first X-Forwarded-For value
+# x_proto=1 means trust X-Forwarded-Proto
+# x_host=1 means trust X-Forwarded-Host
+# x_port=1 means trust X-Forwarded-Port
+# x_prefix=1 means trust X-Forwarded-Prefix
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_prefix=1)
+
 app.config['MAX_CONTENT_LENGTH'] = 300 * 1024 * 1024 # 300MB Limit
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
@@ -257,16 +266,17 @@ def log_request(response):
         # Filter out favicon
         if request.path == '/favicon.ico':
             return response
+        
+        # --- DEBUG: Print Headers to Console (for Cloud Diagnosis) ---
+        # Only print for non-static requests to optimize
+        if not 'visitor_logs' in request.path: 
+            print(f"DEBUG_HEADERS [{request.path}]: {dict(request.headers)}")
 
-        # --- 1. Robust IP Detection (Pass X-Forwarded-For, X-Real-IP, Remote-Addr) ---
+        # --- 1. Robust IP Detection ---
+        # ProxyFix (applied above) should make remote_addr correct.
+        # But we keep fallback logic just in case.
         ip = request.remote_addr
-        if request.headers.get('X-Forwarded-For'):
-            # X-Forwarded-For: client, proxy1, proxy2
-            ip = request.headers.get('X-Forwarded-For').split(',')[0].strip()
-        elif request.headers.get('X-Real-IP'):
-            # Nginx often sets this
-            ip = request.headers.get('X-Real-IP').strip()
-            
+        
         # --- 2. Throttling for /api/visitor_logs (Prevent Log Spam) ---
         if request.path == '/api/visitor_logs':
             try:
