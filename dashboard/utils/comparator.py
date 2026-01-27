@@ -25,6 +25,14 @@ class CollusionDetector:
         text = re.sub(r'\s+', '', text)
         return text
 
+    def get_skeleton(self, text):
+        """
+        获取中文骨架（仅保留中文字符）。
+        用于忽略 数字/符号/标点 的差异（如 "≥14" vs "14"）。
+        """
+        # Range for CJK Unified Ideographs: 4E00-9FFF
+        return re.sub(r'[^\u4e00-\u9fa5]', '', text)
+
     def extract_text_with_pages(self, pdf_path):
         """
         提取文本并保留页码映射。
@@ -53,13 +61,23 @@ class CollusionDetector:
 
     def load_tender(self):
         """
-        加载招标文件，建立索引。
+        加载招标文件，建立索引（全文句子 + 骨架）。
         """
         print(f"Loading tender: {self.tender_path}")
         text, _, _ = self.extract_text_with_pages(self.tender_path)
         self.tender_full_text = self.normalize(text)
+        
         # 建立句子索引
-        self.tender_sentences = set(self.get_sentences(text))
+        sentences = self.get_sentences(text)
+        self.tender_sentences = set(sentences)
+        
+        # 建立骨架索引 (set of Chinese-only strings)
+        self.tender_skeletons = set()
+        for s in sentences:
+            skel = self.get_skeleton(s)
+            if len(skel) > 4: # 只有骨架足够长才索引，防止两字词误杀
+                self.tender_skeletons.add(skel)
+                
         gc.collect()
 
     def get_sentences(self, text):
@@ -143,6 +161,11 @@ class CollusionDetector:
             
             # Exclusion logic
             if sent not in self.tender_sentences and sent not in self.tender_full_text:
+                 # Check Skeleton (Chinese only) to ignore numeric/symbol differences (User Request)
+                 skel = self.get_skeleton(sent)
+                 if len(skel) > 4 and skel in self.tender_skeletons:
+                     continue # Safe exclusion: textual content is identical to tender, only symbols/numbers differ
+
                  if len(sent) > 8: 
                     page_a = self.find_page_for_text(sent, pages_a)
                     page_b = self.find_page_for_text(sent, pages_b)
@@ -158,9 +181,7 @@ class CollusionDetector:
                     
                     collisions.append({
                         "type": "text",
-                        "text_a": sent, # Normalized text might be hard to read, but frontend calls escapeHtml. 
-                                        # Ideally we map back to raw text, but that's hard. 
-                                        # For now simply return the normalized matched constraint.
+                        "text_a": sent, 
                         "text_b": sent,
                         "page_a": page_a,
                         "page_b": page_b,
