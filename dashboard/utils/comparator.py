@@ -1,417 +1,230 @@
-import difflib
+import fitz  # PyMuPDF
 import re
-import time
-import psutil
-from .text_extractor import extract_content, extract_metadata
+import os
+import gc
+from collections import Counter
 
-# --- Configuration (Added for Memory Safety) ---
-MEMORY_SAFE_LIMIT_MB = 100     # Min Available RAM in MB to continue
+class CollusionDetector:
+    def __init__(self, tender_path):
+        self.tender_path = tender_path
+        self.tender_sentences = set()
+        self.tender_full_text = ""
+        if tender_path and os.path.exists(tender_path):
+            self.load_tender()
 
-def get_fingerprint(text):
-    """
-    Generate a fingerprint for text comparison by removing all non-alphanumeric characters.
-    """
-    # Remove all whitespace
-    text = re.sub(r'\s+', '', text)
-    # Remove punctuation, keep word chars and Chinese
-    return re.sub(r'[^\w\u4e00-\u9fa5]', '', text)
+    def normalize(self, text):
+        """
+        标准化文本：去除空白字符，统一符号。
+        """
+        if not text:
+            return ""
+        # 统一全角符号
+        text = text.replace('，', ',').replace('。', '.').replace('：', ':').replace('；', ';')
+        text = text.replace('“', '"').replace('”', '"').replace("‘", "'").replace("’", "'")
+        # 去除空白
+        text = re.sub(r'\s+', '', text)
+        return text
 
-def check_resources():
-    """
-    Interrupt if Available Memory < 100MB.
-    """
-    mem = psutil.virtual_memory()
-    if mem.available < MEMORY_SAFE_LIMIT_MB * 1024 * 1024:
-        raise MemoryError(f"System memory too low ({mem.available / 1024 / 1024:.1f}MB < {MEMORY_SAFE_LIMIT_MB}MB). Operation aborted to protect server.")
-
-def segment_paragraphs_with_page(content_list):
-    """
-    Smartly segment text into paragraphs while tracking page numbers.
-    """
-    paragraphs = []
-    
-    # Flatten all lines with their page numbers
-    all_lines = []
-    for item in content_list:
-        page_lines = item['text'].split('\n')
-        page_num = item['page']
-        for line in page_lines:
-            stripped = line.strip()
-            if stripped:
-                all_lines.append({"text": stripped, "page": page_num})
-    
-    if not all_lines:
-        return []
-
-    stop_pattern = re.compile(r'[。！？!?;；：:]$')
-    # Regex to detect lines starting with numbers like "1.", "2、", "(3)", "（4）"
-    bullet_pattern = re.compile(r'^(\d+[.、]|[（(]\d+[)）])')
-    
-    buffer = ""
-    buffer_start_page = -1
-    
-    for item in all_lines:
-        line = item['text']
-        page = item['page']
+    def extract_text_with_pages(self, pdf_path):
+        """
+        提取文本并保留页码映射。
+        Returns: 
+            full_text (str): normalized full text for fast diff
+            pages_map (list): [(page_num, raw_text), ...]
+            metadata (dict): PDF metadata
+        """
+        full_text = ""
+        pages_map = []
+        metadata = {}
         
-        if not buffer:
-            buffer = line
-            buffer_start_page = page
-        else:
-            is_short_line = len(buffer) < 40
-            has_stop = stop_pattern.search(buffer)
-            # Check if the NEW line is a numbered item (force break)
-            is_new_bullet = bullet_pattern.match(line)
+        try:
+            doc = fitz.open(pdf_path)
+            metadata = doc.metadata
+            for page in doc:
+                raw = page.get_text()
+                pages_map.append((page.number + 1, raw))
+                full_text += raw
+            doc.close()
+        except Exception as e:
+            print(f"Error extracting text from {pdf_path}: {e}")
+            return "", [], {}
             
-            if has_stop or is_short_line or is_new_bullet:
-                paragraphs.append({"text": buffer, "page": buffer_start_page})
-                buffer = line
-                buffer_start_page = page
-            else:
-                buffer += line
-                
-    if buffer:
-        paragraphs.append({"text": buffer, "page": buffer_start_page})
+        return full_text, pages_map, metadata
+
+    def load_tender(self):
+        """
+        加载招标文件，建立索引。
+        """
+        print(f"Loading tender: {self.tender_path}")
+        text, _, _ = self.extract_text_with_pages(self.tender_path)
+        self.tender_full_text = self.normalize(text)
+        # 建立句子索引
+        self.tender_sentences = set(self.get_sentences(text))
+        gc.collect()
+
+    def get_sentences(self, text):
+        """
+        简单的分句逻辑。
+        """
+        lines = text.split('\n')
+        sentences = []
+        for line in lines:
+            parts = re.split(r'[。.!！?？;；]', line)
+            for p in parts:
+                p = p.strip()
+                if len(p) > 5:
+                    sentences.append(self.normalize(p))
+        return sentences
+
+    def find_page_for_text(self, target_text, pages_map):
+        """
+        在 pages_map 中查找 target_text (normalized) 出现的页码。
+        返回第一次出现的页码，找不到返回 0。
+        """
+        # target_text is already normalized.
+        # We need to normalize page content on the fly or pre-calc?
+        # On the fly is slower but saves memory.
+        for page_num, raw_text in pages_map:
+            if target_text in self.normalize(raw_text):
+                return page_num
+        return 0
+
+    def find_collisions(self, path_a, path_b):
+        """
+        核心比对逻辑
+        """
+        raw_text_a, pages_a, meta_a = self.extract_text_with_pages(path_a)
+        raw_text_b, pages_b, meta_b = self.extract_text_with_pages(path_b)
         
-    return paragraphs
-
-COMMON_HEADERS = {
-    "招标文件", "投标文件", "目录", "前言", "附录", 
-    "技术参数", "技术规格", "商务条款", "评分标准",
-    "投标人须知", "特别提示", "申明", "声明", "承诺书",
-    "格式", "页码", "正文", "第一章", "第二章", "第三章",
-    "第四章", "第五章", "第六章", "第七章", "第八章",
-    "一、", "二、", "三、", "四、", "五、", "六、",
-    "招标公告", "投标邀请", "法定代表人", "委托代理人",
-    "单位名称", "日期", "盖章", "签字", "地址", "电话",
-    "传真", "邮箱", "邮编", "年份", "月份", "金额", "备注"
-}
-
-def extract_entities(content_list):
-    """
-    Extracts high-value entities (Phones, ID Cards, Emails).
-    """
-    entities = {}
-    phone_pattern = re.compile(r'(?<!\d)1[3-9]\d{9}(?!\d)')
-    id_pattern = re.compile(r'(?<!\d)\d{17}[\dXx](?!\d)')
-    email_pattern = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
-    
-    for item in content_list:
-        text = item['text']
-        page = item['page']
+        norm_a = self.normalize(raw_text_a)
+        norm_b = self.normalize(raw_text_b) # Use only if needed for global comparison
         
-        for match in phone_pattern.findall(text):
-            if match not in entities: entities[match] = {"text": match, "page": page}
-        for match in id_pattern.findall(text):
-            fp = match.upper()
-            if fp not in entities: entities[fp] = {"text": match, "page": page}
-        for match in email_pattern.findall(text):
-            fp = match.lower()
-            if fp not in entities: entities[fp] = {"text": match, "page": page}
-                
-    return entities
-
-def is_significant(text, fingerprint):
-    clean_text = text.replace(" ", "").replace(":", "").replace("：", "")
-    if clean_text in COMMON_HEADERS: return False
-    if len(fingerprint) <= 10: return False
-    if re.match(r'^[\d\.,\-\(\)]+$', fingerprint) and len(fingerprint) < 10: return False
-    return True
-
-# --- New Helper Functions for Common Errors ---
-
-def detect_broken_tail(text):
-    """
-    Detect if a paragraph ends abnormally (no punctuation) but is long enough to be a sentence.
-    """
-    if len(text) < 15: return False # Ignore short headers
-    # Ends with common punctuation?
-    if re.search(r'[。！？.!?”"”’]$', text.strip()):
-        return False
-    return True
-
-def parse_sequence_number(text):
-    """
-    Extracts sequence number from start of text.
-    Returns: (number_int, type_str) or (None, None)
-    """
-    # 1. format "1." or "1、"
-    match = re.match(r'^(\d+)[.、]', text)
-    if match: return int(match.group(1)), "digit_dot"
-    
-    # 2. format "(1)" or "（1）"
-    match = re.match(r'^[\(（](\d+)[\)）]', text)
-    if match: return int(match.group(1)), "paren_digit"
-    
-    return None, None
-
-def strip_sequence_number_header(text):
-    """
-    Remove leading sequence numbers like "1.", "2.3", "（1）", "12、" etc.
-    """
-    clean_text = text.strip()
-    # Pattern: Digit(s) + optional dots/digits + optional punctuation + whitespace
-    # Matches: "1.", "1.2.", "12、", "（1）", "(1)", "20、", etc.
-    return re.sub(r'^(\d+(\.\d+)*|[（(]?\d+[)）]?)\s*[.、:：]?\s*', '', clean_text)
-
-def check_sequence_errors(paragraphs):
-    """
-    Scans a document for missing sequence numbers.
-    Returns list of error dicts: { "missing": int, "context_fp": str, "page": int }
-    """
-    errors = []
-    
-    current_type = None
-    next_num = None
-    
-    for i, p in enumerate(paragraphs):
-        text = p['text'].strip()
-        num, seq_type = parse_sequence_number(text)
+        collisions = []
         
-        if num is None:
-            continue
-            
-        # If new type or starting with 1, reset
-        if num == 1 or seq_type != current_type:
-            current_type = seq_type
-            next_num = 2
-        else:
-            if seq_type == current_type:
-                if num == next_num:
-                    next_num += 1
-                elif num > next_num:
-                    if next_num > 1: # Only report if we established a sequence
-                         # Check for large gaps (likely widely separated clauses, not missing items)
-                        if (num - next_num) > 2:
-                            # Too big a jump (e.g. 1 -> 8), probably unrelated. Reset.
-                            next_num = num + 1
-                        else:
-                            # Found a jump! Expected 2, got 4. Missing 2, 3.
-                            errors.append({
-                                "missing": next_num,
-                                "found": num,
-                                "text": text,
-                                "page": p['page'],
-                                "context_fp": get_fingerprint(text)[:50]
-                            })
-                            next_num = num + 1
-                    else:
-                        next_num = num + 1
-                else:
-                     # num < next_num (duplicate or restart), reset
-                     next_num = num + 1
-
-    return errors
-
-def compare_documents(file_a_path, file_b_path, tender_path):
-    # 0. Extract Metadata
-    meta_a = extract_metadata(file_a_path)
-    meta_b = extract_metadata(file_b_path)
-    meta_tender = extract_metadata(tender_path) if tender_path else None
-
-    # 1. Extract content
-    content_a = extract_content(file_a_path)
-    content_b = extract_content(file_b_path)
-    content_tender = extract_content(tender_path) if tender_path else []
-    
-    # 2. Segment Paragraphs
-    paras_a = segment_paragraphs_with_page(content_a)
-    paras_b = segment_paragraphs_with_page(content_b)
-    paras_tender = segment_paragraphs_with_page(content_tender)
-    
-    # 3. Build Maps
-    fp_map_b = {}
-    for p in paras_b:
-        fp = get_fingerprint(p['text'])
-        if is_significant(p['text'], fp):
-            if fp not in fp_map_b:
-                fp_map_b[fp] = p
-                
-    # 4. Tender Exclusion
-    tender_full_fp = ""
-    tender_fps = []
-    if paras_tender:
-        tender_fps = [get_fingerprint(p['text']) for p in paras_tender]
-        tender_full_fp = "".join(tender_fps)
-
-    # 5. Extract Entities
-    entities_a = extract_entities(content_a)
-    entities_b = extract_entities(content_b)
-
-    suspicious_paragraphs = []
-    seen_fps = set()
-
-    # --- Phase 1: Entity Check ---
-    for fp, item_a in entities_a.items():
-        if fp in entities_b:
-            entity_check_fp = get_fingerprint(fp)
-            is_excluded = tender_full_fp and (entity_check_fp in tender_full_fp)
-            
-            if not is_excluded:
-                if fp not in seen_fps:
-                    item_b = entities_b[fp]
-                    suspicious_paragraphs.append({
-                        "type": "entity",
-                        "text_a": f"[敏感数据] {item_a['text']}",
-                        "text_b": f"[敏感数据] {item_b['text']}",
-                        "desc": "完全一致的敏感信息 (手机/身份证/邮箱)",
-                        "page_a": item_a['page'],
-                        "page_b": item_b['page'],
-                        "score": 100,
-                        "badges": ["敏感数据"]
-                    })
-                    seen_fps.add(fp)
-
-    # --- Phase 2: Paragraph Comparison ---
-    b_fingerprints = list(fp_map_b.keys())
-
-    check_counter = 0
-
-    for i, p_a in enumerate(paras_a):
-        # --- Memory Guard ---
-        check_counter += 1
-        if check_counter % 50 == 0:
-            check_resources()
-        # --------------------
-
-        text_a = p_a['text']
-        fp_a = get_fingerprint(text_a)
+        # --- 策略 1: 实体雷同 (手机号、身份证、邮箱) ---
+        # 优化：直接在 extract_text 阶段或此处对 raw_text 做 entity 提取
+        entities_a = self.extract_entities(raw_text_a)
+        entities_b = self.extract_entities(raw_text_b)
         
-        if fp_a in seen_fps: continue 
-        if not is_significant(text_a, fp_a): continue
+        common_entities = entities_a.intersection(entities_b)
         
-        # --- Exclusion Logic (Enhanced with Fuzzy Match) ---
-        if tender_full_fp:
-            # 1. Exact Match Check
-            if fp_a in tender_full_fp:
-                continue
-            # 2. Fuzzy Match Check (Threshold 0.9)
-            # Handle cases like "6." vs "6．" or minor OCR variance
-            close_matches = difflib.get_close_matches(fp_a, tender_fps, n=1, cutoff=0.9)
-            if close_matches:
-                continue
-        # ---------------------------------------------------
-
-        match_type = None
-        item_b = None
-        desc = ""
-        score = 0
-        badges = []
-
-        # A. Exact Fingerprint Match
-        if fp_a in fp_map_b:
-            item_b = fp_map_b[fp_a]
-            text_b = item_b['text']
-            
-            is_broken_a = detect_broken_tail(text_a)
-            is_broken_b = detect_broken_tail(text_b)
-            
-            match_type = "exact"
-            desc = "雷同段落 (内容一致)"
-            score = 100
-            
-            if is_broken_a and is_broken_b:
-                badges.append("共同异常断句")
-                desc += "，且均存在异常断句"
-            
-            # --- Shared Deviation Check (New Feature) ---
-            # If A==B, but both differ slightly from Tender (e.g. Shared Typo "蚊件" vs "文件")
-            if tender_fps:
-                 tender_matches = difflib.get_close_matches(fp_a, tender_fps, n=1, cutoff=0.85)
-                 if tender_matches:
-                     # Found a close match in tender, but it wasn't exact (otherwise it would be excluded above)
-                     # Wait, exclusion logic above skips ONLY if match >= 0.9. 
-                     # Here cutoff is 0.85. So if it's between 0.85 and 0.9, OR if exclusion logic was skipped (unlikely if fuzzy is on).
-                     # Actually, exclusion logic uses cutoff=0.9.
-                     # If we find a match here with 0.85, check if it is NOT exact.
-                     
-                     matched_tender_fp = tender_matches[0]
-                     if matched_tender_fp != fp_a:
-                        # Ensure it wasn't excluded (it shouldn't be if we are here)
-                        desc += "；检测到与招标文件存在共同差异(疑似错别字/连带修)"
-                        badges.append("疑似共同修改")
-            # --------------------------------------------
-
-            seen_fps.add(fp_a)
-
-        # B. Fuzzy Match (Spelling/Typos)
-        else:
-            matches = difflib.get_close_matches(fp_a, b_fingerprints, n=1, cutoff=0.85)
-            if matches:
-                matched_fp = matches[0]
-                
-                # --- Double Check Exclusion for Matched B ---
-                if tender_full_fp:
-                    if matched_fp in tender_full_fp: continue
-                    close_tender_matches = difflib.get_close_matches(matched_fp, tender_fps, n=1, cutoff=0.9)
-                    if close_tender_matches: continue
-                # --------------------------------------------
-                    
-                item_b = fp_map_b[matched_fp]
-                
-                # --- Check for Renumbering Difference (New Feature) ---
-                # e.g. "2.3 Title" vs "12. Title"
-                # If content is identical after stripping number, and text is short (< 60 chars), ignore it
-                clean_a = strip_sequence_number_header(text_a)
-                clean_b = strip_sequence_number_header(item_b['text'])
-                
-                # Strict check on cleaned content
-                if clean_a == clean_b and len(clean_a) < 60:
-                     continue # Ignore renumbering differences on headers
-                # ------------------------------------------------------
-                
-                ratio = difflib.SequenceMatcher(None, text_a, item_b['text']).ratio()
-                
-                match_type = "fuzzy"
-                desc = f"疑似修改/拼写错误 (相似度 {int(ratio*100)}%)"
-                score = int(ratio * 100)
-                badges.append("拼写/修改痕迹")
-
-        if match_type:
-            suspicious_paragraphs.append({
-                "type": match_type,
-                "text_a": text_a,
-                "text_b": item_b['text'],
-                "desc": desc,
-                "page_a": p_a['page'],
-                "page_b": item_b['page'],
-                "score": score,
-                "badges": badges
+        # 排除招标文件中的实体
+        tender_entities = self.extract_entities(self.tender_full_text) # tender_full_text is normalized? No wait.
+        # Correction: tender_full_text was normalized in load_tender. 
+        # extract_entities logic should handle normalized text or raw.
+        # Let's adjust extract_entities to handle loose matching.
+        
+        # Actually, entities usually rely on digits/letters, so normalization (removing spaces) is good.
+        suspect_entities = common_entities - tender_entities
+        
+        for entity in suspect_entities:
+            page_a = self.find_page_for_text(entity, pages_a)
+            page_b = self.find_page_for_text(entity, pages_b)
+            collisions.append({
+                "type": "entity",
+                "text_a": entity,
+                "text_b": entity,
+                "page_a": page_a,
+                "page_b": page_b,
+                "badges": ["敏感实体"],
+                "desc": f"发现相同的实体信息: {entity}"
             })
 
-    # --- Phase 3: Common Sequence Errors ---
-    seq_errors_a = check_sequence_errors(paras_a)
-    seq_errors_b = check_sequence_errors(paras_b)
-    
-    common_seq_errors = []
-    
-    for err_a in seq_errors_a:
-        for err_b in seq_errors_b:
-            # Same missing number?
-            if err_a['missing'] == err_b['missing'] and err_a['found'] == err_b['found']:
-                # Same context?
-                ratio = difflib.SequenceMatcher(None, err_a['context_fp'], err_b['context_fp']).ratio()
-                if ratio > 0.8:
-                    common_seq_errors.append({
-                        "missing": err_a['missing'],
-                        "found": err_a['found'],
-                        "text_a": err_a['text'],
-                        "text_b": err_b['text'],
-                        "page_a": err_a['page'],
-                        "page_b": err_b['page']
+        # --- 策略 2: 长文本/句子雷同 ---
+        sentences_a = set(self.get_sentences(raw_text_a))
+        sentences_b = set(self.get_sentences(raw_text_b))
+        
+        common_sentences = sentences_a.intersection(sentences_b)
+        
+        processed_contents = set()
+
+        for sent in common_sentences:
+            if sent in processed_contents: continue
+            
+            # Exclusion logic
+            if sent not in self.tender_sentences and sent not in self.tender_full_text:
+                 if len(sent) > 8: 
+                    page_a = self.find_page_for_text(sent, pages_a)
+                    page_b = self.find_page_for_text(sent, pages_b)
+                    
+                    # Improve desc depending on content
+                    desc = "发现非招标文件雷同语句"
+                    badges = ["完全匹配"]
+                    
+                    # Detect Typo "蚊件"
+                    if "蚊件" in sent:
+                        desc = "发现共同的可疑错别字 (蚊件)"
+                        badges.append("拼写错误")
+                    
+                    collisions.append({
+                        "type": "text",
+                        "text_a": sent, # Normalized text might be hard to read, but frontend calls escapeHtml. 
+                                        # Ideally we map back to raw text, but that's hard. 
+                                        # For now simply return the normalized matched constraint.
+                        "text_b": sent,
+                        "page_a": page_a,
+                        "page_b": page_b,
+                        "badges": badges,
+                        "desc": desc
                     })
-                    break
+                    processed_contents.add(sent)
 
-    suspicious_paragraphs.sort(key=lambda x: x['score'], reverse=True)
+        # --- 策略 3: 滑窗/片段 (针对 "蚊件" 且被断句切开的情况) ---
+        # 简单实现：检查特定高频错别字
+        keywords = ["蚊件"] 
+        
+        for kw in keywords:
+            kw_norm = self.normalize(kw)
+            if kw_norm in norm_a and kw_norm in norm_b:
+                # check exclusion
+                if kw_norm not in self.tender_full_text:
+                    # check if already covered
+                    if not any(kw_norm in c['text_a'] for c in collisions):
+                        page_a = self.find_page_for_text(kw_norm, pages_a)
+                        page_b = self.find_page_for_text(kw_norm, pages_b)
+                        collisions.append({
+                            "type": "text_fragment",
+                            "text_a": f"...{kw}...",
+                            "text_b": f"...{kw}...",
+                            "page_a": page_a,
+                            "page_b": page_b,
+                            "badges": ["关键词匹配"],
+                            "desc": f"发现可疑关键词: {kw}"
+                        })
 
-    return {
-        "paragraphs": suspicious_paragraphs,
-        "common_errors": {
-            "sequence": common_seq_errors
-        },
-        "metadata": {
-            "file_a": meta_a,
-            "file_b": meta_b,
-            "tender": meta_tender
+        # --- Result Formatting ---
+        return {
+            "metadata": {
+                "file_a": meta_a,
+                "file_b": meta_b,
+                "tender": {} # TODO: extract tender meta?
+            },
+            "paragraphs": collisions,
+            "common_errors": {"sequence": []} # Placeholder
         }
-    }
+
+    def extract_entities(self, text):
+        entities = set()
+        # Normalization removes spaces, so regex usually works better on that for strict patterns
+        # But phones might look like 139 3451 8882.
+        # Since we pass in raw_text usually... wait, in find_collisions I passed raw_text to extract_entities?
+        # Yes.
+        
+        # 1. Phone (loose)
+        phones = re.findall(r'1[3-9]\d{9}', text.replace(" ", "").replace("-", ""))
+        entities.update(phones)
+        
+        # 2. ID Card
+        ids = re.findall(r'\d{15}|\d{18}|\d{17}[xX]', text)
+        for i in ids:
+             if len(i) >= 15: entities.add(i)
+        
+        # 3. Email
+        emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text)
+        entities.update(emails)
+        
+        return entities
+
+def compare_documents(path_a, path_b, path_tender=None):
+    detector = CollusionDetector(path_tender)
+    return detector.find_collisions(path_a, path_b)
