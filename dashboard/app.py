@@ -208,11 +208,36 @@ def log_request(response):
         if request.path == '/favicon.ico':
             return response
 
+        # --- 1. Robust IP Detection (Pass X-Forwarded-For, X-Real-IP, Remote-Addr) ---
         ip = request.remote_addr
-        # Try to get real IP if behind proxy (e.g. nginx)
         if request.headers.get('X-Forwarded-For'):
-            ip = request.headers.get('X-Forwarded-For').split(',')[0]
+            # X-Forwarded-For: client, proxy1, proxy2
+            ip = request.headers.get('X-Forwarded-For').split(',')[0].strip()
+        elif request.headers.get('X-Real-IP'):
+            # Nginx often sets this
+            ip = request.headers.get('X-Real-IP').strip()
             
+        # --- 2. Throttling for /api/visitor_logs (Prevent Log Spam) ---
+        if request.path == '/api/visitor_logs':
+            try:
+                # Check last log for this IP/Path
+                conn_check = sqlite3.connect(VISITOR_DB)
+                cursor_check = conn_check.cursor()
+                cursor_check.execute('''
+                    SELECT timestamp FROM logs 
+                    WHERE ip = ? AND path = ? 
+                    ORDER BY id DESC LIMIT 1
+                ''', (ip, request.path))
+                row = cursor_check.fetchone()
+                conn_check.close()
+                
+                if row:
+                    last_time = datetime.datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+                    if datetime.datetime.now() - last_time < datetime.timedelta(minutes=30):
+                        return response # SKIP LOGGING
+            except Exception as e:
+                print(f"Throttling check error: {e}")
+
         ua_string = request.user_agent.string
         ua = request.user_agent
         
