@@ -51,6 +51,11 @@ docker run -d \
 
 if [ $? -eq 0 ]; then
     echo "✅ 部署成功！"
+    
+    # 自动清理悬空镜像 (节省空间)
+    echo "🧹 自动清理旧镜像缓存..."
+    docker image prune -f
+    
     echo "📜 正在查看日志 (按 Ctrl+C 退出)..."
     sleep 2
     docker logs -f bidding-app
