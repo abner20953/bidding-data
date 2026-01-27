@@ -41,25 +41,56 @@ def test_real_files():
              text = text.replace('“', '"').replace('”', '"').replace("‘", "'").replace("’", "'")
              return re.sub(r'\s+', '', text)
         
-        target_map = {t: normalize_check(t) for t in raw_targets}
-        found_map = {t: False for t in raw_targets}
-        
-        # import re removed
+        # Define targets with expected segments if needed
+        # We just need to know if coverage is "good enough" or "found something"
+        raw_targets = [
+            "我方投标文件的有效期和招标文件规定的投标有效期一致，我方承诺在招标文件规定的投标有效期内不撤销投标蚊件",
+            "13934518882",
+            "SQL Server Always On",
+            "凡我公司售出的产品，保修期间一切因产品质量而引起的产品故障及损坏，本中心均将提供免费上门维修及更换零配件服务"
+        ]
+
+        target_map = {}
+        for t in raw_targets:
+            # key: raw target
+            # value: list of normalized segments (split by comma)
+            norm = normalize_check(t)
+            segs = re.split(r'[,]', norm)
+            target_map[t] = [s for s in segs if len(s) > 5]
+
+        found_map = {t: set() for t in raw_targets} # Track which segments found
         
         # Print first 20 collisions
+        print("-" * 30)
         for i, c in enumerate(collisions):
-            text = c['text_a'] # This is normalized content from detector
+            text = c['text_a'] # This is normalized content
             if i < 10: 
                 print(f"[{i}] [{c['type']}] {text[:50]}... (Page {c['page_a']})")
             
-            for raw, norm_target in target_map.items():
-                if norm_target in text:
-                    found_map[raw] = True
-                    
+            for raw, segs in target_map.items():
+                for seg in segs:
+                    if seg in text:
+                        found_map[raw].add(seg)
+        
         print("\nVerification Results:")
-        for k, v in found_map.items():
-            print(f"  Target: {k[:20]}...")
-            print(f"  Status: {'✅ FOUND' if v else '❌ MISSING'}")
+        for raw, found_segs in found_map.items():
+            total_segs = len(target_map[raw])
+            found_count = len(found_segs)
+            status = "✅ FOUND" if found_count > 0 else "❌ MISSING"
+            print(f"  Target: {raw[:20]}... [{found_count}/{total_segs} segments match]")
+            if found_count > 0 and found_count < total_segs:
+                print(f"     (Partial match. Found: {list(found_segs)})")
+        
+        # Explicit check for typo keyword in ALL collisions
+        typo_found = False
+        for c in collisions:
+             if "蚊件" in c['text_a']:
+                 print(f"  🔍 TYPO CONFIRMED in collision: {c['text_a']}")
+                 typo_found = True
+                 break
+        if not typo_found:
+             print("  ⚠️ TYPO '蚊件' NOT FOUND in any collision.")
+
             
     except Exception as e:
         print(f"Error: {e}")

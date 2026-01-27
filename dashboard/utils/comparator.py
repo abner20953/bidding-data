@@ -69,10 +69,10 @@ class CollusionDetector:
         lines = text.split('\n')
         sentences = []
         for line in lines:
-            parts = re.split(r'[。.!！?？;；]', line)
+            parts = re.split(r'[。.!！?？;；,，]', line)
             for p in parts:
                 p = p.strip()
-                if len(p) > 5:
+                if len(p) > 8: # Increase threshold slightly to avoid noise from short comma segments
                     sentences.append(self.normalize(p))
         return sentences
 
