@@ -262,6 +262,10 @@ def log_request(response):
     try:
         if request.path.startswith('/static') or request.path.startswith('/api/file'):
             return response
+            
+        # Filter out all API calls (User Request: Only log page visits)
+        if request.path.startswith('/api/'):
+            return response
         
         # Filter out favicon
         if request.path == '/favicon.ico':
