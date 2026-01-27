@@ -163,42 +163,55 @@
                 <a href="/all" class="back-link">← 返回导航</a>
                 <h1 style="margin-top: 8px;">访客日志监控</h1>
             </div>
-            <div>
-                <a href="/api/visitor_logs/download" class="refresh-btn"
-                    style="text-decoration:none; margin-right:8px;">⬇️ 导出数据库</a>
-                <button class="refresh-btn" onclick="fetchLogs()">🔄 刷新列表</button>
-            </div>
+            <h1 style="margin-top: 8px;">访客日志监控</h1>
         </div>
+        <div style="display: flex; gap: 12px; align-items: center;">
+            <input type="text" id="ipFilter" placeholder="搜索 IP 地址..."
+                style="padding: 8px; border: 1px solid #e5e7eb; border-radius: 6px; font-size: 14px;">
+            <input type="date" id="dateFilter"
+                style="padding: 8px; border: 1px solid #e5e7eb; border-radius: 6px; font-size: 14px;">
+            <button class="refresh-btn" onclick="fetchLogs()">🔍 查询 / 刷新</button>
+        </div>
+    </div>
 
-        <div class="card">
-            <div class="table-container">
-                <table id="logsTable">
-                    <thead>
-                        <tr>
-                            <th style="width: 160px;">访问时间</th>
-                            <th style="width: 120px;">IP 地址</th>
-                            <th style="width: 80px;">设备</th>
-                            <th style="width: 150px;">系统/浏览器</th>
-                            <th style="width: 200px;">访问路径</th>
-                            <!-- <th>User Agent</th> -->
-                        </tr>
-                    </thead>
-                    <tbody id="logsBody">
-                        <tr>
-                            <td colspan="6" class="loading">正在加载日志数据...</td>
-                        </tr>
-                    </tbody>
-                </table>
-            </div>
+    <div class="card">
+        <div class="table-container">
+            <table id="logsTable">
+                <thead>
+                    <tr>
+                        <th style="width: 160px;">访问时间</th>
+                        <th style="width: 120px;">IP 地址</th>
+                        <th style="width: 80px;">设备</th>
+                        <th style="width: 150px;">系统/浏览器</th>
+                        <th style="width: 200px;">访问路径</th>
+                        <!-- <th>User Agent</th> -->
+                    </tr>
+                </thead>
+                <tbody id="logsBody">
+                    <tr>
+                        <td colspan="6" class="loading">正在加载日志数据...</td>
+                    </tr>
+                </tbody>
+            </table>
         </div>
+    </div>
     </div>
 
     <script>
         async function fetchLogs() {
             const tbody = document.getElementById('logsBody');
+            const ip = document.getElementById('ipFilter').value;
+            const date = document.getElementById('dateFilter').value;
 
             try {
-                const response = await fetch('/api/visitor_logs');
+                // Build query params
+                let url = '/api/visitor_logs';
+                const params = new URLSearchParams();
+                if (ip) params.append('ip', ip);
+                if (date) params.append('date', date);
+                if (params.toString()) url += '?' + params.toString();
+
+                const response = await fetch(url);
                 const data = await response.json();
 
                 if (data.error) {

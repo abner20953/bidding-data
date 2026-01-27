@@ -257,12 +257,28 @@ def visitor_logs_view():
 @app.route('/api/visitor_logs')
 def api_get_visitor_logs():
     try:
+        ip_query = request.args.get('ip', '').strip()
+        date_query = request.args.get('date', '').strip()
+        
         conn = sqlite3.connect(VISITOR_DB)
         conn.row_factory = sqlite3.Row # Allow dict-like access
         cursor = conn.cursor()
         
-        # Get latest 200 logs
-        cursor.execute('SELECT * FROM logs ORDER BY id DESC LIMIT 200')
+        query = "SELECT * FROM logs WHERE 1=1"
+        params = []
+        
+        if ip_query:
+            query += " AND ip LIKE ?"
+            params.append(f"%{ip_query}%")
+            
+        if date_query:
+             query += " AND timestamp LIKE ?"
+             params.append(f"{date_query}%")
+             
+        # Order by latest first
+        query += " ORDER BY id DESC LIMIT 500" # Increase limit for searching
+        
+        cursor.execute(query, tuple(params))
         rows = cursor.fetchall()
         
         logs = []
@@ -275,16 +291,6 @@ def api_get_visitor_logs():
         return jsonify({"error": str(e)}), 500
 
 # --- 路由配置 ---
-
-@app.route('/api/visitor_logs/download')
-def api_download_visitor_db():
-    try:
-        if os.path.exists(VISITOR_DB):
-            return send_from_directory(BASE_DIR, 'visitor_logs.db', as_attachment=True)
-        else:
-            return jsonify({"error": "Database file not found"}), 404
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 @app.route('/')
 def index():
@@ -800,9 +806,9 @@ def scheduled_job():
                 
     log_scheduler(f"   [清理完成] 共删除了 {deleted_count} 个过期文件。")
 
-    # --- 3. 访客日志清理逻辑 (保留最近 30 天) ---
+    # --- 3. 访客日志清理逻辑 (保留最近 7 天) ---
     try:
-        cleanup_date_limit = (today - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+        cleanup_date_limit = (today - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
         log_scheduler(f"   [日志维护] 正在清理 {cleanup_date_limit} 之前的访客记录...")
         
         conn = sqlite3.connect(VISITOR_DB)
