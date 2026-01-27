@@ -11,6 +11,7 @@ import re
 import shutil
 import time
 import math
+import sqlite3
 from werkzeug.utils import secure_filename
 
 # 配置目录
@@ -40,7 +41,36 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 # --- 定时任务日志存储 (改为文件存储以解决多进程/线程问题) ---
 LOG_FILE = os.path.join(BASE_DIR, 'scheduler.log')
 print(f"DEBUG: BASE_DIR={BASE_DIR}")
+LOG_FILE = os.path.join(BASE_DIR, 'scheduler.log')
+VISITOR_DB = os.path.join(BASE_DIR, 'visitor_logs.db')
+print(f"DEBUG: BASE_DIR={BASE_DIR}")
 print(f"DEBUG: LOG_FILE={LOG_FILE}")
+print(f"DEBUG: VISITOR_DB={VISITOR_DB}")
+
+def init_visitor_db():
+    try:
+        conn = sqlite3.connect(VISITOR_DB)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip TEXT,
+                path TEXT,
+                method TEXT,
+                status_code INTEGER,
+                timestamp TEXT,
+                user_agent TEXT,
+                browser TEXT,
+                os TEXT,
+                device TEXT
+            )
+        ''')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error initializing visitor db: {e}")
+
+init_visitor_db()
 
 # Ensure file exists
 try:
@@ -165,6 +195,84 @@ def run_auto_scrape_thread(dates, is_scheduled_task=False):
     finally:
         SCRAPER_STATUS["is_running"] = False
         SCRAPER_STATUS["current_date"] = None
+
+# --- Middleware for Visitor Logging ---
+
+@app.after_request
+def log_request(response):
+    try:
+        if request.path.startswith('/static') or request.path.startswith('/api/file'):
+            return response
+        
+        # Filter out favicon
+        if request.path == '/favicon.ico':
+            return response
+
+        ip = request.remote_addr
+        # Try to get real IP if behind proxy (e.g. nginx)
+        if request.headers.get('X-Forwarded-For'):
+            ip = request.headers.get('X-Forwarded-For').split(',')[0]
+            
+        ua_string = request.user_agent.string
+        ua = request.user_agent
+        
+        browser = f"{ua.browser} {ua.version}" if ua.browser else "Unknown"
+        os_info = f"{ua.platform} {ua.version}" if ua.platform else "Unknown" # platform is generic, customized below
+        
+        # Better OS detection
+        if 'Windows' in ua_string: os_info = 'Windows'
+        elif 'Android' in ua_string: os_info = 'Android'
+        elif 'iPhone' in ua_string or 'iPad' in ua_string: os_info = 'iOS'
+        elif 'Mac' in ua_string: os_info = 'MacOS'
+        elif 'Linux' in ua_string: os_info = 'Linux'
+        
+        # Device Type
+        device = "PC"
+        if 'Mobile' in ua_string or 'Android' in ua_string or 'iPhone' in ua_string:
+            device = "Mobile"
+            
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Insert into DB
+        conn = sqlite3.connect(VISITOR_DB)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO logs (ip, path, method, status_code, timestamp, user_agent, browser, os, device)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (ip, request.path, request.method, response.status_code, timestamp, ua_string, browser, os_info, device))
+        conn.commit()
+        conn.close()
+        
+    except Exception as e:
+        print(f"Logging error: {e}")
+        
+    return response
+
+# --- New Routes for Visitor Logs ---
+
+@app.route('/fangke')
+def visitor_logs_view():
+    return render_template('access_logs.html')
+
+@app.route('/api/visitor_logs')
+def api_get_visitor_logs():
+    try:
+        conn = sqlite3.connect(VISITOR_DB)
+        conn.row_factory = sqlite3.Row # Allow dict-like access
+        cursor = conn.cursor()
+        
+        # Get latest 200 logs
+        cursor.execute('SELECT * FROM logs ORDER BY id DESC LIMIT 200')
+        rows = cursor.fetchall()
+        
+        logs = []
+        for row in rows:
+            logs.append(dict(row))
+            
+        conn.close()
+        return jsonify(logs)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # --- 路由配置 ---
 

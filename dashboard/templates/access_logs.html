@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>访客日志 - Smarter Tools</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary-color: #3b82f6;
+            --bg-color: #f3f4f6;
+            --card-bg: #ffffff;
+            --text-main: #1f2937;
+            --text-sub: #6b7280;
+            --border-color: #e5e7eb;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            margin: 0;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+        }
+
+        h1 {
+            font-size: 24px;
+            font-weight: 600;
+            margin: 0;
+        }
+
+        .back-link {
+            text-decoration: none;
+            color: var(--text-sub);
+            font-size: 14px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        
+        .back-link:hover {
+            color: var(--primary-color);
+        }
+
+        .card {
+            background: var(--card-bg);
+            border-radius: 12px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+
+        .table-container {
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 14px;
+            text-align: left;
+        }
+
+        th {
+            background-color: #f9fafb;
+            color: var(--text-sub);
+            font-weight: 500;
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border-color);
+            white-space: nowrap;
+        }
+
+        td {
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border-color);
+            color: var(--text-main);
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+        
+        tr:hover {
+            background-color: #f9fafb;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 9999px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        
+        .badge-pc { background-color: #dbeafe; color: #1e40af; }
+        .badge-mobile { background-color: #d1fae5; color: #065f46; }
+        
+        .badge-method-get { background-color: #e0e7ff; color: #3730a3; }
+        .badge-method-post { background-color: #fce7f3; color: #9d174d; }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-sub);
+        }
+        
+        .refresh-btn {
+            background-color: white;
+            border: 1px solid var(--border-color);
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s;
+        }
+        
+        .refresh-btn:hover {
+            background-color: #f3f4f6;
+            border-color: #d1d5db;
+        }
+        
+        .meta-info {
+            font-size: 12px;
+            color: #9ca3af;
+            max-width: 200px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div>
+                <a href="/all" class="back-link">← 返回导航</a>
+                <h1 style="margin-top: 8px;">访客日志监控</h1>
+            </div>
+            <button class="refresh-btn" onclick="fetchLogs()">🔄 刷新列表</button>
+        </div>
+
+        <div class="card">
+            <div class="table-container">
+                <table id="logsTable">
+                    <thead>
+                        <tr>
+                            <th style="width: 160px;">访问时间</th>
+                            <th style="width: 120px;">IP 地址</th>
+                            <th style="width: 80px;">设备</th>
+                            <th style="width: 150px;">系统/浏览器</th>
+                            <th style="width: 200px;">访问路径</th>
+                            <!-- <th>User Agent</th> -->
+                        </tr>
+                    </thead>
+                    <tbody id="logsBody">
+                        <tr><td colspan="6" class="loading">正在加载日志数据...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function fetchLogs() {
+            const tbody = document.getElementById('logsBody');
+            
+            try {
+                const response = await fetch('/api/visitor_logs');
+                const data = await response.json();
+                
+                if (data.error) {
+                    tbody.innerHTML = `<tr><td colspan="6" class="loading" style="color:red">加载失败: ${data.error}</td></tr>`;
+                    return;
+                }
+                
+                if (data.length === 0) {
+                    tbody.innerHTML = `<tr><td colspan="6" class="loading">暂无访客记录</td></tr>`;
+                    return;
+                }
+                
+                tbody.innerHTML = data.map(log => {
+                    const isMobile = log.device === 'Mobile';
+                    const deviceClass = isMobile ? 'badge-mobile' : 'badge-pc';
+                    const deviceIcon = isMobile ? '📱' : '💻';
+                    
+                    return `
+                        <tr>
+                            <td>${log.timestamp}</td>
+                            <td style="font-family: monospace;">${log.ip}</td>
+                            <td><span class="badge ${deviceClass}">${deviceIcon} ${log.device}</span></td>
+                            <td>
+                                <div>${log.os}</div>
+                                <div style="font-size:12px;color:#6b7280">${log.browser}</div>
+                            </td>
+                            <td>
+                                <span class="badge ${log.method === 'GET' ? 'badge-method-get' : 'badge-method-post'}">${log.method}</span>
+                                <span style="margin-left:8px; font-family:monospace">${log.path}</span>
+                            </td>
+                            <!-- <td class="meta-info" title="${log.user_agent}">${log.user_agent}</td> -->
+                        </tr>
+                    `;
+                }).join('');
+                
+            } catch (err) {
+                console.error(err);
+                tbody.innerHTML = `<tr><td colspan="6" class="loading" style="color:red">网络错误，请稍后重试</td></tr>`;
+            }
+        }
+
+        // Auto load
+        fetchLogs();
+        
+        // Auto refresh every 30s
+        setInterval(fetchLogs, 30000);
+    </script>
+</body>
+</html>
