@@ -258,6 +258,7 @@ def visitor_logs_view():
 def api_get_visitor_logs():
     try:
         ip_query = request.args.get('ip', '').strip()
+        path_query = request.args.get('path', '').strip()
         date_query = request.args.get('date', '').strip()
         
         conn = sqlite3.connect(VISITOR_DB)
@@ -267,10 +268,14 @@ def api_get_visitor_logs():
         query = "SELECT * FROM logs WHERE 1=1"
         params = []
         
-        if ip_query:
-            query += " AND ip LIKE ?"
-            params.append(f"%{ip_query}%")
+        if ip_query and ip_query != 'all':
+            query += " AND ip = ?"
+            params.append(ip_query)
             
+        if path_query and path_query != 'all':
+             query += " AND path = ?"
+             params.append(path_query)
+
         if date_query:
              query += " AND timestamp LIKE ?"
              params.append(f"{date_query}%")
@@ -287,6 +292,24 @@ def api_get_visitor_logs():
             
         conn.close()
         return jsonify(logs)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/visitor_logs/options')
+def api_visitor_log_options():
+    try:
+        conn = sqlite3.connect(VISITOR_DB)
+        cursor = conn.cursor()
+        
+        # Get distinct IPs and Paths from the last 7 days (logs table is self-cleaning)
+        cursor.execute("SELECT DISTINCT ip FROM logs ORDER BY id DESC")
+        ips = [row[0] for row in cursor.fetchall()]
+        
+        cursor.execute("SELECT DISTINCT path FROM logs ORDER BY path ASC")
+        paths = [row[0] for row in cursor.fetchall()]
+        
+        conn.close()
+        return jsonify({"ips": ips, "paths": paths})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

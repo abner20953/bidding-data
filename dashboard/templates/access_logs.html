@@ -4,24 +4,34 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>访客日志 - Smarter Tools</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <title>访客日志监控 - Smarter Tools</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
+            /* Consistent with nav_index.html */
+            --bg-gradient: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            --card-bg: rgba(255, 255, 255, 0.7);
+            --card-border: rgba(255, 255, 255, 0.8);
+            --text-primary: #1f2937;
+            --text-secondary: #6b7280;
+
+            /* Custom for table */
             --primary-color: #3b82f6;
-            --bg-color: #f3f4f6;
-            --card-bg: #ffffff;
-            --text-main: #1f2937;
-            --text-sub: #6b7280;
             --border-color: #e5e7eb;
         }
 
-        body {
-            font-family: 'Inter', sans-serif;
-            background-color: var(--bg-color);
-            color: var(--text-main);
+        * {
             margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            background: var(--bg-gradient);
+            min-height: 100vh;
             padding: 20px;
+            color: var(--text-primary);
         }
 
         .container {
@@ -29,36 +39,105 @@
             margin: 0 auto;
         }
 
-        .header {
+        /* Header & Toolbar */
+        .header-section {
             display: flex;
             justify-content: space-between;
             align-items: center;
             margin-bottom: 24px;
+            flex-wrap: wrap;
+            gap: 16px;
         }
 
-        h1 {
-            font-size: 24px;
-            font-weight: 600;
-            margin: 0;
+        .page-title {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .page-title h1 {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--text-primary);
         }
 
         .back-link {
             text-decoration: none;
-            color: var(--text-sub);
-            font-size: 14px;
+            color: var(--text-secondary);
+            font-size: 0.95rem;
             display: flex;
             align-items: center;
-            gap: 4px;
+            gap: 6px;
+            padding: 8px 12px;
+            background: rgba(255, 255, 255, 0.5);
+            border-radius: 8px;
+            transition: all 0.2s;
         }
 
         .back-link:hover {
+            background: rgba(255, 255, 255, 0.9);
             color: var(--primary-color);
         }
 
+        /* Filter Toolbar */
+        .toolbar {
+            display: flex;
+            gap: 12px;
+            background: var(--card-bg);
+            padding: 12px;
+            border-radius: 12px;
+            backdrop-filter: blur(12px);
+            border: 1px solid var(--card-border);
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+            flex-wrap: wrap;
+        }
+
+        .toolbar select,
+        .toolbar input {
+            padding: 8px 12px;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            font-size: 14px;
+            background: rgba(255, 255, 255, 0.9);
+            color: var(--text-primary);
+            min-width: 150px;
+            outline: none;
+        }
+
+        .toolbar select:focus,
+        .toolbar input:focus {
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+        }
+
+        .refresh-btn {
+            background-color: var(--primary-color);
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: opacity 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .refresh-btn:hover {
+            opacity: 0.9;
+        }
+
+        /* Card & Table */
         .card {
             background: var(--card-bg);
-            border-radius: 12px;
-            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+            padding: 24px;
+            /* Reduced padding for more table space */
+            backdrop-filter: blur(12px);
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
             overflow: hidden;
         }
 
@@ -74,34 +153,39 @@
         }
 
         th {
-            background-color: #f9fafb;
-            color: var(--text-sub);
-            font-weight: 500;
+            background-color: rgba(249, 250, 251, 0.5);
+            /* Semi-transparent */
+            color: var(--text-secondary);
+            font-weight: 600;
             padding: 12px 16px;
-            border-bottom: 1px solid var(--border-color);
+            border-bottom: 2px solid var(--border-color);
             white-space: nowrap;
         }
 
         td {
             padding: 12px 16px;
             border-bottom: 1px solid var(--border-color);
-            color: var(--text-main);
+            color: var(--text-primary);
+            vertical-align: middle;
         }
 
         tr:last-child td {
             border-bottom: none;
         }
 
-        tr:hover {
-            background-color: #f9fafb;
+        tr:hover td {
+            background-color: rgba(255, 255, 255, 0.5);
         }
 
+        /* Badges */
         .badge {
-            display: inline-block;
+            display: inline-flex;
+            align-items: center;
             padding: 2px 8px;
             border-radius: 9999px;
             font-size: 12px;
             font-weight: 500;
+            gap: 4px;
         }
 
         .badge-pc {
@@ -127,100 +211,144 @@
         .loading {
             text-align: center;
             padding: 40px;
-            color: var(--text-sub);
+            color: var(--text-secondary);
         }
 
-        .refresh-btn {
-            background-color: white;
-            border: 1px solid var(--border-color);
-            padding: 8px 16px;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 14px;
-            transition: all 0.2s;
+        /* Animation */
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
         }
 
-        .refresh-btn:hover {
-            background-color: #f3f4f6;
-            border-color: #d1d5db;
-        }
-
-        .meta-info {
-            font-size: 12px;
-            color: #9ca3af;
-            max-width: 200px;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
+        .fade-in {
+            animation: fadeIn 0.4s ease-out;
         }
     </style>
 </head>
 
 <body>
-    <div class="container">
-        <div class="header">
-            <div>
+    <div class="container fade-in">
+        <div class="header-section">
+            <div class="page-title">
                 <a href="/all" class="back-link">← 返回导航</a>
-                <h1 style="margin-top: 8px;">访客日志监控</h1>
+                <h1>访客日志监控</h1>
             </div>
-            <h1 style="margin-top: 8px;">访客日志监控</h1>
-        </div>
-        <div style="display: flex; gap: 12px; align-items: center;">
-            <input type="text" id="ipFilter" placeholder="搜索 IP 地址..."
-                style="padding: 8px; border: 1px solid #e5e7eb; border-radius: 6px; font-size: 14px;">
-            <input type="date" id="dateFilter"
-                style="padding: 8px; border: 1px solid #e5e7eb; border-radius: 6px; font-size: 14px;">
-            <button class="refresh-btn" onclick="fetchLogs()">🔍 查询 / 刷新</button>
-        </div>
-    </div>
 
-    <div class="card">
-        <div class="table-container">
-            <table id="logsTable">
-                <thead>
-                    <tr>
-                        <th style="width: 160px;">访问时间</th>
-                        <th style="width: 120px;">IP 地址</th>
-                        <th style="width: 80px;">设备</th>
-                        <th style="width: 150px;">系统/浏览器</th>
-                        <th style="width: 200px;">访问路径</th>
-                        <!-- <th>User Agent</th> -->
-                    </tr>
-                </thead>
-                <tbody id="logsBody">
-                    <tr>
-                        <td colspan="6" class="loading">正在加载日志数据...</td>
-                    </tr>
-                </tbody>
-            </table>
+            <div class="toolbar">
+                <select id="ipFilter">
+                    <option value="" disabled selected>IP 地址 (加载中...)</option>
+                </select>
+
+                <select id="pathFilter">
+                    <option value="" disabled selected>访问路径 (加载中...)</option>
+                </select>
+
+                <input type="date" id="dateFilter" title="按日期筛选">
+
+                <button class="refresh-btn" onclick="fetchLogs()">
+                    <span>🔍</span> 查询
+                </button>
+            </div>
         </div>
-    </div>
+
+        <div class="card fade-in" style="animation-delay: 0.1s;">
+            <div class="table-container">
+                <table id="logsTable">
+                    <thead>
+                        <tr>
+                            <th style="width: 160px;">访问时间</th>
+                            <th style="width: 140px;">IP 地址</th>
+                            <th style="width: 100px;">设备</th>
+                            <th style="width: 180px;">系统/浏览器</th>
+                            <th>访问路径</th>
+                        </tr>
+                    </thead>
+                    <tbody id="logsBody">
+                        <tr>
+                            <td colspan="5" class="loading">正在加载日志数据...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
     </div>
 
     <script>
+        // Init
+        document.addEventListener('DOMContentLoaded', () => {
+            fetchOptions();
+            fetchLogs();
+
+            // Auto refresh every 30s
+            setInterval(fetchLogs, 30000);
+        });
+
+        async function fetchOptions() {
+            try {
+                const response = await fetch('/api/visitor_logs/options');
+                const data = await response.json();
+
+                // Populate IP Select
+                const ipSelect = document.getElementById('ipFilter');
+                ipSelect.innerHTML = '<option value="all">全部 IP 地址</option>';
+                data.ips.forEach(ip => {
+                    const option = document.createElement('option');
+                    option.value = ip;
+                    option.textContent = ip;
+                    ipSelect.appendChild(option);
+                });
+
+                // Populate Path Select
+                const pathSelect = document.getElementById('pathFilter');
+                pathSelect.innerHTML = '<option value="all">全部访问路径</option>';
+                data.paths.forEach(path => {
+                    const option = document.createElement('option');
+                    option.value = path;
+                    option.textContent = path;
+                    pathSelect.appendChild(option);
+                });
+
+            } catch (error) {
+                console.error('Failed to load filter options:', error);
+            }
+        }
+
         async function fetchLogs() {
             const tbody = document.getElementById('logsBody');
+
+            // Get values
             const ip = document.getElementById('ipFilter').value;
+            const path = document.getElementById('pathFilter').value;
             const date = document.getElementById('dateFilter').value;
 
             try {
                 // Build query params
                 let url = '/api/visitor_logs';
                 const params = new URLSearchParams();
-                if (ip) params.append('ip', ip);
+
+                if (ip && ip !== 'all') params.append('ip', ip);
+                if (path && path !== 'all') params.append('path', path);
                 if (date) params.append('date', date);
+
                 if (params.toString()) url += '?' + params.toString();
 
                 const response = await fetch(url);
                 const data = await response.json();
 
                 if (data.error) {
-                    tbody.innerHTML = `<tr><td colspan="6" class="loading" style="color:red">加载失败: ${data.error}</td></tr>`;
+                    tbody.innerHTML = `<tr><td colspan="5" class="loading" style="color:red">加载失败: ${data.error}</td></tr>`;
                     return;
                 }
 
                 if (data.length === 0) {
-                    tbody.innerHTML = `<tr><td colspan="6" class="loading">暂无访客记录</td></tr>`;
+                    tbody.innerHTML = `<tr><td colspan="5" class="loading">暂无符合条件的访客记录</td></tr>`;
                     return;
                 }
 
@@ -231,33 +359,29 @@
 
                     return `
                         <tr>
-                            <td>${log.timestamp}</td>
-                            <td style="font-family: monospace;">${log.ip}</td>
+                            <td style="color:#6b7280; font-size:13px;">${log.timestamp}</td>
+                            <td style="font-family: monospace; font-weight:500;">${log.ip}</td>
                             <td><span class="badge ${deviceClass}">${deviceIcon} ${log.device}</span></td>
                             <td>
-                                <div>${log.os}</div>
-                                <div style="font-size:12px;color:#6b7280">${log.browser}</div>
+                                <div style="font-weight:500; font-size:13px;">${log.os}</div>
+                                <div style="font-size:12px;color:#9ca3af">${log.browser}</div>
                             </td>
                             <td>
-                                <span class="badge ${log.method === 'GET' ? 'badge-method-get' : 'badge-method-post'}">${log.method}</span>
-                                <span style="margin-left:8px; font-family:monospace">${log.path}</span>
+                                <div style="display:flex; align-items:center;">
+                                    <span class="badge ${log.method === 'GET' ? 'badge-method-get' : 'badge-method-post'}" 
+                                          style="font-size:10px; padding:1px 6px; margin-right:8px;">${log.method}</span>
+                                    <span style="font-family:monospace; color:#374151;">${log.path}</span>
+                                </div>
                             </td>
-                            <!-- <td class="meta-info" title="${log.user_agent}">${log.user_agent}</td> -->
                         </tr>
                     `;
                 }).join('');
 
             } catch (err) {
                 console.error(err);
-                tbody.innerHTML = `<tr><td colspan="6" class="loading" style="color:red">网络错误，请稍后重试</td></tr>`;
+                tbody.innerHTML = `<tr><td colspan="5" class="loading" style="color:red">网络错误，请稍后重试</td></tr>`;
             }
         }
-
-        // Auto load
-        fetchLogs();
-
-        // Auto refresh every 30s
-        setInterval(fetchLogs, 30000);
     </script>
 </body>
 
