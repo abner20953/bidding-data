@@ -255,6 +255,10 @@
                 <button class="refresh-btn" onclick="fetchLogs()">
                     <span>🔍</span> 查询
                 </button>
+
+                <button class="refresh-btn" style="background-color: #ef4444;" onclick="clearLogs()">
+                    <span>🗑️</span> 清空日志
+                </button>
             </div>
         </div>
 
@@ -283,6 +287,10 @@
     <script>
         // Init
         document.addEventListener('DOMContentLoaded', () => {
+            // 1. Default to Today
+            const today = new Date().toISOString().split('T')[0];
+            document.getElementById('dateFilter').value = today;
+
             fetchOptions();
             fetchLogs();
 
@@ -317,6 +325,28 @@
 
             } catch (error) {
                 console.error('Failed to load filter options:', error);
+            }
+        }
+
+        async function clearLogs() {
+            if (!confirm('⚠️ 警告：确定要清空数据库中的【所有】日志记录吗？此操作不可恢复！')) {
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/visitor_logs', { method: 'DELETE' });
+                const data = await response.json();
+
+                if (data.status === 'success') {
+                    alert('日志已在数据库中清空。');
+                    fetchLogs(); // Reload table
+                    fetchOptions(); // Reload dropdowns
+                } else {
+                    alert('清空失败: ' + data.error);
+                }
+            } catch (err) {
+                alert('网络错误，请稍后重试');
+                console.error(err);
             }
         }
 

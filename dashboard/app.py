@@ -343,8 +343,19 @@ def log_request(response):
 def visitor_logs_view():
     return render_template('access_logs.html')
 
-@app.route('/api/visitor_logs')
+@app.route('/api/visitor_logs', methods=['GET', 'DELETE'])
 def api_get_visitor_logs():
+    if request.method == 'DELETE':
+        try:
+            conn = sqlite3.connect(VISITOR_DB)
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM logs')
+            conn.commit()
+            conn.close()
+            return jsonify({"status": "success", "message": "All logs cleared."})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
     try:
         ip_query = request.args.get('ip', '').strip()
         path_query = request.args.get('path', '').strip()
