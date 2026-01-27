@@ -1,0 +1,38 @@
+# Version Control
+.git
+.gitignore
+.gitattributes
+.github
+
+# Virtual Environment
+.venv
+venv
+env
+
+# Python Cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+
+# Application Data (Large files not needed for build)
+file/
+results/
+model_data/
+dashboard/uploads/
+dashboard/visitor_logs.db
+dashboard/scheduler.log
+
+# IDE Settings
+.vscode
+.idea
+
+# Large Temp Files
+*.pdf
+*.7z
+*.zip
+*.log
+*.safetensors
+
+# Tests
+tests/
