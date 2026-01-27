@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -49,7 +50,7 @@
             align-items: center;
             gap: 4px;
         }
-        
+
         .back-link:hover {
             color: var(--primary-color);
         }
@@ -57,7 +58,7 @@
         .card {
             background: var(--card-bg);
             border-radius: 12px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
             overflow: hidden;
         }
 
@@ -90,7 +91,7 @@
         tr:last-child td {
             border-bottom: none;
         }
-        
+
         tr:hover {
             background-color: #f9fafb;
         }
@@ -102,19 +103,33 @@
             font-size: 12px;
             font-weight: 500;
         }
-        
-        .badge-pc { background-color: #dbeafe; color: #1e40af; }
-        .badge-mobile { background-color: #d1fae5; color: #065f46; }
-        
-        .badge-method-get { background-color: #e0e7ff; color: #3730a3; }
-        .badge-method-post { background-color: #fce7f3; color: #9d174d; }
+
+        .badge-pc {
+            background-color: #dbeafe;
+            color: #1e40af;
+        }
+
+        .badge-mobile {
+            background-color: #d1fae5;
+            color: #065f46;
+        }
+
+        .badge-method-get {
+            background-color: #e0e7ff;
+            color: #3730a3;
+        }
+
+        .badge-method-post {
+            background-color: #fce7f3;
+            color: #9d174d;
+        }
 
         .loading {
             text-align: center;
             padding: 40px;
             color: var(--text-sub);
         }
-        
+
         .refresh-btn {
             background-color: white;
             border: 1px solid var(--border-color);
@@ -124,12 +139,12 @@
             font-size: 14px;
             transition: all 0.2s;
         }
-        
+
         .refresh-btn:hover {
             background-color: #f3f4f6;
             border-color: #d1d5db;
         }
-        
+
         .meta-info {
             font-size: 12px;
             color: #9ca3af;
@@ -140,6 +155,7 @@
         }
     </style>
 </head>
+
 <body>
     <div class="container">
         <div class="header">
@@ -147,7 +163,11 @@
                 <a href="/all" class="back-link">← 返回导航</a>
                 <h1 style="margin-top: 8px;">访客日志监控</h1>
             </div>
-            <button class="refresh-btn" onclick="fetchLogs()">🔄 刷新列表</button>
+            <div>
+                <a href="/api/visitor_logs/download" class="refresh-btn"
+                    style="text-decoration:none; margin-right:8px;">⬇️ 导出数据库</a>
+                <button class="refresh-btn" onclick="fetchLogs()">🔄 刷新列表</button>
+            </div>
         </div>
 
         <div class="card">
@@ -164,7 +184,9 @@
                         </tr>
                     </thead>
                     <tbody id="logsBody">
-                        <tr><td colspan="6" class="loading">正在加载日志数据...</td></tr>
+                        <tr>
+                            <td colspan="6" class="loading">正在加载日志数据...</td>
+                        </tr>
                     </tbody>
                 </table>
             </div>
@@ -174,26 +196,26 @@
     <script>
         async function fetchLogs() {
             const tbody = document.getElementById('logsBody');
-            
+
             try {
                 const response = await fetch('/api/visitor_logs');
                 const data = await response.json();
-                
+
                 if (data.error) {
                     tbody.innerHTML = `<tr><td colspan="6" class="loading" style="color:red">加载失败: ${data.error}</td></tr>`;
                     return;
                 }
-                
+
                 if (data.length === 0) {
                     tbody.innerHTML = `<tr><td colspan="6" class="loading">暂无访客记录</td></tr>`;
                     return;
                 }
-                
+
                 tbody.innerHTML = data.map(log => {
                     const isMobile = log.device === 'Mobile';
                     const deviceClass = isMobile ? 'badge-mobile' : 'badge-pc';
                     const deviceIcon = isMobile ? '📱' : '💻';
-                    
+
                     return `
                         <tr>
                             <td>${log.timestamp}</td>
@@ -211,7 +233,7 @@
                         </tr>
                     `;
                 }).join('');
-                
+
             } catch (err) {
                 console.error(err);
                 tbody.innerHTML = `<tr><td colspan="6" class="loading" style="color:red">网络错误，请稍后重试</td></tr>`;
@@ -220,9 +242,10 @@
 
         // Auto load
         fetchLogs();
-        
+
         // Auto refresh every 30s
         setInterval(fetchLogs, 30000);
     </script>
 </body>
+
 </html>

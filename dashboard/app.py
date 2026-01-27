@@ -276,6 +276,16 @@ def api_get_visitor_logs():
 
 # --- 路由配置 ---
 
+@app.route('/api/visitor_logs/download')
+def api_download_visitor_db():
+    try:
+        if os.path.exists(VISITOR_DB):
+            return send_from_directory(BASE_DIR, 'visitor_logs.db', as_attachment=True)
+        else:
+            return jsonify({"error": "Database file not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/')
 def index():
     user_agent = request.user_agent.string.lower()
