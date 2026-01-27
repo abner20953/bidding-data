@@ -13,10 +13,10 @@ docker stop bidding-app 2>/dev/null
 docker rm bidding-app 2>/dev/null
 
 echo "2. 清理所有未使用的 Docker 对象 (镜像/缓存/网络)..."
-# -a: 清理未被任何容器使用的镜像 (不仅仅是 dangling)
-# -f: 强制执行不提示
-# --volumes: 清理未使用的数据卷 (注意：我们挂载的 /app/file 是主机路径，不会被删)
-docker system prune -a -f --volumes
+docker system prune -f
+
+echo "3. 深度清理 Docker 构建缓存 (针对那 43GB)..."
+docker builder prune -a -f
 
 echo "--------------------------------"
 echo "✅ 清理完成！"
