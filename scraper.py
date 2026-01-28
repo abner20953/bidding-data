@@ -106,14 +106,14 @@ def fetch_page(url, params=None):
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            response = requests.get(url, params=params, headers=headers, timeout=15)
+            response = requests.get(url, params=params, headers=headers, timeout=30)
             response.raise_for_status()
             response.encoding = 'utf-8'
             return response.text
         except Exception as e:
             if attempt < max_retries - 1:
                 print(f"请求失败，正在重试 ({attempt + 1}/{max_retries})...")
-                time.sleep(2)
+                time.sleep(5)
             else:
                 print(f"请求失败 (已重试{max_retries}次): {url}, 错误: {e}")
                 return None

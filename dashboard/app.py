@@ -271,10 +271,12 @@ def log_request(response):
         if request.path == '/favicon.ico':
             return response
         
-        # --- DEBUG: Print Headers to Console (for Cloud Diagnosis) ---
-        # Only print for non-static requests to optimize
-        if not 'visitor_logs' in request.path: 
-            print(f"DEBUG_HEADERS [{request.path}]: {dict(request.headers)}")
+
+
+        # --- Filter out invalid paths (User Request: Only log real existing access paths) ---
+        # If request.url_rule is None, it means the request did not match any defined route.
+        if not request.url_rule:
+            return response
 
         # --- 1. Robust IP Detection ---
         # ProxyFix (applied above) should make remote_addr correct.
@@ -947,9 +949,9 @@ def scheduled_job():
 
 # 添加定时任务并启动调度器
 try:
-    scheduler.add_job(id='daily_task', func=scheduled_job, trigger='cron', hour=2, minute=0)
+    scheduler.add_job(id='daily_task', func=scheduled_job, trigger='cron', hour=7, minute=0)
     scheduler.start()
-    print("✅ 定时任务调度器已启动 (每天 02:00 执行)")
+    print("✅ 定时任务调度器已启动 (每天 07:00 执行)")
 except Exception as e:
     print(f"⚠️ 调度器启动失败: {e}")
 
