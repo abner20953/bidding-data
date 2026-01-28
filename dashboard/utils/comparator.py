@@ -8,6 +8,7 @@ class CollusionDetector:
     def __init__(self, tender_path):
         self.tender_path = tender_path
         self.tender_sentences = set()
+        self.tender_skeletons = set()
         self.tender_full_text = ""
         if tender_path and os.path.exists(tender_path):
             self.load_tender()
