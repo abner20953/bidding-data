@@ -875,10 +875,10 @@ def scheduled_job():
     
     today = date.today()
     
-    # --- 1. 自动采集逻辑 (今天、明天、后天) ---
+    # --- 1. 自动采集逻辑 (今天、明天、后天、大后天) ---
     scrape_targets = []
-    for i in range(3):
-        target_date = today + timedelta(days=i) # 0=今天, 1=明天, 2=后天
+    for i in range(4):
+        target_date = today + timedelta(days=i) # 0=今天, 1=明天, 2=后天, 3=大后天
         
         # 检查文件是否已存在
         date_str_iso = target_date.strftime("%Y年%m月%d日")
