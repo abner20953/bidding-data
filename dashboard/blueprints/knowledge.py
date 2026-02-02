@@ -1,0 +1,444 @@
+from flask import Blueprint, render_template, request, jsonify, current_app, send_from_directory
+import sqlite3
+import os
+import datetime
+import json
+import jieba
+import time
+
+# 定义 Blueprint
+knowledge_bp = Blueprint('knowledge', __name__, 
+                        template_folder='../templates/knowledge',
+                        url_prefix='/anli')
+
+DB_NAME = 'knowledge_base.db'
+
+def get_db_path():
+    base_dir = current_app.config.get('BASE_DIR')
+    if not base_dir:
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_dir, '..', DB_NAME)
+
+def init_db():
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    
+    # 1. 条目表
+    # Check ifscreenshot column exists, if not need to add it (or just fail gracefully/recreate for dev)
+    # For simplicity in this dev phase, let's CREATE IF NOT EXISTS. 
+    # MIGRATION STRATEGY: user has almost no data. 
+    # But to be safe, we will try to add column if missing.
+    
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            type TEXT NOT NULL, 
+            tags TEXT, 
+            content TEXT, 
+            url TEXT,
+            publish_date TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            screenshot TEXT -- Path to uploaded screenshot
+        )
+    ''')
+    
+    # Try adding screenshot column if it doesn't exist (for existing DB)
+    try:
+        c.execute("ALTER TABLE entries ADD COLUMN screenshot TEXT")
+    except sqlite3.OperationalError:
+        pass # Column likely exists
+    
+    # 2. 评论表
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_id INTEGER,
+            username TEXT,
+            content TEXT,
+            created_at TEXT,
+            FOREIGN KEY(entry_id) REFERENCES entries(id)
+        )
+    ''')
+    
+    # 3. 标签表 (New)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE
+        )
+    ''')
+    
+    # Pre-populate some tags if empty
+    try:
+        count = c.execute("SELECT COUNT(*) FROM tags").fetchone()[0]
+        if count == 0:
+            defaults = ["招投标", "政府采购", "信息化", "法律法规", "违规案例", "合同管理"]
+            c.executemany("INSERT INTO tags (name) VALUES (?)", [(t,) for t in defaults])
+    except:
+        pass
+        
+    conn.commit()
+    conn.close()
+
+db_initialized = False
+
+def get_db():
+    global db_initialized
+    if not db_initialized:
+        init_db()
+        db_initialized = True
+    
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# --- Routes ---
+
+@knowledge_bp.route('/')
+def index():
+    return render_template('list.html')
+
+@knowledge_bp.route('/view/<int:id>')
+def view_entry(id):
+    conn = get_db()
+    entry = conn.execute('SELECT * FROM entries WHERE id = ?', (id,)).fetchone()
+    comments = conn.execute('SELECT * FROM comments WHERE entry_id = ? ORDER BY id DESC', (id,)).fetchall()
+    conn.close()
+    
+    if not entry:
+        return "Not Found", 404
+        
+    return render_template('detail.html', entry=dict(entry), comments=[dict(c) for c in comments])
+
+@knowledge_bp.route('/edit')
+@knowledge_bp.route('/edit/<int:id>')
+def edit_entry(id=None):
+    entry = {}
+    if id:
+        conn = get_db()
+        row = conn.execute('SELECT * FROM entries WHERE id = ?', (id,)).fetchone()
+        conn.close()
+        if row:
+            entry = dict(row)
+    return render_template('edit.html', entry=entry)
+
+# --- APIs ---
+
+@knowledge_bp.route('/api/list')
+def api_list():
+    query = request.args.get('q', '').strip()
+    type_filter = request.args.get('type', '')
+    tag_filter = request.args.get('tag', '')
+    page = int(request.args.get('page', 1))
+    per_page = 20
+    offset = (page - 1) * per_page
+    
+    conn = get_db()
+    # Fetch full content to generate snippet in Python
+    sql = "SELECT id, title, type, tags, publish_date, created_at, content, screenshot FROM entries WHERE 1=1"
+    params = []
+    
+    if type_filter:
+        sql += " AND type = ?"
+        params.append(type_filter)
+        
+    if tag_filter:
+        # Support multi-tags separated by comma (OR logic)
+        tags = [t.strip() for t in tag_filter.split(',') if t.strip()]
+        if tags:
+            tag_clauses = []
+            for t in tags:
+                tag_clauses.append("tags LIKE ?")
+                params.append(f'%"{t}"%')
+            sql += " AND (" + " OR ".join(tag_clauses) + ")" 
+    
+    search_terms = []
+    if query:
+        seg_list = list(jieba.cut_for_search(query))
+        if seg_list:
+            sub_clauses = []
+            for term in seg_list:
+                term = term.strip()
+                if term:
+                    search_terms.append(term)
+                    sub_clauses.append(f"(title LIKE ? OR content LIKE ?)")
+                    params.extend([f'%{term}%', f'%{term}%'])
+            if sub_clauses:
+                sql += " AND (" + " AND ".join(sub_clauses) + ")"
+                
+    count_sql = "SELECT COUNT(*) FROM (" + sql + ")"
+    total = conn.execute(count_sql, params).fetchone()[0]
+    
+    sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    params.extend([per_page, offset])
+    
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    
+    results = []
+    for row in rows:
+        item = dict(row)
+        content = item.pop('content') or '' # Remove full content from response
+        
+        # Smart Snippet Logic
+        summary = content[:200]
+        if query:
+            content_lower = content.lower()
+            query_lower = query.lower()
+            
+            # 1. Try exact phrase match first
+            best_pos = content_lower.find(query_lower)
+            
+            # 2. If not found, try finding the earliest occurrence of individual terms
+            if best_pos == -1 and search_terms:
+                min_pos = -1
+                for term in search_terms:
+                    pos = content_lower.find(term.lower())
+                    if pos != -1:
+                        if min_pos == -1 or pos < min_pos:
+                            min_pos = pos
+                best_pos = min_pos
+            
+            if best_pos != -1:
+                start = max(0, best_pos - 30)
+                end = min(len(content), start + 200)
+                summary = ('...' if start > 0 else '') + content[start:end] + ('...' if end < len(content) else '')
+        
+        item['summary'] = summary
+        results.append(item)
+    
+    return jsonify({
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "data": results
+    })
+
+@knowledge_bp.route('/api/tags', methods=['GET', 'POST', 'PUT'])
+def api_tags():
+    conn = get_db()
+    if request.method == 'GET':
+        rows = conn.execute("SELECT name FROM tags ORDER BY id").fetchall()
+        conn.close()
+        return jsonify([r['name'] for r in rows])
+        
+    if request.method == 'POST':
+        name = request.get_json().get('name', '').strip()
+        if not name:
+            return jsonify({"error": "标签名不能为空"}), 400
+        try:
+            conn.execute("INSERT INTO tags (name) VALUES (?)", (name,))
+            conn.commit()
+            status = "success"
+        except sqlite3.IntegrityError:
+            status = "exists"
+        conn.close()
+        return jsonify({"status": status, "name": name})
+
+    if request.method == 'PUT':
+        data = request.get_json()
+        old_name = data.get('old_name', '').strip()
+        new_name = data.get('new_name', '').strip()
+        
+        if not old_name or not new_name:
+            return jsonify({"error": "标签名不能为空"}), 400
+            
+        try:
+            # 1. Update tags table
+            conn.execute("UPDATE tags SET name=? WHERE name=?", (new_name, old_name))
+            
+            # 2. Update entries (Global Rename)
+            cursor = conn.execute("SELECT id, tags FROM entries WHERE tags LIKE ?", (f'%"{old_name}"%',))
+            rows = cursor.fetchall()
+            
+            for row in rows:
+                try:
+                    entry_id = row['id']
+                    tags_list = json.loads(row['tags'])
+                    if old_name in tags_list:
+                        new_tags_list = [new_name if t == old_name else t for t in tags_list]
+                        new_tags_list = list(set(new_tags_list)) 
+                        conn.execute("UPDATE entries SET tags=? WHERE id=?", 
+                                    (json.dumps(new_tags_list, ensure_ascii=False), entry_id))
+                except:
+                    pass
+                    
+            conn.commit()
+            return jsonify({"status": "success"})
+        except sqlite3.IntegrityError:
+             return jsonify({"error": "该标签名已存在"}), 400
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        finally:
+            conn.close()
+
+    if request.method == 'DELETE':
+        name = request.get_json().get('name', '').strip()
+        if not name:
+             return jsonify({"error": "标签名不能为空"}), 400
+             
+        try:
+            # 1. Delete from tags table
+            conn.execute("DELETE FROM tags WHERE name=?", (name,))
+            
+            # 2. Remove from entries
+            cursor = conn.execute("SELECT id, tags FROM entries WHERE tags LIKE ?", (f'%"{name}"%',))
+            rows = cursor.fetchall()
+            
+            for row in rows:
+                try:
+                    entry_id = row['id']
+                    tags_list = json.loads(row['tags'])
+                    if name in tags_list:
+                        new_tags_list = [t for t in tags_list if t != name]
+                        conn.execute("UPDATE entries SET tags=? WHERE id=?", 
+                                    (json.dumps(new_tags_list, ensure_ascii=False), entry_id))
+                except:
+                    pass
+            
+            conn.commit()
+            return jsonify({"status": "success"})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        finally:
+            conn.close()
+
+@knowledge_bp.route('/api/save', methods=['POST'])
+def api_save():
+    data = request.get_json()
+    id = data.get('id')
+    title = data.get('title')
+    type_val = data.get('type')
+    tags = json.dumps(data.get('tags', []), ensure_ascii=False)
+    content = data.get('content')
+    url = data.get('url')
+    publish_date = data.get('publish_date')
+    screenshot = data.get('screenshot') # New field
+    
+    if not title or not content:
+        return jsonify({"error": "标题和内容不能为空"}), 400
+        
+    conn = get_db()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    if id:
+        conn.execute('''
+            UPDATE entries SET title=?, type=?, tags=?, content=?, url=?, publish_date=?, screenshot=?, updated_at=?
+            WHERE id=?
+        ''', (title, type_val, tags, content, url, publish_date, screenshot, now, id))
+    else:
+        conn.execute('''
+            INSERT INTO entries (title, type, tags, content, url, publish_date, screenshot, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (title, type_val, tags, content, url, publish_date, screenshot, now, now))
+        
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "success"})
+
+@knowledge_bp.route('/api/comment', methods=['POST'])
+def api_comment():
+    data = request.get_json()
+    entry_id = data.get('entry_id')
+    username = data.get('username', '匿名用户')
+    content = data.get('content')
+    
+    if not entry_id or not content:
+        return jsonify({"error": "参数缺失"}), 400
+        
+    conn = get_db()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute('INSERT INTO comments (entry_id, username, content, created_at) VALUES (?, ?, ?, ?)',
+                (entry_id, username, content, now))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "success"})
+
+@knowledge_bp.route('/api/extract', methods=['POST'])
+def api_extract():
+    import requests
+    from bs4 import BeautifulSoup
+    
+    url = request.get_json().get('url')
+    if not url:
+        return jsonify({"error": "URL cannot be empty"}), 400
+        
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.encoding = resp.apparent_encoding 
+        
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        
+        title = ""
+        content = ""
+        publish_date = ""
+        
+        if "gov.cn" in url:
+            h1 = soup.find('h1') or soup.find(class_='article-title')
+            if h1: title = h1.get_text().strip()
+            article = soup.find(id='UCAP-CONTENT') or soup.find(class_='pages_content') or soup.find(class_='article-content')
+            if article:
+                content = article.get_text('\n', strip=True)
+            meta_date = soup.find('meta', {'name': 'pubdate'})
+            if meta_date: publish_date = meta_date.get('content')
+        elif "ccgp" in url:
+            title_node = soup.find(class_='vF_detail_header') or soup.find('h1') or soup.find(class_='title')
+            if title_node: title = title_node.get_text().strip()
+            content_node = soup.find(class_='vF_detail_content') or soup.find(class_='table')
+            if content_node:
+                content = content_node.get_text('\n', strip=True)
+        else:
+            if soup.title: title = soup.title.string.strip()
+            h1 = soup.find('h1')
+            if h1: title = h1.get_text().strip()
+            ps = soup.find_all('p')
+            content = "\n".join([p.get_text().strip() for p in ps if len(p.get_text().strip()) > 10])
+
+        return jsonify({
+            "status": "success",
+            "data": {
+                "title": title,
+                "content": content,
+                "publish_date": publish_date,
+                "url": url
+            }
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@knowledge_bp.route('/api/upload', methods=['POST'])
+def api_upload():
+    if 'file' not in request.files:
+         return jsonify({"error": "No file part"}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+        
+    if file:
+        # Generate safe filename
+        ext = os.path.splitext(file.filename)[1]
+        filename = f"{int(time.time())}_{os.urandom(4).hex()}{ext}"
+        
+        # Save path relative to app root
+        # Ideally this should be passed from config, but we hardcode for simplicity as request by user task
+        # dashboard/static/uploads
+        base_dir = current_app.root_path # this is dashboard/
+        upload_folder = os.path.join(base_dir, 'static', 'uploads')
+        
+        if not os.path.exists(upload_folder):
+            os.makedirs(upload_folder)
+            
+        file.save(os.path.join(upload_folder, filename))
+        
+        # Return web accessible path
+        web_path = f"/static/uploads/{filename}"
+        return jsonify({"status": "success", "file_path": web_path})
+    
+    return jsonify({"error": "Upload failed"}), 500

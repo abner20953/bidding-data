@@ -10,6 +10,7 @@ results/
 logs/
 model_data/
 dashboard/uploads/
+dashboard/static/uploads/
 file/
 *.log
 *.db

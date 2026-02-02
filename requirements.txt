@@ -10,3 +10,4 @@ pdfplumber
 psutil
 datasketch
 PyMuPDF
+jieba

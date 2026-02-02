@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ entry.title }} - 法律法规与案例库</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        :root {
+            --bg-gradient: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            --card-bg: rgba(255, 255, 255, 0.9);
+            --card-border: rgba(255, 255, 255, 0.8);
+            --text-primary: #1f2937;
+        }
+
+        body {
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            background: var(--bg-gradient);
+            color: var(--text-primary);
+            min-height: 100vh;
+        }
+
+        .navbar {
+            background: rgba(255, 255, 255, 0.8) !important;
+            backdrop-filter: blur(10px);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.5);
+        }
+
+        .navbar-brand,
+        .nav-link {
+            color: var(--text-primary) !important;
+            font-weight: 600;
+        }
+
+        .content-box {
+            background: var(--card-bg);
+            border-radius: 16px;
+            padding: 40px;
+            margin-top: 30px;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.05);
+            border: 1px solid var(--card-border);
+            backdrop-filter: blur(12px);
+        }
+
+        .meta-info {
+            color: #6b7280;
+            font-size: 0.95rem;
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+        }
+
+        .entry-content {
+            font-size: 1.1rem;
+            line-height: 1.8;
+            color: #374151;
+            white-space: pre-wrap;
+        }
+
+        .comment-section {
+            background: rgba(255, 255, 255, 0.8);
+            border-radius: 12px;
+            padding: 30px;
+            margin-top: 30px;
+            margin-bottom: 50px;
+        }
+
+        .badge-law {
+            background-color: #3b82f6;
+        }
+
+        .badge-case {
+            background-color: #10b981;
+        }
+
+        .screenshot-container {
+            margin: 20px 0;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        .screenshot-container img {
+            max-width: 100%;
+            height: auto;
+            display: block;
+        }
+    </style>
+</head>
+
+<body>
+    <nav class="navbar navbar-expand-lg mb-4">
+        <div class="container">
+            <a class="navbar-brand" href="/"><i class="fas fa-home"></i> Smarter Tools</a>
+            <div class="navbar-nav">
+                <a class="nav-link" href="/anli"><i class="fas fa-chevron-left"></i> 返回列表</a>
+            </div>
+            <a href="/anli/edit/{{ entry.id }}" class="btn btn-outline-primary btn-sm ms-auto rounded-pill px-3"><i
+                    class="fas fa-edit"></i> 编辑</a>
+        </div>
+    </nav>
+
+    <div class="container pb-5">
+        <div class="content-box">
+            <h1 class="mb-3 fw-bold">{{ entry.title }}</h1>
+
+            <div class="meta-info d-flex flex-wrap align-items-center">
+                <span
+                    class="badge {{ 'badge-law' if entry.type == '法律法规' else 'badge-case' }} me-3 rounded-pill px-3">{{
+                    entry.type }}</span>
+                <span class="me-3"><i class="far fa-clock"></i> 发布: {{ entry.publish_date or '未知' }}</span>
+                <span class="me-3"><i class="fas fa-user-edit"></i> 录入: {{ entry.created_at.split(' ')[0] }}</span>
+                {% if entry.url %}
+                <a href="{{ entry.url }}" target="_blank" class="text-decoration-none text-primary"><i
+                        class="fas fa-external-link-alt"></i> 原始链接</a>
+                {% endif %}
+            </div>
+
+
+
+            <!-- Content -->
+            <div class="entry-content">
+                {{ entry.content }}
+            </div>
+
+        </div>
+
+        <!-- Screenshot (Only for '案例' and if exists) -->
+        {% if entry.type == '案例' and entry.screenshot and entry.screenshot != 'None' and entry.screenshot|length > 0 %}
+        <div class="screenshot-container mt-4">
+            <h5 class="fw-bold mb-3"><i class="far fa-image"></i> 原文截图</h5>
+            <img src="{{ entry.screenshot }}" alt="Screenshot">
+        </div>
+        {% endif %}
+
+        <!-- Tags -->
+        <div class="mt-5 pt-4 border-top">
+            <span class="text-muted small me-2"><i class="fas fa-tags"></i> 标签:</span>
+            <span id="tagsContainer"></span>
+            <script>
+                try {
+                    const tags = JSON.parse('{{ entry.tags | safe }}');
+                    const container = document.getElementById('tagsContainer');
+                    if (tags && tags.length > 0) {
+                        tags.forEach(t => {
+                            const span = document.createElement('span');
+                            span.className = 'badge bg-secondary me-1 fw-normal';
+                            span.textContent = t;
+                            container.appendChild(span);
+                        });
+                    } else {
+                        container.innerHTML = '<span class="text-muted small">无</span>';
+                    }
+                } catch (e) { }
+            </script>
+        </div>
+        <!-- Container continues to wrap comments -->
+
+        <!-- Comments -->
+        <div class="comment-section">
+            <h4 class="mb-4 fw-bold"><i class="far fa-comments"></i> 留言备注</h4>
+
+            <div id="commentList" class="mb-4">
+                {% for comment in comments %}
+                <div class="d-flex mb-3 align-items-start border-bottom pb-3">
+                    <div class="flex-shrink-0 bg-light rounded-circle text-center d-flex align-items-center justify-content-center"
+                        style="width: 40px; height: 40px; color: #666;">
+                        <i class="fas fa-user"></i>
+                    </div>
+                    <div class="flex-grow-1 ms-3">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <h6 class="mb-0 fw-bold">{{ comment.username }}</h6>
+                            <small class="text-muted">{{ comment.created_at }}</small>
+                        </div>
+                        <p class="mb-0 mt-1 text-secondary">{{ comment.content }}</p>
+                    </div>
+                </div>
+                {% endfor %}
+                {% if not comments %}
+                <div class="text-muted text-center py-3 bg-light rounded">暂无留言</div>
+                {% endif %}
+            </div>
+
+            <form id="commentForm">
+                <div class="row g-3">
+                    <div class="col-md-3">
+                        <input type="text" class="form-control" id="username" placeholder="您的姓名">
+                    </div>
+                    <div class="col-md-7">
+                        <input type="text" class="form-control" id="commentContent" placeholder="写下您的备注..." required>
+                    </div>
+                    <div class="col-md-2">
+                        <button type="submit" class="btn btn-primary w-100">发 送</button>
+                    </div>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('commentForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const btn = e.target.querySelector('button');
+            const username = document.getElementById('username').value || '匿名用户';
+            const content = document.getElementById('commentContent').value;
+
+            if (!content) return;
+
+            btn.disabled = true;
+            try {
+                const resp = await fetch('/anli/api/comment', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        entry_id: {{ entry.id }},
+                    username: username,
+                    content: content
+                    })
+                });
+        const res = await resp.json();
+        if (res.status === 'success') {
+            location.reload();
+        } else {
+            alert('提交失败: ' + (res.error || '未知错误'));
+        }
+            } catch (e) {
+            alert('网络错误');
+        } finally {
+            btn.disabled = false;
+        }
+        });
+    </script>
+</body>
+
+</html>

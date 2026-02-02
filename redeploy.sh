@@ -35,10 +35,24 @@ if [ ! -d "file" ]; then
     mkdir -p file
 fi
 
+# Ensure Uploads directory exists
+if [ ! -d "dashboard/static/uploads" ]; then
+    echo "📂 创建上传目录..."
+    mkdir -p dashboard/static/uploads
+fi
+
+# Ensure DB files exist (otherwise Docker creates them as directories)
+if [ ! -f "knowledge_base.db" ]; then
+    touch knowledge_base.db
+fi
+if [ ! -f "dashboard/visitor_logs.db" ]; then
+    touch dashboard/visitor_logs.db
+fi
+
 echo "🔒 正在修正目录权限..."
-# 尝试将 file 目录及其内容的所有者设置为 UID 1000 (容器内用户)
-# 2>/dev/null 屏蔽错误输出 (比如在非 Linux 环境或无权限时)
-chown -R 1000:1000 file 2>/dev/null || echo "⚠️ 自动修改权限失败(非Root?)，如果遇到 'Permission denied' 请手动执行: sudo chown -R 1000:1000 file"
+# 尝试将 file/uploads 目录及其内容的所有者设置为 UID 1000 (容器内用户)
+chown -R 1000:1000 file dashboard/static/uploads knowledge_base.db dashboard/visitor_logs.db 2>/dev/null || echo "⚠️ 自动修改权限失败"
+
 # 4. 重启容器
 echo "🔄 正在重启容器..."
 docker stop bidding-app
@@ -50,6 +64,9 @@ docker run -d \
   -p 80:7860 \
   -v $(pwd)/results:/app/results \
   -v $(pwd)/file:/app/file \
+  -v $(pwd)/dashboard/static/uploads:/app/dashboard/static/uploads \
+  -v $(pwd)/knowledge_base.db:/app/knowledge_base.db \
+  -v $(pwd)/dashboard/visitor_logs.db:/app/dashboard/visitor_logs.db \
   bidding-app
 
 if [ $? -eq 0 ]; then

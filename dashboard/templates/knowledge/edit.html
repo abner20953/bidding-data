@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ '编辑' if entry.id else '录入' }} - 法律法规与案例库</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        :root {
+            --bg-gradient: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            --card-bg: rgba(255, 255, 255, 0.85);
+            --card-border: rgba(255, 255, 255, 0.9);
+            --text-primary: #1f2937;
+            --text-secondary: #6b7280;
+            --primary-color: #3b82f6;
+        }
+
+        body {
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            background: var(--bg-gradient);
+            color: var(--text-primary);
+            min-height: 100vh;
+            padding-bottom: 40px;
+        }
+
+        .navbar {
+            background: rgba(255, 255, 255, 0.8) !important;
+            backdrop-filter: blur(10px);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.5);
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+        }
+
+        .navbar-brand,
+        .nav-link {
+            color: var(--text-primary) !important;
+            font-weight: 600;
+        }
+
+        .editor-container {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+            padding: 40px;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.05);
+            backdrop-filter: blur(12px);
+            margin-top: 30px;
+        }
+
+        .form-label {
+            font-weight: 600;
+            color: #4b5563;
+        }
+
+        .form-control,
+        .form-select {
+            border-radius: 8px;
+            border: 1px solid #e5e7eb;
+            padding: 10px 15px;
+            background: rgba(255, 255, 255, 0.9);
+        }
+
+        .form-control:focus {
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+        }
+
+        .tag-checkbox-group .btn-check+.btn-outline-primary {
+            border-radius: 20px;
+            padding: 5px 15px;
+            margin: 0 5px 5px 0;
+            border-color: #e5e7eb;
+            color: var(--text-secondary);
+        }
+
+        .tag-checkbox-group .btn-check:checked+.btn-outline-primary {
+            background-color: var(--primary-color);
+            border-color: var(--primary-color);
+            color: white;
+        }
+
+        .img-preview {
+            max-width: 100%;
+            height: auto;
+            border-radius: 8px;
+            margin-top: 10px;
+            border: 1px solid #ddd;
+            display: none;
+        }
+    </style>
+</head>
+
+<body>
+    <nav class="navbar navbar-expand-lg mb-4">
+        <div class="container">
+            <a class="navbar-brand" href="/"><i class="fas fa-home"></i> Smarter Tools</a>
+            <div class="navbar-nav">
+                <a class="nav-link" href="/anli"><i class="fas fa-chevron-left"></i> 返回列表</a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container">
+        <div class="editor-container">
+            <h2 class="mb-4 text-center">{{ '编辑条目' if entry.id else '录入新条目' }}</h2>
+
+            <form id="entryForm">
+                <input type="hidden" id="entryId" value="{{ entry.id }}">
+                <input type="hidden" id="screenshotPath" value="{{ entry.screenshot }}">
+
+                <!-- URL Auto Extract -->
+                <div class="mb-4 p-4 bg-white rounded-3 shadow-sm border">
+                    <label class="form-label text-primary"><i class="fas fa-magic"></i> 智能抓取</label>
+                    <div class="input-group">
+                        <input type="text" id="autoUrl" class="form-control" placeholder="输入文章网址...">
+                        <button class="btn btn-primary" type="button" onclick="autoExtract()">抓取内容</button>
+                    </div>
+                </div>
+
+                <div class="row g-4">
+                    <div class="col-md-8">
+                        <div class="mb-3">
+                            <label class="form-label">标题 <span class="text-danger">*</span></label>
+                            <input type="text" class="form-control form-control-lg fw-bold" id="title"
+                                value="{{ entry.title }}" required>
+                        </div>
+                    </div>
+                    <div class="col-md-4">
+                        <div class="mb-3">
+                            <label class="form-label">类型 <span class="text-danger">*</span></label>
+                            <select class="form-select form-select-lg" id="type" required onchange="toggleCaseFields()">
+                                <option value="法律法规" {{ 'selected' if entry.type=='法律法规' else '' }}>法律法规</option>
+                                <option value="案例" {{ 'selected' if entry.type=='案例' else '' }}>案例</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="mb-3">
+                    <label class="form-label">标签 <span class="text-danger">*</span></label>
+                    <div class="p-3 border rounded bg-white" style="min-height: 60px;">
+                        <div id="selectedRefTags" class="d-flex flex-wrap gap-2 mb-2">
+                            <!-- Selected tags will appear here -->
+                            <span class="text-muted small align-self-center fst-italic" id="noTagsHint">未选择标签...</span>
+                        </div>
+                        <div class="d-flex gap-2">
+                            <button type="button" class="btn btn-sm btn-outline-primary rounded-pill px-3"
+                                onclick="openSelectTagModal()">
+                                <i class="fas fa-check-square"></i> 选择标签
+                            </button>
+                            <button type="button" class="btn btn-sm btn-outline-secondary rounded-pill px-3"
+                                onclick="openManageTagModal()">
+                                <i class="fas fa-cog"></i> 管理标签
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="row g-4">
+                    <div class="col-md-6">
+                        <label class="form-label">发布时间</label>
+                        <input type="date" class="form-control" id="publishDate" value="{{ entry.publish_date }}">
+                    </div>
+                    <div class="col-md-6">
+                        <label class="form-label">原始链接</label>
+                        <input type="text" class="form-control" id="originalUrl" value="{{ entry.url }}">
+                    </div>
+                </div>
+
+                <!-- Case Specific: Upload -->
+                <div id="caseFields" class="mt-4 mb-4 p-3 bg-light rounded border d-none">
+                    <label class="form-label"><i class="fas fa-image"></i> 案例截图/附件</label>
+                    <input type="file" class="form-control" id="imageInput" accept="image/*">
+                    <div class="mt-2">
+                        <img id="imagePreview" class="img-preview" src="{{ entry.screenshot }}"
+                            style="{{ 'display:block' if entry.screenshot else '' }}">
+                    </div>
+                </div>
+
+                <div class="mb-4 mt-4">
+                    <label class="form-label">正文内容 <span class="text-danger">*</span></label>
+                    <textarea class="form-control" id="content" rows="15" required
+                        placeholder="在此输入详细内容...">{{ entry.content }}</textarea>
+                </div>
+
+                <div class="d-grid gap-2">
+                    <button type="submit" class="btn btn-primary btn-lg">保 存</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Manage Tags Modal -->
+    <!-- Select Tags Modal -->
+    <div class="modal fade" id="selectTagModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header border-0 pb-0">
+                    <h5 class="modal-title fw-bold">选择标签</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <input type="text" class="form-control form-control-sm" id="searchSelectTagInput"
+                            placeholder="🔍 搜索标签..." oninput="filterSelectTags()">
+                    </div>
+                    <div id="selectTagList" class="row g-2" style="max-height: 400px; overflow-y: auto; padding: 2px;">
+                        <!-- Tags rendered here -->
+                        <div class="col-12 text-center text-muted py-3">加载中...</div>
+                    </div>
+                </div>
+                <div class="modal-footer border-0 pt-0">
+                    <button type="button" class="btn btn-primary" data-bs-dismiss="modal"
+                        onclick="confirmSelection()">确定</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Manage Tags Modal -->
+    <div class="modal fade" id="manageTagModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header border-0 pb-0">
+                    <h5 class="modal-title fw-bold">管理标签库</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <!-- Add New Tag -->
+                    <div class="bg-light p-3 rounded mb-4 border">
+                        <label class="form-label fw-bold small text-primary mb-2"><i class="fas fa-plus"></i>
+                            新增标签</label>
+                        <div class="input-group">
+                            <input type="text" class="form-control" id="newTagName" placeholder="输入新标签名称...">
+                            <button class="btn btn-primary px-4" onclick="addNewTag()">添加</button>
+                        </div>
+                    </div>
+
+                    <!-- Manage List -->
+                    <div class="d-flex justify-content-between align-items-center mb-2">
+                        <label class="form-label fw-bold small text-secondary mb-0"><i class="fas fa-list"></i> 现有标签
+                            (总数: <span id="manageTagCount">0</span>)</label>
+                    </div>
+                    <div class="mb-3">
+                        <input type="text" class="form-control form-control-sm" id="searchManageTagInput"
+                            placeholder="🔍 搜索标签..." oninput="filterManageTags()">
+                    </div>
+                    <div id="manageTagList" class="row g-2" style="max-height: 350px; overflow-y: auto; padding: 2px;">
+                        <!-- Tags rendered here -->
+                    </div>
+                </div>
+                <div class="modal-footer border-0 pt-0">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        const selectTagModal = new bootstrap.Modal(document.getElementById('selectTagModal'));
+        const manageTagModal = new bootstrap.Modal(document.getElementById('manageTagModal'));
+
+        let selectedTags = new Set();
+        let tempSelectedTags = new Set(); // For Selection Modal only
+        let allTags = [];
+
+        document.addEventListener('DOMContentLoaded', () => {
+            // Set Default Date if empty
+            const dateInput = document.getElementById('publishDate');
+            if (!dateInput.value) {
+                dateInput.valueAsDate = new Date();
+            }
+
+            // Initial Tag Load
+            loadInitialTags();
+            toggleCaseFields();
+
+            // Image Upload Handler
+            document.getElementById('imageInput').addEventListener('change', async function (e) {
+                const file = e.target.files[0];
+                if (!file) return;
+
+                const formData = new FormData();
+                formData.append('file', file);
+
+                try {
+                    const resp = await fetch('/anli/api/upload', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    const res = await resp.json();
+                    if (res.status === 'success') {
+                        document.getElementById('screenshotPath').value = res.file_path;
+                        const img = document.getElementById('imagePreview');
+                        img.src = res.file_path;
+                        img.style.display = 'block';
+                    } else {
+                        alert('上传失败: ' + res.error);
+                        e.target.value = ''; // clear
+                    }
+                } catch (err) {
+                    alert('上传出错');
+                }
+            });
+        });
+
+        function toggleCaseFields() {
+            const type = document.getElementById('type').value;
+            const caseFields = document.getElementById('caseFields');
+            if (type === '案例') {
+                caseFields.classList.remove('d-none');
+            } else {
+                caseFields.classList.add('d-none');
+            }
+        }
+
+        async function loadInitialTags() {
+            try {
+                // Parse server-provided tags for this entry
+                const serverTags = JSON.parse('{{ entry.tags | safe }}' || '[]');
+                serverTags.forEach(t => selectedTags.add(t));
+                updateMainTagDisplay();
+            } catch (e) {
+                console.error('Initial tag parse error', e);
+            }
+        }
+
+        function updateMainTagDisplay() {
+            const container = document.getElementById('selectedRefTags');
+            const hint = document.getElementById('noTagsHint');
+
+            // Clear current badges (except hint)
+            const badges = container.querySelectorAll('.badge');
+            badges.forEach(b => b.remove());
+
+            if (selectedTags.size === 0) {
+                hint.style.display = 'block';
+            } else {
+                hint.style.display = 'none';
+
+                selectedTags.forEach(tag => {
+                    const badge = document.createElement('span');
+                    badge.className = 'badge bg-primary text-white d-flex align-items-center py-2 px-3 shadow-sm';
+                    badge.style.fontSize = '0.9rem';
+                    badge.innerHTML = `
+                        ${tag} 
+                        <i class="fas fa-times ms-2 cursor-pointer" onclick="removeTagSelection('${tag}')" style="cursor:pointer; opacity:0.8;"></i>
+                    `;
+                    container.appendChild(badge);
+                });
+            }
+        }
+
+        function removeTagSelection(tag) {
+            selectedTags.delete(tag);
+            updateMainTagDisplay();
+        }
+
+        async function fetchTags() {
+            try {
+                const resp = await fetch('/anli/api/tags');
+                allTags = await resp.json();
+                return true;
+            } catch (e) { return false; }
+        }
+
+        // ================= SELECT MODAL LOGIC =================
+        async function openSelectTagModal() {
+            await fetchTags();
+            // Copy current selection to temp
+            tempSelectedTags = new Set(selectedTags);
+            renderSelectTags();
+            selectTagModal.show();
+        }
+
+        function renderSelectTags() {
+            const query = document.getElementById('searchSelectTagInput').value.toLowerCase();
+            const container = document.getElementById('selectTagList');
+            container.innerHTML = '';
+
+            const filtered = allTags.filter(t => t.toLowerCase().includes(query));
+
+            if (filtered.length === 0) {
+                container.innerHTML = '<div class="col-12 text-center text-muted py-3">无匹配标签</div>';
+                return;
+            }
+
+            filtered.forEach(tag => {
+                const isChecked = tempSelectedTags.has(tag) ? 'checked' : '';
+                const col = document.createElement('div');
+                col.className = 'col-md-4 col-sm-6';
+                col.innerHTML = `
+                <div class="p-2 border rounded bg-white shadow-sm hover-bg-light" onclick="toggleTempSelection(this, '${tag}')" style="cursor:pointer">
+                    <div class="form-check pointer-events-none">
+                        <input class="form-check-input" type="checkbox" ${isChecked}>
+                        <label class="form-check-label user-select-none">
+                            ${tag}
+                        </label>
+                    </div>
+                </div>
+            `;
+                container.appendChild(col);
+            });
+        }
+
+        function filterSelectTags() {
+            renderSelectTags();
+        }
+
+        function toggleTempSelection(div, tag) {
+            const checkbox = div.querySelector('input');
+            // Toggle logic
+            if (tempSelectedTags.has(tag)) {
+                tempSelectedTags.delete(tag);
+                checkbox.checked = false;
+            } else {
+                tempSelectedTags.add(tag);
+                checkbox.checked = true;
+            }
+        }
+
+        function confirmSelection() {
+            selectedTags = new Set(tempSelectedTags);
+            updateMainTagDisplay();
+        }
+
+        // ================= MANAGE MODAL LOGIC =================
+        async function openManageTagModal() {
+            await fetchTags();
+            renderManageTags();
+            manageTagModal.show();
+        }
+
+        function renderManageTags() {
+            const query = document.getElementById('searchManageTagInput').value.toLowerCase();
+            const container = document.getElementById('manageTagList');
+            document.getElementById('manageTagCount').innerText = allTags.length;
+            container.innerHTML = '';
+
+            const filtered = allTags.filter(t => t.toLowerCase().includes(query));
+
+            if (filtered.length === 0) {
+                container.innerHTML = '<div class="col-12 text-center text-muted py-3">无匹配标签</div>';
+                return;
+            }
+
+            filtered.forEach(tag => {
+                const col = document.createElement('div');
+                col.className = 'col-md-6';
+                col.innerHTML = `
+                <div class="p-2 border rounded d-flex justify-content-between align-items-center bg-white shadow-sm">
+                    <span class="text-truncate fw-bold text-primary px-2" title="${tag}">${tag}</span>
+                    <div class="text-nowrap">
+                        <button class="btn btn-sm btn-link text-secondary p-0 ms-2" onclick="renameTag('${tag}')" title="重命名">
+                            <i class="fas fa-edit"></i>
+                        </button>
+                        <button class="btn btn-sm btn-link text-danger p-0 ms-1" onclick="deleteTag('${tag}')" title="删除">
+                            <i class="fas fa-trash-alt"></i>
+                        </button>
+                    </div>
+                </div>
+            `;
+                container.appendChild(col);
+            });
+        }
+
+        function filterManageTags() {
+            renderManageTags();
+        }
+
+        // ================= SHARED / CRUD =================
+
+        async function deleteTag(name) {
+            if (!confirm(`确定要删除标签 "${name}" 吗？\n删除后，所有文章中的此标签也将被移除！`)) return;
+
+            try {
+                const resp = await fetch('/anli/api/tags', {
+                    method: 'DELETE',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: name })
+                });
+                const res = await resp.json();
+                if (res.status === 'success') {
+                    // Update main selection if it contained this tag
+                    selectedTags.delete(name);
+                    updateMainTagDisplay();
+
+                    // Refresh manager
+                    await fetchTags();
+                    renderManageTags();
+                } else {
+                    alert(res.error);
+                }
+            } catch (e) {
+                alert('删除失败');
+            }
+        }
+
+        async function renameTag(oldName) {
+            const newName = prompt(`将标签 "${oldName}" 重命名为:`, oldName);
+            if (!newName || newName === oldName) return;
+
+            try {
+                const resp = await fetch('/anli/api/tags', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ old_name: oldName, new_name: newName })
+                });
+                const res = await resp.json();
+                if (res.status === 'success') {
+                    // Update main selection
+                    if (selectedTags.has(oldName)) {
+                        selectedTags.delete(oldName);
+                        selectedTags.add(newName);
+                        updateMainTagDisplay();
+                    }
+
+                    // Refresh manager
+                    await fetchTags();
+                    renderManageTags();
+                } else {
+                    alert(res.error);
+                }
+            } catch (e) {
+                alert('重命名失败');
+            }
+        }
+
+        async function addNewTag() {
+            const name = document.getElementById('newTagName').value.trim();
+            if (!name) return;
+
+            try {
+                const resp = await fetch('/anli/api/tags', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: name })
+                });
+                const res = await resp.json();
+                if (res.status === 'success' || res.status === 'exists') {
+                    document.getElementById('newTagName').value = '';
+                    await fetchTags();
+                    renderManageTags();
+                } else {
+                    alert(res.error);
+                }
+            } catch (e) {
+                alert('添加失败');
+            }
+        }
+
+        async function autoExtract() {
+            const url = document.getElementById('autoUrl').value;
+            if (!url) { alert('请输入网址'); return; }
+
+            const btn = document.querySelector('button[onclick="autoExtract()"]');
+            const originalText = btn.innerText;
+            btn.innerText = '抓取中...';
+            btn.disabled = true;
+
+            try {
+                const resp = await fetch('/anli/api/extract', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: url })
+                });
+                const res = await resp.json();
+
+                if (res.status === 'success') {
+                    if (res.data.title) document.getElementById('title').value = res.data.title;
+                    if (res.data.content) document.getElementById('content').value = res.data.content;
+                    if (res.data.publish_date) document.getElementById('publishDate').value = res.data.publish_date;
+                    if (res.data.url) document.getElementById('originalUrl').value = res.data.url;
+
+                    alert('抓取成功！');
+                } else {
+                    alert('抓取失败: ' + res.error);
+                }
+            } catch (e) {
+                alert('网络错误');
+            } finally {
+                btn.innerText = originalText;
+                btn.disabled = false;
+            }
+        }
+
+        document.getElementById('entryForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const id = document.getElementById('entryId').value;
+            const title = document.getElementById('title').value;
+            const type = document.getElementById('type').value;
+            const content = document.getElementById('content').value;
+            const url = document.getElementById('originalUrl').value;
+            const publishDate = document.getElementById('publishDate').value;
+            const screenshot = document.getElementById('screenshotPath').value;
+
+            // Collect checked tags
+            const tags = Array.from(selectedTags);
+
+            try {
+                const resp = await fetch('/anli/api/save', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        id: id ? parseInt(id) : null,
+                        title, type, tags, content, url, publish_date: publishDate, screenshot
+                    })
+                });
+                const res = await resp.json();
+                if (res.status === 'success') {
+                    alert('保存成功');
+                    window.location.href = '/anli';
+                } else {
+                    alert('保存失败: ' + res.error);
+                }
+            } catch (e) {
+                alert('网络错误');
+            }
+        });
+    </script>
+</body>
+
+</html>

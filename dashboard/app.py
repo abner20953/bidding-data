@@ -638,6 +638,17 @@ def file_list_view():
 def download_archived_file(filename):
     return send_from_directory(ARCHIVE_FOLDER, filename, as_attachment=True)
 
+# --- Knowledge Base Blueprint ---
+from dashboard.blueprints.knowledge import knowledge_bp, init_db as init_knowledge_db
+app.register_blueprint(knowledge_bp)
+# Initialize DB at startup
+try:
+    with app.app_context():
+        init_knowledge_db()
+    print("✅ Knowledge Base DB Initialized")
+except Exception as e:
+    print(f"⚠️ Knowledge Base DB Init Failed: {e}")
+
 # --- 投标文件对比功能 ---
 
 @app.route('/bijiao')
