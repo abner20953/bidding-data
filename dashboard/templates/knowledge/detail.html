@@ -130,9 +130,26 @@
 
         <!-- Screenshot (Only for '案例' and if exists) -->
         {% if entry.type == '案例' and entry.screenshot and entry.screenshot != 'None' and entry.screenshot|length > 0 %}
-        <div class="screenshot-container mt-4">
-            <h5 class="fw-bold mb-3"><i class="far fa-image"></i> 原文截图</h5>
-            <img src="{{ entry.screenshot }}" alt="Screenshot">
+        <div class="mt-4">
+            <button type="button" class="btn btn-outline-secondary" data-bs-toggle="modal"
+                data-bs-target="#screenshotModal">
+                <i class="far fa-image"></i> 查看原文截图
+            </button>
+        </div>
+
+        <!-- Screenshot Modal -->
+        <div class="modal fade" id="screenshotModal" tabindex="-1" aria-hidden="true">
+            <div class="modal-dialog modal-xl modal-dialog-centered">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title">原文截图</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body p-0 bg-light text-center">
+                        <img src="{{ entry.screenshot }}" class="img-fluid" alt="原文截图">
+                    </div>
+                </div>
+            </div>
         </div>
         {% endif %}
 
@@ -233,6 +250,7 @@
         }
         });
     </script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 
 </html>

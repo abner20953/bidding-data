@@ -288,12 +288,25 @@
             // Let's stick to manual search button trigger based on UI layout.
         }
 
-        function highlightText(text, query) {
-            if (!query || !text) return text;
+        function highlightText(text, query, tokens = []) {
+            if (!text) return text;
+
+            // Prefer tokens from backend (Jieba) if available
+            let terms = [];
+            if (tokens && tokens.length > 0) {
+                terms = tokens;
+            } else if (query) {
+                // Fallback to simple split
+                terms = query.split(/\s+/).filter(t => t.length > 0);
+            }
+
+            if (terms.length === 0) return text;
+
             try {
-                const terms = query.split(/\s+/).filter(t => t.length > 0);
-                if (terms.length === 0) return text;
                 const safeTerms = terms.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+                // Sort by length desc to match longer terms first (e.g. "Review Standard" before "Review")
+                safeTerms.sort((a, b) => b.length - a.length);
+
                 const pattern = new RegExp(`(${safeTerms.join('|')})`, 'gi');
                 return text.replace(pattern, '<span class="search-highlight">$1</span>');
             } catch (e) {
@@ -310,7 +323,7 @@
             // Join tags by comma
             const tagStr = Array.from(selectedTags).join(',');
 
-            let url = `/anli/api/list?page=${page}&q=${encodeURIComponent(q)}&type=${encodeURIComponent(type)}`;
+            let url = `/anli/api/list?page=${page}&q=${encodeURIComponent(q)}&type=${encodeURIComponent(type)}&t=${new Date().getTime()}`;
             if (tagStr) url += `&tag=${encodeURIComponent(tagStr)}`;
 
             const listContainer = document.getElementById('resultsList');
@@ -337,8 +350,8 @@
                     } catch (e) { }
 
                     const badgeClass = item.type === '法律法规' ? 'badge-law' : 'badge-case';
-                    const titleHtml = highlightText(item.title, currentQuery);
-                    const summaryHtml = highlightText(item.summary, currentQuery);
+                    const titleHtml = highlightText(item.title, currentQuery, data.search_terms);
+                    const summaryHtml = highlightText(item.summary, currentQuery, data.search_terms);
 
                     const html = `
                     <a href="/anli/view/${item.id}" class="card-item">

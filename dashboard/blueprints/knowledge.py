@@ -167,7 +167,44 @@ def api_list():
     count_sql = "SELECT COUNT(*) FROM (" + sql + ")"
     total = conn.execute(count_sql, params).fetchone()[0]
     
-    sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    # Sort Logic: Relevance > Time
+    order_clause = "created_at DESC"
+    
+    if query and search_terms:
+        # Relevance Score Calculation:
+        # 1. Title contains full query string (High Weight: 100)
+        # 2. Title contains individual term (Medium Weight: 10 per term)
+        # Note: We rely on filter AND logic, so all terms are present in the doc. 
+        # We differentiate by seeing if they are in the TITLE.
+        
+        score_parts = []
+        score_vals = []
+        
+        # Exact/Full Query in Title
+        score_parts.append("(CASE WHEN title LIKE ? THEN 100 ELSE 0 END)")
+        score_vals.append(f"%{query}%")
+
+        # Exact/Full Query in Content (Medium-High Weight: 50)
+        # This fixes the issue where "Query matches Content perfectly" was ranked lower than "Title matches one term"
+        score_parts.append("(CASE WHEN content LIKE ? THEN 50 ELSE 0 END)")
+        score_vals.append(f"%{query}%")
+        
+        # Terms in Title
+        for term in search_terms:
+            score_parts.append("(CASE WHEN title LIKE ? THEN 10 ELSE 0 END)")
+            score_vals.append(f"%{term}%")
+            
+        score_expr = " + ".join(score_parts)
+        order_clause = f"({score_expr}) DESC, created_at DESC"
+        
+        # DEBUG: Print SQL logic to console (remove in prod)
+        # print(f"DEBUG SQL ORDER: {order_clause}")
+        # print(f"DEBUG PARAMS: {score_vals}")
+        
+        # Append score params to main params (Before Limit/Offset)
+        params.extend(score_vals)
+    
+    sql += f" ORDER BY {order_clause} LIMIT ? OFFSET ?"
     params.extend([per_page, offset])
     
     rows = conn.execute(sql, params).fetchall()
@@ -209,7 +246,8 @@ def api_list():
         "total": total,
         "page": page,
         "per_page": per_page,
-        "data": results
+        "data": results,
+        "search_terms": search_terms
     })
 
 @knowledge_bp.route('/api/tags', methods=['GET', 'POST', 'PUT'])
@@ -357,6 +395,8 @@ def api_extract():
     import requests
     from bs4 import BeautifulSoup
     
+    import re
+    
     url = request.get_json().get('url')
     if not url:
         return jsonify({"error": "URL cannot be empty"}), 400
@@ -370,30 +410,93 @@ def api_extract():
         
         soup = BeautifulSoup(resp.text, 'html.parser')
         
+        # --- 1. Universal Title Extraction ---
+        # Priority: h1 > og:title > title > class matches
         title = ""
-        content = ""
-        publish_date = ""
+        h1 = soup.find('h1')
+        if h1: 
+            title = h1.get_text().strip()
         
-        if "gov.cn" in url:
-            h1 = soup.find('h1') or soup.find(class_='article-title')
-            if h1: title = h1.get_text().strip()
-            article = soup.find(id='UCAP-CONTENT') or soup.find(class_='pages_content') or soup.find(class_='article-content')
-            if article:
-                content = article.get_text('\n', strip=True)
-            meta_date = soup.find('meta', {'name': 'pubdate'})
-            if meta_date: publish_date = meta_date.get('content')
-        elif "ccgp" in url:
-            title_node = soup.find(class_='vF_detail_header') or soup.find('h1') or soup.find(class_='title')
-            if title_node: title = title_node.get_text().strip()
-            content_node = soup.find(class_='vF_detail_content') or soup.find(class_='table')
-            if content_node:
-                content = content_node.get_text('\n', strip=True)
-        else:
+        if not title:
+            og_title = soup.find('meta', property='og:title')
+            if og_title: title = og_title.get('content').strip()
+            
+        if not title:
             if soup.title: title = soup.title.string.strip()
-            h1 = soup.find('h1')
-            if h1: title = h1.get_text().strip()
+            
+        # Clean title (remove common suffixes)
+        if title:
+            title = re.sub(r'[_|-].*$', '', title).strip()
+
+        # --- 2. Universal Date Extraction ---
+        publish_date = ""
+        # 2.1 Meta tags
+        date_metas = [
+            {'name': 'pubdate'}, {'name': 'publishdate'}, {'name': 'PubDate'},
+            {'property': 'article:published_time'}, {'name': 'date'}
+        ]
+        for meta in date_metas:
+            tag = soup.find('meta', meta)
+            if tag:
+                publish_date = tag.get('content')
+                break
+        
+        # 2.2 Regex in text (Fallback)
+        if not publish_date:
+            # Look for YYYY-MM-DD or YYYY年MM月DD日 pattern in likely areas
+            date_pattern = re.compile(r'(\d{4}[-年]\d{1,2}[-月]\d{1,2}[日]?)')
+            # Limit search to top of body or meta info containers
+            text_sample = soup.get_text()[:2000] 
+            match = date_pattern.search(text_sample)
+            if match:
+                publish_date = match.group(1)
+
+        # --- 3. Universal Content Extraction (Waterfall Strategy) ---
+        content = ""
+        
+        # Strategy A: Specific Domain Optimizations (Preserve existing logic)
+        if "gov.cn" in url:
+             article = soup.find(id='UCAP-CONTENT') or soup.find(class_='pages_content') or soup.find(class_='article-content') or soup.find(class_='article')
+             if article: content = article.get_text('\n', strip=True)
+        elif "ccgp" in url:
+             content_node = soup.find(class_='vF_detail_content') or soup.find(class_='table')
+             if content_node: content = content_node.get_text('\n', strip=True)
+
+        # Strategy B: Common Content Containers (Heuristic)
+        if not content:
+            # List of common class/id names for main content
+            common_selectors = [
+                'article', '.article', '#article', 
+                '.content', '#content', '.main-content',
+                '.post-content', '.entry-content', '.detail-content',
+                '.news_content', '.view-content',
+                # Legacy / Gov Site Selectors
+                '.txt', '#txt', '.news_con', '.news-con', 
+                '.detail_con', '#news_content', '.zoom', 
+                '.TRS_Editor', '.Section1'
+            ]
+            for selector in common_selectors:
+                if selector.startswith('.'):
+                    node = soup.find(class_=selector[1:])
+                elif selector.startswith('#'):
+                    node = soup.find(id=selector[1:])
+                else:
+                    node = soup.find(selector)
+                
+                if node:
+                    # Validate: Should have substantial text
+                    text = node.get_text('\n', strip=True)
+                    if len(text) > 50:
+                        content = text
+                        break
+
+        # Strategy C: Paragraph Density (Fallback)
+        if not content:
+            # Find all p tags, filter out short ones (nav links etc)
             ps = soup.find_all('p')
-            content = "\n".join([p.get_text().strip() for p in ps if len(p.get_text().strip()) > 10])
+            valid_ps = [p.get_text().strip() for p in ps if len(p.get_text().strip()) > 10]
+            if valid_ps:
+                content = "\n".join(valid_ps)
 
         return jsonify({
             "status": "success",
