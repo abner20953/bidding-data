@@ -71,14 +71,8 @@ def init_db():
         )
     ''')
     
-    # Pre-populate some tags if empty
-    try:
-        count = c.execute("SELECT COUNT(*) FROM tags").fetchone()[0]
-        if count == 0:
-            defaults = ["招投标", "政府采购", "信息化", "法律法规", "违规案例", "合同管理"]
-            c.executemany("INSERT INTO tags (name) VALUES (?)", [(t,) for t in defaults])
-    except:
-        pass
+    # Tags are managed dynamically by the user, no hardcoded defaults.
+    pass
         
     conn.commit()
     conn.close()
