@@ -268,6 +268,10 @@ def log_request(response):
         if request.path.startswith('/static') or request.path.startswith('/api/file') or request.path == '/favicon.ico':
             return response
             
+        # Filter out specific user-defined "backend" paths
+        if request.path.startswith('/anli/view/') or request.path.startswith('/anli/edit/'):
+            return response
+            
         # 2. Identify Request Type
         is_api = request.path.startswith('/api/') or '/api/' in request.path
         
