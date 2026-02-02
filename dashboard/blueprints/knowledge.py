@@ -372,6 +372,32 @@ def api_save():
         return jsonify({"error": "标题和内容不能为空"}), 400
         
     conn = get_db()
+    
+    # --- Uniqueness Check ---
+    # 1. Check Doc Number
+    if doc_number:
+        sql = "SELECT id FROM entries WHERE doc_number = ?"
+        params = [doc_number]
+        if id:
+             sql += " AND id != ?"
+             params.append(id)
+        exists = conn.execute(sql, params).fetchone()
+        if exists:
+            conn.close()
+            return jsonify({"error": f"文号 '{doc_number}' 已存在！"}), 400
+            
+    # 2. Check Title
+    sql = "SELECT id FROM entries WHERE title = ?"
+    params = [title]
+    if id:
+         sql += " AND id != ?"
+         params.append(id)
+    exists = conn.execute(sql, params).fetchone()
+    if exists:
+        conn.close()
+        return jsonify({"error": f"标题 '{title}' 已存在！"}), 400
+    # ------------------------
+
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     if id:

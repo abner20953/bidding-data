@@ -255,85 +255,99 @@ def run_auto_scrape_thread(dates, is_scheduled_task=False):
         SCRAPER_STATUS["is_running"] = False
         SCRAPER_STATUS["current_date"] = None
 
+# --- Global Pending Visits Store ---
+PENDING_VISITS = {} # Format: { ip: { 'path': ..., 'timestamp': datetime, 'data': ... } }
+PENDING_LOCK = threading.Lock()
+
 # --- Middleware for Visitor Logging ---
 
 @app.after_request
 def log_request(response):
     try:
-        if request.path.startswith('/static') or request.path.startswith('/api/file'):
+        # 1. Basic Filters
+        if request.path.startswith('/static') or request.path.startswith('/api/file') or request.path == '/favicon.ico':
             return response
             
-        # Filter out all API calls (User Request: Only log page visits)
-        if request.path.startswith('/api/'):
-            return response
+        # 2. Identify Request Type
+        is_api = request.path.startswith('/api/') or '/api/' in request.path
         
-        # Filter out favicon
-        if request.path == '/favicon.ico':
-            return response
-        
-
-
-        # --- Filter out invalid paths (User Request: Only log real existing access paths) ---
-        # If request.url_rule is None, it means the request did not match any defined route.
-        if not request.url_rule:
-            return response
-
-        # --- 1. Robust IP Detection ---
-        # ProxyFix (applied above) should make remote_addr correct.
-        # But we keep fallback logic just in case.
+        # 3. Get IP (Proxy safe)
         ip = request.remote_addr
-        
-        # --- 2. Throttling for /api/visitor_logs (Prevent Log Spam) ---
-        if request.path == '/api/visitor_logs':
-            try:
-                # Check last log for this IP/Path
-                conn_check = sqlite3.connect(VISITOR_DB)
-                cursor_check = conn_check.cursor()
-                cursor_check.execute('''
-                    SELECT timestamp FROM logs 
-                    WHERE ip = ? AND path = ? 
-                    ORDER BY id DESC LIMIT 1
-                ''', (ip, request.path))
-                row = cursor_check.fetchone()
-                conn_check.close()
-                
-                if row:
-                    last_time = datetime.datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
-                    if datetime.datetime.now() - last_time < datetime.timedelta(minutes=30):
-                        return response # SKIP LOGGING
-            except Exception as e:
-                print(f"Throttling check error: {e}")
-
-        ua_string = request.user_agent.string
-        ua = request.user_agent
-        
-        browser = f"{ua.browser} {ua.version}" if ua.browser else "Unknown"
-        os_info = f"{ua.platform} {ua.version}" if ua.platform else "Unknown" # platform is generic, customized below
-        
-        # Better OS detection
-        if 'Windows' in ua_string: os_info = 'Windows'
-        elif 'Android' in ua_string: os_info = 'Android'
-        elif 'iPhone' in ua_string or 'iPad' in ua_string: os_info = 'iOS'
-        elif 'Mac' in ua_string: os_info = 'MacOS'
-        elif 'Linux' in ua_string: os_info = 'Linux'
-        
-        # Device Type
-        device = "PC"
-        if 'Mobile' in ua_string or 'Android' in ua_string or 'iPhone' in ua_string:
-            device = "Mobile"
             
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        # Insert into DB
-        conn = sqlite3.connect(VISITOR_DB)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO logs (ip, path, method, status_code, timestamp, user_agent, browser, os, device)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (ip, request.path, request.method, response.status_code, timestamp, ua_string, browser, os_info, device))
-        conn.commit()
-        conn.close()
-        
+        current_time = datetime.datetime.now()
+
+        # --- LOGIC BRANCH ---
+        with PENDING_LOCK:
+            if is_api:
+                # [API Request] -> Check & Flush Pending Page Visits
+                # Does NOT log the API request itself (as per requirements)
+                
+                if ip in PENDING_VISITS:
+                    pending = PENDING_VISITS[ip]
+                    visit_time = pending['timestamp']
+                    
+                    # Check time window (5 minutes)
+                    if (current_time - visit_time) < datetime.timedelta(minutes=5):
+                        # VALID VISIT! Write to DB
+                        try:
+                            # Re-construct user agent info from pending data
+                            # (We use the pending data because that was the page visit context)
+                            p_data = pending['data']
+                            
+                            conn = sqlite3.connect(VISITOR_DB)
+                            cursor = conn.cursor()
+                            cursor.execute('''
+                                INSERT INTO logs (ip, path, method, status_code, timestamp, user_agent, browser, os, device)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ''', (ip, pending['path'], p_data['method'], p_data['status_code'], 
+                                  visit_time.strftime("%Y-%m-%d %H:%M:%S"), 
+                                  p_data['ua_string'], p_data['browser'], p_data['os'], p_data['device']))
+                            conn.commit()
+                            conn.close()
+                            # print(f"DEBUG: Validated visit for {ip} -> {pending['path']}")
+                        except Exception as e:
+                            print(f"Error writing validated log: {e}")
+                    
+                    # Clear pending after processing (whether valid or expired)
+                    del PENDING_VISITS[ip]
+                    
+            else:
+                # [Page Request] -> Store as Pending
+                # Only log if it matches a valid route
+                if request.url_rule:
+                    
+                    # Prepare Data
+                    ua = request.user_agent
+                    ua_string = ua.string
+                    
+                    browser = f"{ua.browser} {ua.version}" if ua.browser else "Unknown"
+                    os_info = f"{ua.platform} {ua.version}" if ua.platform else "Unknown"
+                    
+                    if 'Windows' in ua_string: os_info = 'Windows'
+                    elif 'Android' in ua_string: os_info = 'Android'
+                    elif 'iPhone' in ua_string or 'iPad' in ua_string: os_info = 'iOS'
+                    elif 'Mac' in ua_string: os_info = 'MacOS'
+                    elif 'Linux' in ua_string: os_info = 'Linux'
+                    
+                    device = "PC"
+                    if 'Mobile' in ua_string or 'Android' in ua_string or 'iPhone' in ua_string:
+                        device = "Mobile"
+                    
+                    # Overwrite any existing pending visit for this IP (User moved to new page)
+                    PENDING_VISITS[ip] = {
+                        'path': request.path,
+                        'timestamp': current_time,
+                        'data': {
+                            'method': request.method,
+                            'status_code': response.status_code,
+                            'ua_string': ua_string,
+                            'browser': browser,
+                            'os': os_info,
+                            'device': device
+                        }
+                    }
+                    # print(f"DEBUG: Pending visit stored for {ip} -> {request.path}")
+
     except Exception as e:
         print(f"Logging error: {e}")
         
