@@ -174,6 +174,24 @@
                     </div>
                 </div>
 
+                <!-- Related Entries Section -->
+                <div class="mb-4 p-4 mt-4 bg-white rounded-3 shadow-sm border">
+                    <label class="form-label text-primary"><i class="fas fa-link"></i> 关联信息 (法律法规/案例)</label>
+
+                    <!-- Selected Relations Display -->
+                    <div id="selectedRelations" class="mb-3 d-flex flex-wrap gap-2">
+                        <!-- Rendered by JS -->
+                        <span class="text-muted small align-self-center fst-italic"
+                            id="noRelationsHint">暂无关联信息...</span>
+                    </div>
+
+                    <div class="input-group">
+                        <button class="btn btn-outline-primary" type="button" onclick="openRelationModal()">
+                            <i class="fas fa-plus"></i> 添加关联
+                        </button>
+                    </div>
+                </div>
+
                 <!-- Case Specific: Upload -->
                 <div id="caseFields" class="mt-4 mb-4 p-3 bg-light rounded border d-none">
                     <label class="form-label"><i class="fas fa-image"></i> 案例截图/附件</label>
@@ -263,12 +281,39 @@
         </div>
     </div>
 
+    <!-- Relation Select Modal -->
+    <div class="modal fade" id="relationModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header border-0 pb-0">
+                    <h5 class="modal-title fw-bold">添加关联信息</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <div class="input-group">
+                            <input type="text" class="form-control" id="searchRelationInput" placeholder="输入标题关键字搜索..."
+                                onkeyup="if(event.keyCode===13) searchRelations()">
+                            <button class="btn btn-primary" onclick="searchRelations()">搜索</button>
+                        </div>
+                    </div>
+                    <div id="relationSearchResults" class="list-group list-group-flush border rounded"
+                        style="max-height: 300px; overflow-y: auto;">
+                        <div class="text-center text-muted py-3">请输入关键字进行搜索</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         const selectTagModal = new bootstrap.Modal(document.getElementById('selectTagModal'));
         const manageTagModal = new bootstrap.Modal(document.getElementById('manageTagModal'));
+        const relationModal = new bootstrap.Modal(document.getElementById('relationModal'));
 
         let selectedTags = new Set();
+        let selectedRelations = new Map(); // id -> {title, type}
         let tempSelectedTags = new Set(); // For Selection Modal only
         let allTags = [];
 
@@ -279,8 +324,9 @@
                 dateInput.valueAsDate = new Date();
             }
 
-            // Initial Tag Load
+            // Initial Load
             loadInitialTags();
+            loadInitialRelations();
             toggleCaseFields();
 
             // Image Upload Handler
@@ -322,9 +368,117 @@
             }
         }
 
+        // ================= RELATION LOGIC =================
+        async function loadInitialRelations() {
+            try {
+                // Jinja injection of list of dicts: [{id, title, type}, ...]
+                const raw = '{{ related_entries | tojson | safe }}';
+                // Handle empty or None case gracefully
+                const serverRels = JSON.parse(raw || '[]');
+                serverRels.forEach(r => selectedRelations.set(r.id.toString(), r));
+                updateRelationDisplay();
+            } catch (e) {
+                console.error('Initial relations parse error', e);
+            }
+        }
+
+        function updateRelationDisplay() {
+            const container = document.getElementById('selectedRelations');
+            const hint = document.getElementById('noRelationsHint');
+
+            // Clear current list items (keep structure)
+            container.innerHTML = '';
+
+            if (selectedRelations.size === 0) {
+                container.appendChild(hint);
+                hint.style.display = 'block';
+            } else {
+                // Must append hint (hidden) back or it gets lost
+                container.appendChild(hint);
+                hint.style.display = 'none';
+
+                selectedRelations.forEach((item, id) => {
+                    const badge = document.createElement('span');
+                    badge.className = 'badge bg-light text-dark border d-flex align-items-center py-2 px-3';
+                    badge.innerHTML = `
+                        <i class="fas fa-link me-2 text-primary"></i> 
+                        <span class="fw-bold me-1">[${item.type}]</span> ${item.title}
+                        <i class="fas fa-times ms-2 text-danger cursor-pointer" onclick="removeRelation('${id}')" style="cursor:pointer"></i>
+                    `;
+                    container.appendChild(badge);
+                });
+            }
+        }
+
+        function removeRelation(id) {
+            selectedRelations.delete(id.toString());
+            updateRelationDisplay();
+        }
+
+        function openRelationModal() {
+            document.getElementById('searchRelationInput').value = '';
+            document.getElementById('relationSearchResults').innerHTML = '<div class="text-center text-muted py-3">请输入关键字进行搜索</div>';
+            relationModal.show();
+        }
+
+        async function searchRelations() {
+            const q = document.getElementById('searchRelationInput').value.trim();
+            if (!q) return;
+
+            const container = document.getElementById('relationSearchResults');
+            container.innerHTML = '<div class="text-center py-3">搜索中...</div>';
+
+            try {
+                const resp = await fetch(`/anli/api/search_titles?q=${encodeURIComponent(q)}`);
+                const items = await resp.json();
+
+                container.innerHTML = '';
+                if (items.length === 0) {
+                    container.innerHTML = '<div class="text-center text-muted py-3">无匹配结果</div>';
+                    return;
+                }
+
+                // Get current Entry ID to exclude self
+                const currentId = document.getElementById('entryId').value;
+
+                items.forEach(item => {
+                    // Exclude self
+                    if (currentId && item.id.toString() === currentId) return;
+
+                    const isSelected = selectedRelations.has(item.id.toString());
+                    const div = document.createElement('a');
+                    div.className = "list-group-item list-group-item-action d-flex justify-content-between align-items-center";
+                    div.style.cursor = "pointer";
+                    div.onclick = () => toggleRelationSelection(item);
+                    div.innerHTML = `
+                        <div>
+                            <span class="badge bg-secondary me-2">${item.type}</span>
+                            <span class="fw-bold">${item.title}</span>
+                        </div>
+                        ${isSelected ? '<i class="fas fa-check text-success"></i>' : '<i class="fas fa-plus text-primary force-hidden-icon"></i>'}
+                    `;
+                    container.appendChild(div);
+                });
+            } catch (e) {
+                container.innerHTML = '<div class="text-center text-danger py-3">搜索出错</div>';
+            }
+        }
+
+        function toggleRelationSelection(item) {
+            const id = item.id.toString();
+            if (selectedRelations.has(id)) {
+                selectedRelations.delete(id);
+            } else {
+                selectedRelations.set(id, item);
+            }
+            updateRelationDisplay();
+            // Refresh list to show checkmark without closing modal (allows multiple select)
+            searchRelations();
+        }
+
+        // ================= TAG LOGIC =================
         async function loadInitialTags() {
             try {
-                // Parse server-provided tags for this entry
                 const serverTags = JSON.parse('{{ entry.tags | safe }}' || '[]');
                 serverTags.forEach(t => selectedTags.add(t));
                 updateMainTagDisplay();
@@ -337,7 +491,7 @@
             const container = document.getElementById('selectedRefTags');
             const hint = document.getElementById('noTagsHint');
 
-            // Clear current badges (except hint)
+            // Clear current badges
             const badges = container.querySelectorAll('.badge');
             badges.forEach(b => b.remove());
 
@@ -417,7 +571,6 @@
 
         function toggleTempSelection(div, tag) {
             const checkbox = div.querySelector('input');
-            // Toggle logic
             if (tempSelectedTags.has(tag)) {
                 tempSelectedTags.delete(tag);
                 checkbox.checked = false;
@@ -489,11 +642,8 @@
                 });
                 const res = await resp.json();
                 if (res.status === 'success') {
-                    // Update main selection if it contained this tag
                     selectedTags.delete(name);
                     updateMainTagDisplay();
-
-                    // Refresh manager
                     await fetchTags();
                     renderManageTags();
                 } else {
@@ -516,14 +666,11 @@
                 });
                 const res = await resp.json();
                 if (res.status === 'success') {
-                    // Update main selection
                     if (selectedTags.has(oldName)) {
                         selectedTags.delete(oldName);
                         selectedTags.add(newName);
                         updateMainTagDisplay();
                     }
-
-                    // Refresh manager
                     await fetchTags();
                     renderManageTags();
                 } else {
@@ -580,7 +727,6 @@
                     if (res.data.publish_date) document.getElementById('publishDate').value = res.data.publish_date;
                     if (res.data.url) document.getElementById('originalUrl').value = res.data.url;
                     if (res.data.doc_number) document.getElementById('docNumber').value = res.data.doc_number;
-
                     alert('抓取成功！');
                 } else {
                     alert('抓取失败: ' + res.error);
@@ -601,34 +747,47 @@
             const type = document.getElementById('type').value;
             const content = document.getElementById('content').value;
             const url = document.getElementById('originalUrl').value;
-            const publishDate = document.getElementById('publishDate').value;
+            const publish_date = document.getElementById('publishDate').value;
             const screenshot = document.getElementById('screenshotPath').value;
-            const docNumber = document.getElementById('docNumber').value;
+            const doc_number = document.getElementById('docNumber').value;
 
-            // Collect checked tags
             const tags = Array.from(selectedTags);
+            const related_ids = Array.from(selectedRelations.keys());
 
             try {
                 const resp = await fetch('/anli/api/save', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
                     body: JSON.stringify({
-                        id: id ? parseInt(id) : null,
-                        title, type, tags, content, url, publish_date: publishDate, screenshot, doc_number: docNumber
+                        id: id,
+                        title: title,
+                        type: type,
+                        tags: tags,
+                        content: content,
+                        url: url,
+                        publish_date: publish_date,
+                        screenshot: screenshot,
+                        doc_number: doc_number,
+                        related_ids: related_ids
                     })
                 });
+
                 const res = await resp.json();
                 if (res.status === 'success') {
-                    alert('保存成功');
+                    alert('保存成功！');
                     window.location.href = '/anli';
                 } else {
-                    alert('保存失败: ' + res.error);
+                    alert('保存失败: ' + (res.error || '未知错误'));
                 }
-            } catch (e) {
+            } catch (err) {
                 alert('网络错误');
+                console.error(err);
             }
         });
     </script>
 </body>
 
 </html>
+```

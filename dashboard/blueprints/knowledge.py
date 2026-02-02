@@ -79,6 +79,20 @@ def init_db():
     
     # Tags are managed dynamically by the user, no hardcoded defaults.
     pass
+
+    # 4. 关联表 (New - for related entries)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS entry_relations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id INTEGER,
+            target_id INTEGER,
+            FOREIGN KEY(source_id) REFERENCES entries(id),
+            FOREIGN KEY(target_id) REFERENCES entries(id)
+        )
+    ''')
+    # Add index for performance
+    c.execute('CREATE INDEX IF NOT EXISTS idx_relations_source ON entry_relations(source_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_relations_target ON entry_relations(source_id)')
         
     conn.commit()
     conn.close()
@@ -107,6 +121,14 @@ def view_entry(id):
     conn = get_db()
     entry = conn.execute('SELECT * FROM entries WHERE id = ?', (id,)).fetchone()
     comments = conn.execute('SELECT * FROM comments WHERE entry_id = ? ORDER BY id DESC', (id,)).fetchall()
+    # Fetch Related Entries
+    relations = conn.execute('''
+        SELECT t.id, t.title, t.type, t.doc_number 
+        FROM entry_relations r
+        JOIN entries t ON r.target_id = t.id
+        WHERE r.source_id = ?
+    ''', (id,)).fetchall()
+    
     conn.close()
     
     if not entry:
@@ -122,19 +144,33 @@ def view_entry(id):
              # Fallback to query itself if tokens are empty
              highlight_tokens = [query]
         
-    return render_template('detail.html', entry=dict(entry), comments=[dict(c) for c in comments], highlight_tokens=highlight_tokens)
+    return render_template('detail.html', entry=dict(entry), comments=[dict(c) for c in comments], 
+                           related_entries=[dict(r) for r in relations], highlight_tokens=highlight_tokens)
 
 @knowledge_bp.route('/edit')
 @knowledge_bp.route('/edit/<int:id>')
 def edit_entry(id=None):
     entry = {}
+    related_entries = []
+    
     if id:
         conn = get_db()
         row = conn.execute('SELECT * FROM entries WHERE id = ?', (id,)).fetchone()
-        conn.close()
+        
+        # Fetch existing relations
         if row:
             entry = dict(row)
-    return render_template('edit.html', entry=entry)
+            rels = conn.execute('''
+                SELECT t.id, t.title 
+                FROM entry_relations r
+                JOIN entries t ON r.target_id = t.id
+                WHERE r.source_id = ?
+            ''', (id,)).fetchall()
+            related_entries = [dict(r) for r in rels]
+            
+        conn.close()
+        
+    return render_template('edit.html', entry=entry, related_entries=related_entries)
 
 # --- APIs ---
 
@@ -400,17 +436,32 @@ def api_save():
 
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
+    cursor = conn.cursor()
+    
     if id:
-        conn.execute('''
+        cursor.execute('''
             UPDATE entries SET title=?, type=?, tags=?, content=?, url=?, publish_date=?, screenshot=?, doc_number=?, updated_at=?
             WHERE id=?
         ''', (title, type_val, tags, content, url, publish_date, screenshot, doc_number, now, id))
+        entry_id = int(id)
     else:
-        conn.execute('''
+        cursor.execute('''
             INSERT INTO entries (title, type, tags, content, url, publish_date, screenshot, doc_number, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (title, type_val, tags, content, url, publish_date, screenshot, doc_number, now, now))
+        entry_id = cursor.lastrowid
         
+    # --- Process Relations ---
+    # Delete all existing relations for this source
+    cursor.execute("DELETE FROM entry_relations WHERE source_id = ?", (entry_id,))
+    
+    related_ids = data.get('related_ids', [])
+    if related_ids and isinstance(related_ids, list):
+         for target_id in related_ids:
+             # Prevent self-relation
+             if int(target_id) != entry_id:
+                  cursor.execute("INSERT INTO entry_relations (source_id, target_id) VALUES (?, ?)", (entry_id, target_id))
+
     conn.commit()
     conn.close()
     return jsonify({"status": "success"})
@@ -590,16 +641,23 @@ def api_upload():
         # Save path relative to app root
         # Ideally this should be passed from config, but we hardcode for simplicity as request by user task
         # dashboard/static/uploads
-        base_dir = current_app.root_path # this is dashboard/
-        upload_folder = os.path.join(base_dir, 'static', 'uploads')
-        
-        if not os.path.exists(upload_folder):
-            os.makedirs(upload_folder)
-            
-        file.save(os.path.join(upload_folder, filename))
         
         # Return web accessible path
         web_path = f"/static/uploads/{filename}"
         return jsonify({"status": "success", "file_path": web_path})
     
     return jsonify({"error": "Upload failed"}), 500
+
+@knowledge_bp.route('/api/search_titles', methods=['GET'])
+def api_search_titles():
+    query = request.args.get('q', '').strip()
+    if not query:
+        return jsonify([])
+        
+    conn = get_db()
+    # Simple partial match
+    sql = "SELECT id, title, type, doc_number FROM entries WHERE title LIKE ? ORDER BY created_at DESC LIMIT 20"
+    rows = conn.execute(sql, (f'%{query}%',)).fetchall()
+    conn.close()
+    
+    return jsonify([dict(r) for r in rows])
