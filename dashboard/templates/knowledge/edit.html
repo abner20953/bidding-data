@@ -159,11 +159,16 @@
                 </div>
 
                 <div class="row g-4">
-                    <div class="col-md-6">
+                    <div class="col-md-4">
+                        <label class="form-label">文号</label>
+                        <input type="text" class="form-control" id="docNumber" value="{{ entry.doc_number }}"
+                            placeholder="例如：发改法规〔2022〕1117号">
+                    </div>
+                    <div class="col-md-4">
                         <label class="form-label">发布时间</label>
                         <input type="date" class="form-control" id="publishDate" value="{{ entry.publish_date }}">
                     </div>
-                    <div class="col-md-6">
+                    <div class="col-md-4">
                         <label class="form-label">原始链接</label>
                         <input type="text" class="form-control" id="originalUrl" value="{{ entry.url }}">
                     </div>
@@ -574,6 +579,7 @@
                     if (res.data.content) document.getElementById('content').value = res.data.content;
                     if (res.data.publish_date) document.getElementById('publishDate').value = res.data.publish_date;
                     if (res.data.url) document.getElementById('originalUrl').value = res.data.url;
+                    if (res.data.doc_number) document.getElementById('docNumber').value = res.data.doc_number;
 
                     alert('抓取成功！');
                 } else {
@@ -597,6 +603,7 @@
             const url = document.getElementById('originalUrl').value;
             const publishDate = document.getElementById('publishDate').value;
             const screenshot = document.getElementById('screenshotPath').value;
+            const docNumber = document.getElementById('docNumber').value;
 
             // Collect checked tags
             const tags = Array.from(selectedTags);
@@ -607,7 +614,7 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         id: id ? parseInt(id) : null,
-                        title, type, tags, content, url, publish_date: publishDate, screenshot
+                        title, type, tags, content, url, publish_date: publishDate, screenshot, doc_number: docNumber
                     })
                 });
                 const res = await resp.json();

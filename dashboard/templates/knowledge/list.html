@@ -353,10 +353,17 @@
                     const titleHtml = highlightText(item.title, currentQuery, data.search_terms);
                     const summaryHtml = highlightText(item.summary, currentQuery, data.search_terms);
 
+                    const detailUrl = currentQuery ? `/anli/view/${item.id}?q=${encodeURIComponent(currentQuery)}` : `/anli/view/${item.id}`;
+
+                    const docNumHtml = item.doc_number ? `<span class="badge bg-secondary ms-2 align-middle" style="font-size: 0.75rem;">${highlightText(item.doc_number, currentQuery, data.search_terms)}</span>` : '';
+
                     const html = `
-                    <a href="/anli/view/${item.id}" class="card-item">
+                    <a href="${detailUrl}" class="card-item">
                         <div class="d-flex justify-content-between align-items-center mb-1">
-                            <h6 class="mb-0 fw-bold text-dark" style="font-size: 1.1rem;">${titleHtml}</h6>
+                            <div>
+                                <h6 class="mb-0 fw-bold text-dark d-inline align-middle" style="font-size: 1.1rem;">${titleHtml}</h6>
+                                ${docNumHtml}
+                            </div>
                             <span class="badge ${badgeClass} rounded-pill" style="font-size: 0.75rem;">${item.type}</span>
                         </div>
                         <p class="text-secondary small mb-2" style="font-size: 0.9rem; line-height: 1.5;">${summaryHtml}...</p>

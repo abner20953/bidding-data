@@ -50,6 +50,12 @@ def init_db():
         c.execute("ALTER TABLE entries ADD COLUMN screenshot TEXT")
     except sqlite3.OperationalError:
         pass # Column likely exists
+        
+    # Try adding doc_number column if it doesn't exist
+    try:
+        c.execute("ALTER TABLE entries ADD COLUMN doc_number TEXT")
+    except sqlite3.OperationalError:
+        pass
     
     # 2. 评论表
     c.execute('''
@@ -106,7 +112,17 @@ def view_entry(id):
     if not entry:
         return "Not Found", 404
         
-    return render_template('detail.html', entry=dict(entry), comments=[dict(c) for c in comments])
+    # Handle Search Highlighting
+    query = request.args.get('q', '')
+    highlight_tokens = []
+    if query:
+        seg_list = list(jieba.cut_for_search(query))
+        highlight_tokens = [term.strip() for term in seg_list if term.strip()]
+        if not highlight_tokens:
+             # Fallback to query itself if tokens are empty
+             highlight_tokens = [query]
+        
+    return render_template('detail.html', entry=dict(entry), comments=[dict(c) for c in comments], highlight_tokens=highlight_tokens)
 
 @knowledge_bp.route('/edit')
 @knowledge_bp.route('/edit/<int:id>')
@@ -133,7 +149,7 @@ def api_list():
     
     conn = get_db()
     # Fetch full content to generate snippet in Python
-    sql = "SELECT id, title, type, tags, publish_date, created_at, content, screenshot FROM entries WHERE 1=1"
+    sql = "SELECT id, title, type, tags, publish_date, created_at, content, screenshot, doc_number FROM entries WHERE 1=1"
     params = []
     
     if type_filter:
@@ -159,8 +175,9 @@ def api_list():
                 term = term.strip()
                 if term:
                     search_terms.append(term)
-                    sub_clauses.append(f"(title LIKE ? OR content LIKE ?)")
-                    params.extend([f'%{term}%', f'%{term}%'])
+                    # Search Title, Content AND Doc Number
+                    sub_clauses.append(f"(title LIKE ? OR content LIKE ? OR doc_number LIKE ?)")
+                    params.extend([f'%{term}%', f'%{term}%', f'%{term}%'])
             if sub_clauses:
                 sql += " AND (" + " AND ".join(sub_clauses) + ")"
                 
@@ -173,9 +190,9 @@ def api_list():
     if query and search_terms:
         # Relevance Score Calculation:
         # 1. Title contains full query string (High Weight: 100)
-        # 2. Title contains individual term (Medium Weight: 10 per term)
-        # Note: We rely on filter AND logic, so all terms are present in the doc. 
-        # We differentiate by seeing if they are in the TITLE.
+        # 2. Doc Number contains full query string (High Weight: 80) !! NEW
+        # 3. Content contains full query string (Medium Weight: 50)
+        # 4. Title contains individual term (Low Weight: 10 per term)
         
         score_parts = []
         score_vals = []
@@ -184,8 +201,11 @@ def api_list():
         score_parts.append("(CASE WHEN title LIKE ? THEN 100 ELSE 0 END)")
         score_vals.append(f"%{query}%")
 
+        # Exact/Full Query in Doc Number
+        score_parts.append("(CASE WHEN doc_number LIKE ? THEN 80 ELSE 0 END)")
+        score_vals.append(f"%{query}%")
+
         # Exact/Full Query in Content (Medium-High Weight: 50)
-        # This fixes the issue where "Query matches Content perfectly" was ranked lower than "Title matches one term"
         score_parts.append("(CASE WHEN content LIKE ? THEN 50 ELSE 0 END)")
         score_vals.append(f"%{query}%")
         
@@ -196,10 +216,6 @@ def api_list():
             
         score_expr = " + ".join(score_parts)
         order_clause = f"({score_expr}) DESC, created_at DESC"
-        
-        # DEBUG: Print SQL logic to console (remove in prod)
-        # print(f"DEBUG SQL ORDER: {order_clause}")
-        # print(f"DEBUG PARAMS: {score_vals}")
         
         # Append score params to main params (Before Limit/Offset)
         params.extend(score_vals)
@@ -349,7 +365,8 @@ def api_save():
     content = data.get('content')
     url = data.get('url')
     publish_date = data.get('publish_date')
-    screenshot = data.get('screenshot') # New field
+    screenshot = data.get('screenshot')
+    doc_number = data.get('doc_number', '').strip() # New field
     
     if not title or not content:
         return jsonify({"error": "标题和内容不能为空"}), 400
@@ -359,14 +376,14 @@ def api_save():
     
     if id:
         conn.execute('''
-            UPDATE entries SET title=?, type=?, tags=?, content=?, url=?, publish_date=?, screenshot=?, updated_at=?
+            UPDATE entries SET title=?, type=?, tags=?, content=?, url=?, publish_date=?, screenshot=?, doc_number=?, updated_at=?
             WHERE id=?
-        ''', (title, type_val, tags, content, url, publish_date, screenshot, now, id))
+        ''', (title, type_val, tags, content, url, publish_date, screenshot, doc_number, now, id))
     else:
         conn.execute('''
-            INSERT INTO entries (title, type, tags, content, url, publish_date, screenshot, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (title, type_val, tags, content, url, publish_date, screenshot, now, now))
+            INSERT INTO entries (title, type, tags, content, url, publish_date, screenshot, doc_number, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (title, type_val, tags, content, url, publish_date, screenshot, doc_number, now, now))
         
     conn.commit()
     conn.close()
@@ -497,6 +514,26 @@ def api_extract():
             valid_ps = [p.get_text().strip() for p in ps if len(p.get_text().strip()) > 10]
             if valid_ps:
                 content = "\n".join(valid_ps)
+        
+        # --- 4. Doc Number Extraction (Regex) ---
+        doc_number = ""
+        if content or title:
+            # Regex for Chinese Doc Number: 
+            # e.g., 发改法规规〔2022〕1117号, 国办发[2020]15号
+            # Core pattern: [Prefix] + [Bracket] + Year + [Bracket] + Number + "号"
+            
+            # Pattern 1: Standard
+            doc_pattern = re.compile(r'([\u4e00-\u9fa5A-Za-z0-9]{2,10}[〔\[【]\d{4}[】\]〕]\d+号)')
+            
+            # Check Title First
+            match = doc_pattern.search(title)
+            if match:
+                doc_number = match.group(0)
+            else:
+                 # Check Content (First 3000 chars)
+                 match = doc_pattern.search(content[:3000])
+                 if match:
+                     doc_number = match.group(0)
 
         return jsonify({
             "status": "success",
@@ -504,7 +541,8 @@ def api_extract():
                 "title": title,
                 "content": content,
                 "publish_date": publish_date,
-                "url": url
+                "url": url,
+                "doc_number": doc_number
             }
         })
     except Exception as e:

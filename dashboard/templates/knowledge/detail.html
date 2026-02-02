@@ -88,6 +88,14 @@
             height: auto;
             display: block;
         }
+
+        .search-highlight {
+            background-color: #ffd700;
+            color: #000;
+            font-weight: bold;
+            padding: 0 2px;
+            border-radius: 2px;
+        }
     </style>
 </head>
 
@@ -111,6 +119,10 @@
                 <span
                     class="badge {{ 'badge-law' if entry.type == '法律法规' else 'badge-case' }} me-3 rounded-pill px-3">{{
                     entry.type }}</span>
+                {% if entry.doc_number %}
+                <span class="badge bg-secondary me-3 rounded-pill px-3"><i class="fas fa-file-alt me-1"></i> {{
+                    entry.doc_number }}</span>
+                {% endif %}
                 <span class="me-3"><i class="far fa-clock"></i> 发布: {{ entry.publish_date or '未知' }}</span>
                 <span class="me-3"><i class="fas fa-user-edit"></i> 录入: {{ entry.created_at.split(' ')[0] }}</span>
                 {% if entry.url %}
@@ -247,6 +259,38 @@
             alert('网络错误');
         } finally {
             btn.disabled = false;
+        }
+        });
+    </script>
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            try {
+                const highlightTokens = {{ highlight_tokens | tojson | safe
+            }};
+        if (highlightTokens && highlightTokens.length > 0) {
+            const contentDiv = document.querySelector('.entry-content');
+            if (contentDiv) {
+                let text = contentDiv.innerHTML;
+                const uniqueTokens = [...new Set(highlightTokens)];
+                // Sort by length desc
+                uniqueTokens.sort((a, b) => b.length - a.length);
+
+                if (uniqueTokens.length > 0) {
+                    const safeTerms = uniqueTokens.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+                    const pattern = new RegExp(`(${safeTerms.join('|')})`, 'gi');
+                    text = text.replace(pattern, '<span class="search-highlight">$1</span>');
+                    contentDiv.innerHTML = text;
+
+                    // Scroll to first match
+                    const firstMatch = contentDiv.querySelector('.search-highlight');
+                    if (firstMatch) {
+                        firstMatch.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    }
+                }
+            }
+        }
+            } catch (e) {
+            console.error("Highlight error:", e);
         }
         });
     </script>
