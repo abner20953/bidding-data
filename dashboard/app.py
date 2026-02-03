@@ -459,6 +459,10 @@ def mobile_view():
 def navigation_index():
     return render_template('nav_index.html')
 
+@app.route('/a11')
+def navigation_index_full():
+    return render_template('nav_index_full.html')
+
 @app.route('/api/tools/download')
 def download_tools():
     # 保留此路由用于首页按钮 (只下载 Beyond Compare)
