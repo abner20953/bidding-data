@@ -240,12 +240,47 @@
                     }
                 </script>
 
-                <div class="d-grid gap-2">
-                    <button type="submit" class="btn btn-primary btn-lg">保 存</button>
+                <div class="d-flex gap-2">
+                    {% if entry.id %}
+                    <button type="button" class="btn btn-danger btn-lg px-5" onclick="deleteEntry()">删 除</button>
+                    {% endif %}
+                    <button type="submit" class="btn btn-primary btn-lg flex-grow-1">保 存</button>
                 </div>
             </form>
         </div>
     </div>
+
+    <script>
+        async function deleteEntry() {
+            const pwd = prompt("请输入管理密码以删除此条目：");
+            if (pwd === null) return; // Cancelled
+
+            if (pwd !== "108") {
+                alert("密码错误！");
+                return;
+            }
+
+            if (!confirm("确定要永久删除此条目吗？此操作无法撤销！")) return;
+
+            const id = document.getElementById('entryId').value;
+            try {
+                const resp = await fetch('/anli/api/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id: id })
+                });
+                const res = await resp.json();
+                if (res.status === 'success') {
+                    alert('删除成功');
+                    window.location.href = '/anli';
+                } else {
+                    alert('删除失败: ' + (res.error || '未知错误'));
+                }
+            } catch (e) {
+                alert('网络错误');
+            }
+        }
+    </script>
 
     <!-- Manage Tags Modal -->
     <!-- Select Tags Modal -->

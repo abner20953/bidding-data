@@ -466,6 +466,30 @@ def api_save():
     conn.close()
     return jsonify({"status": "success"})
 
+@knowledge_bp.route('/api/delete', methods=['POST'])
+def api_delete():
+    data = request.get_json()
+    id = data.get('id')
+    
+    if not id:
+        return jsonify({"error": "ID is required"}), 400
+        
+    conn = get_db()
+    try:
+        # Delete entry
+        conn.execute("DELETE FROM entries WHERE id = ?", (id,))
+        # Delete comments
+        conn.execute("DELETE FROM comments WHERE entry_id = ?", (id,))
+        # Delete relations (as source or target)
+        conn.execute("DELETE FROM entry_relations WHERE source_id = ? OR target_id = ?", (id, id))
+        
+        conn.commit()
+        return jsonify({"status": "success"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
 @knowledge_bp.route('/api/comment', methods=['POST'])
 def api_comment():
     data = request.get_json()
