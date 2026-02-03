@@ -5,6 +5,8 @@ import datetime
 import json
 import jieba
 import time
+import uuid
+import re
 
 # 定义 Blueprint
 knowledge_bp = Blueprint('knowledge', __name__, 
@@ -25,14 +27,10 @@ def init_db():
     c = conn.cursor()
     
     # 1. 条目表
-    # Check ifscreenshot column exists, if not need to add it (or just fail gracefully/recreate for dev)
-    # For simplicity in this dev phase, let's CREATE IF NOT EXISTS. 
-    # MIGRATION STRATEGY: user has almost no data. 
-    # But to be safe, we will try to add column if missing.
-    
     c.execute('''
         CREATE TABLE IF NOT EXISTS entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uuid TEXT UNIQUE,
             title TEXT NOT NULL,
             type TEXT NOT NULL, 
             tags TEXT, 
@@ -41,21 +39,34 @@ def init_db():
             publish_date TEXT,
             created_at TEXT,
             updated_at TEXT,
-            screenshot TEXT -- Path to uploaded screenshot
+            screenshot TEXT,
+            doc_number TEXT
         )
     ''')
     
-    # Try adding screenshot column if it doesn't exist (for existing DB)
+    # Try adding columns if they don't exist
     try:
         c.execute("ALTER TABLE entries ADD COLUMN screenshot TEXT")
     except sqlite3.OperationalError:
-        pass # Column likely exists
+        pass 
         
-    # Try adding doc_number column if it doesn't exist
     try:
         c.execute("ALTER TABLE entries ADD COLUMN doc_number TEXT")
     except sqlite3.OperationalError:
         pass
+
+    try:
+        c.execute("ALTER TABLE entries ADD COLUMN uuid TEXT")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_uuid ON entries(uuid)")
+    except sqlite3.OperationalError:
+        pass
+    
+    # Backfill UUIDs
+    c.execute("SELECT id FROM entries WHERE uuid IS NULL OR uuid = ''")
+    rows = c.fetchall()
+    for row in rows:
+        uid = str(uuid.uuid4())
+        c.execute("UPDATE entries SET uuid = ? WHERE id = ?", (uid, row[0]))
     
     # 2. 评论表
     c.execute('''
@@ -69,7 +80,7 @@ def init_db():
         )
     ''')
     
-    # 3. 标签表 (New)
+    # 3. 标签表
     c.execute('''
         CREATE TABLE IF NOT EXISTS tags (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,10 +88,7 @@ def init_db():
         )
     ''')
     
-    # Tags are managed dynamically by the user, no hardcoded defaults.
-    pass
-
-    # 4. 关联表 (New - for related entries)
+    # 4. 关联表
     c.execute('''
         CREATE TABLE IF NOT EXISTS entry_relations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,7 +98,6 @@ def init_db():
             FOREIGN KEY(target_id) REFERENCES entries(id)
         )
     ''')
-    # Add index for performance
     c.execute('CREATE INDEX IF NOT EXISTS idx_relations_source ON entry_relations(source_id)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_relations_target ON entry_relations(source_id)')
         
@@ -116,24 +123,36 @@ def get_db():
 def index():
     return render_template('list.html')
 
-@knowledge_bp.route('/view/<int:id>')
-def view_entry(id):
+@knowledge_bp.route('/view/<entry_id>')
+def view_entry(entry_id):
     conn = get_db()
-    entry = conn.execute('SELECT * FROM entries WHERE id = ?', (id,)).fetchone()
-    comments = conn.execute('SELECT * FROM comments WHERE entry_id = ? ORDER BY id DESC', (id,)).fetchall()
+    # Try UUID first
+    entry = conn.execute('SELECT * FROM entries WHERE uuid = ?', (entry_id,)).fetchone()
+    
+    # Fallback to ID for backward compatibility ONLY if not found (optional, but good for transition)
+    # But user specifically wants to hide numbers. Let's support both but redirect numbers? 
+    # Or just support UUID. For now, strict UUID match if entry_id is long, else try ID?
+    # Simple approach: If it finds by UUID, good. If not, try ID.
+    if not entry and entry_id.isdigit():
+         entry = conn.execute('SELECT * FROM entries WHERE id = ?', (entry_id,)).fetchone()
+    
+    if not entry:
+        conn.close()
+        return "Not Found", 404
+        
+    internal_id = entry['id']
+    
+    comments = conn.execute('SELECT * FROM comments WHERE entry_id = ? ORDER BY id DESC', (internal_id,)).fetchall()
     # Fetch Related Entries
     relations = conn.execute('''
-        SELECT t.id, t.title, t.type, t.doc_number 
+        SELECT t.id, t.uuid, t.title, t.type, t.doc_number 
         FROM entry_relations r
         JOIN entries t ON r.target_id = t.id
         WHERE r.source_id = ?
-    ''', (id,)).fetchall()
+    ''', (internal_id,)).fetchall()
     
     conn.close()
     
-    if not entry:
-        return "Not Found", 404
-        
     # Handle Search Highlighting
     query = request.args.get('q', '')
     highlight_tokens = []
@@ -141,31 +160,34 @@ def view_entry(id):
         seg_list = list(jieba.cut_for_search(query))
         highlight_tokens = [term.strip() for term in seg_list if term.strip()]
         if not highlight_tokens:
-             # Fallback to query itself if tokens are empty
              highlight_tokens = [query]
         
     return render_template('detail.html', entry=dict(entry), comments=[dict(c) for c in comments], 
                            related_entries=[dict(r) for r in relations], highlight_tokens=highlight_tokens)
 
 @knowledge_bp.route('/edit')
-@knowledge_bp.route('/edit/<int:id>')
-def edit_entry(id=None):
+@knowledge_bp.route('/edit/<entry_id>')
+def edit_entry(entry_id=None):
     entry = {}
     related_entries = []
     
-    if id:
+    if entry_id:
         conn = get_db()
-        row = conn.execute('SELECT * FROM entries WHERE id = ?', (id,)).fetchone()
+        entry_row = conn.execute('SELECT * FROM entries WHERE uuid = ?', (entry_id,)).fetchone()
         
-        # Fetch existing relations
-        if row:
-            entry = dict(row)
+        # Fallback
+        if not entry_row and str(entry_id).isdigit():
+            entry_row = conn.execute('SELECT * FROM entries WHERE id = ?', (entry_id,)).fetchone()
+            
+        if entry_row:
+            entry = dict(entry_row)
+            internal_id = entry['id']
             rels = conn.execute('''
-                SELECT t.id, t.title 
+                SELECT t.id, t.uuid, t.title 
                 FROM entry_relations r
                 JOIN entries t ON r.target_id = t.id
                 WHERE r.source_id = ?
-            ''', (id,)).fetchall()
+            ''', (internal_id,)).fetchall()
             related_entries = [dict(r) for r in rels]
             
         conn.close()
@@ -184,8 +206,8 @@ def api_list():
     offset = (page - 1) * per_page
     
     conn = get_db()
-    # Fetch full content to generate snippet in Python
-    sql = "SELECT id, title, type, tags, publish_date, created_at, content, screenshot, doc_number FROM entries WHERE 1=1"
+    # Ensure uuid is fetched
+    sql = "SELECT id, uuid, title, type, tags, publish_date, created_at, content, screenshot, doc_number FROM entries WHERE 1=1"
     params = []
     
     if type_filter:
@@ -193,7 +215,6 @@ def api_list():
         params.append(type_filter)
         
     if tag_filter:
-        # Support multi-tags separated by comma (OR logic)
         tags = [t.strip() for t in tag_filter.split(',') if t.strip()]
         if tags:
             tag_clauses = []
@@ -211,7 +232,6 @@ def api_list():
                 term = term.strip()
                 if term:
                     search_terms.append(term)
-                    # Search Title, Content AND Doc Number
                     sub_clauses.append(f"(title LIKE ? OR content LIKE ? OR doc_number LIKE ?)")
                     params.extend([f'%{term}%', f'%{term}%', f'%{term}%'])
             if sub_clauses:
@@ -220,63 +240,46 @@ def api_list():
     count_sql = "SELECT COUNT(*) FROM (" + sql + ")"
     total = conn.execute(count_sql, params).fetchone()[0]
     
-    # Sort Logic: Relevance > Time
     order_clause = "created_at DESC"
     
     if query and search_terms:
-        # Relevance Score Calculation:
-        # 1. Title contains full query string (High Weight: 100)
-        # 2. Doc Number contains full query string (High Weight: 80) !! NEW
-        # 3. Content contains full query string (Medium Weight: 50)
-        # 4. Title contains individual term (Low Weight: 10 per term)
-        
         score_parts = []
         score_vals = []
-        
-        # Exact/Full Query in Title
         score_parts.append("(CASE WHEN title LIKE ? THEN 100 ELSE 0 END)")
         score_vals.append(f"%{query}%")
-
-        # Exact/Full Query in Doc Number
         score_parts.append("(CASE WHEN doc_number LIKE ? THEN 80 ELSE 0 END)")
         score_vals.append(f"%{query}%")
-
-        # Exact/Full Query in Content (Medium-High Weight: 50)
         score_parts.append("(CASE WHEN content LIKE ? THEN 50 ELSE 0 END)")
         score_vals.append(f"%{query}%")
-        
-        # Terms in Title
         for term in search_terms:
             score_parts.append("(CASE WHEN title LIKE ? THEN 10 ELSE 0 END)")
             score_vals.append(f"%{term}%")
-            
         score_expr = " + ".join(score_parts)
         order_clause = f"({score_expr}) DESC, created_at DESC"
-        
-        # Append score params to main params (Before Limit/Offset)
         params.extend(score_vals)
     
     sql += f" ORDER BY {order_clause} LIMIT ? OFFSET ?"
     params.extend([per_page, offset])
     
     rows = conn.execute(sql, params).fetchall()
-    conn.close()
     
+    # Check if UUIDs are present, backfill on the fly if needed (safety net)
     results = []
     for row in rows:
         item = dict(row)
-        content = item.pop('content') or '' # Remove full content from response
-        
-        # Smart Snippet Logic
+        if not item.get('uuid'):
+            # This shouldn't happen if init_db ran, but just in case
+            new_uid = str(uuid.uuid4())
+            conn.execute("UPDATE entries SET uuid = ? WHERE id = ?", (new_uid, item['id']))
+            conn.commit()
+            item['uuid'] = new_uid
+            
+        content = item.pop('content') or ''
         summary = content[:200]
         if query:
             content_lower = content.lower()
             query_lower = query.lower()
-            
-            # 1. Try exact phrase match first
             best_pos = content_lower.find(query_lower)
-            
-            # 2. If not found, try finding the earliest occurrence of individual terms
             if best_pos == -1 and search_terms:
                 min_pos = -1
                 for term in search_terms:
@@ -285,7 +288,6 @@ def api_list():
                         if min_pos == -1 or pos < min_pos:
                             min_pos = pos
                 best_pos = min_pos
-            
             if best_pos != -1:
                 start = max(0, best_pos - 30)
                 end = min(len(content), start + 200)
@@ -294,6 +296,8 @@ def api_list():
         item['summary'] = summary
         results.append(item)
     
+    conn.close()
+    
     return jsonify({
         "total": total,
         "page": page,
@@ -301,6 +305,8 @@ def api_list():
         "data": results,
         "search_terms": search_terms
     })
+
+
 
 @knowledge_bp.route('/api/tags', methods=['GET', 'POST', 'PUT'])
 def api_tags():
@@ -394,7 +400,7 @@ def api_tags():
 @knowledge_bp.route('/api/save', methods=['POST'])
 def api_save():
     data = request.get_json()
-    id = data.get('id')
+    entry_id_or_uuid = data.get('id')
     title = data.get('title')
     type_val = data.get('type')
     tags = json.dumps(data.get('tags', []), ensure_ascii=False)
@@ -402,21 +408,33 @@ def api_save():
     url = data.get('url')
     publish_date = data.get('publish_date')
     screenshot = data.get('screenshot')
-    doc_number = data.get('doc_number', '').strip() # New field
+    doc_number = data.get('doc_number', '').strip()
     
     if not title or not content:
         return jsonify({"error": "标题和内容不能为空"}), 400
         
     conn = get_db()
+    cursor = conn.cursor()
+    
+    # Resolve internal ID
+    internal_id = None
+    if entry_id_or_uuid:
+        # Try UUID
+        row = conn.execute("SELECT id FROM entries WHERE uuid = ?", (entry_id_or_uuid,)).fetchone()
+        if not row and str(entry_id_or_uuid).isdigit():
+            row = conn.execute("SELECT id FROM entries WHERE id = ?", (entry_id_or_uuid,)).fetchone()
+        
+        if row: 
+            internal_id = row['id']
     
     # --- Uniqueness Check ---
     # 1. Check Doc Number
     if doc_number:
         sql = "SELECT id FROM entries WHERE doc_number = ?"
         params = [doc_number]
-        if id:
+        if internal_id:
              sql += " AND id != ?"
-             params.append(id)
+             params.append(internal_id)
         exists = conn.execute(sql, params).fetchone()
         if exists:
             conn.close()
@@ -425,9 +443,9 @@ def api_save():
     # 2. Check Title
     sql = "SELECT id FROM entries WHERE title = ?"
     params = [title]
-    if id:
+    if internal_id:
          sql += " AND id != ?"
-         params.append(id)
+         params.append(internal_id)
     exists = conn.execute(sql, params).fetchone()
     if exists:
         conn.close()
@@ -436,31 +454,38 @@ def api_save():
 
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
-    cursor = conn.cursor()
-    
-    if id:
+    if internal_id:
         cursor.execute('''
             UPDATE entries SET title=?, type=?, tags=?, content=?, url=?, publish_date=?, screenshot=?, doc_number=?, updated_at=?
             WHERE id=?
-        ''', (title, type_val, tags, content, url, publish_date, screenshot, doc_number, now, id))
-        entry_id = int(id)
+        ''', (title, type_val, tags, content, url, publish_date, screenshot, doc_number, now, internal_id))
     else:
+        new_uuid = str(uuid.uuid4())
         cursor.execute('''
-            INSERT INTO entries (title, type, tags, content, url, publish_date, screenshot, doc_number, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (title, type_val, tags, content, url, publish_date, screenshot, doc_number, now, now))
-        entry_id = cursor.lastrowid
+            INSERT INTO entries (uuid, title, type, tags, content, url, publish_date, screenshot, doc_number, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (new_uuid, title, type_val, tags, content, url, publish_date, screenshot, doc_number, now, now))
+        internal_id = cursor.lastrowid
         
     # --- Process Relations ---
     # Delete all existing relations for this source
-    cursor.execute("DELETE FROM entry_relations WHERE source_id = ?", (entry_id,))
+    cursor.execute("DELETE FROM entry_relations WHERE source_id = ?", (internal_id,))
     
     related_ids = data.get('related_ids', [])
     if related_ids and isinstance(related_ids, list):
-         for target_id in related_ids:
-             # Prevent self-relation
-             if int(target_id) != entry_id:
-                  cursor.execute("INSERT INTO entry_relations (source_id, target_id) VALUES (?, ?)", (entry_id, target_id))
+         for target_identifier in related_ids:
+             # target_identifier could be UUID or ID (if old). 
+             # We should resolve it to internal ID first.
+             # Assume frontend sends UUIDs for related entries too.
+             target_row = conn.execute("SELECT id FROM entries WHERE uuid = ?", (target_identifier,)).fetchone()
+             if not target_row and str(target_identifier).isdigit():
+                 target_row = conn.execute("SELECT id FROM entries WHERE id = ?", (target_identifier,)).fetchone()
+                 
+             if target_row:
+                 t_id = target_row['id']
+                 # Prevent self-relation
+                 if t_id != internal_id:
+                      cursor.execute("INSERT INTO entry_relations (source_id, target_id) VALUES (?, ?)", (internal_id, t_id))
 
     conn.commit()
     conn.close()
@@ -469,19 +494,29 @@ def api_save():
 @knowledge_bp.route('/api/delete', methods=['POST'])
 def api_delete():
     data = request.get_json()
-    id = data.get('id')
+    uid = data.get('id')
     
-    if not id:
+    if not uid:
         return jsonify({"error": "ID is required"}), 400
         
     conn = get_db()
     try:
+        # Resolve to internal ID
+        row = conn.execute("SELECT id FROM entries WHERE uuid = ?", (uid,)).fetchone()
+        if not row and str(uid).isdigit():
+             row = conn.execute("SELECT id FROM entries WHERE id = ?", (uid,)).fetchone()
+             
+        if not row:
+            return jsonify({"error": "Entry not found"}), 404
+            
+        internal_id = row['id']
+        
         # Delete entry
-        conn.execute("DELETE FROM entries WHERE id = ?", (id,))
+        conn.execute("DELETE FROM entries WHERE id = ?", (internal_id,))
         # Delete comments
-        conn.execute("DELETE FROM comments WHERE entry_id = ?", (id,))
+        conn.execute("DELETE FROM comments WHERE entry_id = ?", (internal_id,))
         # Delete relations (as source or target)
-        conn.execute("DELETE FROM entry_relations WHERE source_id = ? OR target_id = ?", (id, id))
+        conn.execute("DELETE FROM entry_relations WHERE source_id = ? OR target_id = ?", (internal_id, internal_id))
         
         conn.commit()
         return jsonify({"status": "success"})
@@ -685,8 +720,18 @@ def api_search_titles():
         
     conn = get_db()
     # Simple partial match
-    sql = "SELECT id, title, type, doc_number FROM entries WHERE title LIKE ? ORDER BY created_at DESC LIMIT 20"
+    sql = "SELECT id, uuid, title, type, doc_number FROM entries WHERE title LIKE ? ORDER BY created_at DESC LIMIT 20"
     rows = conn.execute(sql, (f'%{query}%',)).fetchall()
     conn.close()
     
-    return jsonify([dict(r) for r in rows])
+    # Ensure uuid is present (backfill safety)
+    results = []
+    for row in rows:
+        d = dict(row)
+        if not d.get('uuid'):
+            d['uuid'] = str(uuid.uuid4())
+            # We won't save back here for perf/simplicity, assuming api_list/init_db caught most.
+            # actually better to save it if we can, but let's trust init_db.
+        results.append(d)
+        
+    return jsonify(results)

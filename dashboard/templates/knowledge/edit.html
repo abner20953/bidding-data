@@ -107,146 +107,152 @@
             <h2 class="mb-4 text-center">{{ '编辑条目' if entry.id else '录入新条目' }}</h2>
 
             <form id="entryForm">
-                <input type="hidden" id="entryId" value="{{ entry.id }}">
-                <input type="hidden" id="screenshotPath" value="{{ entry.screenshot }}">
+                <h2 class="mb-4 text-center">{{ '编辑条目' if entry.id else '录入新条目' }}</h2>
 
-                <!-- URL Auto Extract -->
-                <div class="mb-4 p-4 bg-white rounded-3 shadow-sm border">
-                    <label class="form-label text-primary"><i class="fas fa-magic"></i> 智能抓取</label>
-                    <div class="input-group">
-                        <input type="text" id="autoUrl" class="form-control" placeholder="输入文章网址...">
-                        <button class="btn btn-primary" type="button" onclick="autoExtract()">抓取内容</button>
-                    </div>
-                </div>
+                <form id="entryForm">
+                    <input type="hidden" id="entryId" value="{{ entry.uuid }}">
+                    <input type="hidden" id="screenshotPath" value="{{ entry.screenshot }}">
+                    <input type="hidden" id="screenshotPath" value="{{ entry.screenshot }}">
 
-                <div class="row g-4">
-                    <div class="col-md-8">
-                        <div class="mb-3">
-                            <label class="form-label">标题 <span class="text-danger">*</span></label>
-                            <input type="text" class="form-control form-control-lg fw-bold" id="title"
-                                value="{{ entry.title }}" required>
+                    <!-- URL Auto Extract -->
+                    <div class="mb-4 p-4 bg-white rounded-3 shadow-sm border">
+                        <label class="form-label text-primary"><i class="fas fa-magic"></i> 智能抓取</label>
+                        <div class="input-group">
+                            <input type="text" id="autoUrl" class="form-control" placeholder="输入文章网址...">
+                            <button class="btn btn-primary" type="button" onclick="autoExtract()">抓取内容</button>
                         </div>
                     </div>
-                    <div class="col-md-4">
-                        <div class="mb-3">
-                            <label class="form-label">类型 <span class="text-danger">*</span></label>
-                            <select class="form-select form-select-lg" id="type" required onchange="toggleCaseFields()">
-                                <option value="法律法规" {{ 'selected' if entry.type=='法律法规' else '' }}>法律法规</option>
-                                <option value="案例" {{ 'selected' if entry.type=='案例' else '' }}>案例</option>
-                            </select>
+
+                    <div class="row g-4">
+                        <div class="col-md-8">
+                            <div class="mb-3">
+                                <label class="form-label">标题 <span class="text-danger">*</span></label>
+                                <input type="text" class="form-control form-control-lg fw-bold" id="title"
+                                    value="{{ entry.title }}" required>
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="mb-3">
+                                <label class="form-label">类型 <span class="text-danger">*</span></label>
+                                <select class="form-select form-select-lg" id="type" required
+                                    onchange="toggleCaseFields()">
+                                    <option value="法律法规" {{ 'selected' if entry.type=='法律法规' else '' }}>法律法规</option>
+                                    <option value="案例" {{ 'selected' if entry.type=='案例' else '' }}>案例</option>
+                                </select>
+                            </div>
                         </div>
                     </div>
-                </div>
 
-                <div class="mb-3">
-                    <label class="form-label">标签 <span class="text-danger">*</span></label>
-                    <div class="p-3 border rounded bg-white" style="min-height: 60px;">
-                        <div id="selectedRefTags" class="d-flex flex-wrap gap-2 mb-2">
-                            <!-- Selected tags will appear here -->
-                            <span class="text-muted small align-self-center fst-italic" id="noTagsHint">未选择标签...</span>
+                    <div class="mb-3">
+                        <label class="form-label">标签 <span class="text-danger">*</span></label>
+                        <div class="p-3 border rounded bg-white" style="min-height: 60px;">
+                            <div id="selectedRefTags" class="d-flex flex-wrap gap-2 mb-2">
+                                <!-- Selected tags will appear here -->
+                                <span class="text-muted small align-self-center fst-italic"
+                                    id="noTagsHint">未选择标签...</span>
+                            </div>
+                            <div class="d-flex gap-2">
+                                <button type="button" class="btn btn-sm btn-outline-primary rounded-pill px-3"
+                                    onclick="openSelectTagModal()">
+                                    <i class="fas fa-check-square"></i> 选择标签
+                                </button>
+                                <button type="button" class="btn btn-sm btn-outline-secondary rounded-pill px-3"
+                                    onclick="openManageTagModal()">
+                                    <i class="fas fa-cog"></i> 管理标签
+                                </button>
+                            </div>
                         </div>
-                        <div class="d-flex gap-2">
-                            <button type="button" class="btn btn-sm btn-outline-primary rounded-pill px-3"
-                                onclick="openSelectTagModal()">
-                                <i class="fas fa-check-square"></i> 选择标签
+                    </div>
+
+                    <div class="row g-4">
+                        <div class="col-md-4">
+                            <label class="form-label">文号</label>
+                            <input type="text" class="form-control" id="docNumber" value="{{ entry.doc_number }}"
+                                placeholder="例如：发改法规〔2022〕1117号">
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">发布时间</label>
+                            <input type="date" class="form-control" id="publishDate" value="{{ entry.publish_date }}">
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">原始链接</label>
+                            <input type="text" class="form-control" id="originalUrl" value="{{ entry.url }}">
+                        </div>
+                    </div>
+
+                    <!-- Related Entries Section -->
+                    <div class="mb-4 p-4 mt-4 bg-white rounded-3 shadow-sm border">
+                        <label class="form-label text-primary"><i class="fas fa-link"></i> 关联信息 (法律法规/案例)</label>
+
+                        <!-- Selected Relations Display -->
+                        <div id="selectedRelations" class="mb-3 d-flex flex-wrap gap-2">
+                            <!-- Rendered by JS -->
+                            <span class="text-muted small align-self-center fst-italic"
+                                id="noRelationsHint">暂无关联信息...</span>
+                        </div>
+
+                        <div class="input-group">
+                            <button class="btn btn-outline-primary" type="button" onclick="openRelationModal()">
+                                <i class="fas fa-plus"></i> 添加关联
                             </button>
-                            <button type="button" class="btn btn-sm btn-outline-secondary rounded-pill px-3"
-                                onclick="openManageTagModal()">
-                                <i class="fas fa-cog"></i> 管理标签
-                            </button>
                         </div>
                     </div>
-                </div>
 
-                <div class="row g-4">
-                    <div class="col-md-4">
-                        <label class="form-label">文号</label>
-                        <input type="text" class="form-control" id="docNumber" value="{{ entry.doc_number }}"
-                            placeholder="例如：发改法规〔2022〕1117号">
-                    </div>
-                    <div class="col-md-4">
-                        <label class="form-label">发布时间</label>
-                        <input type="date" class="form-control" id="publishDate" value="{{ entry.publish_date }}">
-                    </div>
-                    <div class="col-md-4">
-                        <label class="form-label">原始链接</label>
-                        <input type="text" class="form-control" id="originalUrl" value="{{ entry.url }}">
-                    </div>
-                </div>
-
-                <!-- Related Entries Section -->
-                <div class="mb-4 p-4 mt-4 bg-white rounded-3 shadow-sm border">
-                    <label class="form-label text-primary"><i class="fas fa-link"></i> 关联信息 (法律法规/案例)</label>
-
-                    <!-- Selected Relations Display -->
-                    <div id="selectedRelations" class="mb-3 d-flex flex-wrap gap-2">
-                        <!-- Rendered by JS -->
-                        <span class="text-muted small align-self-center fst-italic"
-                            id="noRelationsHint">暂无关联信息...</span>
+                    <!-- Case Specific: Upload -->
+                    <div id="caseFields" class="mt-4 mb-4 p-3 bg-light rounded border d-none">
+                        <label class="form-label"><i class="fas fa-image"></i> 案例截图/附件</label>
+                        <input type="file" class="form-control" id="imageInput" accept="image/*">
+                        <div class="mt-2">
+                            <img id="imagePreview" class="img-preview" src="{{ entry.screenshot }}"
+                                style="{{ 'display:block' if entry.screenshot else '' }}">
+                        </div>
                     </div>
 
-                    <div class="input-group">
-                        <button class="btn btn-outline-primary" type="button" onclick="openRelationModal()">
-                            <i class="fas fa-plus"></i> 添加关联
-                        </button>
+                    <div class="mb-4 mt-4">
+                        <label class="form-label">正文内容 <span class="text-danger">*</span></label>
+                        <div class="mb-2">
+                            <button type="button" class="btn btn-sm btn-outline-secondary me-2"
+                                onclick="insertTag('<b>', '</b>')">
+                                <i class="fas fa-bold"></i> 加粗
+                            </button>
+                            <button type="button" class="btn btn-sm btn-outline-danger"
+                                onclick="insertTag('<span style=\'color:red\'>', '</span>')">
+                                <i class="fas fa-font"></i> 标红
+                            </button>
+                        </div>
+                        <textarea class="form-control" id="content" rows="15" required
+                            placeholder="在此输入详细内容...">{{ entry.content }}</textarea>
                     </div>
-                </div>
 
-                <!-- Case Specific: Upload -->
-                <div id="caseFields" class="mt-4 mb-4 p-3 bg-light rounded border d-none">
-                    <label class="form-label"><i class="fas fa-image"></i> 案例截图/附件</label>
-                    <input type="file" class="form-control" id="imageInput" accept="image/*">
-                    <div class="mt-2">
-                        <img id="imagePreview" class="img-preview" src="{{ entry.screenshot }}"
-                            style="{{ 'display:block' if entry.screenshot else '' }}">
+                    <script>
+                        function insertTag(startTag, endTag) {
+                            const textarea = document.getElementById('content');
+                            const start = textarea.selectionStart;
+                            const end = textarea.selectionEnd;
+                            const text = textarea.value;
+
+                            if (start === end) return; // No selection
+
+                            const before = text.substring(0, start);
+                            const selected = text.substring(start, end);
+                            const after = text.substring(end);
+
+                            textarea.value = before + startTag + selected + endTag + after;
+
+                            // Reset selection
+                            textarea.selectionStart = start + startTag.length;
+                            textarea.selectionEnd = end + startTag.length;
+                            textarea.focus();
+                        }
+                    </script>
+
+                    <div class="d-flex gap-2">
+                        {% if entry.id %}
+                        <button type="button" class="btn btn-danger btn-lg px-5" onclick="deleteEntry()">删 除</button>
+                        {% endif %}
+                        <button type="submit" class="btn btn-primary btn-lg flex-grow-1">保 存</button>
                     </div>
-                </div>
-
-                <div class="mb-4 mt-4">
-                    <label class="form-label">正文内容 <span class="text-danger">*</span></label>
-                    <div class="mb-2">
-                        <button type="button" class="btn btn-sm btn-outline-secondary me-2"
-                            onclick="insertTag('<b>', '</b>')">
-                            <i class="fas fa-bold"></i> 加粗
-                        </button>
-                        <button type="button" class="btn btn-sm btn-outline-danger"
-                            onclick="insertTag('<span style=\'color:red\'>', '</span>')">
-                            <i class="fas fa-font"></i> 标红
-                        </button>
-                    </div>
-                    <textarea class="form-control" id="content" rows="15" required
-                        placeholder="在此输入详细内容...">{{ entry.content }}</textarea>
-                </div>
-
-                <script>
-                    function insertTag(startTag, endTag) {
-                        const textarea = document.getElementById('content');
-                        const start = textarea.selectionStart;
-                        const end = textarea.selectionEnd;
-                        const text = textarea.value;
-
-                        if (start === end) return; // No selection
-
-                        const before = text.substring(0, start);
-                        const selected = text.substring(start, end);
-                        const after = text.substring(end);
-
-                        textarea.value = before + startTag + selected + endTag + after;
-
-                        // Reset selection
-                        textarea.selectionStart = start + startTag.length;
-                        textarea.selectionEnd = end + startTag.length;
-                        textarea.focus();
-                    }
-                </script>
-
-                <div class="d-flex gap-2">
-                    {% if entry.id %}
-                    <button type="button" class="btn btn-danger btn-lg px-5" onclick="deleteEntry()">删 除</button>
-                    {% endif %}
-                    <button type="submit" class="btn btn-primary btn-lg flex-grow-1">保 存</button>
-                </div>
-            </form>
+                </form>
         </div>
     </div>
 
@@ -442,7 +448,7 @@
                 const raw = '{{ related_entries | tojson | safe }}';
                 // Handle empty or None case gracefully
                 const serverRels = JSON.parse(raw || '[]');
-                serverRels.forEach(r => selectedRelations.set(r.id.toString(), r));
+                serverRels.forEach(r => selectedRelations.set(r.uuid, r));
                 updateRelationDisplay();
             } catch (e) {
                 console.error('Initial relations parse error', e);
@@ -509,10 +515,10 @@
                 const currentId = document.getElementById('entryId').value;
 
                 items.forEach(item => {
-                    // Exclude self
-                    if (currentId && item.id.toString() === currentId) return;
+                    // Exclude self (compare UUIDs)
+                    if (currentId && item.uuid === currentId) return;
 
-                    const isSelected = selectedRelations.has(item.id.toString());
+                    const isSelected = selectedRelations.has(item.uuid);
                     const div = document.createElement('a');
                     div.className = "list-group-item list-group-item-action d-flex justify-content-between align-items-center";
                     div.style.cursor = "pointer";
@@ -532,7 +538,7 @@
         }
 
         function toggleRelationSelection(item) {
-            const id = item.id.toString();
+            const id = item.uuid;
             if (selectedRelations.has(id)) {
                 selectedRelations.delete(id);
             } else {
