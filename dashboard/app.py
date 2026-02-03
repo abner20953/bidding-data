@@ -475,7 +475,7 @@ def download_tools():
         
     return send_from_directory(directory, filename, as_attachment=True)
 
-# --- 白老师工具箱相关路由 ---
+# --- 工具箱相关路由 ---
 
 ALLOWED_TOOLS = {
     'Beyond-Compare-Pro-5.0.4.30422-x64.7z',
