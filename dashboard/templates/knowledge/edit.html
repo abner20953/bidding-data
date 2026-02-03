@@ -204,9 +204,41 @@
 
                 <div class="mb-4 mt-4">
                     <label class="form-label">正文内容 <span class="text-danger">*</span></label>
+                    <div class="mb-2">
+                        <button type="button" class="btn btn-sm btn-outline-secondary me-2"
+                            onclick="insertTag('<b>', '</b>')">
+                            <i class="fas fa-bold"></i> 加粗
+                        </button>
+                        <button type="button" class="btn btn-sm btn-outline-danger"
+                            onclick="insertTag('<span style=\'color:red\'>', '</span>')">
+                            <i class="fas fa-font"></i> 标红
+                        </button>
+                    </div>
                     <textarea class="form-control" id="content" rows="15" required
                         placeholder="在此输入详细内容...">{{ entry.content }}</textarea>
                 </div>
+
+                <script>
+                    function insertTag(startTag, endTag) {
+                        const textarea = document.getElementById('content');
+                        const start = textarea.selectionStart;
+                        const end = textarea.selectionEnd;
+                        const text = textarea.value;
+
+                        if (start === end) return; // No selection
+
+                        const before = text.substring(0, start);
+                        const selected = text.substring(start, end);
+                        const after = text.substring(end);
+
+                        textarea.value = before + startTag + selected + endTag + after;
+
+                        // Reset selection
+                        textarea.selectionStart = start + startTag.length;
+                        textarea.selectionEnd = end + startTag.length;
+                        textarea.focus();
+                    }
+                </script>
 
                 <div class="d-grid gap-2">
                     <button type="submit" class="btn btn-primary btn-lg">保 存</button>
