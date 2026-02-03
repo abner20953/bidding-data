@@ -638,9 +638,14 @@ def api_upload():
         ext = os.path.splitext(file.filename)[1]
         filename = f"{int(time.time())}_{os.urandom(4).hex()}{ext}"
         
-        # Save path relative to app root
-        # Ideally this should be passed from config, but we hardcode for simplicity as request by user task
+        # Determine absolute path to save
         # dashboard/static/uploads
+        static_uploads_dir = os.path.join(current_app.root_path, 'static', 'uploads')
+        if not os.path.exists(static_uploads_dir):
+            os.makedirs(static_uploads_dir)
+            
+        save_path = os.path.join(static_uploads_dir, filename)
+        file.save(save_path) # Critical Fix: Actually save the file!
         
         # Return web accessible path
         web_path = f"/static/uploads/{filename}"
