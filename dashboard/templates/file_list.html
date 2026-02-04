@@ -176,6 +176,9 @@
                             <button onclick="openRemark('{{ file.name }}')" class="remark-btn" title="查看/编辑备注">
                                 📝
                             </button>
+                            <button onclick="deleteFile('{{ file.name }}')" class="delete-file-btn" title="删除文件">
+                                🗑️
+                            </button>
                         </td>
                     </tr>
                     {% endfor %}
@@ -190,8 +193,11 @@
         </div>
 
         <div class="storage-info">
+            <span style="margin-right: auto;">
+                <button onclick="openBatchClean()" class="batch-clean-btn">🗑️ 批量清理</button>
+            </span>
             <span>占用空间: <strong>{{ total_size }}</strong></span>
-            <span>自动清理阈值: <strong>1 GB</strong> (触发后清理至 600 MB)</span>
+            <span>自动清理阈值: <strong>3 GB</strong> (触发后清理至 2.2 GB)</span>
         </div>
     </div>
 
@@ -199,11 +205,11 @@
     <div id="remarkModal" class="modal">
         <div class="modal-content">
             <div class="modal-header">
-                <h3 id="modalTitle" style="color: #9ca3af;">文件备注</h3>
+                <h3 id="modalTitle" style="color: #111827;">文件备注</h3>
                 <span class="close" onclick="closeRemark()">&times;</span>
             </div>
             <div class="modal-body">
-                <textarea id="remarkText" placeholder="在此输入备注信息..." style="color: #9ca3af;"></textarea>
+                <textarea id="remarkText" placeholder="在此输入备注信息..." style="color: #374151;"></textarea>
             </div>
             <div class="modal-footer">
                 <button class="cancel-btn" onclick="closeRemark()">取消</button>
@@ -212,7 +218,35 @@
         </div>
     </div>
 
+    <!-- Batch Clean Modal -->
+    <div id="batchModal" class="modal">
+        <div class="modal-content" style="max-width: 400px;">
+            <div class="modal-header">
+                <h3 style="color: #111827;">批量清理文件</h3>
+                <span class="close" onclick="closeBatch()">&times;</span>
+            </div>
+            <div class="modal-body">
+                <p style="color: #666; font-size: 0.9rem; margin-top: 0;">将会删除选定日期之前的所有文件。</p>
+                <div style="margin-bottom: 15px;">
+                    <label style="display: block; margin-bottom: 5px; font-weight: 500;">选择日期:</label>
+                    <input type="date" id="cleanDate"
+                        style="width: 100%; padding: 8px; border: 1px solid #d1d5db; border-radius: 6px;">
+                </div>
+                <div>
+                    <label style="display: block; margin-bottom: 5px; font-weight: 500;">管理密码:</label>
+                    <input type="password" id="cleanPassword" placeholder="输入密码"
+                        style="width: 100%; padding: 8px; border: 1px solid #d1d5db; border-radius: 6px;">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="cancel-btn" onclick="closeBatch()">取消</button>
+                <button class="delete-btn" onclick="confirmBatchClean()">确认清理</button>
+            </div>
+        </div>
+    </div>
+
     <script>
+        // --- Remark Logic ---
         let currentFilename = null;
         const modal = document.getElementById("remarkModal");
         const remarkText = document.getElementById("remarkText");
@@ -260,7 +294,6 @@
                 const data = await response.json();
 
                 if (data.status === 'success') {
-                    // Show simple feedback
                     const saveBtn = document.querySelector('.save-btn');
                     const originalText = saveBtn.textContent;
                     saveBtn.textContent = "已保存!";
@@ -278,10 +311,91 @@
             }
         }
 
+        // --- Delete Logic ---
+        async function deleteFile(filename) {
+            const password = prompt("请输入管理密码以删除文件:", "");
+            if (password === null) return; // Cancelled
+
+            try {
+                const response = await fetch(`/api/file/archive/${filename}`, {
+                    method: 'DELETE',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: password })
+                });
+                const data = await response.json();
+
+                if (data.status === 'success') {
+                    alert("删除成功");
+                    window.location.reload();
+                } else {
+                    alert("删除失败: " + data.message);
+                }
+            } catch (e) {
+                alert("请求出错: " + e);
+            }
+        }
+
+        // --- Batch Clean Logic ---
+        const batchModal = document.getElementById("batchModal");
+
+        function openBatchClean() {
+            batchModal.style.display = "block";
+            // Default to today
+            document.getElementById('cleanDate').valueAsDate = new Date();
+        }
+
+        function closeBatch() {
+            batchModal.style.display = "none";
+            document.getElementById('cleanPassword').value = '';
+        }
+
+        async function confirmBatchClean() {
+            const date = document.getElementById('cleanDate').value;
+            const password = document.getElementById('cleanPassword').value;
+
+            if (!date) {
+                alert("请选择日期");
+                return;
+            }
+            if (!password) {
+                alert("请输入密码");
+                return;
+            }
+
+            const btn = document.querySelector('.delete-btn');
+            const originalText = btn.textContent;
+            btn.textContent = "清理中...";
+            btn.disabled = true;
+
+            try {
+                const response = await fetch('/api/file/archive/batch', {
+                    method: 'DELETE',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: password, date: date })
+                });
+                const data = await response.json();
+
+                if (data.status === 'success') {
+                    alert(`清理完成！\n已删除 ${data.deleted_count} 个文件\n释放空间: ${data.freed_size}`);
+                    window.location.reload();
+                } else {
+                    alert("清理失败: " + data.message);
+                }
+            } catch (e) {
+                alert("请求出错: " + e);
+            } finally {
+                btn.textContent = originalText;
+                btn.disabled = false;
+            }
+        }
+
         // Close modal when clicking outside
         window.onclick = function (event) {
             if (event.target == modal) {
                 closeRemark();
+            }
+            if (event.target == batchModal) {
+                closeBatch();
             }
         }
     </script>
@@ -304,6 +418,52 @@
 
         .remark-btn:hover {
             background-color: #d97706;
+        }
+
+        .delete-file-btn {
+            display: inline-flex;
+            align-items: center;
+            padding: 6px 12px;
+            background-color: #ef4444;
+            color: white;
+            text-decoration: none;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            transition: background 0.2s;
+            border: none;
+            cursor: pointer;
+            margin-left: 8px;
+        }
+
+        .delete-file-btn:hover {
+            background-color: #dc2626;
+        }
+
+        .batch-clean-btn {
+            padding: 6px 12px;
+            background-color: #ef4444;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.9rem;
+        }
+
+        .batch-clean-btn:hover {
+            background-color: #dc2626;
+        }
+
+        .delete-btn {
+            background-color: #ef4444;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            border: none;
+        }
+
+        .delete-btn:hover {
+            background-color: #dc2626;
         }
 
         /* Modal Styles */

@@ -479,7 +479,9 @@ def download_tools():
 
 ALLOWED_TOOLS = {
     'Beyond-Compare-Pro-5.0.4.30422-x64.7z',
-    'WPS2016单文件极简版.7z'
+    'WPS2016单文件极简版.7z',
+    'WPS2023专业增强版-v12.1.0.23542-激活优化版.exe',
+    'WPS2019专业增强版_v11.8.2.10972_中石油定制版.exe'
 }
 
 @app.route('/bai')
@@ -532,17 +534,17 @@ def cleanup_file_archive():
                     total_size += size
                     file_list.append({"path": entry.path, "name": entry.name, "size": size, "mtime": mtime})
         
-        limit_1gb = 1 * 1024 * 1024 * 1024 # 1GB
-        target_600mb = 600 * 1024 * 1024   # 600MB
+        limit_3gb = 3 * 1024 * 1024 * 1024 # 3GB
+        target_2_2gb = int(2.2 * 1024 * 1024 * 1024)   # 2.2GB
         
-        if total_size > limit_1gb:
+        if total_size > limit_3gb:
             print(f"Archive clean up started. Current size: {total_size / (1024*1024):.2f} MB")
             # 按修改时间排序 (旧文件在前)
             file_list.sort(key=lambda x: x['mtime'])
             
             deleted_size = 0
             for f in file_list:
-                if total_size <= target_600mb:
+                if total_size <= target_2_2gb:
                     break
                 
                 try:
@@ -619,6 +621,73 @@ def api_save_remark(filename):
             f.write(content)
             
         return jsonify({"status": "success"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/file/archive/<filename>', methods=['DELETE'])
+def api_delete_archive(filename):
+    try:
+        data = request.get_json()
+        password = data.get('password')
+        
+        if password != '108':
+            return jsonify({"status": "error", "message": "密码错误"}), 403
+            
+        file_path = os.path.join(ARCHIVE_FOLDER, filename)
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            
+        remark_path = os.path.join(ARCHIVE_FOLDER, filename + ".txt")
+        if os.path.exists(remark_path):
+            os.remove(remark_path)
+            
+        return jsonify({"status": "success"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/file/archive/batch', methods=['DELETE'])
+def api_batch_delete_archive():
+    try:
+        data = request.get_json()
+        password = data.get('password')
+        date_str = data.get('date')
+        
+        if password != '108':
+            return jsonify({"status": "error", "message": "密码错误"}), 403
+            
+        if not date_str:
+            return jsonify({"status": "error", "message": "请选择日期"}), 400
+            
+        target_date = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+        
+        deleted_count = 0
+        freed_size = 0
+        
+        with os.scandir(ARCHIVE_FOLDER) as it:
+            for entry in it:
+                if entry.is_file():
+                    # Check modification time
+                    mtime = datetime.datetime.fromtimestamp(entry.stat().st_mtime)
+                    if mtime < target_date:
+                        try:
+                            size = entry.stat().st_size
+                            os.remove(entry.path)
+                            freed_size += size
+                            deleted_count += 1
+                            
+                            # Try delete remark
+                            remark_path = entry.path + ".txt"
+                            if os.path.exists(remark_path):
+                                freed_size += os.path.getsize(remark_path)
+                                os.remove(remark_path)
+                        except Exception as e:
+                            print(f"Error deleting {entry.name}: {e}")
+                            
+        return jsonify({
+            "status": "success", 
+            "deleted_count": deleted_count,
+            "freed_size": format_size(freed_size)
+        })
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
