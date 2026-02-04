@@ -255,9 +255,9 @@
         <div class="container">
             <a class="navbar-brand" href="/"><i class="fas fa-home"></i> Smarter Tools</a>
             <div class="navbar-nav">
-                <a class="nav-link" href="/anli"><i class="fas fa-chevron-left"></i> 返回列表</a>
+                <a class="nav-link" href="/zhishi"><i class="fas fa-chevron-left"></i> 返回列表</a>
             </div>
-            <a href="/anli/edit/{{ entry.uuid }}"
+            <a href="/zhishi/edit/{{ entry.uuid }}"
                 class="btn btn-outline-primary btn-sm ms-auto rounded-pill px-3 d-none d-md-inline-block"><i
                     class="fas fa-edit"></i> 编辑</a>
         </div>
@@ -345,7 +345,7 @@
             <h5 class="fw-bold mb-3 small text-muted text-uppercase"><i class="fas fa-link"></i> 关联信息</h5>
             <div class="list-group list-group-flush border rounded-3 bg-white">
                 {% for item in related_entries %}
-                <a href="/anli/view/{{ item.uuid }}"
+                <a href="/zhishi/view/{{ item.uuid }}"
                     class="list-group-item list-group-item-action py-3 d-flex align-items-center">
                     <span class="badge bg-light text-dark border me-3">{{ item.type }}</span>
                     <span class="fw-medium text-dark">{{ item.title }}</span>
@@ -412,7 +412,7 @@
 
             btn.disabled = true;
             try {
-                const resp = await fetch('/anli/api/comment', {
+                const resp = await fetch('/zhishi/api/comment', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({

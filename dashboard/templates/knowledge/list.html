@@ -125,7 +125,7 @@
         <div class="container">
             <a class="navbar-brand" href="/"><i class="fas fa-home"></i> Smarter Tools</a>
             <div class="navbar-nav ms-auto">
-                <a href="/anli/edit" class="btn btn-primary btn-sm rounded-pill px-4"><i class="fas fa-plus"></i>
+                <a href="/zhishi/edit" class="btn btn-primary btn-sm rounded-pill px-4"><i class="fas fa-plus"></i>
                     新增条目</a>
             </div>
         </div>
@@ -220,7 +220,7 @@
 
         async function loadTagsDropdown() {
             try {
-                const resp = await fetch('/anli/api/tags');
+                const resp = await fetch('/zhishi/api/tags');
                 allTags = await resp.json();
                 renderTagDropdown();
             } catch (e) {
@@ -355,7 +355,7 @@
             // Join tags by comma
             const tagStr = Array.from(selectedTags).join(',');
 
-            let url = `/anli/api/list?page=${page}&q=${encodeURIComponent(q)}&type=${encodeURIComponent(type)}&t=${new Date().getTime()}`;
+            let url = `/zhishi/api/list?page=${page}&q=${encodeURIComponent(q)}&type=${encodeURIComponent(type)}&t=${new Date().getTime()}`;
             if (tagStr) url += `&tag=${encodeURIComponent(tagStr)}`;
 
             const listContainer = document.getElementById('resultsList');
@@ -385,7 +385,7 @@
                     const titleHtml = highlightText(item.title, currentQuery, data.search_terms);
                     const summaryHtml = highlightText(item.summary, currentQuery, data.search_terms);
 
-                    const detailUrl = currentQuery ? `/anli/view/${item.uuid}?q=${encodeURIComponent(currentQuery)}` : `/anli/view/${item.uuid}`;
+                    const detailUrl = currentQuery ? `/zhishi/view/${item.uuid}?q=${encodeURIComponent(currentQuery)}` : `/zhishi/view/${item.uuid}`;
 
                     const docNumHtml = item.doc_number ? `<span class="badge bg-secondary ms-2 align-middle" style="font-size: 0.75rem;">${highlightText(item.doc_number, currentQuery, data.search_terms)}</span>` : '';
 

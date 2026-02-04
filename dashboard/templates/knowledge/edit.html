@@ -121,7 +121,7 @@
         <div class="container">
             <a class="navbar-brand" href="/"><i class="fas fa-home"></i> Smarter Tools</a>
             <div class="navbar-nav">
-                <a class="nav-link" href="/anli"><i class="fas fa-chevron-left"></i> 返回列表</a>
+                <a class="nav-link" href="/zhishi"><i class="fas fa-chevron-left"></i> 返回列表</a>
             </div>
         </div>
     </nav>
@@ -303,7 +303,7 @@
 
             const id = document.getElementById('entryId').value;
             try {
-                const resp = await fetch('/anli/api/delete', {
+                const resp = await fetch('/zhishi/api/delete', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ id: id })
@@ -311,7 +311,7 @@
                 const res = await resp.json();
                 if (res.status === 'success') {
                     alert('删除成功');
-                    window.location.href = '/anli';
+                    window.location.href = '/zhishi';
                 } else {
                     alert('删除失败: ' + (res.error || '未知错误'));
                 }
@@ -444,7 +444,7 @@
                 formData.append('file', file);
 
                 try {
-                    const resp = await fetch('/anli/api/upload', {
+                    const resp = await fetch('/zhishi/api/upload', {
                         method: 'POST',
                         body: formData
                     });
@@ -535,7 +535,7 @@
             container.innerHTML = '<div class="text-center py-3">搜索中...</div>';
 
             try {
-                const resp = await fetch(`/anli/api/search_titles?q=${encodeURIComponent(q)}`);
+                const resp = await fetch(`/zhishi/api/search_titles?q=${encodeURIComponent(q)}`);
                 const items = await resp.json();
 
                 container.innerHTML = '';
@@ -626,7 +626,7 @@
 
         async function fetchTags() {
             try {
-                const resp = await fetch('/anli/api/tags');
+                const resp = await fetch('/zhishi/api/tags');
                 allTags = await resp.json();
                 return true;
             } catch (e) { return false; }
@@ -741,7 +741,7 @@
             if (!confirm(`确定要删除标签 "${name}" 吗？\n删除后，所有文章中的此标签也将被移除！`)) return;
 
             try {
-                const resp = await fetch('/anli/api/tags', {
+                const resp = await fetch('/zhishi/api/tags', {
                     method: 'DELETE',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ name: name })
@@ -765,7 +765,7 @@
             if (!newName || newName === oldName) return;
 
             try {
-                const resp = await fetch('/anli/api/tags', {
+                const resp = await fetch('/zhishi/api/tags', {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ old_name: oldName, new_name: newName })
@@ -792,7 +792,7 @@
             if (!name) return;
 
             try {
-                const resp = await fetch('/anli/api/tags', {
+                const resp = await fetch('/zhishi/api/tags', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ name: name })
@@ -820,7 +820,7 @@
             btn.disabled = true;
 
             try {
-                const resp = await fetch('/anli/api/extract', {
+                const resp = await fetch('/zhishi/api/extract', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ url: url })
@@ -903,7 +903,7 @@
             const related_ids = Array.from(selectedRelations.keys());
 
             try {
-                const resp = await fetch('/anli/api/save', {
+                const resp = await fetch('/zhishi/api/save', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
@@ -925,7 +925,7 @@
                 const res = await resp.json();
                 if (res.status === 'success') {
                     alert('保存成功！');
-                    window.location.href = '/anli';
+                    window.location.href = '/zhishi';
                 } else {
                     alert('保存失败: ' + (res.error || '未知错误'));
                 }

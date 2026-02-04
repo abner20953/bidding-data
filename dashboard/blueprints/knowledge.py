@@ -11,7 +11,7 @@ import re
 # 定义 Blueprint
 knowledge_bp = Blueprint('knowledge', __name__, 
                         template_folder='../templates/knowledge',
-                        url_prefix='/anli')
+                        url_prefix='/zhishi')
 
 DB_NAME = 'knowledge_base.db'
 

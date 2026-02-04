@@ -268,9 +268,9 @@ def log_request(response):
         if request.path.startswith('/static') or request.path.startswith('/api/file') or request.path == '/favicon.ico':
             return response
             
-        # Filter out specific user-defined "backend" paths
-        if request.path.startswith('/anli/view/') or request.path.startswith('/anli/edit/'):
-            return response
+        # If trying to access specific knowledge pages, store return URL
+        if request.path.startswith('/zhishi/view/') or request.path.startswith('/zhishi/edit/'):
+            session['return_url'] = request.url
             
         # 2. Identify Request Type
         is_api = request.path.startswith('/api/') or '/api/' in request.path
