@@ -828,27 +828,41 @@
                 const res = await resp.json();
 
                 if (res.status === 'success') {
-                    let hasData = false;
+                    let msgParts = [];
                     if (res.data.title) {
                         document.getElementById('title').value = res.data.title;
-                        hasData = true;
+                        msgParts.push("标题");
                     }
                     if (res.data.content) {
                         document.getElementById('content').value = res.data.content;
                         // Sync to WangEditor
                         if (window.editor) {
-                            window.editor.setHtml(res.data.content);
+                            try {
+                                window.editor.setHtml('<p>' + res.data.content.replace(/\n/g, '<br>') + '</p>'); // Basic format
+                                msgParts.push("正文");
+                            } catch (err) {
+                                console.error("Editor sync failed", err);
+                                msgParts.push("正文(编辑器同步失败)");
+                            }
+                        } else {
+                            console.warn("window.editor not found");
+                            msgParts.push("正文(编辑器未初始化)");
                         }
-                        hasData = true;
                     }
-                    if (res.data.publish_date) document.getElementById('publishDate').value = res.data.publish_date;
+                    if (res.data.publish_date) {
+                        document.getElementById('publishDate').value = res.data.publish_date;
+                        msgParts.push("日期");
+                    }
                     if (res.data.url) document.getElementById('originalUrl').value = res.data.url;
-                    if (res.data.doc_number) document.getElementById('docNumber').value = res.data.doc_number;
+                    if (res.data.doc_number) {
+                        document.getElementById('docNumber').value = res.data.doc_number;
+                        msgParts.push("文号");
+                    }
 
-                    if (hasData) {
-                        alert('抓取成功！');
+                    if (msgParts.length > 0) {
+                        alert('抓取成功！已提取：' + msgParts.join('、'));
                     } else {
-                        alert('抓取完成，但未识别到有效标题或内容。可能是页面结构特殊或反爬限制。');
+                        alert('抓取请求成功，但未识别到任何有效字段（标题/内容等）。\n可能是该页面结构特殊中，或已被反爬屏蔽。');
                     }
                 } else {
                     alert('抓取失败: ' + res.error);
