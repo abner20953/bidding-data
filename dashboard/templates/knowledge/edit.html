@@ -206,7 +206,7 @@
                 <div class="mb-4 mt-4">
                     <label class="form-label">正文内容 <span class="text-danger">*</span></label>
                     <!-- Old buttons removed -->
-                    <textarea class="form-control" id="content" rows="15" required
+                    <textarea class="form-control" id="content" rows="15"
                         placeholder="在此输入详细内容...">{{ entry.content }}</textarea>
                 </div>
 
@@ -813,6 +813,11 @@
                 tinymce.triggerSave();
             }
             const content = document.getElementById('content').value;
+
+            if (!content.trim()) {
+                alert('正文内容不能为空');
+                return;
+            }
 
             const url = document.getElementById('originalUrl').value;
             const publish_date = document.getElementById('publishDate').value;
