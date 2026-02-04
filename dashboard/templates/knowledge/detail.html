@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ entry.title }} - 知识库</title>
+    <title>{{ entry.title }} - 法律法规与知识库</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
@@ -270,7 +270,7 @@
             <div class="meta-info d-flex flex-wrap align-items-center">
                 <span
                     class="badge {{ 'badge-law' if entry.type == '法律法规' else 'badge-case' }} me-3 rounded-pill px-3">{{
-                    entry.type }}</span>
+                    '知识库' if entry.type == '案例' else entry.type }}</span>
                 {% if entry.doc_number %}
                 <span class="badge bg-secondary me-3 rounded-pill px-3"><i class="fas fa-file-alt me-1"></i> {{
                     entry.doc_number }}</span>
@@ -347,7 +347,8 @@
                 {% for item in related_entries %}
                 <a href="/zhishi/view/{{ item.uuid }}"
                     class="list-group-item list-group-item-action py-3 d-flex align-items-center">
-                    <span class="badge bg-light text-dark border me-3">{{ item.type }}</span>
+                    <span class="badge bg-light text-dark border me-3">{{ '知识库' if item.type == '案例' else item.type
+                        }}</span>
                     <span class="fw-medium text-dark">{{ item.title }}</span>
                     {% if item.doc_number %}
                     <span class="ms-auto text-muted small"><i class="far fa-file-alt"></i> {{ item.doc_number }}</span>
