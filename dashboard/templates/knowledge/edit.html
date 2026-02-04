@@ -254,9 +254,71 @@
                             }
                         };
 
+                        // Helper to fix "Text node parent is Editor" error
+                        function normalizeEditorContent(html) {
+                            if (!html || !html.trim()) return '';
+                            // Quick check: if it doesn't look like HTML tags, wrap in <p>
+                            if (!/^<[a-z][\s\S]*>/i.test(html.trim())) {
+                                return `<p>${html}</p>`;
+                            }
+
+                            // More robust check: use DOMParser
+                            const parser = new DOMParser();
+                            const doc = parser.parseFromString(html, 'text/html');
+                            const body = doc.body;
+
+                            let needsWrap = false;
+                            const newNodes = [];
+
+                            // Check if any direct child is a text node or inline element
+                            // If so, we collect them and wrap in <p>
+                            let buffer = [];
+
+                            Array.from(body.childNodes).forEach(node => {
+                                const isBlock = node.nodeType === 1 && /^(P|DIV|H[1-6]|BLOCKQUOTE|UL|OL|TABLE|PRE|HR)$/i.test(node.tagName);
+
+                                if (isBlock) {
+                                    // Flush buffer if exists
+                                    if (buffer.length > 0) {
+                                        const p = document.createElement('p');
+                                        buffer.forEach(n => p.appendChild(n));
+                                        newNodes.push(p);
+                                        buffer = [];
+                                    }
+                                    newNodes.push(node);
+                                } else {
+                                    // Add to buffer (Text node or inline like <b>, <span>)
+                                    // Ignore empty text nodes (newlines between blocks) if they are just whitespace?
+                                    // But be careful not to eat whitespace between words.
+                                    // For safety, just treat all non-block as buffer.
+                                    if (node.nodeType === 3 && !node.textContent.trim()) {
+                                        // Skip empty whitespace text nodes between blocks
+                                    } else {
+                                        buffer.push(node);
+                                    }
+                                }
+                            });
+
+                            // Flush remaining buffer
+                            if (buffer.length > 0) {
+                                const p = document.createElement('p');
+                                buffer.forEach(n => p.appendChild(n));
+                                newNodes.push(p);
+                            }
+
+                            // Reconstruct HTML
+                            const div = document.createElement('div');
+                            newNodes.forEach(n => div.appendChild(n));
+                            return div.innerHTML;
+                        }
+
+                        // Get raw content and normalize it
+                        const rawContent = document.getElementById('content').value;
+                        const safeContent = normalizeEditorContent(rawContent);
+
                         const editor = createEditor({
                             selector: '#editor-container',
-                            html: document.getElementById('content').value,
+                            html: safeContent, // Use normalized content
                             config: editorConfig,
                             mode: 'default',
                         });
