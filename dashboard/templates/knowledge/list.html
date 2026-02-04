@@ -52,6 +52,25 @@
             z-index: 100;
         }
 
+        /* Enforce equal height for all search inputs/buttons */
+        .search-box .form-control,
+        .search-box .input-group-text,
+        .search-box .btn-lg,
+        .search-box .form-select-lg,
+        .search-box .dropdown-toggle {
+            height: 50px;
+            font-size: 1rem;
+        }
+
+        .search-box .input-group-text i {
+            line-height: 1;
+        }
+
+        .search-box .dropdown-toggle {
+            display: flex;
+            align-items: center;
+        }
+
         .card-item {
             display: block;
             text-decoration: none;
