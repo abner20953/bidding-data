@@ -1,4 +1,4 @@
-﻿from flask import Flask, jsonify, render_template, request, redirect, url_for, send_from_directory
+﻿from flask import Flask, jsonify, render_template, request, redirect, url_for, send_from_directory, session
 from flask_apscheduler import APScheduler
 import pandas as pd
 import threading
@@ -105,6 +105,7 @@ import scraper
 from dashboard.utils.comparator import compare_documents
 
 app = Flask(__name__)
+app.secret_key = os.urandom(24)
 # Apply ProxyFix to handle X-Forwarded-For headers from Nginx/LoadBalancer
 # x_for=1 means trust the first X-Forwarded-For value
 # x_proto=1 means trust X-Forwarded-Proto
