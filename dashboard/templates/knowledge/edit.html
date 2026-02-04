@@ -746,12 +746,12 @@
                     body: JSON.stringify({ name: name, password: pwd })
                 });
 
+                const text = await resp.text();
                 let res;
                 try {
-                    res = await resp.json();
+                    res = JSON.parse(text);
                 } catch (e) {
-                    const text = await resp.text();
-                    console.error("Server Error:", text);
+                    console.error("Server Error Response:", text);
                     alert(`服务器错误: ${resp.status} - 详情请查看控制台`);
                     return;
                 }
