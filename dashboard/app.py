@@ -493,18 +493,18 @@ def download_specific_file(filename):
     if filename not in ALLOWED_TOOLS:
         return jsonify({"error": "File not found or access denied"}), 404
         
+    # Priority 1: Check mounted external tools directory (Docker volume)
+    # Mounted from /root/bidding-data -> /app/tools
+    external_tools_dir = '/app/tools'
+    if os.path.exists(os.path.join(external_tools_dir, filename)):
+        return send_from_directory(external_tools_dir, filename, as_attachment=True)
+
+    # Priority 2: Fallback to old behavior (project root)
     directory = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    
     file_path = os.path.join(directory, filename)
+    
     if not os.path.exists(file_path):
-        # Try explicit fallback for server environment
-        fallback_path = os.path.join('/root/bidding-data', filename)
-        if os.path.exists(fallback_path):
-            directory = '/root/bidding-data'
-            file_path = fallback_path
-        else:
-            # Return path for debugging
-            return jsonify({"error": f"File not found on server. Looked in: {file_path} AND {fallback_path}"}), 404
+        return jsonify({"error": f"File not found on server. Looked in: {external_tools_dir} AND {file_path}"}), 404
         
     return send_from_directory(directory, filename, as_attachment=True)
 

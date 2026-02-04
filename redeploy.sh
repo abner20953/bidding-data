@@ -67,6 +67,7 @@ docker run -d \
   -v $(pwd)/dashboard/static/uploads:/app/dashboard/static/uploads \
   -v $(pwd)/knowledge_base.db:/app/knowledge_base.db \
   -v $(pwd)/dashboard/visitor_logs.db:/app/dashboard/visitor_logs.db \
+  -v $(pwd):/app/tools \
   bidding-app
 
 if [ $? -eq 0 ]; then

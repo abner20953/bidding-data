@@ -33,6 +33,7 @@ dashboard/scheduler.log
 *.zip
 *.log
 *.safetensors
+*.exe
 
 # Tests
 tests/
