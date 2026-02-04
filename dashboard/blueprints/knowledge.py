@@ -320,7 +320,7 @@ def api_list():
 
 
 
-@knowledge_bp.route('/api/tags', methods=['GET', 'POST', 'PUT'])
+@knowledge_bp.route('/api/tags', methods=['GET', 'POST', 'PUT', 'DELETE'])
 def api_tags():
     conn = get_db()
     if request.method == 'GET':
