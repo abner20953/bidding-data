@@ -836,16 +836,16 @@
                     if (res.data.content) {
                         document.getElementById('content').value = res.data.content;
                         // Sync to WangEditor
-                        if (window.editor) {
+                        if (window.editorInstance) {
                             try {
-                                window.editor.setHtml('<p>' + res.data.content.replace(/\n/g, '<br>') + '</p>'); // Basic format
+                                window.editorInstance.setHtml('<p>' + res.data.content.replace(/\n/g, '<br>') + '</p>'); // Basic format
                                 msgParts.push("正文");
                             } catch (err) {
                                 console.error("Editor sync failed", err);
                                 msgParts.push("正文(编辑器同步失败)");
                             }
                         } else {
-                            console.warn("window.editor not found");
+                            console.warn("window.editorInstance not found");
                             msgParts.push("正文(编辑器未初始化)");
                         }
                     }
