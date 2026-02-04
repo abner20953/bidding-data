@@ -181,15 +181,38 @@
                 /* Ensure wrapping */
             }
 
-            .entry-content p {
+            .entry-content p,
+            .entry-content div {
                 margin-bottom: 1.25em;
                 /* Add paragraph spacing */
             }
 
+            .entry-content h1,
+            .entry-content h2,
+            .entry-content h3,
+            .entry-content h4,
+            .entry-content h5,
+            .entry-content h6 {
+                margin-top: 1.5em;
+                margin-bottom: 0.75em;
+                line-height: 1.4;
+                font-weight: 600;
+            }
+
+            .entry-content ul,
+            .entry-content ol {
+                margin-bottom: 1.25em;
+                padding-left: 1.5em;
+            }
+
+            .entry-content li {
+                margin-bottom: 0.5em;
+            }
+
             .entry-content img {
                 max-width: 100% !important;
-                /* Prevent image overflow */
                 height: auto;
+                margin: 10px 0;
             }
         }
     </style>
