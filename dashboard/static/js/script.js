@@ -691,6 +691,8 @@ document.addEventListener('DOMContentLoaded', () => {
         const overwrites = [...selectedDates].filter(d => existingDates.has(d));
         if (overwrites.length === 0) return;
 
+        if (!verifyAdminPassword(`删除选中的 ${overwrites.length} 个日期`)) return;
+
         if (!confirm(`确定要删除选中的 ${overwrites.length} 个日期的数据吗？`)) return;
 
         let successCount = 0;
@@ -735,6 +737,8 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         const dateStr = [...selectedDates][0];
+
+        if (!verifyAdminPassword(`删除 [${dateStr}] 之前的所有历史数据`)) return;
 
         if (!confirm(`⚠️ 警告：确定要删除 [${dateStr}] 之前的所有历史数据吗？\n（保留 ${dateStr} 当天及之后的数据）\n此操作不可恢复！`)) return;
 

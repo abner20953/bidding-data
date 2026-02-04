@@ -11,6 +11,7 @@
     <!-- WangEditor Local Assets -->
     <link href="{{ url_for('static', filename='wangeditor/style.css') }}" rel="stylesheet">
     <script src="{{ url_for('static', filename='wangeditor/index.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/core.js') }}"></script>
     <style>
         :root {
             --bg-gradient: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
@@ -291,13 +292,7 @@
 
     <script>
         async function deleteEntry() {
-            const pwd = prompt("请输入管理密码以删除此条目：");
-            if (pwd === null) return; // Cancelled
-
-            if (pwd !== "108") {
-                alert("密码错误！");
-                return;
-            }
+            if (!verifyAdminPassword('删除此条目')) return;
 
             if (!confirm("确定要永久删除此条目吗？此操作无法撤销！")) return;
 
@@ -738,11 +733,8 @@
         // ================= SHARED / CRUD =================
 
         async function deleteTag(name) {
-            const pwd = prompt(`请输入管理密码以确认删除标签 "${name}"：`);
-            if (pwd !== '108') {
-                alert('密码错误，操作取消');
-                return;
-            }
+            if (!verifyAdminPassword(`删除标签 "${name}"`)) return;
+
             if (!confirm(`再次确认：删除标签 "${name}" 后，所有文章中的此标签也将被移除！确定要继续吗？`)) return;
 
             try {

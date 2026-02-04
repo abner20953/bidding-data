@@ -140,6 +140,7 @@
             gap: 20px;
         }
     </style>
+    <script src="{{ url_for('static', filename='js/core.js') }}"></script>
 </head>
 
 <body>
@@ -232,11 +233,7 @@
                     <input type="date" id="cleanDate"
                         style="width: 100%; padding: 8px; border: 1px solid #d1d5db; border-radius: 6px;">
                 </div>
-                <div>
-                    <label style="display: block; margin-bottom: 5px; font-weight: 500;">管理密码:</label>
-                    <input type="password" id="cleanPassword" placeholder="输入密码"
-                        style="width: 100%; padding: 8px; border: 1px solid #d1d5db; border-radius: 6px;">
-                </div>
+                <!-- Password prompt removed, handled by global verification -->
             </div>
             <div class="modal-footer">
                 <button class="cancel-btn" onclick="closeBatch()">取消</button>
@@ -313,14 +310,13 @@
 
         // --- Delete Logic ---
         async function deleteFile(filename) {
-            const password = prompt("请输入管理密码以删除文件:", "");
-            if (password === null) return; // Cancelled
+            if (!verifyAdminPassword(`删除文件 "${filename}"`)) return;
 
             try {
                 const response = await fetch(`/api/file/archive/${filename}`, {
                     method: 'DELETE',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ password: password })
+                    body: JSON.stringify({ password: ADMIN_PASSWORD })
                 });
                 const data = await response.json();
 
@@ -346,21 +342,18 @@
 
         function closeBatch() {
             batchModal.style.display = "none";
-            document.getElementById('cleanPassword').value = '';
         }
 
         async function confirmBatchClean() {
             const date = document.getElementById('cleanDate').value;
-            const password = document.getElementById('cleanPassword').value;
 
             if (!date) {
                 alert("请选择日期");
                 return;
             }
-            if (!password) {
-                alert("请输入密码");
-                return;
-            }
+
+            if (!verifyAdminPassword('批量清理文件')) return;
+            const password = ADMIN_PASSWORD;
 
             const btn = document.querySelector('.delete-btn');
             const originalText = btn.textContent;
