@@ -691,14 +691,19 @@ document.addEventListener('DOMContentLoaded', () => {
         const overwrites = [...selectedDates].filter(d => existingDates.has(d));
         if (overwrites.length === 0) return;
 
-        if (!verifyAdminPassword(`删除选中的 ${overwrites.length} 个日期`)) return;
+        const pwd = getAdminPassword(`删除选中的 ${overwrites.length} 个日期`);
+        if (!pwd) return;
 
         if (!confirm(`确定要删除选中的 ${overwrites.length} 个日期的数据吗？`)) return;
 
         let successCount = 0;
         for (const dateStr of overwrites) {
             try {
-                const resp = await fetch(`/api/data?date=${dateStr}`, { method: 'DELETE' });
+                const resp = await fetch(`/api/data?date=${dateStr}`, {
+                    method: 'DELETE',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: pwd })
+                });
                 const res = await resp.json();
                 if (res.status === 'success') {
                     existingDates.delete(dateStr);
@@ -738,12 +743,17 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const dateStr = [...selectedDates][0];
 
-        if (!verifyAdminPassword(`删除 [${dateStr}] 之前的所有历史数据`)) return;
+        const pwd = getAdminPassword(`删除 [${dateStr}] 之前的所有历史数据`);
+        if (!pwd) return;
 
         if (!confirm(`⚠️ 警告：确定要删除 [${dateStr}] 之前的所有历史数据吗？\n（保留 ${dateStr} 当天及之后的数据）\n此操作不可恢复！`)) return;
 
         try {
-            const resp = await fetch(`/api/data?before_date=${dateStr}`, { method: 'DELETE' });
+            const resp = await fetch(`/api/data?before_date=${dateStr}`, {
+                method: 'DELETE',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ password: pwd })
+            });
             const result = await resp.json();
 
             if (result.status === 'success') {

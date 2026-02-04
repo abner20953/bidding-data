@@ -21,6 +21,26 @@ RESULTS_DIR = os.path.join(BASE_DIR, '..', 'results')
 # 临时上传目录
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 
+# Admin Password Configuration
+ADMIN_PASSWORD = "108"
+
+def verify_request_password(req):
+    """
+    Check if request contains valid admin password in JSON body or query args.
+    Returns (True, None) or (False, error_response).
+    """
+    # Check JSON body
+    if req.is_json:
+        data = req.get_json()
+        if data and data.get('password') == ADMIN_PASSWORD:
+            return True, None
+            
+    # Check Query Args
+    if req.args.get('password') == ADMIN_PASSWORD:
+        return True, None
+        
+    return False, jsonify({"error": "Admin password required or invalid"}), 403
+
 # --- EMERGENCY STARTUP CLEANUP (Fix for "No space left on device") ---
 def free_up_space():
     try:
@@ -829,6 +849,14 @@ def api_dates():
 @app.route('/api/data', methods=['GET', 'DELETE'])
 def api_data():
     if request.method == 'DELETE':
+        # Verify Password
+        is_valid, error = verify_request_password(request)
+        if not is_valid:
+            # Checking JSON explicitly for this endpoint as it might be called differently
+            data = request.get_json(silent=True)
+            if not data or data.get('password') != ADMIN_PASSWORD:
+                 return error
+
         try:
             delete_all = request.args.get('all') == 'true'
             date_str = request.args.get('date')

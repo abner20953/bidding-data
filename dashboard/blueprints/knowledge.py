@@ -9,6 +9,10 @@ import uuid
 import re
 
 # 定义 Blueprint
+
+# Admin Password
+ADMIN_PASSWORD = "108"
+
 knowledge_bp = Blueprint('knowledge', __name__, 
                         template_folder='../templates/knowledge',
                         url_prefix='/zhishi')
@@ -369,7 +373,13 @@ def api_tags():
             conn.close()
 
     if request.method == 'DELETE':
-        name = request.get_json().get('name', '').strip()
+        data = request.get_json()
+        password = data.get('password') if data else None
+        
+        if password != ADMIN_PASSWORD:
+             return jsonify({"error": "Admin password required or invalid"}), 403
+
+        name = data.get('name', '').strip()
         if not name:
              return jsonify({"error": "标签名不能为空"}), 400
              
@@ -496,6 +506,9 @@ def api_save():
 @knowledge_bp.route('/api/delete', methods=['POST'])
 def api_delete():
     data = request.get_json()
+    if not data or data.get('password') != ADMIN_PASSWORD:
+        return jsonify({"error": "Admin password required or invalid"}), 403
+
     uid = data.get('id')
     
     if not uid:

@@ -292,7 +292,8 @@
 
     <script>
         async function deleteEntry() {
-            if (!verifyAdminPassword('删除此条目')) return;
+            const pwd = getAdminPassword('删除此条目');
+            if (!pwd) return;
 
             if (!confirm("确定要永久删除此条目吗？此操作无法撤销！")) return;
 
@@ -301,7 +302,7 @@
                 const resp = await fetch('/zhishi/api/delete', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ id: id })
+                    body: JSON.stringify({ id: id, password: pwd })
                 });
                 const res = await resp.json();
                 if (res.status === 'success') {

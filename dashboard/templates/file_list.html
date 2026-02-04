@@ -310,13 +310,14 @@
 
         // --- Delete Logic ---
         async function deleteFile(filename) {
-            if (!verifyAdminPassword(`删除文件 "${filename}"`)) return;
+            const pwd = getAdminPassword(`删除文件 "${filename}"`);
+            if (!pwd) return;
 
             try {
                 const response = await fetch(`/api/file/archive/${filename}`, {
                     method: 'DELETE',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ password: ADMIN_PASSWORD })
+                    body: JSON.stringify({ password: pwd })
                 });
                 const data = await response.json();
 
@@ -352,8 +353,8 @@
                 return;
             }
 
-            if (!verifyAdminPassword('批量清理文件')) return;
-            const password = ADMIN_PASSWORD;
+            const pwd = getAdminPassword('批量清理文件');
+            if (!pwd) return;
 
             const btn = document.querySelector('.delete-btn');
             const originalText = btn.textContent;
@@ -364,7 +365,7 @@
                 const response = await fetch('/api/file/archive/batch', {
                     method: 'DELETE',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ password: password, date: date })
+                    body: JSON.stringify({ password: pwd, date: date })
                 });
                 const data = await response.json();
 
