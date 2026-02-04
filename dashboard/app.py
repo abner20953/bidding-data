@@ -497,7 +497,14 @@ def download_specific_file(filename):
     
     file_path = os.path.join(directory, filename)
     if not os.path.exists(file_path):
-        return jsonify({"error": f"File not found on server: {filename}"}), 404
+        # Try explicit fallback for server environment
+        fallback_path = os.path.join('/root/bidding-data', filename)
+        if os.path.exists(fallback_path):
+            directory = '/root/bidding-data'
+            file_path = fallback_path
+        else:
+            # Return path for debugging
+            return jsonify({"error": f"File not found on server. Looked in: {file_path} AND {fallback_path}"}), 404
         
     return send_from_directory(directory, filename, as_attachment=True)
 
