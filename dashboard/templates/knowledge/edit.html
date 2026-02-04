@@ -212,33 +212,26 @@
 
                 <script>
                     document.addEventListener("DOMContentLoaded", function () {
-                        tinymce.init({
-                            selector: '#content',
-                            language: 'zh-Hans', // Need to check if language file is available or just use default English if complex
-                            // Using default language (English) first to avoid loading errors if zh-Hans is missing on CDN without extra config
-                            // Actually, let's try to set language if we can, or just stick to English UI for safety.
-                            // Given I can't easily upload lang files now, I will use default.
-                            height: 500,
-                            plugins: 'preview importcss searchreplace autolink autosave save directionality code visualblocks visualchars fullscreen image link media template codesample table charmap pagebreak nonbreaking anchor insertdatetime advlist lists wordcount help charmap quickbars emoticons',
-                            toolbar: 'undo redo | bold italic underline strikethrough | fontfamily fontsize blocks | alignleft aligncenter alignright alignjustify | outdent indent |  numlist bullist | forecolor backcolor removeformat | pagebreak | charmap emoticons | fullscreen  preview save print | insertfile image media template link anchor codesample | ltr rtl',
-                            toolbar_sticky: true,
-                            verify_html: false, // Allow potentially unsafe styles if needed, or strictly validation?
-                            // Enable valid_elements to allow style attributes
-                            valid_elements: '*[*]',
-                            valid_children: '+body[style]',
-                            content_style: 'body { font-family:Inter,sans-serif; font-size:14px }',
-                            // Table configuration to keep styles
-                            table_default_attributes: {
-                                border: '1'
-                            },
-                            table_default_styles: {
-                                'border-collapse': 'collapse',
-                                'width': '100%'
-                            },
-                            // Paste configuration for Word
-                            paste_data_images: true,
-                            paste_as_text: false
-                        });
+                        if (typeof tinymce !== 'undefined') {
+                            tinymce.init({
+                                selector: '#content',
+                                language: 'zh-Hans',
+                                height: 500,
+                                // Minimalist plugins
+                                plugins: 'table lists autolink wordcount',
+                                // Minimalist toolbar: Undo/Redo | Bold Red | Table
+                                toolbar: 'undo redo | bold forecolor | table',
+                                menubar: false,
+                                statusbar: false,
+                                content_style: 'body { font-family:Inter,sans-serif; font-size:14px }',
+                                // Table configuration to keep styles
+                                table_default_attributes: { border: '1' },
+                                table_default_styles: { 'border-collapse': 'collapse', 'width': '100%' },
+                                // Paste configuration for Word
+                                paste_data_images: true,
+                                paste_as_text: false
+                            });
+                        }
                     });
                 </script>
 
@@ -815,9 +808,9 @@
             const title = document.getElementById('title').value;
             const type = document.getElementById('type').value;
 
-            // Sync TinyMCE to textarea
-            if (tinymce.get('content')) {
-                tinymce.get('content').save();
+            // Safe Sync TinyMCE to textarea
+            if (typeof tinymce !== 'undefined' && tinymce.get('content')) {
+                tinymce.triggerSave();
             }
             const content = document.getElementById('content').value;
 
