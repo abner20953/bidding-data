@@ -745,17 +745,28 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ name: name, password: pwd })
                 });
-                const res = await resp.json();
-                if (res.status === 'success') {
+
+                let res;
+                try {
+                    res = await resp.json();
+                } catch (e) {
+                    const text = await resp.text();
+                    console.error("Server Error:", text);
+                    alert(`服务器错误: ${resp.status} - 详情请查看控制台`);
+                    return;
+                }
+
+                if (resp.ok && res.status === 'success') {
                     selectedTags.delete(name);
                     updateMainTagDisplay();
                     await fetchTags();
                     renderManageTags();
                 } else {
-                    alert(res.error);
+                    alert(res.error || `删除失败 (Status: ${resp.status})`);
                 }
             } catch (e) {
-                alert('删除失败');
+                console.error(e);
+                alert(`请求失败: ${e.message}`);
             }
         }
 
