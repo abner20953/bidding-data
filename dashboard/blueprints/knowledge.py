@@ -275,9 +275,11 @@ def api_list():
             item['uuid'] = new_uid
             
         content = item.pop('content') or ''
-        summary = content[:200]
+        # Strip HTML tags for summary to prevent layout breakage
+        clean_content = re.sub(r'<[^>]+>', '', content)
+        summary = clean_content[:200]
         if query:
-            content_lower = content.lower()
+            content_lower = clean_content.lower()
             query_lower = query.lower()
             best_pos = content_lower.find(query_lower)
             if best_pos == -1 and search_terms:
@@ -290,8 +292,8 @@ def api_list():
                 best_pos = min_pos
             if best_pos != -1:
                 start = max(0, best_pos - 30)
-                end = min(len(content), start + 200)
-                summary = ('...' if start > 0 else '') + content[start:end] + ('...' if end < len(content) else '')
+                end = min(len(clean_content), start + 200)
+                summary = ('...' if start > 0 else '') + clean_content[start:end] + ('...' if end < len(clean_content) else '')
         
         item['summary'] = summary
         results.append(item)
