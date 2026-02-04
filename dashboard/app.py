@@ -504,7 +504,17 @@ def download_specific_file(filename):
     file_path = os.path.join(directory, filename)
     
     if not os.path.exists(file_path):
-        return jsonify({"error": f"File not found on server. Looked in: {external_tools_dir} AND {file_path}"}), 404
+        # Debug: List files in /app/tools to see what is mounted
+        try:
+            mount_files = os.listdir(external_tools_dir)
+        except Exception as e:
+            mount_files = str(e)
+            
+        return jsonify({
+            "error": f"File not found. Looked in: {external_tools_dir} AND {file_path}",
+            "mount_content": mount_files,
+            "cwd": os.getcwd()
+        }), 404
         
     return send_from_directory(directory, filename, as_attachment=True)
 
