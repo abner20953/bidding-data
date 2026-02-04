@@ -738,7 +738,12 @@
         // ================= SHARED / CRUD =================
 
         async function deleteTag(name) {
-            if (!confirm(`确定要删除标签 "${name}" 吗？\n删除后，所有文章中的此标签也将被移除！`)) return;
+            const pwd = prompt(`请输入管理密码以确认删除标签 "${name}"：`);
+            if (pwd !== '108') {
+                alert('密码错误，操作取消');
+                return;
+            }
+            if (!confirm(`再次确认：删除标签 "${name}" 后，所有文章中的此标签也将被移除！确定要继续吗？`)) return;
 
             try {
                 const resp = await fetch('/zhishi/api/tags', {
