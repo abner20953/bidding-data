@@ -151,6 +151,26 @@
             background-color: #f8f9fa;
             font-weight: 600;
         }
+
+        @media (max-width: 768px) {
+            .content-box {
+                padding: 20px;
+                margin-top: 15px;
+            }
+
+            .entry-content table {
+                display: block;
+                width: 100% !important;
+                overflow-x: auto;
+                -webkit-overflow-scrolling: touch;
+            }
+
+            .entry-content th,
+            .entry-content td {
+                min-width: 100px;
+                /* Ensure columns don't squash too much */
+            }
+        }
     </style>
 </head>
 

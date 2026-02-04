@@ -85,6 +85,38 @@
             padding: 0 2px;
             border-radius: 2px;
         }
+
+        /* Mobile Adaptation */
+        @media (max-width: 768px) {
+            .navbar-nav .btn-primary {
+                display: none !important;
+                /* Hide Add button on mobile */
+            }
+
+            .search-box {
+                padding: 15px;
+                /* Reduce padding */
+                margin-top: 15px;
+            }
+
+            .card-item {
+                padding: 15px;
+                /* Compact cards */
+            }
+
+            .navbar {
+                padding: 0.5rem 1rem;
+            }
+
+            /* Stack filters with gaps */
+            .search-box .row [class^="col-"] {
+                margin-bottom: 10px;
+            }
+
+            .badge {
+                font-size: 0.7rem !important;
+            }
+        }
     </style>
 </head>
 
