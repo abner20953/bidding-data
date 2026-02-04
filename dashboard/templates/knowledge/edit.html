@@ -223,7 +223,7 @@
                     <input type="file" class="form-control" id="imageInput" accept="image/*">
                     <div class="mt-2">
                         <img id="imagePreview" class="img-preview" src="{{ entry.screenshot }}"
-                            style="{{ 'display:block' if entry.screenshot else '' }}">
+                            style="{{ 'display:block;' if entry.screenshot else 'display:none;' }}">
                     </div>
                 </div>
 
@@ -734,7 +734,8 @@
         // ================= SHARED / CRUD =================
 
         async function deleteTag(name) {
-            if (!verifyAdminPassword(`删除标签 "${name}"`)) return;
+            const pwd = getAdminPassword(`删除标签 "${name}"`);
+            if (!pwd) return;
 
             if (!confirm(`再次确认：删除标签 "${name}" 后，所有文章中的此标签也将被移除！确定要继续吗？`)) return;
 
@@ -742,7 +743,7 @@
                 const resp = await fetch('/zhishi/api/tags', {
                     method: 'DELETE',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ name: name })
+                    body: JSON.stringify({ name: name, password: pwd })
                 });
                 const res = await resp.json();
                 if (res.status === 'success') {
