@@ -8,7 +8,7 @@
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
-    <script src="https://cdn.bootcdn.net/ajax/libs/tinymce/6.8.2/tinymce.min.js"></script>
+    <script src="https://cdn.staticfile.org/tinymce/6.8.2/tinymce.min.js"></script>
     <style>
         :root {
             --bg-gradient: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
@@ -217,20 +217,23 @@
                                 selector: '#content',
                                 language: 'zh-Hans',
                                 height: 500,
-                                // Plugins: Added 'advlist' for better list support if needed, though 'lists' is often enough
+                                // Plugins
                                 plugins: 'table lists autolink wordcount',
-                                // Expanded toolbar: Font Size | Bold Italic Underline | Alignments | Color | Table
+                                // Toolbar
                                 toolbar: 'undo redo | fontsize | bold italic underline | alignleft aligncenter alignright | forecolor backcolor | table | removeformat',
                                 menubar: false,
                                 statusbar: false,
                                 content_style: 'body { font-family:Inter,sans-serif; font-size:14px }',
-                                // Table configuration to keep styles
                                 table_default_attributes: { border: '1' },
                                 table_default_styles: { 'border-collapse': 'collapse', 'width': '100%' },
-                                // Paste configuration for Word
                                 paste_data_images: true,
                                 paste_as_text: false
                             });
+                        } else {
+                            console.error("TinyMCE failed to load");
+                            const textarea = document.getElementById('content');
+                            textarea.style.display = 'block'; // Fallback
+                            // alert("编辑器资源加载失败。已切换回普通文本模式。");
                         }
                     });
                 </script>
