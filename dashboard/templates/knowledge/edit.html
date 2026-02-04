@@ -228,7 +228,12 @@
                 </div>
 
                 <div class="mb-4 mt-4">
-                    <label class="form-label">正文内容 <span class="text-danger">*</span></label>
+                    <div class="d-flex justify-content-between align-items-center mb-2">
+                        <label class="form-label mb-0">正文内容 <span class="text-danger">*</span></label>
+                        <button type="button" class="btn btn-sm btn-outline-primary" onclick="autoFormatContent()">
+                            <i class="fas fa-indent"></i> 一键排版 (首行缩进)
+                        </button>
+                    </div>
                     <div style="border: 1px solid #ccc; z-index: 100;">
                         <div id="editor-toolbar" style="border-bottom: 1px solid #ccc;"></div>
                         <div id="editor-container" style="height: 500px;"></div>
@@ -312,7 +317,46 @@
                     alert('删除失败: ' + (res.error || '未知错误'));
                 }
             } catch (e) {
-                alert('网络错误');
+                console.error(e);
+                alert(`请求失败: ${e.message}`);
+            }
+        }
+
+        function autoFormatContent() {
+            if (!window.editorInstance) {
+                alert('编辑器尚未初始化');
+                return;
+            }
+
+            // Get current HTML
+            const html = window.editorInstance.getHtml();
+            if (!html) return;
+
+            // Parse to DOM for easy manipulation
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(html, 'text/html');
+
+            // Apply text-indent: 2em to all <p> tags
+            const paragraphs = doc.querySelectorAll('p');
+            let count = 0;
+            paragraphs.forEach(p => {
+                // Check if already indented to allow toggling or just enforcing? 
+                // Creating a standard style string handling existing styles is complex.
+                // Simpler: Just set/overwrite text-indent in style.
+                p.style.textIndent = '2em';
+                count++;
+            });
+
+            if (count > 0) {
+                // Set back to editor
+                window.editorInstance.setHtml(doc.body.innerHTML);
+                // Also update hidden input
+                document.getElementById('content').value = window.editorInstance.getHtml();
+                // Toast or small alert?
+                // alert(`排版完成：已处理 ${count} 个段落。`); 
+                // Non-intrusive notification better, but alert is acceptable for now per user request style.
+            } else {
+                alert('未找到段落内容');
             }
         }
     </script>
