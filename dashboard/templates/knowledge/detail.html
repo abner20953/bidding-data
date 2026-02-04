@@ -170,6 +170,27 @@
                 min-width: 100px;
                 /* Ensure columns don't squash too much */
             }
+
+            /* Mobile Typography Optimization */
+            .entry-content {
+                font-size: 17px;
+                /* Slightly larger for varied screens */
+                line-height: 1.8;
+                /* Increase line height */
+                word-wrap: break-word;
+                /* Ensure wrapping */
+            }
+
+            .entry-content p {
+                margin-bottom: 1.25em;
+                /* Add paragraph spacing */
+            }
+
+            .entry-content img {
+                max-width: 100% !important;
+                /* Prevent image overflow */
+                height: auto;
+            }
         }
     </style>
 </head>
