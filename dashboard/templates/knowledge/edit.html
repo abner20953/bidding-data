@@ -828,12 +828,28 @@
                 const res = await resp.json();
 
                 if (res.status === 'success') {
-                    if (res.data.title) document.getElementById('title').value = res.data.title;
-                    if (res.data.content) document.getElementById('content').value = res.data.content;
+                    let hasData = false;
+                    if (res.data.title) {
+                        document.getElementById('title').value = res.data.title;
+                        hasData = true;
+                    }
+                    if (res.data.content) {
+                        document.getElementById('content').value = res.data.content;
+                        // Sync to WangEditor
+                        if (window.editor) {
+                            window.editor.setHtml(res.data.content);
+                        }
+                        hasData = true;
+                    }
                     if (res.data.publish_date) document.getElementById('publishDate').value = res.data.publish_date;
                     if (res.data.url) document.getElementById('originalUrl').value = res.data.url;
                     if (res.data.doc_number) document.getElementById('docNumber').value = res.data.doc_number;
-                    alert('抓取成功！');
+
+                    if (hasData) {
+                        alert('抓取成功！');
+                    } else {
+                        alert('抓取完成，但未识别到有效标题或内容。可能是页面结构特殊或反爬限制。');
+                    }
                 } else {
                     alert('抓取失败: ' + res.error);
                 }
