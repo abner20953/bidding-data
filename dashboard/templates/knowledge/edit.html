@@ -329,34 +329,39 @@
             }
 
             // Get current HTML
-            const html = window.editorInstance.getHtml();
+            let html = window.editorInstance.getHtml();
             if (!html) return;
+
+            // 1. Convert soft breaks (<br>) to paragraph breaks for proper indentation
+            // Regex handles <br>, <br/>, <br />case insensitive
+            html = html.replace(/<br\s*\/?>/gi, '</p><p>');
 
             // Parse to DOM for easy manipulation
             const parser = new DOMParser();
             const doc = parser.parseFromString(html, 'text/html');
 
-            // Apply text-indent: 2em to all <p> tags
-            const paragraphs = doc.querySelectorAll('p');
+            // 2. Apply text-indent: 2em to all block text tags
+            const blocks = doc.querySelectorAll('p, div');
             let count = 0;
-            paragraphs.forEach(p => {
-                // Check if already indented to allow toggling or just enforcing? 
-                // Creating a standard style string handling existing styles is complex.
-                // Simpler: Just set/overwrite text-indent in style.
-                p.style.textIndent = '2em';
+            blocks.forEach(block => {
+                // Determine if block has significant content (text or images)
+                // If it's just empty or whitespace, maybe skip? 
+                // However, user might want to indent everything.
+                // Priority: indent.
+                block.style.textIndent = '2em';
+
+                // Optional: Ensure margin for readability if splitting created many Ps
+                // block.style.marginBottom = '0.5em'; 
+
                 count++;
             });
 
             if (count > 0) {
                 // Set back to editor
                 window.editorInstance.setHtml(doc.body.innerHTML);
-                // Also update hidden input
                 document.getElementById('content').value = window.editorInstance.getHtml();
-                // Toast or small alert?
-                // alert(`排版完成：已处理 ${count} 个段落。`); 
-                // Non-intrusive notification better, but alert is acceptable for now per user request style.
             } else {
-                alert('未找到段落内容');
+                alert('未找到可格式化的段落');
             }
         }
     </script>
