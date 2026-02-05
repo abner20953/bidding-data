@@ -419,7 +419,7 @@
             try {
                 // Construct URL
                 let url = `/zhishi/api/list?page=${page}&q=${encodeURIComponent(query)}&type=${encodeURIComponent(type)}`;
-                if (tags) url += `&tags=${encodeURIComponent(tags)}`;
+                if (tags) url += `&tag=${encodeURIComponent(tags)}`;
 
                 const resp = await fetch(url);
                 const data = await resp.json();
