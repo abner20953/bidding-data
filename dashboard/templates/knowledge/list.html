@@ -466,8 +466,15 @@
                     displayDate = item.created_at.split(' ')[0]; // Just date part usually preferred
                 }
 
+                // Get current search query for highlighting
+                const query = document.getElementById('searchInput').value.trim();
+                let viewUrl = `/zhishi/view/${item.uuid}`;
+                if (query) {
+                    viewUrl += `?q=${encodeURIComponent(query)}`;
+                }
+
                 html += `
-                <a href="/zhishi/view/${item.uuid}" class="card-item">
+                <a href="${viewUrl}" class="card-item">
                     <div class="d-flex justify-content-between align-items-start mb-2">
                         <h5 class="fw-bold mb-0 text-dark flex-grow-1 me-2">${highlightText(item.title, keywords)}</h5>
                         <span class="badge ${badgeClass} rounded-pill px-3 py-2 text-nowrap">${item.type === '案例' ? '知识库' : item.type}</span>
