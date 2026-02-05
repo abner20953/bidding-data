@@ -336,8 +336,13 @@ def api_tags():
         
     if request.method == 'POST':
         # Check for Reorder Action first
+        print(f"DEBUG: api_tags POST args={request.args}")
         if request.args.get('action') == 'reorder':
-             data = request.get_json()
+             data = request.get_json(silent=True)
+             print(f"DEBUG: api_tags reorder data={data}")
+             if not data:
+                 return jsonify({"error": "Invalid JSON"}), 400
+             
              tags = data.get('tags', []) # List of names in order
              
              if not tags:
