@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>知识库</title>
+    <title>知识�?/title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
@@ -175,49 +175,27 @@
                         <span class="input-group-text bg-white border-end-0"><i
                                 class="fas fa-search text-muted"></i></span>
                         <input type="text" id="searchInput" class="form-control border-start-0"
-                            placeholder="搜索主题、内容或关键词..." style="font-size: 1rem;">
+                            placeholder="搜索主题、内容或关键�?.." style="font-size: 1rem;">
                     </div>
                 </div>
                 <div class="col-md-3">
-                    <!-- Multi-Select Dropdown for Tags -->
-                    <div class="dropdown w-100">
-                        <button
-                            class="btn btn-lg btn-outline-secondary w-100 dropdown-toggle text-start d-flex justify-content-between align-items-center bg-white"
-                            type="button" id="tagFilterDropdown" data-bs-toggle="dropdown" aria-expanded="false"
-                            data-bs-auto-close="outside">
-                            <span id="selectedTagsLabel" class="text-truncate">选择标签</span>
-                        </button>
-                        <ul class="dropdown-menu w-100 p-2" id="tagDropdownMenu"
-                            style="max-height: 300px; overflow-y: auto;">
-                            <li>
-                                <div class="px-2 pb-2">
-                                    <input type="text" class="form-control form-control-sm" id="tagDropdownSearch"
-                                        placeholder="🔍 检索标签..." oninput="filterDropdownTags(this.value)"
-                                        onclick="event.stopPropagation()">
-                                </div>
-                            </li>
-                            <li>
-                                <h6 class="dropdown-header">可用标签 (多选)</h6>
-                            </li>
-                            <li>
-                                <hr class="dropdown-divider">
-                            </li>
-                            <!-- Tags loaded here -->
-                            <div id="dropdownTagList">
-                                <li class="text-center text-muted small py-2">加载中...</li>
-                            </div>
-                        </ul>
-                    </div>
+                    <!-- Tag Filter Button -->
+                    <button
+                        class="btn btn-lg btn-outline-secondary w-100 d-flex justify-content-between align-items-center bg-white"
+                        onclick="openFilterTagModal()">
+                        <span id="tagFilterButtonLabel">选择标签</span>
+                        <i class="fas fa-tags text-muted"></i>
+                    </button>
                 </div>
                 <div class="col-md-2">
                     <select id="typeFilter" class="form-select form-select-lg">
-                        <option value="">所有类型</option>
+                        <option value="">所有类�?/option>
                         <option value="法律法规" selected>法律法规</option>
-                        <option value="案例">知识库</option>
+                        <option value="案例">知识�?/option>
                     </select>
                 </div>
                 <div class="col-md-2">
-                    <button class="btn btn-primary btn-lg w-100" onclick="loadData()">搜 索</button>
+                    <button class="btn btn-primary btn-lg w-100" onclick="loadData()">�?�?/button>
                 </div>
             </div>
             <div class="mt-2" id="selectedTagsContainer">
@@ -236,15 +214,43 @@
         </nav>
     </div>
 
+    <!-- Filter Tags Modal -->
+    <div class="modal fade" id="filterTagModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header border-0 pb-0">
+                    <h5 class="modal-title fw-bold">筛选标�?/h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <input type="text" class="form-control" id="filterTagSearchInput" placeholder="🔍 搜索标签..."
+                            oninput="renderFilterModalTags()">
+                    </div>
+                    <div id="filterTagList" class="d-flex flex-wrap gap-2"
+                        style="max-height: 400px; overflow-y: auto; padding: 5px;">
+                        <!-- Tags rendered here -->
+                    </div>
+                </div>
+                <div class="modal-footer border-0 pt-0">
+                    <div class="me-auto text-muted small" id="tagSelectionCount">已�?0 �?/div>
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+                    <button type="button" class="btn btn-primary px-4" onclick="confirmFilterTags()">确定筛�?/button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         let currentPage = 1;
         let currentQuery = '';
         let selectedTags = new Set();
         let allTags = [];
+        let tempSelectedTags = new Set(); // For Modal state
 
         document.addEventListener('DOMContentLoaded', () => {
-            loadTagsDropdown();
+            fetchTags(); // Load tags initially
             loadData();
 
             document.getElementById('searchInput').addEventListener('keypress', function (e) {
@@ -252,211 +258,265 @@
             });
         });
 
-        async function loadTagsDropdown() {
+        // --- Tag Logic ---
+        async function fetchTags() {
             try {
                 const resp = await fetch('/zhishi/api/tags');
                 allTags = await resp.json();
-                renderTagDropdown();
             } catch (e) {
-                console.error("Tags load failed", e);
+                console.error("Failed to load tags", e);
             }
         }
 
-        function renderTagDropdown() {
-            filterDropdownTags('');
+        function openFilterTagModal() {
+            // Copy current selection to temp
+            tempSelectedTags = new Set(selectedTags);
+
+            // Clear search
+            document.getElementById('filterTagSearchInput').value = '';
+
+            // Render
+            renderFilterModalTags();
+
+            // Show Modal
+            new bootstrap.Modal(document.getElementById('filterTagModal')).show();
         }
 
-        function filterDropdownTags(query) {
-            const container = document.getElementById('dropdownTagList');
+        function renderFilterModalTags() {
+            const container = document.getElementById('filterTagList');
+            const search = document.getElementById('filterTagSearchInput').value.toLowerCase();
+
             container.innerHTML = '';
 
-            const q = query.toLowerCase();
-            const filtered = allTags.filter(t => t.toLowerCase().includes(q));
+            const filtered = allTags.filter(t => t.toLowerCase().includes(search));
 
             if (filtered.length === 0) {
-                container.innerHTML = '<li class="text-center text-muted small py-2">无匹配标签</li>';
+                container.innerHTML = '<div class="w-100 text-center text-muted py-4">未找到匹配标�?/div>';
                 return;
             }
 
-            filtered.forEach((tag) => {
-                const idx = allTags.indexOf(tag);
-                const isChecked = selectedTags.has(tag);
-
-                const li = document.createElement('li');
-                li.className = 'dropdown-item p-0 mb-1 rounded';
-                li.onclick = (e) => e.stopPropagation();
-
-                const div = document.createElement('div');
-                div.className = 'form-check m-2 position-relative'; // Add position-relative to contain stretched-link
-
-                const input = document.createElement('input');
-                input.className = 'form-check-input';
-                input.type = 'checkbox';
-                input.value = tag;
-                input.id = `cb_tag_${idx}`;
-                if (isChecked) input.checked = true;
-
-                input.onchange = () => toggleTag(tag);
-
-                const label = document.createElement('label');
-                label.className = 'form-check-label w-100 stretched-link';
-                label.htmlFor = `cb_tag_${idx}`;
-                label.innerText = tag;
-
-                div.appendChild(input);
-                div.appendChild(label);
-                li.appendChild(div);
-                container.appendChild(li);
+            filtered.forEach(tag => {
+                const isSelected = tempSelectedTags.has(tag);
+                const btn = document.createElement('button');
+                btn.className = `btn btn-sm ${isSelected ? 'btn-primary' : 'btn-outline-secondary'} rounded-pill px-3`;
+                btn.textContent = tag;
+                btn.onclick = () => toggleModalTag(tag);
+                container.appendChild(btn);
             });
+
+            updateModalCount();
         }
 
-        function toggleTag(tag) {
-            if (selectedTags.has(tag)) {
-                selectedTags.delete(tag);
+        function toggleModalTag(tag) {
+            if (tempSelectedTags.has(tag)) {
+                tempSelectedTags.delete(tag);
             } else {
-                selectedTags.add(tag);
+                tempSelectedTags.add(tag);
             }
-            updateSelectedUI();
+            renderFilterModalTags();
         }
 
-        function updateSelectedUI() {
-            const label = document.getElementById('selectedTagsLabel');
+        function updateModalCount() {
+            document.getElementById('tagSelectionCount').textContent = `已�?${tempSelectedTags.size} 个`;
+        }
+
+        function confirmFilterTags() {
+            // Commit changes
+            selectedTags = new Set(tempSelectedTags);
+
+            // Update UI Button Label
+            const btnLabel = document.getElementById('tagFilterButtonLabel');
+            if (selectedTags.size > 0) {
+                btnLabel.textContent = `已�?${selectedTags.size} 个标签`;
+                btnLabel.classList.add('text-primary', 'fw-bold');
+            } else {
+                btnLabel.textContent = '选择标签';
+                btnLabel.classList.remove('text-primary', 'fw-bold');
+            }
+
+            // Update Selected Container (Below Search Box)
+            renderSelectedTagsBadge();
+
+            // Close Modal
+            bootstrap.Modal.getInstance(document.getElementById('filterTagModal')).hide();
+
+            // Reload Data
+            loadData();
+        }
+
+        function renderSelectedTagsBadge() {
             const container = document.getElementById('selectedTagsContainer');
+            container.innerHTML = '';
 
-            if (selectedTags.size === 0) {
-                label.innerText = '选择标签';
-                label.classList.remove('fw-bold', 'text-primary');
-                container.innerHTML = '';
-            } else {
-                label.innerText = `已选 ${selectedTags.size} 个标签`;
-                label.classList.add('fw-bold', 'text-primary');
+            if (selectedTags.size === 0) return;
 
-                // Show pills below
-                let html = '';
-                selectedTags.forEach(t => {
-                    html += `<span class="badge bg-primary me-2 mb-2 p-2">
-                                ${t} <i class="fas fa-times ms-1 cursor-pointer" onclick="removeTag('${t}')" style="cursor:pointer"></i>
-                            </span>`;
-                });
-                container.innerHTML = html;
+            const badgeContainer = document.createElement('div');
+            badgeContainer.className = 'd-flex flex-wrap gap-2 align-items-center';
+            badgeContainer.innerHTML = '<span class="text-muted small me-1">筛选条�?</span>';
+
+            selectedTags.forEach(tag => {
+                const badge = document.createElement('span');
+                badge.className = 'badge bg-primary rounded-pill d-flex align-items-center gap-1 ps-3 pe-2 py-2';
+                badge.innerHTML = `
+                    ${tag}
+                    <i class="fas fa-times-circle" style="cursor:pointer; opacity:0.8;" 
+                       onclick="removeTag('${tag}')"></i>
+                `;
+                badgeContainer.appendChild(badge);
+            });
+
+            // Clear all button
+            if (selectedTags.size > 1) {
+                const clearBtn = document.createElement('button');
+                clearBtn.className = 'btn btn-link btn-sm text-decoration-none text-muted p-0 ms-2';
+                clearBtn.textContent = '清空';
+                clearBtn.onclick = clearAllTags;
+                badgeContainer.appendChild(clearBtn);
             }
+
+            container.appendChild(badgeContainer);
         }
 
         function removeTag(tag) {
-            // Uncheck box
-            const idx = allTags.indexOf(tag);
-            if (idx > -1) {
-                const cb = document.getElementById(`cb_tag_${idx}`);
-                if (cb) cb.checked = false;
+            selectedTags.delete(tag);
+            renderSelectedTagsBadge();
+
+            // Update Button Label
+            const btnLabel = document.getElementById('tagFilterButtonLabel');
+            if (selectedTags.size > 0) {
+                btnLabel.textContent = `已�?${selectedTags.size} 个标签`;
+            } else {
+                btnLabel.textContent = '选择标签';
+                btnLabel.classList.remove('text-primary', 'fw-bold');
             }
-            toggleTag(tag);
-            // Optionally reload data immediately? User might expect "Search" button click first.
-            // Let's stick to manual search button trigger based on UI layout.
+
+            loadData();
         }
 
-        function highlightText(text, query, tokens = []) {
-            if (!text) return text;
-
-            // Prefer tokens from backend (Jieba) if available
-            let terms = [];
-            if (tokens && tokens.length > 0) {
-                terms = tokens;
-            } else if (query) {
-                // Fallback to simple split
-                terms = query.split(/\s+/).filter(t => t.length > 0);
-            }
-
-            if (terms.length === 0) return text;
-
-            try {
-                const safeTerms = terms.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-                // Sort by length desc to match longer terms first (e.g. "Review Standard" before "Review")
-                safeTerms.sort((a, b) => b.length - a.length);
-
-                const pattern = new RegExp(`(${safeTerms.join('|')})`, 'gi');
-                return text.replace(pattern, '<span class="search-highlight">$1</span>');
-            } catch (e) {
-                return text;
-            }
+        function clearAllTags() {
+            selectedTags.clear();
+            renderSelectedTagsBadge();
+            document.getElementById('tagFilterButtonLabel').textContent = '选择标签';
+            document.getElementById('tagFilterButtonLabel').classList.remove('text-primary', 'fw-bold');
+            loadData();
         }
 
+        // --- Data Loading ---
         async function loadData(page = 1) {
             currentPage = page;
-            const q = document.getElementById('searchInput').value;
-            currentQuery = q;
+            const query = document.getElementById('searchInput').value.trim();
             const type = document.getElementById('typeFilter').value;
+            const container = document.getElementById('resultsList');
 
-            // Join tags by comma
-            const tagStr = Array.from(selectedTags).join(',');
+            // Tags
+            const tags = Array.from(selectedTags).join(',');
 
-            let url = `/zhishi/api/list?page=${page}&q=${encodeURIComponent(q)}&type=${encodeURIComponent(type)}&t=${new Date().getTime()}`;
-            if (tagStr) url += `&tag=${encodeURIComponent(tagStr)}`;
-
-            const listContainer = document.getElementById('resultsList');
-            listContainer.style.opacity = '0.5';
+            container.innerHTML = '<div class="text-center py-5"><i class="fas fa-spinner fa-spin fa-2x text-muted"></i></div>';
 
             try {
+                // Construct URL
+                let url = `/zhishi/api/list?page=${page}&q=${encodeURIComponent(query)}&type=${encodeURIComponent(type)}`;
+                if (tags) url += `&tags=${encodeURIComponent(tags)}`;
+
                 const resp = await fetch(url);
                 const data = await resp.json();
 
-                listContainer.style.opacity = '1';
-                listContainer.innerHTML = '';
+                renderList(data.data, data.search_terms);
+                renderPagination(data);
 
-                if (data.data.length === 0) {
-                    listContainer.innerHTML = '<div class="text-center py-5 text-muted">暂无符合条件的数据</div>';
-                    document.getElementById('pagination').innerHTML = '';
-                    return;
-                }
-
-                data.data.forEach(item => {
-                    let tagsHtml = '';
-                    try {
-                        const tags = JSON.parse(item.tags || '[]');
-                        tags.forEach(t => tagsHtml += `<span class="badge tag-badge me-1">${t}</span>`);
-                    } catch (e) { }
-
-                    const badgeClass = item.type === '法律法规' ? 'badge-law' : 'badge-case';
-                    const titleHtml = highlightText(item.title, currentQuery, data.search_terms);
-                    const summaryHtml = highlightText(item.summary, currentQuery, data.search_terms);
-
-                    const detailUrl = currentQuery ? `/zhishi/view/${item.uuid}?q=${encodeURIComponent(currentQuery)}` : `/zhishi/view/${item.uuid}`;
-
-                    const docNumHtml = item.doc_number ? `<span class="badge bg-secondary ms-2 align-middle" style="font-size: 0.75rem;">${highlightText(item.doc_number, currentQuery, data.search_terms)}</span>` : '';
-
-                    const html = `
-                    <a href="${detailUrl}" class="card-item">
-                        <div class="d-flex justify-content-between align-items-center mb-1">
-                            <div>
-                                <h6 class="mb-0 fw-bold text-dark d-inline align-middle" style="font-size: 1.1rem;">${titleHtml}</h6>
-                                ${docNumHtml}
-                            </div>
-                            <span class="badge ${badgeClass} rounded-pill" style="font-size: 0.75rem;">${item.type === '案例' ? '知识库' : item.type}</span>
-                        </div>
-                        <p class="text-secondary small mb-2" style="font-size: 0.9rem; line-height: 1.5;">${summaryHtml}...</p>
-                        <div class="d-flex justify-content-between align-items-center">
-                            <div>${tagsHtml}</div>
-                            <small class="text-muted" style="font-size: 0.8rem;"><i class="far fa-clock"></i> ${item.created_at.split(' ')[0]}</small>
-                        </div>
-                    </a>`;
-
-                    listContainer.innerHTML += html;
-                });
-
-                const totalPages = Math.ceil(data.total / data.per_page);
-                let pageHtml = '';
-                if (currentPage > 1) {
-                    pageHtml += `<li class="page-item"><button class="page-link" onclick="loadData(${currentPage - 1})">上一页</button></li>`;
-                }
-                pageHtml += `<li class="page-item disabled"><span class="page-link"> ${currentPage} / ${totalPages} </span></li>`;
-                if (currentPage < totalPages) {
-                    pageHtml += `<li class="page-item"><button class="page-link" onclick="loadData(${currentPage + 1})">下一页</button></li>`;
-                }
-                document.getElementById('pagination').innerHTML = pageHtml;
-
+                // Highlight active tags in badges if any
             } catch (e) {
                 console.error(e);
-                listContainer.innerHTML = '<div class="alert alert-danger">数据加载失败</div>';
+                container.innerHTML = '<div class="text-center py-5 text-danger">加载失败</div>';
             }
+        }
+
+        function renderList(items, keywords) {
+            const container = document.getElementById('resultsList');
+            if (!items || items.length === 0) {
+                container.innerHTML = '<div class="text-center py-5 text-muted">暂无相关数据</div>';
+                return;
+            }
+
+            let html = '';
+            items.forEach(item => {
+                let badgeClass = 'bg-secondary';
+                if (item.type === '法律法规') badgeClass = 'badge-law';
+                if (item.type === '案例') badgeClass = 'badge-case';
+
+                // Format Tags
+                let tagsHtml = '';
+                if (item.tags) {
+                    try {
+                        const tList = JSON.parse(item.tags);
+                        tagsHtml = tList.map(t => `<span class="badge bg-light text-dark border me-1">${t}</span>`).join('');
+                    } catch (e) { }
+                }
+
+                html += `
+                <a href="/zhishi/view/${item.id}" class="card-item">
+                    <div class="d-flex justify-content-between align-items-start mb-2">
+                        <span class="badge ${badgeClass} rounded-pill px-3 py-2">${item.type}</span>
+                        <small class="text-muted">${item.publish_date || ''}</small>
+                    </div>
+                    <h5 class="fw-bold mb-3 text-dark">${highlightText(item.title, keywords)}</h5>
+                    <p class="text-secondary mb-3 text-truncate-3" style="display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;">
+                        ${highlightText(item.summary || '', keywords)}
+                    </p>
+                    <div class="d-flex justify-content-between align-items-center">
+                        <div class="d-flex align-items-center">
+                           ${tagsHtml}
+                        </div>
+                        <small class="text-muted"><i class="far fa-eye me-1"></i> ${item.id}</small>
+                    </div>
+                </a>
+                `;
+            });
+            container.innerHTML = html;
+        }
+
+        function highlightText(text, keywords) {
+            if (!keywords || keywords.length === 0) return text;
+            let res = text;
+            keywords.forEach(k => {
+                if (k) res = res.replace(new RegExp(k, 'gi'), `<span class="search-highlight">$&</span>`);
+            });
+            return res;
+        }
+
+        function renderPagination(data) {
+            const container = document.getElementById('pagination');
+            let html = '';
+
+            const totalPages = Math.ceil(data.total / data.per_page);
+            if (totalPages <= 1) {
+                container.innerHTML = '';
+                return;
+            }
+
+            // Prev
+            html += `<li class="page-item ${data.page === 1 ? 'disabled' : ''}">
+                        <button class="page-link" onclick="loadData(${data.page - 1})">上一�?/button>
+                    </li>`;
+
+            // Simple Pagination: 1 ... current ... last
+            // For now just show all or simple range? Let's show simple range.
+            for (let i = 1; i <= totalPages; i++) {
+                if (i === 1 || i === totalPages || (i >= data.page - 2 && i <= data.page + 2)) {
+                    html += `<li class="page-item ${i === data.page ? 'active' : ''}">
+                                <button class="page-link" onclick="loadData(${i})">${i}</button>
+                            </li>`;
+                } else if (i === data.page - 3 || i === data.page + 3) {
+                    html += `<li class="page-item disabled"><span class="page-link">...</span></li>`;
+                }
+            }
+
+            // Next
+            html += `<li class="page-item ${data.page === totalPages ? 'disabled' : ''}">
+                        <button class="page-link" onclick="loadData(${data.page + 1})">下一�?/button>
+                    </li>`;
+
+            container.innerHTML = html;
         }
     </script>
 </body>
