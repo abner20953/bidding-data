@@ -469,7 +469,7 @@
 
     <!-- Manage Tags Modal -->
     <div class="modal fade" id="manageTagModal" tabindex="-1">
-        <div class="modal-dialog modal-dialog-scrollable">
+        <div class="modal-dialog modal-dialog-scrollable modal-lg">
             <div class="modal-content">
                 <div class="modal-header border-0 pb-0">
                     <h5 class="modal-title fw-bold">管理标签库</h5>
@@ -863,40 +863,44 @@
                 return;
             }
 
-            // Ensure container has row class for grid
-            container.className = 'list-group list-group-flush border rounded row g-0'; // Use row
+            // Grid Container: 5 columns on MD+, 2 columns on small screens
+            container.className = 'row row-cols-2 row-cols-md-5 g-2';
 
             allTags.forEach((tag, index) => {
                 const item = document.createElement('div');
-                // col-6 for 2 columns, border for separation
-                item.className = 'list-group-item d-flex justify-content-between align-items-center draggable-item col-6 border-bottom border-end';
+                item.className = 'col draggable-item';
                 item.draggable = true;
                 item.dataset.index = index;
                 item.dataset.tag = tag;
 
-                // Input for position (1-based)
-                const posInput = `<input type="number" class="form-control form-control-sm me-2 text-center" 
-                                    style="width: 60px;" 
+                // Compact Card Design
+                item.innerHTML = `
+                    <div class="card h-100 border shadow-none bg-light card-hover-effect">
+                        <div class="card-body p-2 d-flex flex-column justify-content-between">
+                            <div class="d-flex align-items-center mb-2" style="overflow: hidden;">
+                                <i class="fas fa-grip-vertical text-muted me-2" style="cursor: grab; font-size: 0.8rem;"></i>
+                                <span class="fw-bold text-dark text-truncate small" title="${tag}">${tag}</span>
+                            </div>
+                            <div class="d-flex justify-content-between align-items-center">
+                                <input type="number" class="form-control form-control-sm px-1 text-center border-0 bg-white" 
+                                    style="width: 40px; font-size: 0.8rem;" 
                                     value="${index + 1}" 
                                     min="1" max="${allTags.length}"
                                     onchange="updateTagPosition(${index}, this.value)"
                                     onclick="event.stopPropagation();" 
                                     onmousedown="event.stopPropagation();"
-                                  >`;
-
-                item.innerHTML = `
-                    <div class="d-flex align-items-center flex-grow-1" style="overflow: hidden;">
-                        <i class="fas fa-grip-vertical text-muted me-2" style="cursor: grab;"></i>
-                        <span class="fw-bold text-dark text-truncate me-2" title="${tag}">${tag}</span>
-                    </div>
-                    <div class="d-flex align-items-center">
-                        ${posInput}
-                        <button class="btn btn-sm btn-link text-secondary p-1" onclick="renameTag('${tag}')" title="重命名">
-                            <i class="fas fa-edit"></i>
-                        </button>
-                        <button class="btn btn-sm btn-link text-danger p-1 ms-1" onclick="deleteTag('${tag}')" title="删除">
-                            <i class="fas fa-trash-alt"></i>
-                        </button>
+                                    title="调整序号"
+                                >
+                                <div class="d-flex">
+                                    <button class="btn btn-sm btn-link text-secondary p-0 me-2" onclick="renameTag('${tag}')" title="重命名">
+                                        <i class="fas fa-edit" style="font-size: 0.8rem;"></i>
+                                    </button>
+                                    <button class="btn btn-sm btn-link text-danger p-0" onclick="deleteTag('${tag}')" title="删除">
+                                        <i class="fas fa-trash-alt" style="font-size: 0.8rem;"></i>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 `;
 
