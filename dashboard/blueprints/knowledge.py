@@ -94,9 +94,15 @@ def init_db():
     c.execute('''
         CREATE TABLE IF NOT EXISTS tags (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE
+            name TEXT UNIQUE,
+            sort_order INTEGER DEFAULT 0
         )
     ''')
+
+    try:
+        c.execute("ALTER TABLE tags ADD COLUMN sort_order INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
     
     # 4. 关联表
     c.execute('''
@@ -324,7 +330,7 @@ def api_list():
 def api_tags():
     conn = get_db()
     if request.method == 'GET':
-        rows = conn.execute("SELECT name FROM tags ORDER BY id").fetchall()
+        rows = conn.execute("SELECT name FROM tags ORDER BY sort_order ASC, id ASC").fetchall()
         conn.close()
         return jsonify([r['name'] for r in rows])
         
@@ -340,6 +346,24 @@ def api_tags():
             status = "exists"
         conn.close()
         return jsonify({"status": status, "name": name})
+
+    if request.method == 'POST' and request.args.get('action') == 'reorder':
+         data = request.get_json()
+         tags = data.get('tags', []) # List of names in order
+         
+         if not tags:
+             return jsonify({"error": "No tags provided"}), 400
+             
+         try:
+             # Transaction
+             for idx, name in enumerate(tags):
+                 conn.execute("UPDATE tags SET sort_order = ? WHERE name = ?", (idx, name))
+             conn.commit()
+             return jsonify({"status": "success"})
+         except Exception as e:
+             return jsonify({"error": str(e)}), 500
+         finally:
+             conn.close()
 
     if request.method == 'PUT':
         data = request.get_json()
