@@ -335,6 +335,26 @@ def api_tags():
         return jsonify([r['name'] for r in rows])
         
     if request.method == 'POST':
+        # Check for Reorder Action first
+        if request.args.get('action') == 'reorder':
+             data = request.get_json()
+             tags = data.get('tags', []) # List of names in order
+             
+             if not tags:
+                 return jsonify({"error": "No tags provided"}), 400
+                 
+             try:
+                 # Transaction
+                 for idx, name in enumerate(tags):
+                     conn.execute("UPDATE tags SET sort_order = ? WHERE name = ?", (idx, name))
+                 conn.commit()
+                 return jsonify({"status": "success"})
+             except Exception as e:
+                 return jsonify({"error": str(e)}), 500
+             finally:
+                 conn.close()
+
+        # Regular Create Tag
         name = request.get_json().get('name', '').strip()
         if not name:
             return jsonify({"error": "标签名不能为空"}), 400
@@ -347,23 +367,7 @@ def api_tags():
         conn.close()
         return jsonify({"status": status, "name": name})
 
-    if request.method == 'POST' and request.args.get('action') == 'reorder':
-         data = request.get_json()
-         tags = data.get('tags', []) # List of names in order
-         
-         if not tags:
-             return jsonify({"error": "No tags provided"}), 400
-             
-         try:
-             # Transaction
-             for idx, name in enumerate(tags):
-                 conn.execute("UPDATE tags SET sort_order = ? WHERE name = ?", (idx, name))
-             conn.commit()
-             return jsonify({"status": "success"})
-         except Exception as e:
-             return jsonify({"error": str(e)}), 500
-         finally:
-             conn.close()
+
 
     if request.method == 'PUT':
         data = request.get_json()
