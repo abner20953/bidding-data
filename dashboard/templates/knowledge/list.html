@@ -452,25 +452,34 @@
                 if (item.tags) {
                     try {
                         const tList = JSON.parse(item.tags);
-                        tagsHtml = tList.map(t => `<span class="badge bg-light text-dark border me-1">${t}</span>`).join('');
+                        // Use tag-badge class for purple style
+                        tagsHtml = tList.map(t => `<span class="badge tag-badge rounded-pill me-1">${t}</span>`).join('');
                     } catch (e) { }
+                }
+
+                // Date Logic: Publish Date > Created At
+                // created_at format might be 'YYYY-MM-DD HH:MM:SS', assume we just want Date? 
+                // User said "show entry time" if no publish date. Format as is or substring?
+                // Let's keep it simple first.
+                let displayDate = item.publish_date;
+                if (!displayDate && item.created_at) {
+                    displayDate = item.created_at.split(' ')[0]; // Just date part usually preferred
                 }
 
                 html += `
                 <a href="/zhishi/view/${item.id}" class="card-item">
                     <div class="d-flex justify-content-between align-items-start mb-2">
-                        <span class="badge ${badgeClass} rounded-pill px-3 py-2">${item.type}</span>
-                        <small class="text-muted">${item.publish_date || ''}</small>
+                        <h5 class="fw-bold mb-0 text-dark flex-grow-1 me-2">${highlightText(item.title, keywords)}</h5>
+                        <span class="badge ${badgeClass} rounded-pill px-3 py-2 text-nowrap">${item.type}</span>
                     </div>
-                    <h5 class="fw-bold mb-3 text-dark">${highlightText(item.title, keywords)}</h5>
                     <p class="text-secondary mb-3 text-truncate-3" style="display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;">
                         ${highlightText(item.summary || '', keywords)}
                     </p>
-                    <div class="d-flex justify-content-between align-items-center">
-                        <div class="d-flex align-items-center">
+                    <div class="d-flex justify-content-between align-items-end mt-auto">
+                        <div class="d-flex align-items-center flex-wrap">
                            ${tagsHtml}
                         </div>
-                        <small class="text-muted"><i class="far fa-eye me-1"></i> ${item.id}</small>
+                        <small class="text-muted text-nowrap ms-2">${displayDate || ''}</small>
                     </div>
                 </a>
                 `;
