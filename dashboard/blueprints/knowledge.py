@@ -336,10 +336,8 @@ def api_tags():
         
     if request.method == 'POST':
         # Check for Reorder Action first
-        print(f"DEBUG: api_tags POST args={request.args}")
         if request.args.get('action') == 'reorder':
              data = request.get_json(silent=True)
-             print(f"DEBUG: api_tags reorder data={data}")
              if not data:
                  return jsonify({"error": "Invalid JSON"}), 400
              
@@ -359,12 +357,17 @@ def api_tags():
              finally:
                  conn.close()
 
-        # Regular Create Tag
         name = request.get_json().get('name', '').strip()
         if not name:
             return jsonify({"error": "标签名不能为空"}), 400
         try:
-            conn.execute("INSERT INTO tags (name) VALUES (?)", (name,))
+            # Determine new sort_order (max + 1)
+            cursor = conn.execute("SELECT MAX(sort_order) FROM tags")
+            row = cursor.fetchone()
+            max_order = row[0] if row and row[0] is not None else -1
+            new_order = max_order + 1
+
+            conn.execute("INSERT INTO tags (name, sort_order) VALUES (?, ?)", (name, new_order))
             conn.commit()
             status = "success"
         except sqlite3.IntegrityError:
