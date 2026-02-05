@@ -854,51 +854,47 @@
         });
 
         function renderManageTags() {
-            // Search is removed from Manage Modal to rely on global sorted list for DnD simplicity
-            // Or we allow filtering? If filtering, DnD is confusing. 
-            // Implementation Plan didn't specify removing search, but DnD usually works on full list.
-            // Let's show full list for DnD.
-
             const container = document.getElementById('manageTagList');
             document.getElementById('manageTagCount').innerText = allTags.length;
             container.innerHTML = '';
 
             if (allTags.length === 0) {
-                container.innerHTML = '<div class="text-center text-muted py-3">暂无标签</div>';
+                container.innerHTML = '<div class="text-center text-muted py-3 col-12">暂无标签</div>';
                 return;
             }
 
+            // Ensure container has row class for grid
+            container.className = 'list-group list-group-flush border rounded row g-0'; // Use row
+
             allTags.forEach((tag, index) => {
                 const item = document.createElement('div');
-                item.className = 'list-group-item d-flex justify-content-between align-items-center draggable-item';
+                // col-6 for 2 columns, border for separation
+                item.className = 'list-group-item d-flex justify-content-between align-items-center draggable-item col-6 border-bottom border-end';
                 item.draggable = true;
                 item.dataset.index = index;
                 item.dataset.tag = tag;
 
+                // Input for position (1-based)
+                const posInput = `<input type="number" class="form-control form-control-sm me-2 text-center" 
+                                    style="width: 60px;" 
+                                    value="${index + 1}" 
+                                    min="1" max="${allTags.length}"
+                                    onchange="updateTagPosition(${index}, this.value)"
+                                    onclick="event.stopPropagation();" 
+                                    onmousedown="event.stopPropagation();"
+                                  >`;
+
                 item.innerHTML = `
-                    <div class="d-flex align-items-center flex-grow-1">
-                        <i class="fas fa-grip-vertical text-muted me-3" style="cursor: grab;"></i>
-                        <span class="fw-bold text-dark">${tag}</span>
+                    <div class="d-flex align-items-center flex-grow-1" style="overflow: hidden;">
+                        <i class="fas fa-grip-vertical text-muted me-2" style="cursor: grab;"></i>
+                        <span class="fw-bold text-dark text-truncate me-2" title="${tag}">${tag}</span>
                     </div>
                     <div class="d-flex align-items-center">
-                        <div class="btn-group me-3" role="group">
-                             <button class="btn btn-sm btn-outline-secondary p-1 px-2" onclick="moveTag(${index}, 'top')" title="置顶" ${index === 0 ? 'disabled' : ''}>
-                                <i class="fas fa-angle-double-up"></i>
-                            </button>
-                            <button class="btn btn-sm btn-outline-secondary p-1 px-2" onclick="moveTag(${index}, 'up')" title="上移" ${index === 0 ? 'disabled' : ''}>
-                                <i class="fas fa-angle-up"></i>
-                            </button>
-                            <button class="btn btn-sm btn-outline-secondary p-1 px-2" onclick="moveTag(${index}, 'down')" title="下移" ${index === allTags.length - 1 ? 'disabled' : ''}>
-                                <i class="fas fa-angle-down"></i>
-                            </button>
-                             <button class="btn btn-sm btn-outline-secondary p-1 px-2" onclick="moveTag(${index}, 'bottom')" title="置底" ${index === allTags.length - 1 ? 'disabled' : ''}>
-                                <i class="fas fa-angle-double-down"></i>
-                            </button>
-                        </div>
-                        <button class="btn btn-sm btn-link text-secondary" onclick="renameTag('${tag}')" title="重命名">
+                        ${posInput}
+                        <button class="btn btn-sm btn-link text-secondary p-1" onclick="renameTag('${tag}')" title="重命名">
                             <i class="fas fa-edit"></i>
                         </button>
-                        <button class="btn btn-sm btn-link text-danger ms-1" onclick="deleteTag('${tag}')" title="删除">
+                        <button class="btn btn-sm btn-link text-danger p-1 ms-1" onclick="deleteTag('${tag}')" title="删除">
                             <i class="fas fa-trash-alt"></i>
                         </button>
                     </div>
@@ -979,19 +975,19 @@
             }
         }
 
-        async function moveTag(index, direction) {
-            if (index < 0 || index >= allTags.length) return;
+        async function updateTagPosition(currentIndex, newPositionStr) {
+            let newPos = parseInt(newPositionStr);
+            if (isNaN(newPos) || newPos < 1) newPos = 1;
+            if (newPos > allTags.length) newPos = allTags.length;
 
-            const tag = allTags[index];
-            allTags.splice(index, 1); // Remove
+            // Convert to 0-based index
+            let targetIndex = newPos - 1;
 
-            let newIndex = index;
-            if (direction === 'top') newIndex = 0;
-            else if (direction === 'bottom') newIndex = allTags.length;
-            else if (direction === 'up') newIndex = Math.max(0, index - 1);
-            else if (direction === 'down') newIndex = Math.min(allTags.length, index + 1);
+            if (targetIndex === currentIndex) return;
 
-            allTags.splice(newIndex, 0, tag); // Insert
+            const tag = allTags[currentIndex];
+            allTags.splice(currentIndex, 1); // Remove
+            allTags.splice(targetIndex, 0, tag); // Insert at new pos
 
             renderManageTags();
             await saveTagOrder();
