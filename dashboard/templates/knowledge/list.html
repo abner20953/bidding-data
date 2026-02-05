@@ -261,14 +261,17 @@
         // --- Tag Logic ---
         async function fetchTags() {
             try {
-                const resp = await fetch('/zhishi/api/tags');
+                const resp = await fetch(`/zhishi/api/tags?t=${new Date().getTime()}`);
                 allTags = await resp.json();
             } catch (e) {
                 console.error("Failed to load tags", e);
             }
         }
 
-        function openFilterTagModal() {
+        async function openFilterTagModal() {
+            // Fetch fresh tags
+            await fetchTags();
+
             // Copy current selection to temp
             tempSelectedTags = new Set(selectedTags);
 
