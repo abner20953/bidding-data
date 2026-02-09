@@ -13,6 +13,15 @@ import re
 # Admin Password
 ADMIN_PASSWORD = "108"
 
+# --- Search Configuration ---
+STOPWORDS = {"的", "了", "和", "是", "就", "都", "而", "及", "与", "着", "在", "对", "或者", "等", "之"}
+PROCUREMENT_TERMS = [
+    "不允许", "不接受", "实质性要求", "不得", "必须", "应", "不应", "未提供", "无效"
+]
+for term in PROCUREMENT_TERMS:
+    jieba.add_word(term)
+# ----------------------------
+
 knowledge_bp = Blueprint('knowledge', __name__, 
                         template_folder='../templates/knowledge',
                         url_prefix='/zhishi')
@@ -248,10 +257,17 @@ def api_list():
             sub_clauses = []
             for term in seg_list:
                 term = term.strip()
-                if term:
+                if term and term not in STOPWORDS:
                     search_terms.append(term)
                     sub_clauses.append(f"(title LIKE ? OR content LIKE ? OR doc_number LIKE ?)")
                     params.extend([f'%{term}%', f'%{term}%', f'%{term}%'])
+            
+            # If all terms were filtered (e.g. query was just "的"), fallback to original query to avoid empty WHERE
+            if not sub_clauses and query.strip():
+                 search_terms.append(query)
+                 sub_clauses.append(f"(title LIKE ? OR content LIKE ? OR doc_number LIKE ?)")
+                 params.extend([f'%{query}%', f'%{query}%', f'%{query}%'])
+
             if sub_clauses:
                 sql += " AND (" + " AND ".join(sub_clauses) + ")"
                 

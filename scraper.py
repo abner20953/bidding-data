@@ -163,9 +163,12 @@ def extract_time_only(text):
     if not text or text == "未找到" or text == "待采集":
         return text
     
+    # 预处理：移除空格
+    clean_text = text.replace(" ", "")
+    
     # 尝试匹配 HH:MM 或 HH:MM:SS 格式的时刻
     # 兼容多种分隔符如 : ： 点 分
-    match = re.search(r"(\d{1,2})[:：点](\d{1,2})", text)
+    match = re.search(r"(\d{1,2})[:：点](\d{1,2})", clean_text)
     if not match:
         return text
     
@@ -177,7 +180,8 @@ def extract_date_str(text):
     提取日期字符串并标准化为 YYYY-MM-DD
     """
     if not text: return None
-    match = re.search(r"(\d{4})[年.-](\d{1,2})[月.-](\d{1,2})", text)
+    clean_text = text.replace(" ", "")
+    match = re.search(r"(\d{4})[年.-](\d{1,2})[月.-](\d{1,2})", clean_text)
     if match:
         y, m, d = match.groups()
         return f"{y}-{int(m):02d}-{int(d):02d}"
@@ -308,8 +312,16 @@ def parse_project_details(html_content):
         "代理机构": "未找到",
         "项目编号": "未找到",
         "采购方式": "公开招标",  # 默认为公开招标
-        "采购需求": "未找到"  # 新增字段
+        "采购需求": "未找到",  # 新增字段
+        "标题": "未找到"
     }
+
+    # 尝试提取标题 (Meta 优先)
+    meta_title = soup.find("meta", {"name": "ArticleTitle"})
+    if meta_title:
+        details["标题"] = meta_title.get("content", "").strip()
+    elif soup.title:
+        details["标题"] = soup.title.string.strip()
 
     # 策略 1：尝试从结构化的“公告概要”中提取（最准确）
     # CCGP 经常在 div.table 或 table#summaryTable 中放置隐藏的概要数据
@@ -368,20 +380,28 @@ def parse_project_details(html_content):
         # 修正正则：
         # 1. 移除 '四、' 以防止表格内容中引用 '四、响应文件提交' 时导致截断
         # 2. 增加 \n\s* 前缀，确保匹配的是章节标题而非行内文本
-        correction_section = re.search(r"(?:更正信息|变更信息).*?(?=\n\s*三[、\.]|\n\s*其他补充事宜|$)", text, re.S)
+        # 3. 放宽结尾匹配，移除 \n\s* 强制要求
+        # 4. 增加 "更正内容" 作为起始标记
+        # 5. [Fixed 2026-02] 强制要求结束标记前必须有换行符，防止表格内容包含 "四、" 导致提前截断
+        regex_pattern = r"(?:更正信息|变更信息|更正内容).*?(?:(?:\n\s*三[、\.])|(?:\n\s*其他补充事宜)|(?:\n\s*四[、\.])|$)"
+        correction_section = re.search(regex_pattern, text, re.S)
         if correction_section:
             section_text = correction_section.group(0)
             # 提取所有完整的时间点
             # 修复：增加 (?:\s*(?:上午|下午))? 以匹配 “2026年1月28日上午10:00” 这种格式
             # 修复：增加 '时' 以匹配 "9时00分"
             # 修复：增加 \s* 以匹配 "2026 年" 这种带空格的格式
-            all_times = re.findall(r"(?:20\d{2}\s*年\s*\d{1,2}\s*月\d{1,2}\s*日\s*(?:上午|下午)?\s*[\d:：点分时]{4,8})", section_text)
+            # 修复：增加 \s 允许时间中出现空格 (如 "10 : 00")
+            # 修复：使用严格的时间格式 \d{1,2}[:：点时]\d{1,2}，防止匹配到纯空格或"更正日期"
+            # 修复：增加 \s* 以允许年、月、日之间有空格 (如 "2026 年 2 月 10 日")
+            all_times = re.findall(r"(?:20\d{2}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日\s*(?:上午|下午)?\s*\d{1,2}\s*[:：点时]\s*\d{1,2}(?:\s*分)?)", section_text)
             
             if all_times:
                 # 取最后一个，假设为最新更正的时间
                 # 需清洗掉“上午”“下午”字样，以便 extract_time_only 处理
                 raw_match = all_times[-1].replace("上午", "").replace("下午", "")
-                raw_time = raw_match.replace("点", ":").replace("分", "").replace("：", ":").replace("时", ":").replace(" ", "") # Remove spaces for standard parsing
+                # 清洗空格，统一格式
+                raw_time = raw_match.replace("点", ":").replace("分", "").replace("：", ":").replace("时", ":").replace(" ", "") 
                 extracted = extract_time_only(raw_time)
                 if extracted and extracted != "未找到":
                     details["开标具体时间"] = extracted
@@ -433,23 +453,30 @@ def parse_project_details(html_content):
                 break
 
     # 3. 开标地点 (强制要求“开标”、“投标”或“提交投标文件”前缀，防止误抓“获取招标文件地点”)
+    # 3. 开标地点 (强制要求“开标”、“投标”或“提交投标文件”前缀，防止误抓“获取招标文件地点”)
     if details["开标地点"] == "未找到" or "线上" in details["开标地点"] or "网上" in details["开标地点"]:
+        # 修复：增加 [^”"“] 排除引号，防止匹配到表头如 '开标时间和地点”'
+        # 修复：要求匹配内容至少2个字符 {2,}
         location_patterns = [
-            r"(?:开标|投标|提交投标文件|响应文件开启)地\s*点[:：]?\s*(.*?)(?=\n|；|。|$|（|注：)",
-            r"(?:响应文件开启|开标信息|开标).{0,200}?地\s*点[:：]?\s*(.*?)(?=\n|；|。|$|（|注：)"
+            r"(?:开标|投标|提交投标文件|响应文件开启)地\s*点[:：]?\s*([^”\"“\n]{2,})(?=\n|；|。|$|（|注：)",
+            r"(?:响应文件开启|开标信息|开标).{0,200}?地\s*点[:：]?\s*([^”\"“\n]{2,})(?=\n|；|。|$|（|注：)"
         ]
         
+        found_loc = False
         for p in location_patterns:
-            location_match = re.search(p, text, re.S)
-            if location_match:
+            # 使用 finditer 遍历所有匹配项，防止第一个匹配项是无效的（如“网址”）导致跳过正确项
+            for location_match in re.finditer(p, text, re.S):
                 loc = location_match.group(1).strip()
-                # 修复BUG：增加黑名单过滤
-                # 1. 过滤包含“时间”的（误抓取了时间行）
-                # 2. 过滤以“和”、“及”开头的（误抓了“地点和方式”中的“和方式”）
+                
+                # 黑名单检查
                 if (loc and "线上" not in loc and "网上" not in loc and 
-                    "时间" not in loc and not loc.startswith("和") and not loc.startswith("及")):
+                    "时间" not in loc and not loc.startswith("和") and not loc.startswith("及") and
+                    "网址" not in loc and "登录" not in loc):
                      details["开标地点"] = loc
+                     found_loc = True
                      break
+            if found_loc:
+                break
 
     # 4. 采购人名称
     if details["采购人名称"] == "未找到":
