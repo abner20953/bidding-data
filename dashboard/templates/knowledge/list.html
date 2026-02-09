@@ -478,7 +478,7 @@
                     <div class="d-flex justify-content-between align-items-start mb-2">
                         <h5 class="fw-bold mb-0 text-dark flex-grow-1 me-2">
                             ${highlightText(item.title, keywords)}
-                            ${item.doc_number ? `<span class="ms-2 text-secondary small fw-normal">(${highlightText(item.doc_number, keywords)})</span>` : ''}
+                            ${item.doc_number ? `<span class="badge bg-light text-secondary border ms-2 fw-normal">${highlightText(item.doc_number, keywords)}</span>` : ''}
                         </h5>
                         <span class="badge ${badgeClass} rounded-pill px-3 py-2 text-nowrap">${item.type === '案例' ? '知识库' : item.type}</span>
                     </div>
