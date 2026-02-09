@@ -241,7 +241,9 @@ def api_list():
     
     search_terms = []
     if query:
-        seg_list = list(jieba.cut_for_search(query))
+        # Use jieba.cut (Exact Mode) for better precision
+        # This prevents splitting "非营利" into "非", "营利", avoiding false positives for "营利"
+        seg_list = list(jieba.cut(query))
         if seg_list:
             sub_clauses = []
             for term in seg_list:
