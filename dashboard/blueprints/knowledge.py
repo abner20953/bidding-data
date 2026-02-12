@@ -187,6 +187,10 @@ def view_entry(entry_id):
         if not highlight_tokens:
              highlight_tokens = [query]
         
+        # Add full query for exact match prioritization
+        if query.strip() and query.strip() not in highlight_tokens:
+            highlight_tokens.append(query.strip())
+        
     return render_template('detail.html', entry=dict(entry), comments=[dict(c) for c in comments], 
                            related_entries=[dict(r) for r in relations], highlight_tokens=highlight_tokens)
 

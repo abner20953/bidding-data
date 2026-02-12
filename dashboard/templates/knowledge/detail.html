@@ -454,10 +454,28 @@
                     text = text.replace(pattern, '<span class="search-highlight">$1</span>');
                     contentDiv.innerHTML = text;
 
-                    // Scroll to first match
-                    const firstMatch = contentDiv.querySelector('.search-highlight');
-                    if (firstMatch) {
-                        firstMatch.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    // Scroll to match
+                    // Prioritize exact match of the full query
+                    const queryParam = new URLSearchParams(window.location.search).get('q');
+                    let targetElement = contentDiv.querySelector('.search-highlight'); // Default to first match
+
+                    if (queryParam) {
+                        try {
+                            const decodedQuery = decodeURIComponent(queryParam).trim().toLowerCase();
+                            const allHighlights = contentDiv.querySelectorAll('.search-highlight');
+                            for (const el of allHighlights) {
+                                if (el.textContent.trim().toLowerCase() === decodedQuery) {
+                                    targetElement = el;
+                                    break; // Found the first exact match
+                                }
+                            }
+                        } catch (e) {
+                            console.error("Error finding exact match:", e);
+                        }
+                    }
+
+                    if (targetElement) {
+                        targetElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
                     }
                 }
             }
