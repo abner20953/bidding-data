@@ -202,17 +202,15 @@
                         <td class="filename" title="{{ file.name }}" style="color: #9ca3af;">
                             <div>
                                 <a href="/bijiao/file/{{ file.name }}" style="color: inherit; text-decoration: none;"
-                                    class="privacy-sensitive" data-original="{{ file.name }}">{{
-                                    file.name }}</a>
+                                    class="privacy-sensitive" data-original="{{ file.name }}">***********</a>
                                 <br>
                                 <small class="text-muted privacy-sensitive" data-original="MD5: {{ file.md5 }}"
-                                    style="font-size: 0.75em; color: #9ca3af; opacity: 0.8; font-family: monospace;">MD5:
-                                    {{ file.md5 }}</small>
+                                    style="font-size: 0.75em; color: #9ca3af; opacity: 0.8; font-family: monospace;">***********</small>
                             </div>
                         </td>
                         <td><span class="size-badge">{{ file.size }}</span></td>
-                        <td style="color: #9ca3af;" class="privacy-sensitive" data-original="{{ file.time }}">{{
-                            file.time }}</td>
+                        <td style="color: #9ca3af;" class="privacy-sensitive" data-original="{{ file.time }}">
+                            ***********</td>
                         <td style="white-space: nowrap;">
                             <a href="/bijiao/file/{{ file.name }}" class="download-btn" title="下载文件">
                                 ⬇️
@@ -286,7 +284,7 @@
     </div>
 
     <script>
-        let isPrivacyMode = false;
+        let isPrivacyMode = true;
 
         function toggleFilter() {
             const url = new URL(window.location.href);
