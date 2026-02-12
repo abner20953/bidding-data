@@ -167,7 +167,16 @@
                 <tbody>
                     {% for file in files %}
                     <tr>
-                        <td class="filename" title="{{ file.name }}" style="color: #9ca3af;">{{ file.name }}</td>
+                        <td class="filename" title="{{ file.name }}" style="color: #9ca3af;">
+                            <div>
+                                <a href="/bijiao/file/{{ file.name }}" style="color: inherit; text-decoration: none;">{{
+                                    file.name }}</a>
+                                <br>
+                                <small class="text-muted"
+                                    style="font-size: 0.75em; color: #9ca3af; opacity: 0.8; font-family: monospace;">MD5:
+                                    {{ file.md5 }}</small>
+                            </div>
+                        </td>
                         <td><span class="size-badge">{{ file.size }}</span></td>
                         <td style="color: #9ca3af;">{{ file.time }}</td>
                         <td style="white-space: nowrap;">

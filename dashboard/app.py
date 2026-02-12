@@ -14,6 +14,8 @@ import math
 import sqlite3
 from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
+import hashlib
+import json
 
 # 配置目录
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -541,10 +543,110 @@ def download_specific_file(filename):
 
 # --- 归档辅助函数 ---
 
+# --- 归档辅助函数与索引 ---
+
+def calculate_md5(file_path):
+    """计算文件的 MD5 值"""
+    hash_md5 = hashlib.md5()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+
+class FileIndex:
+    """管理归档文件的 MD5 索引 (双向映射)"""
+    def __init__(self, index_file):
+        self.index_file = index_file
+        self.md5_to_name = {}
+        self.name_to_md5 = {}
+        self.load()
+
+    def load(self):
+        """加载索引，如果不存在或已损坏则重建"""
+        if os.path.exists(self.index_file):
+            try:
+                with open(self.index_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.md5_to_name = data.get('md5_to_name', {})
+                    # 重建反向索引
+                    self.name_to_md5 = {v: k for k, v in self.md5_to_name.items()}
+            except Exception as e:
+                print(f"⚠️ Index load failed, rebuilding: {e}")
+                self.rebuild()
+        else:
+            self.rebuild()
+
+    def save(self):
+        """保存索引到磁盘"""
+        try:
+            with open(self.index_file, 'w', encoding='utf-8') as f:
+                json.dump({'md5_to_name': self.md5_to_name}, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"❌ Failed to save index: {e}")
+
+    def rebuild(self):
+        """扫描归档目录重建索引"""
+        print("🔄 Rebuilding file index...")
+        self.md5_to_name = {}
+        self.name_to_md5 = {}
+        
+        if not os.path.exists(ARCHIVE_FOLDER):
+            return
+
+        try:
+            with os.scandir(ARCHIVE_FOLDER) as it:
+                for entry in it:
+                    if entry.is_file() and not entry.name.endswith('.txt') and entry.name != 'file_index.json':
+                        try:
+                            md5 = calculate_md5(entry.path)
+                            self.md5_to_name[md5] = entry.name
+                            self.name_to_md5[entry.name] = md5
+                        except Exception as e:
+                            print(f"Error indexing {entry.name}: {e}")
+            self.save()
+            print(f"✅ Index rebuilt. Count: {len(self.md5_to_name)}")
+        except Exception as e:
+            print(f"❌ Index rebuild failed: {e}")
+
+    def get_file_by_md5(self, md5):
+        """根据 MD5 获取文件名 (如果文件实际存在)"""
+        filename = self.md5_to_name.get(md5)
+        if filename:
+            filepath = os.path.join(ARCHIVE_FOLDER, filename)
+            if os.path.exists(filepath):
+                return filename
+            else:
+                # 索引过期 (文件被删)，清理之
+                self.remove_file(filename)
+        return None
+
+    def get_md5_by_name(self, filename):
+        """根据文件名获取 MD5"""
+        return self.name_to_md5.get(filename)
+
+    def add_file(self, md5, filename):
+        """添加或更新文件映射"""
+        self.md5_to_name[md5] = filename
+        self.name_to_md5[filename] = md5
+        self.save()
+
+    def remove_file(self, filename):
+        """移除文件映射"""
+        md5 = self.name_to_md5.get(filename)
+        if md5:
+            del self.name_to_md5[filename]
+            if md5 in self.md5_to_name:
+                del self.md5_to_name[md5]
+            self.save()
+
+# 初始化全局索引
+INDEX_FILE = os.path.join(ARCHIVE_FOLDER, 'file_index.json')
+file_index = FileIndex(INDEX_FILE)
+
 def cleanup_file_archive():
     """
     检查归档目录大小，如果超过 1GB，则清理旧文件直到小于 600MB
-    同时清理对应的备注文件 (.txt)
+    同时清理对应的备注文件 (.txt) 和更新索引
     """
     try:
         total_size = 0
@@ -553,17 +655,8 @@ def cleanup_file_archive():
         # 扫描所有文件
         with os.scandir(ARCHIVE_FOLDER) as it:
             for entry in it:
-                if entry.is_file():
-                    # Skip remark files themselves from counting logic to simplify, 
-                    # or include them? Let's include everything but handle pairings during deletion.
-                    # Or simpler: just count everything. 
-                    # If we delete "A.pdf", we also delete "A.pdf.txt".
-                    # If we encounter "A.pdf.txt" in the loop, we might accidentally delete it if we sort by time?
-                    # Better strategy: Only track main files for deletion candidates, but add size of remarks to total.
-                    
+                if entry.is_file() and entry.name != 'file_index.json': # 跳过索引文件
                     if entry.name.endswith('.txt') and os.path.exists(os.path.join(ARCHIVE_FOLDER, entry.name[:-4])):
-                         # This is a remark file and the main file exists. skip adding to list to avoid double checking.
-                         # But add size.
                          total_size += entry.stat().st_size
                          continue
                          
@@ -592,6 +685,9 @@ def cleanup_file_archive():
                         total_size -= f['size']
                         deleted_size += f['size']
                         
+                        # Update Index
+                        file_index.remove_file(f['name'])
+                        
                     # Delete remark file if exists
                     remark_path = f['path'] + ".txt"
                     if os.path.exists(remark_path):
@@ -610,21 +706,56 @@ def cleanup_file_archive():
 
 def archive_file(source_path, original_filename):
     """
-    将临时文件保存到归档目录
+    将临时文件归档到 ARCHIVE_FOLDER。
+    逻辑:
+    1. 计算 MD5。
+    2. 如果 MD5 已存在于库中 -> 返回已有文件路径 (不保存副本)。
+    3. 如果 MD5 是新的:
+       - 检查 original_filename 是否冲突。
+       - 如果冲突，自动重命名 (append size)。
+       - 保存文件并更新索引。
+    返回: 最终归档文件的绝对路径。
     """
     try:
-        if not original_filename:
-            return
-            
-        target_path = os.path.join(ARCHIVE_FOLDER, original_filename)
+        md5 = calculate_md5(source_path)
         
-        # 如果文件已存在，不覆盖，直接跳过
-        if os.path.exists(target_path):
-            return
+        # 1. 检查 MD5 是否已存在
+        existing_filename = file_index.get_file_by_md5(md5)
+        if existing_filename:
+            # 只是因为多线程保险，再次检查物理文件是否存在
+            existing_path = os.path.join(ARCHIVE_FOLDER, existing_filename)
+            if os.path.exists(existing_path):
+                # print(f"Duplicate file detected (MD5 match). Using existing: {existing_filename}")
+                return existing_path
+        
+        # 2. 准备保存，处理文件名冲突
+        target_filename = os.path.basename(original_filename)
+        # 简单循环检查文件名是否存在
+        while os.path.exists(os.path.join(ARCHIVE_FOLDER, target_filename)):
+            name, ext = os.path.splitext(target_filename)
+            # 使用文件大小作为后缀，简单且通常有效
+            # 如果还重复，可以再加 random，但这里先只用 size
+            size = os.path.getsize(source_path)
+            # 防止死循环: 如果 filename_size.ext 还存在 (极低概率不同内容同名同大小)，则加时间戳
+            new_candidate = f"{name}_{size}{ext}"
+            if new_candidate == target_filename:
+                 new_candidate = f"{name}_{size}_{int(time.time())}{ext}"
+            target_filename = new_candidate
             
+        target_path = os.path.join(ARCHIVE_FOLDER, target_filename)
+        
+        # 3. 复制文件
         shutil.copy2(source_path, target_path)
+        
+        # 4. 更新索引
+        file_index.add_file(md5, target_filename)
+        
+        return target_path
     except Exception as e:
         print(f"Error archiving file {original_filename}: {e}")
+        # 如果归档失败，为了不阻断比对流程，返回原临时路径? 
+        # 用户要求优先确保文档保存成功。如果这里失败，应该报错。
+        raise e
 
 # --- 归档页面路由 ---
 
@@ -674,6 +805,8 @@ def api_delete_archive(filename):
         file_path = os.path.join(ARCHIVE_FOLDER, filename)
         if os.path.exists(file_path):
             os.remove(file_path)
+            # Update Index
+            file_index.remove_file(filename)
             
         remark_path = os.path.join(ARCHIVE_FOLDER, filename + ".txt")
         if os.path.exists(remark_path):
@@ -713,6 +846,9 @@ def api_batch_delete_archive():
                             freed_size += size
                             deleted_count += 1
                             
+                            # Update Index
+                            file_index.remove_file(entry.name)
+                            
                             # Try delete remark
                             remark_path = entry.path + ".txt"
                             if os.path.exists(remark_path):
@@ -750,11 +886,22 @@ def file_list_view():
                         
                     stat = entry.stat()
                     total_size += stat.st_size
+                    
+                    # 获取 MD5 (如果没有则计算并更新)
+                    md5 = file_index.get_md5_by_name(entry.name)
+                    if not md5:
+                         try:
+                             md5 = calculate_md5(entry.path)
+                             file_index.add_file(md5, entry.name)
+                         except:
+                             md5 = "Error"
+
                     files.append({
                         "name": entry.name,
                         "size": format_size(stat.st_size),
                         "time": datetime.datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
-                        "timestamp": stat.st_mtime
+                        "timestamp": stat.st_mtime,
+                        "md5": md5
                     })
         # Sort by time descend
         files.sort(key=lambda x: x['timestamp'], reverse=True)
@@ -804,33 +951,63 @@ def api_compare():
 
     # 2. Save temporarily using UUID to avoid Chinese filename issues
     try:
-        def save_temp_file(file_obj):
+        def save_and_archive(file_obj):
+            # Save to Temp
             ext = os.path.splitext(file_obj.filename)[1].lower()
             temp_filename = f"{uuid.uuid4()}{ext}"
             temp_path = os.path.join(app.config['UPLOAD_FOLDER'], temp_filename)
             file_obj.save(temp_path)
             
-            # --- Archive Hook ---
-            # Save original file to archive folder
-            archive_file(temp_path, file_obj.filename)
+            # --- Archive Immediately (Ensure Persistence) ---
+            # Returns the absolute path of the archived file
+            archived_path = archive_file(temp_path, file_obj.filename)
             # --------------------
             
-            return temp_path
+            return temp_path, archived_path
 
-        path_a = save_temp_file(file_a)
-        path_b = save_temp_file(file_b)
+        # 保存并归档 (优先确保文档保存成功)
+        temp_a, archive_a = save_and_archive(file_a)
+        temp_b, archive_b = save_and_archive(file_b)
         
         path_tender = None
+        archive_tender = None
         if file_tender and file_tender.filename != '':
-            path_tender = save_temp_file(file_tender)
+            path_tender, archive_tender = save_and_archive(file_tender)
             
-        # 3. Process
-        results = compare_documents(path_a, path_b, path_tender)
+        # 3. Validation: Check for duplicates
+        # Compare actual archived paths. If they are the same path, it means MD5s were identical.
+        if archive_a == archive_b:
+            # Cleanup temp files
+            try:
+                os.remove(temp_a)
+                os.remove(temp_b)
+                if path_tender: os.remove(path_tender)
+            except: pass
+            return jsonify({"error": "投标文件A与投标文件B内容重复 (MD5一致)"}), 400
+            
+        if archive_tender:
+            if archive_a == archive_tender:
+                 try:
+                    os.remove(temp_a); os.remove(temp_b); os.remove(path_tender)
+                 except: pass
+                 return jsonify({"error": "投标文件A与招标文件内容重复 (MD5一致)"}), 400
+            if archive_b == archive_tender:
+                 try:
+                    os.remove(temp_a); os.remove(temp_b); os.remove(path_tender)
+                 except: pass
+                 return jsonify({"error": "投标文件B与招标文件内容重复 (MD5一致)"}), 400
+            
+        # 4. Process (Using Temp Files)
+        # 为了避免潜在的中文文件名编码问题，我们使用 UUID 临时文件进行比对。
+        # 此时归档文件已安全保存。
+        # 注意: content is identical (verified by loopback copy or just assumed since we just saved it).
         
-        # 4. Clean up
+        results = compare_documents(temp_a, temp_b, path_tender)
+        
+        # 5. Clean up Temp Files Only (Archive remains)
         try:
-            os.remove(path_a)
-            os.remove(path_b)
+            os.remove(temp_a)
+            os.remove(temp_b)
             if path_tender:
                 os.remove(path_tender)
         except Exception:
