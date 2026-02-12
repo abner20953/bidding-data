@@ -255,6 +255,9 @@ def run_auto_scrape_thread(dates, is_scheduled_task=False):
             
             if result.get("file"):
                 SCRAPER_STATUS["completed_files"].append(result["file"])
+            else:
+                if is_scheduled_task:
+                    log_scheduler(f"   [提示] {date_str_iso} 无招标数据。")
                 
             SCRAPER_STATUS["progress"] = i + 1
             
