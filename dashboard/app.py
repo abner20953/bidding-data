@@ -553,6 +553,14 @@ def calculate_md5(file_path):
             hash_md5.update(chunk)
     return hash_md5.hexdigest()
 
+def format_size(size_bytes):
+    if size_bytes == 0: return "0 B"
+    size_name = ("B", "KB", "MB", "GB", "TB")
+    i = int(math.floor(math.log(size_bytes, 1024)))
+    p = math.pow(1024, i)
+    s = round(size_bytes / p, 2)
+    return "%s %s" % (s, size_name[i])
+
 class FileIndex:
     """管理归档文件的 MD5 索引 (双向映射)"""
     def __init__(self, index_file):
@@ -730,17 +738,21 @@ def archive_file(source_path, original_filename):
         
         # 2. 准备保存，处理文件名冲突
         target_filename = os.path.basename(original_filename)
+        
         # 简单循环检查文件名是否存在
-        while os.path.exists(os.path.join(ARCHIVE_FOLDER, target_filename)):
-            name, ext = os.path.splitext(target_filename)
-            # 使用文件大小作为后缀，简单且通常有效
-            # 如果还重复，可以再加 random，但这里先只用 size
-            size = os.path.getsize(source_path)
-            # 防止死循环: 如果 filename_size.ext 还存在 (极低概率不同内容同名同大小)，则加时间戳
-            new_candidate = f"{name}_{size}{ext}"
-            if new_candidate == target_filename:
-                 new_candidate = f"{name}_{size}_{int(time.time())}{ext}"
-            target_filename = new_candidate
+        if os.path.exists(os.path.join(ARCHIVE_FOLDER, target_filename)):
+            base_name, ext = os.path.splitext(target_filename)
+            size_bytes = os.path.getsize(source_path)
+            size_str = format_size(size_bytes).replace(" ", "")
+            
+            # 尝试 1: 加大小后缀 (如 _10.2MB)
+            candidate = f"{base_name}_{size_str}{ext}"
+            
+            # 尝试 2: 如果加大小后缀后仍冲突，则加时间戳
+            if os.path.exists(os.path.join(ARCHIVE_FOLDER, candidate)):
+                candidate = f"{base_name}_{size_str}_{int(time.time()*1000)}{ext}"
+            
+            target_filename = candidate
             
         target_path = os.path.join(ARCHIVE_FOLDER, target_filename)
         
@@ -865,13 +877,7 @@ def api_batch_delete_archive():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
-def format_size(size_bytes):
-    if size_bytes == 0: return "0 B"
-    size_name = ("B", "KB", "MB", "GB", "TB")
-    i = int(math.floor(math.log(size_bytes, 1024)))
-    p = math.pow(1024, i)
-    s = round(size_bytes / p, 2)
-    return "%s %s" % (s, size_name[i])
+
 
 @app.route('/bijiao/file')
 def file_list_view():
