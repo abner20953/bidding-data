@@ -38,20 +38,30 @@
             font-weight: 600;
         }
 
-        .back-link {
+        .action-btn {
             color: rgba(255, 255, 255, 0.9);
             text-decoration: none;
             font-size: 0.9rem;
-            display: flex;
+            display: inline-flex;
             align-items: center;
             padding: 8px 16px;
             background: rgba(255, 255, 255, 0.2);
             border-radius: 6px;
             transition: background 0.2s;
+            border: none;
+            cursor: pointer;
+            line-height: 1.5;
         }
 
-        .back-link:hover {
+        .action-btn:hover {
             background: rgba(255, 255, 255, 0.3);
+            color: white;
+        }
+
+        .action-btn.active {
+            background: rgba(255, 255, 255, 0.4);
+            font-weight: 600;
+            box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.1);
         }
 
         .table-container {
@@ -139,6 +149,12 @@
             justify-content: flex-end;
             gap: 20px;
         }
+
+        .privacy-mask {
+            filter: blur(4px);
+            user-select: none;
+            opacity: 0.5;
+        }
     </style>
     <script src="{{ url_for('static', filename='js/core.js') }}"></script>
 </head>
@@ -147,7 +163,8 @@
     <div class="container">
         <div class="header">
             <div>
-                <h1>📁 归档文件管理</h1>
+                <h1><span id="privacyToggle" style="cursor: pointer;" title="点击切换隐私模式"
+                        onclick="togglePrivacy()">📁</span> 归档文件管理</h1>
                 <div style="font-size: 0.85rem; opacity: 0.9; margin-top: 5px;">
                     {% if show_all %}
                     显示全部历史文件
@@ -157,13 +174,14 @@
                 </div>
             </div>
             <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 8px;">
-                <a href="/bijiao" class="back-link">← 返回比对页面</a>
-                <label
-                    style="color: rgba(255, 255, 255, 0.9); font-size: 0.85rem; cursor: pointer; display: flex; align-items: center; gap: 6px; user-select: none;">
-                    <input type="checkbox" id="showAllToggle" onchange="toggleFilter()" {% if show_all %}checked{% endif
-                        %}>
-                    显示全部文件
-                </label>
+                <a href="/bijiao" class="action-btn">← 返回比对页面</a>
+                <button onclick="toggleFilter()" class="action-btn {{ 'active' if show_all else '' }}">
+                    {% if show_all %}
+                    🔍 已显示全部
+                    {% else %}
+                    ⬜ 显示全部文件
+                    {% endif %}
+                </button>
             </div>
         </div>
 
@@ -183,16 +201,18 @@
                     <tr>
                         <td class="filename" title="{{ file.name }}" style="color: #9ca3af;">
                             <div>
-                                <a href="/bijiao/file/{{ file.name }}" style="color: inherit; text-decoration: none;">{{
+                                <a href="/bijiao/file/{{ file.name }}" style="color: inherit; text-decoration: none;"
+                                    class="privacy-sensitive" data-original="{{ file.name }}">{{
                                     file.name }}</a>
                                 <br>
-                                <small class="text-muted"
+                                <small class="text-muted privacy-sensitive" data-original="MD5: {{ file.md5 }}"
                                     style="font-size: 0.75em; color: #9ca3af; opacity: 0.8; font-family: monospace;">MD5:
                                     {{ file.md5 }}</small>
                             </div>
                         </td>
                         <td><span class="size-badge">{{ file.size }}</span></td>
-                        <td style="color: #9ca3af;">{{ file.time }}</td>
+                        <td style="color: #9ca3af;" class="privacy-sensitive" data-original="{{ file.time }}">{{
+                            file.time }}</td>
                         <td style="white-space: nowrap;">
                             <a href="/bijiao/file/{{ file.name }}" class="download-btn" title="下载文件">
                                 ⬇️
@@ -266,15 +286,32 @@
     </div>
 
     <script>
+        let isPrivacyMode = false;
+
         function toggleFilter() {
-            const isChecked = document.getElementById('showAllToggle').checked;
             const url = new URL(window.location.href);
-            if (isChecked) {
-                url.searchParams.set('filter', 'all');
-            } else {
+            const currentFilter = url.searchParams.get('filter');
+            if (currentFilter === 'all') {
                 url.searchParams.delete('filter');
+            } else {
+                url.searchParams.set('filter', 'all');
             }
             window.location.href = url.toString();
+        }
+
+        function togglePrivacy() {
+            isPrivacyMode = !isPrivacyMode;
+            const elements = document.querySelectorAll('.privacy-sensitive');
+
+            elements.forEach(el => {
+                if (isPrivacyMode) {
+                    el.textContent = "***********";
+                    el.setAttribute('title', '隐私保护已开启');
+                } else {
+                    el.textContent = el.getAttribute('data-original');
+                    el.setAttribute('title', el.getAttribute('data-original'));
+                }
+            });
         }
 
         // --- Remark Logic ---
@@ -283,9 +320,28 @@
         const remarkText = document.getElementById("remarkText");
         const modalTitle = document.getElementById("modalTitle");
 
+        // Hover handling for Modal Title in Privacy Mode
+        modalTitle.addEventListener('mouseenter', () => {
+            if (isPrivacyMode && currentFilename) {
+                modalTitle.textContent = "备注: " + currentFilename;
+            }
+        });
+
+        modalTitle.addEventListener('mouseleave', () => {
+            if (isPrivacyMode) {
+                modalTitle.textContent = "备注: ***********";
+            }
+        });
+
         async function openRemark(filename) {
             currentFilename = filename;
-            modalTitle.textContent = "备注: " + filename;
+
+            if (isPrivacyMode) {
+                modalTitle.textContent = "备注: ***********";
+            } else {
+                modalTitle.textContent = "备注: " + filename;
+            }
+
             remarkText.value = "加载中...";
             modal.style.display = "block";
 
