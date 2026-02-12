@@ -886,14 +886,22 @@ def api_batch_delete_archive():
 def file_list_view():
     files = []
     total_size = 0
+    show_all = request.args.get('filter') == 'all'
+    three_days_ago = time.time() - (3 * 24 * 3600)
+
     try:
         with os.scandir(ARCHIVE_FOLDER) as it:
             for entry in it:
                 if entry.is_file():
                     if not entry.name.lower().endswith('.pdf'):
                         continue
-                        
+                    
                     stat = entry.stat()
+                    
+                    # Filter logic: Default to recent 3 days unless show_all is true
+                    if not show_all and stat.st_mtime < three_days_ago:
+                        continue
+
                     total_size += stat.st_size
                     
                     # 获取 MD5 (如果没有则计算并更新)
@@ -917,7 +925,7 @@ def file_list_view():
     except Exception as e:
         print(f"Error listing archive: {e}")
         
-    return render_template('file_list.html', files=files, total_size=format_size(total_size))
+    return render_template('file_list.html', files=files, total_size=format_size(total_size), show_all=show_all)
 
 @app.route('/bijiao/file/<path:filename>')
 def download_archived_file(filename):

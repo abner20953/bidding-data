@@ -148,9 +148,23 @@
         <div class="header">
             <div>
                 <h1>📁 归档文件管理</h1>
-                <div style="font-size: 0.85rem; opacity: 0.9; margin-top: 5px;">自动保存的历史上传文件</div>
+                <div style="font-size: 0.85rem; opacity: 0.9; margin-top: 5px;">
+                    {% if show_all %}
+                    显示全部历史文件
+                    {% else %}
+                    仅显示近3天文件
+                    {% endif %}
+                </div>
             </div>
-            <a href="/bijiao" class="back-link">← 返回比对页面</a>
+            <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 8px;">
+                <a href="/bijiao" class="back-link">← 返回比对页面</a>
+                <label
+                    style="color: rgba(255, 255, 255, 0.9); font-size: 0.85rem; cursor: pointer; display: flex; align-items: center; gap: 6px; user-select: none;">
+                    <input type="checkbox" id="showAllToggle" onchange="toggleFilter()" {% if show_all %}checked{% endif
+                        %}>
+                    显示全部文件
+                </label>
+            </div>
         </div>
 
         <div class="table-container">
@@ -252,6 +266,17 @@
     </div>
 
     <script>
+        function toggleFilter() {
+            const isChecked = document.getElementById('showAllToggle').checked;
+            const url = new URL(window.location.href);
+            if (isChecked) {
+                url.searchParams.set('filter', 'all');
+            } else {
+                url.searchParams.delete('filter');
+            }
+            window.location.href = url.toString();
+        }
+
         // --- Remark Logic ---
         let currentFilename = null;
         const modal = document.getElementById("remarkModal");
