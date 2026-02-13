@@ -293,7 +293,7 @@
                 <span class="chat-title">Terminal</span>
                 <span class="clear-chat" onclick="clearGlobalChat(event)" title="清空所有人聊天记录 (24h内)">🧹</span>
             </div>
-            <span class="close-chat" onclick="toggleChat()">_</span>
+            <span class="close-chat" onclick="toggleChat()" title="最小化">−</span>
         </div>
         <div id="chatMessages" class="chat-messages">
             <!-- Messages will appear here -->
@@ -542,10 +542,20 @@
 
         chatHeader.addEventListener('mousedown', (e) => {
             isDragging = true;
+
+            // If centered via transform, convert to absolute px position to avoid jump
+            if (chatWindow.style.transform !== 'none' && getComputedStyle(chatWindow).transform !== 'none') {
+                const rect = chatWindow.getBoundingClientRect();
+                chatWindow.style.left = rect.left + 'px';
+                chatWindow.style.top = rect.top + 'px';
+                chatWindow.style.transform = 'none';
+                chatWindow.style.bottom = 'auto';
+                chatWindow.style.right = 'auto';
+            }
+
             dragOffsetX = e.clientX - chatWindow.getBoundingClientRect().left;
             dragOffsetY = e.clientY - chatWindow.getBoundingClientRect().top;
-            chatWindow.style.right = 'auto'; // Disable right/bottom positioning
-            chatWindow.style.bottom = 'auto';
+
             chatHeader.style.cursor = 'grabbing';
         });
 
@@ -908,8 +918,10 @@
         /* Stealth Chat Styles (Light Theme) */
         .chat-window {
             position: fixed;
-            bottom: 20px;
-            right: 20px;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            /* Center */
             width: 320px;
             height: 400px;
             background-color: rgba(255, 255, 255, 0.98);
@@ -964,10 +976,20 @@
             color: #9ca3af;
             cursor: pointer;
             font-weight: bold;
+            font-size: 1.2rem;
+            width: 28px;
+            height: 28px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 4px;
+            transition: all 0.2s;
+            line-height: 1;
         }
 
         .close-chat:hover {
-            color: #6b7280;
+            color: #4b5563;
+            background-color: #e5e7eb;
         }
 
         .chat-messages {
