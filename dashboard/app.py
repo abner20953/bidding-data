@@ -25,6 +25,23 @@ UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 
 # Admin Password Configuration
 ADMIN_PASSWORD = "108"
+CHAT_DB = os.path.join(BASE_DIR, 'chat.db')
+
+def init_chat_db():
+    conn = sqlite3.connect(CHAT_DB)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS messages
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  uid TEXT,
+                  ip TEXT,
+                  content TEXT,
+                  timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    conn.commit()
+    conn.close()
+
+# Initialize chat DB on startup
+if not os.path.exists(CHAT_DB):
+    init_chat_db()
 
 def verify_request_password(req):
     """
@@ -1310,6 +1327,71 @@ def api_trigger_scheduler():
         import traceback
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
+
+# --- Chat API ---
+@app.route('/api/chat/send', methods=['POST'])
+def send_chat():
+    data = request.get_json()
+    content = data.get('content')
+    uid = data.get('uid', 'anonymous')
+    
+    if not content:
+        return jsonify({'status': 'error', 'message': 'No content'})
+        
+    ip = request.remote_addr
+    
+    try:
+        conn = sqlite3.connect(CHAT_DB)
+        c = conn.cursor()
+        c.execute("INSERT INTO messages (uid, ip, content) VALUES (?, ?, ?)", (uid, ip, content))
+        conn.commit()
+        conn.close()
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)})
+
+@app.route('/api/chat/list', methods=['GET'])
+def get_chat():
+    last_id = request.args.get('last_id', 0, type=int)
+    try:
+        conn = sqlite3.connect(CHAT_DB)
+        c = conn.cursor()
+        
+        # Auto-delete messages older than 24 hours
+        c.execute("DELETE FROM messages WHERE timestamp < datetime('now', '-24 hours')")
+        
+        c.execute("SELECT id, uid, content, timestamp FROM messages WHERE id > ? ORDER BY id ASC LIMIT 50", (last_id,))
+        rows = c.fetchall()
+        messages = []
+        for r in rows:
+            messages.append({
+                'id': r[0],
+                'uid': r[1],
+                'content': r[2],
+                'timestamp': r[3]
+            })
+        conn.commit() # Commit deletion
+        conn.close()
+        return jsonify({'status': 'success', 'messages': messages})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)})
+
+@app.route('/api/chat/clear', methods=['POST'])
+def clear_chat():
+    try:
+        conn = sqlite3.connect(CHAT_DB)
+        c = conn.cursor()
+        # Delete all messages
+        c.execute("DELETE FROM messages")
+        # Insert a system command to signal clearance to other clients
+        # Using a special formatted content that frontend will recognize
+        c.execute("INSERT INTO messages (uid, ip, content) VALUES (?, ?, ?)", 
+                 ('system', '127.0.0.1', 'CMD:CLEAR_HISTORY'))
+        conn.commit()
+        conn.close()
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))

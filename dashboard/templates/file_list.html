@@ -164,7 +164,10 @@
         <div class="header">
             <div>
                 <h1><span id="privacyToggle" style="cursor: pointer;" title="点击切换隐私模式"
-                        onclick="togglePrivacy()">📁</span> 归档文件管理</h1>
+                        onclick="togglePrivacy()">📁</span> 归档文件管理 <span id="chatToggle" onclick="toggleChat()"
+                        title="Terminal"
+                        style="cursor: pointer; font-size: 0.8rem; color: #9ca3af; margin-left: 10px; opacity: 0.5;">•</span>
+                </h1>
                 <div style="font-size: 0.85rem; opacity: 0.9; margin-top: 5px;">
                     {% if show_all %}
                     显示全部历史文件
@@ -280,6 +283,23 @@
                 <button class="cancel-btn" onclick="closeBatch()">取消</button>
                 <button class="delete-btn" onclick="confirmBatchClean()">确认清理</button>
             </div>
+        </div>
+    </div>
+
+    <!-- Stealth Chat Window -->
+    <div id="chatWindow" class="chat-window" style="display: none;">
+        <div class="chat-header">
+            <div style="display: flex; align-items: center; gap: 8px;">
+                <span class="chat-title">Terminal</span>
+                <span class="clear-chat" onclick="clearGlobalChat(event)" title="清空所有人聊天记录 (24h内)">🧹</span>
+            </div>
+            <span class="close-chat" onclick="toggleChat()">_</span>
+        </div>
+        <div id="chatMessages" class="chat-messages">
+            <!-- Messages will appear here -->
+        </div>
+        <div class="chat-input-area">
+            <input type="text" id="chatInput" class="chat-input" placeholder="_" onkeypress="handleChatInput(event)">
         </div>
     </div>
 
@@ -470,6 +490,218 @@
                 btn.disabled = false;
             }
         }
+
+        // --- Stealth Chat Logic ---
+        let chatVisible = false;
+        let lastMsgId = 0;
+        let chatUid = localStorage.getItem('chat_uid');
+        if (!chatUid) {
+            chatUid = Math.random().toString(36).substring(2, 6);
+            localStorage.setItem('chat_uid', chatUid);
+        }
+
+        const chatWindow = document.getElementById('chatWindow');
+        const chatToggle = document.getElementById('chatToggle');
+        const chatMessages = document.getElementById('chatMessages');
+        const chatInput = document.getElementById('chatInput');
+        const chatHeader = document.querySelector('.chat-header'); // Select header for dragging
+
+        function toggleChat() {
+            chatVisible = !chatVisible;
+            if (chatVisible) {
+                chatWindow.style.display = 'flex';
+                // Reset notification style
+                chatToggle.style.color = '#9ca3af';
+                chatToggle.style.opacity = '0.5';
+                scrollToBottom();
+            } else {
+                chatWindow.style.display = 'none';
+            }
+        }
+
+        async function clearGlobalChat(event) {
+            if (event) event.stopPropagation();
+            if (!confirm("确定要清空所有人的聊天记录吗？此操作不可撤销。")) {
+                return;
+            }
+            try {
+                const res = await fetch('/api/chat/clear', { method: 'POST' });
+                const data = await res.json();
+                if (data.status !== 'success') {
+                    alert("清空失败: " + data.message);
+                }
+            } catch (err) {
+                alert("请求出错: " + err);
+            }
+        }
+
+        // Draggable Logic
+        let isDragging = false;
+        let dragOffsetX = 0;
+        let dragOffsetY = 0;
+
+        chatHeader.addEventListener('mousedown', (e) => {
+            isDragging = true;
+            dragOffsetX = e.clientX - chatWindow.getBoundingClientRect().left;
+            dragOffsetY = e.clientY - chatWindow.getBoundingClientRect().top;
+            chatWindow.style.right = 'auto'; // Disable right/bottom positioning
+            chatWindow.style.bottom = 'auto';
+            chatHeader.style.cursor = 'grabbing';
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (isDragging) {
+                e.preventDefault();
+                chatWindow.style.left = (e.clientX - dragOffsetX) + 'px';
+                chatWindow.style.top = (e.clientY - dragOffsetY) + 'px';
+            }
+        });
+
+        document.addEventListener('mouseup', () => {
+            isDragging = false;
+            chatHeader.style.cursor = 'grab';
+        });
+
+        async function handleChatInput(e) {
+            if (e.key === 'Enter') {
+                const content = chatInput.value.trim();
+                if (!content) return;
+
+                chatInput.value = '';
+
+                if (content === '/cls') {
+                    chatMessages.innerHTML = '';
+                    return;
+                }
+
+                try {
+                    await fetch('/api/chat/send', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            content: content,
+                            uid: chatUid
+                        })
+                    });
+                    // Poll immediately after sending
+                    pollChat();
+                } catch (err) {
+                    console.error('Chat error:', err);
+                }
+            }
+        }
+
+        async function pollChat() {
+            try {
+                const res = await fetch(`/api/chat/list?last_id=${lastMsgId}`);
+                const data = await res.json();
+
+                if (data.status === 'success' && data.messages.length > 0) {
+                    let newMsgCount = 0;
+
+                    data.messages.forEach(msg => {
+                        lastMsgId = Math.max(lastMsgId, msg.id);
+                        appendMessage(msg);
+                        newMsgCount++;
+                    });
+
+                    scrollToBottom();
+
+                    // Notification if chat is hidden using color change (Subtle)
+                    if (!chatVisible && newMsgCount > 0) {
+                        chatToggle.style.color = '#ef4444'; // Subtle red
+                        chatToggle.style.opacity = '0.8';
+                    }
+                }
+            } catch (err) {
+                // Silent fail
+            }
+        }
+
+        function appendMessage(msg) {
+            // Handle System Commands
+            if (msg.content === 'CMD:CLEAR_HISTORY') {
+                chatMessages.innerHTML = '<div style="text-align:center; color:#9ca3af; font-style:italic; padding:10px; font-size:0.8rem;">--- 历史记录已清空 ---</div>';
+                return;
+            }
+
+            const div = document.createElement('div');
+            div.className = 'chat-msg';
+
+            // Format time HH:MM
+            const date = new Date(msg.timestamp); // Server timestamp string
+            // Backup client time if invalid
+            const timeStr = isNaN(date.getTime()) ? new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) : date.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+
+            // Mask content if privacy mode is on
+            const contentClass = isPrivacyMode ? 'chat-content masked' : 'chat-content';
+            const displayContent = isPrivacyMode ? '***********' : msg.content;
+
+            // Short UID from IP or Client UID
+            // Backend sends 'uid' (client generated) but we could use something else.
+            // Let's use the uid passed back.
+            const displayUid = `User .${msg.uid}`;
+
+            div.innerHTML = `
+                <span class="chat-uid" title="${timeStr}">${displayUid}:</span>
+                <span class="${contentClass}" data-original="${msg.content}">${displayContent}</span>
+            `;
+            chatMessages.appendChild(div);
+        }
+
+        function scrollToBottom() {
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+
+        // Hook into existing togglePrivacy to mask/unmask chat
+        // We need to override or extend the existing function.
+        // Option: Modify the existing togglePrivacy to call a chat update function.
+        // Since I can't easily modify the existing function body without replacement,
+        // I'll append a watcher mechanism or just redefine it? 
+        // Redefining is risky if I duplicate logic.
+        // Better: Use a MutationObserver on the global isPrivacyMode variable? No, JS vars aren't observable like that.
+        // Simple hack: The existing togglePrivacy changes DOM elements with class 'privacy-sensitive'.
+        // My chat elements have class 'chat-content'.
+        // I will add a periodic check or just wrap the togglePrivacy function if I can find it.
+        // But wait, I defined togglePrivacy in the previous script block. 
+        // I will OVERRIDE the togglePrivacy function here to include chat logic.
+        // BUT I must preserve the original logic.
+
+        const originalTogglePrivacy = togglePrivacy;
+        togglePrivacy = function () {
+            originalTogglePrivacy(); // Call original
+            updateChatPrivacy();
+        }
+
+        function updateChatPrivacy() {
+            const chatContents = document.querySelectorAll('.chat-content');
+            const chatInput = document.getElementById('chatInput');
+
+            chatContents.forEach(el => {
+                if (isPrivacyMode) {
+                    el.textContent = '***********';
+                    el.classList.add('masked');
+                } else {
+                    el.textContent = el.getAttribute('data-original');
+                    el.classList.remove('masked');
+                }
+            });
+
+            // In privacy mode, we still allow input, just mask history
+            if (isPrivacyMode) {
+                chatInput.setAttribute('placeholder', '');
+            } else {
+                chatInput.setAttribute('placeholder', '请输入消息...');
+            }
+            chatInput.disabled = false;
+        }
+        // Initialize chat privacy state on load
+        document.addEventListener('DOMContentLoaded', () => {
+            updateChatPrivacy();
+        });
+
+        // Start polling
+        setInterval(pollChat, 3000);
 
         // Close modal when clicking outside
         window.onclick = function (event) {
@@ -667,6 +899,152 @@
 
         .save-btn:hover {
             background-color: #2563eb;
+        }
+
+        .save-btn:hover {
+            background-color: #2563eb;
+        }
+
+        /* Stealth Chat Styles (Light Theme) */
+        .chat-window {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            width: 320px;
+            height: 400px;
+            background-color: rgba(255, 255, 255, 0.98);
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+            display: flex;
+            flex-direction: column;
+            border: 1px solid #e5e7eb;
+            font-family: 'Inter', sans-serif;
+            z-index: 2000;
+        }
+
+        .chat-header {
+            padding: 10px 15px;
+            background-color: #f3f4f6;
+            border-bottom: 1px solid #e5e7eb;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-top-left-radius: 8px;
+            border-top-right-radius: 8px;
+            cursor: grab;
+            user-select: none;
+        }
+
+        .chat-title {
+            color: #4b5563;
+            font-size: 0.85rem;
+            font-weight: 600;
+        }
+
+        .chat-controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .clear-chat {
+            color: #9ca3af;
+            cursor: pointer;
+            font-size: 0.9rem;
+            opacity: 0.7;
+            transition: opacity 0.2s;
+        }
+
+        .clear-chat:hover {
+            opacity: 1;
+            color: #ef4444;
+        }
+
+        .close-chat {
+            color: #9ca3af;
+            cursor: pointer;
+            font-weight: bold;
+        }
+
+        .close-chat:hover {
+            color: #6b7280;
+        }
+
+        .chat-messages {
+            flex: 1;
+            padding: 15px;
+            overflow-y: auto;
+            color: #374151;
+            font-size: 0.9rem;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .chat-msg {
+            word-wrap: break-word;
+            line-height: 1.4;
+        }
+
+        .chat-uid {
+            color: #2563eb;
+            margin-right: 5px;
+            font-weight: 600;
+            font-size: 0.8rem;
+        }
+
+        .chat-content {
+            color: #1f2937;
+        }
+
+        /* Privacy Mode for Chat */
+        .chat-content.masked {
+            color: #9ca3af;
+            letter-spacing: 2px;
+            font-family: monospace;
+        }
+
+        .chat-input-area {
+            padding: 12px;
+            border-top: 1px solid #e5e7eb;
+            background-color: #fff;
+            border-bottom-left-radius: 8px;
+            border-bottom-right-radius: 8px;
+        }
+
+        .chat-input {
+            width: 100%;
+            background: #f9fafb;
+            border: 1px solid #d1d5db;
+            color: #111827;
+            font-family: inherit;
+            font-size: 0.9rem;
+            outline: none;
+            padding: 8px 12px;
+            border-radius: 20px;
+            transition: border-color 0.2s;
+        }
+
+        .chat-input:focus {
+            border-color: #3b82f6;
+        }
+
+        /* Scrollbar for chat */
+        .chat-messages::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .chat-messages::-webkit-scrollbar-track {
+            background: #f1f1f1;
+        }
+
+        .chat-messages::-webkit-scrollbar-thumb {
+            background: #d1d5db;
+            border-radius: 3px;
+        }
+
+        .chat-messages::-webkit-scrollbar-thumb:hover {
+            background: #9ca3af;
         }
     </style>
 </body>
