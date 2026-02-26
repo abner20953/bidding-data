@@ -383,7 +383,8 @@ def parse_project_details(html_content):
         # 3. 放宽结尾匹配，移除 \n\s* 强制要求
         # 4. 增加 "更正内容" 作为起始标记
         # 5. [Fixed 2026-02] 强制要求结束标记前必须有换行符，防止表格内容包含 "四、" 导致提前截断
-        regex_pattern = r"(?:更正信息|变更信息|更正内容).*?(?:(?:\n\s*三[、\.])|(?:\n\s*其他补充事宜)|(?:\n\s*四[、\.])|$)"
+        # 6. [Fixed 2026-02-26] 将更正信息的结束标记限定得更严格，防止匹配到表格内类似 "四、提交投标文件截止时间" 从而导致截断
+        regex_pattern = r"(?:(?:二[、\.]\s*)?(?:更正信息|变更信息|更正内容)).*?(?:(?:\n\s*[三四五六七][、\.]\s*(?:其他补充事宜|凡对本次|联系方式|对(?:本次)?采购|对(?:本次)?招标|项目联系方式))|$)"
         correction_section = re.search(regex_pattern, text, re.S)
         if correction_section:
             section_text = correction_section.group(0)
