@@ -1341,8 +1341,14 @@ def send_chat():
     ip = request.remote_addr
     
     try:
-        conn = sqlite3.connect(CHAT_DB)
+        conn = sqlite3.connect(CHAT_DB, timeout=10.0)
         c = conn.cursor()
+        c.execute("PRAGMA journal_mode=WAL;")
+        c.execute("PRAGMA synchronous=NORMAL;")
+        
+        # Auto-delete messages older than 24 hours (moved here from list API to avoid locks during polling)
+        c.execute("DELETE FROM messages WHERE timestamp < datetime('now', '-24 hours')")
+        
         c.execute("INSERT INTO messages (uid, ip, content) VALUES (?, ?, ?)", (uid, ip, content))
         conn.commit()
         conn.close()
@@ -1354,12 +1360,11 @@ def send_chat():
 def get_chat():
     last_id = request.args.get('last_id', 0, type=int)
     try:
-        conn = sqlite3.connect(CHAT_DB)
+        conn = sqlite3.connect(CHAT_DB, timeout=10.0)
         c = conn.cursor()
+        c.execute("PRAGMA journal_mode=WAL;")
         
-        # Auto-delete messages older than 24 hours
-        c.execute("DELETE FROM messages WHERE timestamp < datetime('now', '-24 hours')")
-        
+        # Only reads are allowed in this high frequency polling endpoint
         c.execute("SELECT id, uid, content, timestamp FROM messages WHERE id > ? ORDER BY id ASC LIMIT 50", (last_id,))
         rows = c.fetchall()
         messages = []
@@ -1370,7 +1375,6 @@ def get_chat():
                 'content': r[2],
                 'timestamp': r[3]
             })
-        conn.commit() # Commit deletion
         conn.close()
         return jsonify({'status': 'success', 'messages': messages})
     except Exception as e:
