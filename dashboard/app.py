@@ -1365,7 +1365,8 @@ def get_chat():
         c.execute("PRAGMA journal_mode=WAL;")
         
         # Only reads are allowed in this high frequency polling endpoint
-        c.execute("SELECT id, uid, content, timestamp FROM messages WHERE id > ? ORDER BY id ASC LIMIT 50", (last_id,))
+        # We explicitly filter out messages older than 24 hours here so they aren't shown even if they haven't been physically deleted yet
+        c.execute("SELECT id, uid, content, timestamp FROM messages WHERE id > ? AND timestamp >= datetime('now', '-24 hours') ORDER BY id ASC LIMIT 50", (last_id,))
         rows = c.fetchall()
         messages = []
         for r in rows:
