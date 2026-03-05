@@ -510,9 +510,9 @@
             chatVisible = !chatVisible;
             if (chatVisible) {
                 chatWindow.style.display = 'flex';
-                // Reset notification style
-                chatToggle.style.color = '#9ca3af';
-                chatToggle.style.opacity = '0.5';
+                // Reset notification style and stop any scrolling title
+                resetChatToggleStyle();
+                stopTitleScroll();
                 scrollToBottom();
             } else {
                 chatWindow.style.display = 'none';
@@ -601,6 +601,50 @@
             }
         }
 
+        // --- Title Scrolling Notification Logic ---
+        let originalTitle = document.title;
+        let scrollTitleInterval = null;
+        let isWindowFocused = true;
+        let hasUnreadMessages = false;
+        let scrollText = "【新消息】" + originalTitle + "   ";
+
+        function startTitleScroll() {
+            if (scrollTitleInterval) return;
+            hasUnreadMessages = true;
+            scrollTitleInterval = setInterval(() => {
+                scrollText = scrollText.substring(1) + scrollText[0];
+                document.title = scrollText;
+            }, 500);
+        }
+
+        function stopTitleScroll() {
+            if (scrollTitleInterval) {
+                clearInterval(scrollTitleInterval);
+                scrollTitleInterval = null;
+            }
+            document.title = originalTitle;
+            hasUnreadMessages = false;
+        }
+
+        // Detect window focus
+        window.addEventListener('focus', () => {
+            isWindowFocused = true;
+            // If chat is visible, clear notifications immediately upon focusing
+            if (chatVisible) {
+                stopTitleScroll();
+                resetChatToggleStyle();
+            }
+        });
+
+        window.addEventListener('blur', () => {
+            isWindowFocused = false;
+        });
+
+        function resetChatToggleStyle() {
+            chatToggle.style.color = '#9ca3af';
+            chatToggle.style.opacity = '0.5';
+        }
+
         async function pollChat() {
             try {
                 const res = await fetch(`/api/chat/list?last_id=${lastMsgId}`);
@@ -610,17 +654,25 @@
                     let newMsgCount = 0;
 
                     data.messages.forEach(msg => {
+                        // Avoid triggering notification for our own newly sent messages
+                        if (msg.uid !== chatUid) {
+                            newMsgCount++;
+                        }
                         lastMsgId = Math.max(lastMsgId, msg.id);
                         appendMessage(msg);
-                        newMsgCount++;
                     });
 
                     scrollToBottom();
 
-                    // Notification if chat is hidden using color change (Subtle)
-                    if (!chatVisible && newMsgCount > 0) {
-                        chatToggle.style.color = '#ef4444'; // Subtle red
-                        chatToggle.style.opacity = '0.8';
+                    // Notification Trigger
+                    if (newMsgCount > 0) {
+                        if (!chatVisible || !isWindowFocused) {
+                            // Turn toggle icon red
+                            chatToggle.style.color = '#ef4444';
+                            chatToggle.style.opacity = '1';
+                            // Start scrolling title
+                            startTitleScroll();
+                        }
                     }
                 }
             } catch (err) {
