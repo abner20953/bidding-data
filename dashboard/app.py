@@ -1398,6 +1398,36 @@ def clear_chat():
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)})
 
+@app.route('/api/chat/rename', methods=['POST'])
+def rename_chat():
+    data = request.get_json()
+    old_uid = data.get('old_uid')
+    new_uid = data.get('new_uid')
+    
+    if not old_uid or not new_uid:
+        return jsonify({'status': 'error', 'message': 'Missing arguments'})
+        
+    ip = request.remote_addr
+    
+    try:
+        conn = sqlite3.connect(CHAT_DB, timeout=10.0)
+        c = conn.cursor()
+        c.execute("PRAGMA journal_mode=WAL;")
+        c.execute("PRAGMA synchronous=NORMAL;")
+        
+        # Retroactively apply new nickname to all past messages
+        c.execute("UPDATE messages SET uid = ? WHERE uid = ?", (new_uid, old_uid))
+        
+        # Broadcast the change dynamically to live clients
+        c.execute("INSERT INTO messages (uid, ip, content) VALUES (?, ?, ?)", 
+                 ('system', ip, f"CMD:RENAME:{old_uid}:{new_uid}"))
+        
+        conn.commit()
+        conn.close()
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)})
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     debug = os.environ.get('DEBUG', 'True').lower() == 'true'

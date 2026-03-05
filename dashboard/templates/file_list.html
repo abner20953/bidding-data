@@ -290,7 +290,8 @@
     <div id="chatWindow" class="chat-window" style="display: none;">
         <div class="chat-header">
             <div style="display: flex; align-items: center; gap: 8px;">
-                <span class="chat-title">Terminal</span>
+                <input type="text" id="chatNickname" class="chat-nickname-input" title="修改昵称" maxlength="15"
+                    onchange="updateNickname(this.value)">
                 <span class="clear-chat" onclick="clearGlobalChat(event)" title="清空所有人聊天记录 (24h内)">🧹</span>
             </div>
             <span class="close-chat" onclick="toggleChat()" title="最小化">−</span>
@@ -496,7 +497,7 @@
         let lastMsgId = 0;
         let chatUid = localStorage.getItem('chat_uid');
         if (!chatUid) {
-            chatUid = Math.random().toString(36).substring(2, 6);
+            chatUid = "User_" + Math.random().toString(36).substring(2, 6);
             localStorage.setItem('chat_uid', chatUid);
         }
 
@@ -505,6 +506,35 @@
         const chatMessages = document.getElementById('chatMessages');
         const chatInput = document.getElementById('chatInput');
         const chatHeader = document.querySelector('.chat-header'); // Select header for dragging
+
+        document.getElementById('chatNickname').value = chatUid;
+
+        async function updateNickname(newUid) {
+            newUid = newUid.trim();
+            if (!newUid || newUid === chatUid) {
+                document.getElementById('chatNickname').value = chatUid;
+                return;
+            }
+            if (newUid.startsWith('CMD:')) {
+                alert("无效的名字");
+                return;
+            }
+
+            const oldUid = chatUid;
+            chatUid = newUid;
+            localStorage.setItem('chat_uid', chatUid);
+
+            try {
+                await fetch('/api/chat/rename', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ old_uid: oldUid, new_uid: chatUid })
+                });
+                pollChat(); // trigger poll immediately
+            } catch (err) {
+                console.error('Rename error:', err);
+            }
+        }
 
         function toggleChat() {
             chatVisible = !chatVisible;
@@ -690,6 +720,24 @@
                 return;
             }
 
+            if (msg.content.startsWith('CMD:RENAME:')) {
+                const parts = msg.content.split(':');
+                if (parts.length >= 4) {
+                    const oldName = parts[2];
+                    const newName = parts.slice(3).join(':'); // joining rest in case of colons
+
+                    // Find all uid spans and update them if they match oldName
+                    const uidSpans = chatMessages.querySelectorAll('.chat-uid');
+                    uidSpans.forEach(span => {
+                        if (span.getAttribute('data-uid') === oldName) {
+                            span.setAttribute('data-uid', newName);
+                            span.textContent = newName;
+                        }
+                    });
+                }
+                return; // Do not append as a visible message
+            }
+
             const div = document.createElement('div');
             div.className = 'chat-msg';
 
@@ -702,14 +750,12 @@
             const contentClass = isPrivacyMode ? 'chat-content masked' : 'chat-content';
             const displayContent = isPrivacyMode ? '***********' : msg.content;
 
-            // Short UID from IP or Client UID
-            // Backend sends 'uid' (client generated) but we could use something else.
-            // Let's use the uid passed back.
-            const displayUid = `User .${msg.uid}`;
+            const displayUid = msg.uid;
 
             div.innerHTML = `
-                <span class="chat-uid" title="${timeStr}">${displayUid}:</span>
-                <span class="${contentClass}" data-original="${msg.content}">${displayContent}</span>
+                <span class="chat-uid" data-uid="${displayUid}">${displayUid}</span>
+                <span class="chat-time">${timeStr}</span>:
+                <span class="${contentClass}" data-original="${msg.content}"> ${displayContent}</span>
             `;
             chatMessages.appendChild(div);
         }
@@ -1008,6 +1054,26 @@
             font-weight: 600;
         }
 
+        .chat-nickname-input {
+            background: transparent;
+            border: 1px dashed transparent;
+            color: #4b5563;
+            font-size: 0.85rem;
+            font-weight: 600;
+            width: 90px;
+            padding: 2px 4px;
+            border-radius: 4px;
+            transition: all 0.2s;
+            font-family: inherit;
+        }
+
+        .chat-nickname-input:hover,
+        .chat-nickname-input:focus {
+            border-color: #d1d5db;
+            background: #fff;
+            outline: none;
+        }
+
         .chat-controls {
             display: flex;
             align-items: center;
@@ -1063,9 +1129,17 @@
             line-height: 1.4;
         }
 
+        .chat-time {
+            font-size: 0.7rem;
+            color: #9ca3af;
+            margin-left: 4px;
+            margin-right: 2px;
+            user-select: none;
+            font-weight: normal;
+        }
+
         .chat-uid {
             color: #2563eb;
-            margin-right: 5px;
             font-weight: 600;
             font-size: 0.8rem;
         }
