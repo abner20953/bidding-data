@@ -606,11 +606,14 @@
         let scrollTitleInterval = null;
         let isWindowFocused = true;
         let hasUnreadMessages = false;
-        let scrollText = "【新消息】" + originalTitle + "   ";
+        // Scroll the title itself with some spacing to distinguish the end/start when looping
+        let scrollText = originalTitle + "        ";
 
         function startTitleScroll() {
             if (scrollTitleInterval) return;
             hasUnreadMessages = true;
+            // Reset text every time we start to make sure we have a clean loop string
+            scrollText = originalTitle + "        ";
             scrollTitleInterval = setInterval(() => {
                 scrollText = scrollText.substring(1) + scrollText[0];
                 document.title = scrollText;
