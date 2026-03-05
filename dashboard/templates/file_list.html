@@ -749,11 +749,10 @@
             // Mask content if privacy mode is on
             const contentClass = isPrivacyMode ? 'chat-content masked' : 'chat-content';
             const displayContent = isPrivacyMode ? '***********' : msg.content;
-
-            const displayUid = msg.uid;
+            const displayUid = isPrivacyMode ? '***********' : msg.uid;
 
             div.innerHTML = `
-                <span class="chat-uid" data-uid="${displayUid}">${displayUid}</span>
+                <span class="chat-uid" data-uid="${msg.uid}">${displayUid}</span>
                 <span class="chat-time">${timeStr}</span>:
                 <span class="${contentClass}" data-original="${msg.content}"> ${displayContent}</span>
             `;
@@ -786,6 +785,7 @@
 
         function updateChatPrivacy() {
             const chatContents = document.querySelectorAll('.chat-content');
+            const chatUids = document.querySelectorAll('.chat-uid');
             const chatInput = document.getElementById('chatInput');
 
             chatContents.forEach(el => {
@@ -795,6 +795,15 @@
                 } else {
                     el.textContent = el.getAttribute('data-original');
                     el.classList.remove('masked');
+                }
+            });
+
+            // Mask/Unmask UIDs
+            chatUids.forEach(el => {
+                if (isPrivacyMode) {
+                    el.textContent = '***********';
+                } else {
+                    el.textContent = el.getAttribute('data-uid');
                 }
             });
 
