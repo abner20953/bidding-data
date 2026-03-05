@@ -742,7 +742,14 @@
             div.className = 'chat-msg';
 
             // Format time HH:MM
-            const date = new Date(msg.timestamp); // Server timestamp string
+            // SQLite returns UTC string like "2024-05-20 12:30:45".
+            // We need to convert it to ISO format "2024-05-20T12:30:45Z" so JS Date parses it as UTC and converts to local time.
+            let safeTimestamp = msg.timestamp;
+            if (safeTimestamp && !safeTimestamp.includes('T') && !safeTimestamp.endsWith('Z')) {
+                safeTimestamp = safeTimestamp.replace(' ', 'T') + 'Z';
+            }
+            const date = new Date(safeTimestamp);
+
             // Backup client time if invalid
             const timeStr = isNaN(date.getTime()) ? new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) : date.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
 
