@@ -11,3 +11,4 @@ psutil
 datasketch
 PyMuPDF
 jieba
+gevent
