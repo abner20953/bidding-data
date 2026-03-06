@@ -204,6 +204,8 @@ def view_entry(entry_id):
     
     conn.close()
     
+    _log_action("查看知识库文章", entry['title'])
+    
     # Handle Search Highlighting
     query = request.args.get('q', '')
     highlight_tokens = []
