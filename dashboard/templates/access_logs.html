@@ -264,16 +264,17 @@
                     <thead>
                         <tr>
                             <th style="width: 160px;">操作时间</th>
-                            <th style="width: 140px;">IP 地址</th>
-                            <th style="width: 80px;">设备</th>
-                            <th style="width: 160px;">系统/浏览器</th>
-                            <th style="width: 140px;">操作类型</th>
+                            <th style="width: 130px;">IP 地址</th>
+                            <th style="width: 90px;">用户</th>
+                            <th style="width: 70px;">设备</th>
+                            <th style="width: 150px;">系统/浏览器</th>
+                            <th style="width: 130px;">操作类型</th>
                             <th>操作详情</th>
                         </tr>
                     </thead>
                     <tbody id="logsBody">
                         <tr>
-                            <td colspan="6" class="loading">正在加载日志数据...</td>
+                            <td colspan="7" class="loading">正在加载日志数据...</td>
                         </tr>
                     </tbody>
                 </table>
@@ -377,12 +378,12 @@
                 const data = await response.json();
 
                 if (data.error) {
-                    tbody.innerHTML = `<tr><td colspan="6" class="loading" style="color:red">加载失败: ${data.error}</td></tr>`;
+                    tbody.innerHTML = `<tr><td colspan="7" class="loading" style="color:red">加载失败: ${data.error}</td></tr>`;
                     return;
                 }
 
                 if (data.length === 0) {
-                    tbody.innerHTML = `<tr><td colspan="6" class="loading">暂无符合条件的操作记录</td></tr>`;
+                    tbody.innerHTML = `<tr><td colspan="7" class="loading">暂无符合条件的操作记录</td></tr>`;
                     return;
                 }
 
@@ -395,6 +396,7 @@
                         <tr>
                             <td style="color:#6b7280; font-size:13px;">${log.timestamp}</td>
                             <td style="font-family: monospace; font-weight:500;">${log.ip}</td>
+                            <td style="font-weight:500; font-size:13px; color:#6366f1;">${log.username || ''}</td>
                             <td><span class="badge ${deviceClass}">${deviceIcon} ${log.device}</span></td>
                             <td>
                                 <div style="font-weight:500; font-size:13px;">${log.os || ''}</div>
@@ -408,7 +410,7 @@
 
             } catch (err) {
                 console.error(err);
-                tbody.innerHTML = `<tr><td colspan="6" class="loading" style="color:red">网络错误，请稍后重试</td></tr>`;
+                tbody.innerHTML = `<tr><td colspan="7" class="loading" style="color:red">网络错误，请稍后重试</td></tr>`;
             }
         }
     </script>

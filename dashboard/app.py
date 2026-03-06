@@ -403,6 +403,31 @@ def api_get_visitor_logs():
         logs = [dict(row) for row in rows]
             
         conn.close()
+        
+        # 通过 chat.db 按 IP 查询用户昵称
+        try:
+            ip_set = set(log['ip'] for log in logs if log.get('ip'))
+            if ip_set:
+                chat_conn = sqlite3.connect(CHAT_DB)
+                chat_cursor = chat_conn.cursor()
+                # 查询每个 IP 最近一条消息的 uid 作为用户名
+                placeholders = ','.join('?' for _ in ip_set)
+                chat_cursor.execute(f'''
+                    SELECT ip, uid FROM messages 
+                    WHERE ip IN ({placeholders}) 
+                    AND uid != 'anonymous'
+                    GROUP BY ip 
+                    HAVING id = MAX(id)
+                ''', list(ip_set))
+                ip_to_name = {row[0]: row[1] for row in chat_cursor.fetchall()}
+                chat_conn.close()
+                
+                for log in logs:
+                    log['username'] = ip_to_name.get(log.get('ip'), '')
+        except Exception as e:
+            print(f"Error looking up usernames: {e}")
+            # 即使查询昵称失败，也不影响日志返回
+        
         return jsonify(logs)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
