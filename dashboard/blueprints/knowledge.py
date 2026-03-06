@@ -28,6 +28,32 @@ knowledge_bp = Blueprint('knowledge', __name__,
 
 DB_NAME = 'knowledge_base.db'
 
+# --- 操作日志工具 ---
+def _log_action(action, detail=""):
+    """记录用户实质性操作到 visitor_logs.db"""
+    try:
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        visitor_db = os.path.join(base_dir, 'visitor_logs.db')
+        ip = request.remote_addr
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ua = request.user_agent
+        ua_string = ua.string
+        browser = f"{ua.browser} {ua.version}" if ua.browser else "Unknown"
+        os_info = "Unknown"
+        if 'Windows' in ua_string: os_info = 'Windows'
+        elif 'Android' in ua_string: os_info = 'Android'
+        elif 'iPhone' in ua_string or 'iPad' in ua_string: os_info = 'iOS'
+        elif 'Mac' in ua_string: os_info = 'MacOS'
+        elif 'Linux' in ua_string: os_info = 'Linux'
+        device = "Mobile" if ('Mobile' in ua_string or 'Android' in ua_string or 'iPhone' in ua_string) else "PC"
+        conn = sqlite3.connect(visitor_db)
+        conn.execute('INSERT INTO action_logs (ip, action, detail, timestamp, user_agent, browser, os, device) VALUES (?,?,?,?,?,?,?,?)',
+                     (ip, action, detail, timestamp, ua_string, browser, os_info, device))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Knowledge log_action error: {e}")
+
 def get_db_path():
     base_dir = current_app.config.get('BASE_DIR')
     if not base_dir:
@@ -338,6 +364,10 @@ def api_list():
     
     conn.close()
     
+    # 记录搜索操作日志（仅有搜索关键词时记录）
+    if query:
+        _log_action("查询知识库", f"搜索: {query}，结果 {total} 条")
+    
     return jsonify({
         "total": total,
         "page": page,
@@ -428,6 +458,7 @@ def api_tags():
                     pass
                     
             conn.commit()
+            _log_action("重命名标签", f"{old_name} → {new_name}")
             return jsonify({"status": "success"})
         except sqlite3.IntegrityError:
              return jsonify({"error": "该标签名已存在"}), 400
@@ -467,6 +498,7 @@ def api_tags():
                     pass
             
             conn.commit()
+            _log_action("删除标签", name)
             return jsonify({"status": "success"})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
@@ -565,6 +597,10 @@ def api_save():
 
     conn.commit()
     conn.close()
+    
+    op = "编辑" if entry_id_or_uuid else "新建"
+    _log_action(f"{op}知识库条目", f"{title}")
+    
     return jsonify({"status": "success"})
 
 @knowledge_bp.route('/api/delete', methods=['POST'])
@@ -581,14 +617,15 @@ def api_delete():
     conn = get_db()
     try:
         # Resolve to internal ID
-        row = conn.execute("SELECT id FROM entries WHERE uuid = ?", (uid,)).fetchone()
+        row = conn.execute("SELECT id, title FROM entries WHERE uuid = ?", (uid,)).fetchone()
         if not row and str(uid).isdigit():
-             row = conn.execute("SELECT id FROM entries WHERE id = ?", (uid,)).fetchone()
+             row = conn.execute("SELECT id, title FROM entries WHERE id = ?", (uid,)).fetchone()
              
         if not row:
             return jsonify({"error": "Entry not found"}), 404
             
         internal_id = row['id']
+        entry_title = row['title']
         
         # Delete entry
         conn.execute("DELETE FROM entries WHERE id = ?", (internal_id,))
@@ -598,6 +635,7 @@ def api_delete():
         conn.execute("DELETE FROM entry_relations WHERE source_id = ? OR target_id = ?", (internal_id, internal_id))
         
         conn.commit()
+        _log_action("删除知识库条目", entry_title)
         return jsonify({"status": "success"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500

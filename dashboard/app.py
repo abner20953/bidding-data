@@ -150,13 +150,13 @@ def init_visitor_db():
     try:
         conn = sqlite3.connect(VISITOR_DB)
         cursor = conn.cursor()
+        # 新表：记录用户实质性操作而非页面访问
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS logs (
+            CREATE TABLE IF NOT EXISTS action_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ip TEXT,
-                path TEXT,
-                method TEXT,
-                status_code INTEGER,
+                action TEXT,
+                detail TEXT,
                 timestamp TEXT,
                 user_agent TEXT,
                 browser TEXT,
@@ -164,6 +164,8 @@ def init_visitor_db():
                 device TEXT
             )
         ''')
+        # 如果旧表 logs 存在，可以删除（数据迁移无意义）
+        cursor.execute("DROP TABLE IF EXISTS logs")
         conn.commit()
         conn.close()
     except Exception as e:
@@ -298,106 +300,56 @@ def run_auto_scrape_thread(dates, is_scheduled_task=False):
         SCRAPER_STATUS["is_running"] = False
         SCRAPER_STATUS["current_date"] = None
 
-# --- Global Pending Visits Store ---
-PENDING_VISITS = {} # Format: { ip: { 'path': ..., 'timestamp': datetime, 'data': ... } }
-PENDING_LOCK = threading.Lock()
+# --- 用户操作日志工具函数 ---
 
-# --- Middleware for Visitor Logging ---
+def _parse_user_agent():
+    """从请求中提取设备信息"""
+    ua = request.user_agent
+    ua_string = ua.string
+    
+    browser = f"{ua.browser} {ua.version}" if ua.browser else "Unknown"
+    os_info = f"{ua.platform} {ua.version}" if ua.platform else "Unknown"
+    
+    if 'Windows' in ua_string: os_info = 'Windows'
+    elif 'Android' in ua_string: os_info = 'Android'
+    elif 'iPhone' in ua_string or 'iPad' in ua_string: os_info = 'iOS'
+    elif 'Mac' in ua_string: os_info = 'MacOS'
+    elif 'Linux' in ua_string: os_info = 'Linux'
+    
+    device = "PC"
+    if 'Mobile' in ua_string or 'Android' in ua_string or 'iPhone' in ua_string:
+        device = "Mobile"
+    
+    return ua_string, browser, os_info, device
+
+def log_user_action(action, detail=""):
+    """记录用户实质性操作到数据库"""
+    try:
+        ip = request.remote_addr
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ua_string, browser, os_info, device = _parse_user_agent()
+        
+        conn = sqlite3.connect(VISITOR_DB)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO action_logs (ip, action, detail, timestamp, user_agent, browser, os, device)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (ip, action, detail, timestamp, ua_string, browser, os_info, device))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error logging user action: {e}")
+
+# --- Middleware: 保留 session return_url 功能 ---
 
 @app.after_request
 def log_request(response):
     try:
-        # 1. Basic Filters
-        if request.path.startswith('/static') or request.path.startswith('/api/file') or request.path == '/favicon.ico':
-            return response
-            
-        # If trying to access specific knowledge pages, store return URL
+        # 保留知识库页面的 return_url 逻辑
         if request.path.startswith('/zhishi/view/') or request.path.startswith('/zhishi/edit/'):
             session['return_url'] = request.url
-            
-        # 2. Identify Request Type
-        is_api = request.path.startswith('/api/') or '/api/' in request.path
-        
-        # 3. Get IP (Proxy safe)
-        ip = request.remote_addr
-            
-        current_time = datetime.datetime.now()
-
-        # --- LOGIC BRANCH ---
-        with PENDING_LOCK:
-            if is_api:
-                # [API Request] -> Check & Flush Pending Page Visits
-                # Does NOT log the API request itself (as per requirements)
-                
-                if ip in PENDING_VISITS:
-                    pending = PENDING_VISITS[ip]
-                    visit_time = pending['timestamp']
-                    
-                    # Check time window (5 minutes)
-                    if (current_time - visit_time) < datetime.timedelta(minutes=5):
-                        # VALID VISIT! Write to DB
-                        try:
-                            # Re-construct user agent info from pending data
-                            # (We use the pending data because that was the page visit context)
-                            p_data = pending['data']
-                            
-                            conn = sqlite3.connect(VISITOR_DB)
-                            cursor = conn.cursor()
-                            cursor.execute('''
-                                INSERT INTO logs (ip, path, method, status_code, timestamp, user_agent, browser, os, device)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            ''', (ip, pending['path'], p_data['method'], p_data['status_code'], 
-                                  visit_time.strftime("%Y-%m-%d %H:%M:%S"), 
-                                  p_data['ua_string'], p_data['browser'], p_data['os'], p_data['device']))
-                            conn.commit()
-                            conn.close()
-                            # print(f"DEBUG: Validated visit for {ip} -> {pending['path']}")
-                        except Exception as e:
-                            print(f"Error writing validated log: {e}")
-                    
-                    # Clear pending after processing (whether valid or expired)
-                    del PENDING_VISITS[ip]
-                    
-            else:
-                # [Page Request] -> Store as Pending
-                # Only log if it matches a valid route
-                if request.url_rule:
-                    
-                    # Prepare Data
-                    ua = request.user_agent
-                    ua_string = ua.string
-                    
-                    browser = f"{ua.browser} {ua.version}" if ua.browser else "Unknown"
-                    os_info = f"{ua.platform} {ua.version}" if ua.platform else "Unknown"
-                    
-                    if 'Windows' in ua_string: os_info = 'Windows'
-                    elif 'Android' in ua_string: os_info = 'Android'
-                    elif 'iPhone' in ua_string or 'iPad' in ua_string: os_info = 'iOS'
-                    elif 'Mac' in ua_string: os_info = 'MacOS'
-                    elif 'Linux' in ua_string: os_info = 'Linux'
-                    
-                    device = "PC"
-                    if 'Mobile' in ua_string or 'Android' in ua_string or 'iPhone' in ua_string:
-                        device = "Mobile"
-                    
-                    # Overwrite any existing pending visit for this IP (User moved to new page)
-                    PENDING_VISITS[ip] = {
-                        'path': request.path,
-                        'timestamp': current_time,
-                        'data': {
-                            'method': request.method,
-                            'status_code': response.status_code,
-                            'ua_string': ua_string,
-                            'browser': browser,
-                            'os': os_info,
-                            'device': device
-                        }
-                    }
-                    # print(f"DEBUG: Pending visit stored for {ip} -> {request.path}")
-
     except Exception as e:
         print(f"Logging error: {e}")
-        
     return response
 
 # --- New Routes for Visitor Logs ---
@@ -412,7 +364,7 @@ def api_get_visitor_logs():
         try:
             conn = sqlite3.connect(VISITOR_DB)
             cursor = conn.cursor()
-            cursor.execute('DELETE FROM logs')
+            cursor.execute('DELETE FROM action_logs')
             conn.commit()
             conn.close()
             return jsonify({"status": "success", "message": "All logs cleared."})
@@ -421,37 +373,34 @@ def api_get_visitor_logs():
 
     try:
         ip_query = request.args.get('ip', '').strip()
-        path_query = request.args.get('path', '').strip()
+        action_query = request.args.get('action', '').strip()
         date_query = request.args.get('date', '').strip()
         
         conn = sqlite3.connect(VISITOR_DB)
-        conn.row_factory = sqlite3.Row # Allow dict-like access
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
-        query = "SELECT * FROM logs WHERE 1=1"
+        query = "SELECT * FROM action_logs WHERE 1=1"
         params = []
         
         if ip_query and ip_query != 'all':
             query += " AND ip = ?"
             params.append(ip_query)
             
-        if path_query and path_query != 'all':
-             query += " AND path = ?"
-             params.append(path_query)
+        if action_query and action_query != 'all':
+            query += " AND action = ?"
+            params.append(action_query)
 
         if date_query:
-             query += " AND timestamp LIKE ?"
-             params.append(f"{date_query}%")
+            query += " AND timestamp LIKE ?"
+            params.append(f"{date_query}%")
              
-        # Order by latest first
-        query += " ORDER BY id DESC LIMIT 500" # Increase limit for searching
+        query += " ORDER BY id DESC LIMIT 500"
         
         cursor.execute(query, tuple(params))
         rows = cursor.fetchall()
         
-        logs = []
-        for row in rows:
-            logs.append(dict(row))
+        logs = [dict(row) for row in rows]
             
         conn.close()
         return jsonify(logs)
@@ -464,15 +413,14 @@ def api_visitor_log_options():
         conn = sqlite3.connect(VISITOR_DB)
         cursor = conn.cursor()
         
-        # Get distinct IPs and Paths from the last 7 days (logs table is self-cleaning)
-        cursor.execute("SELECT DISTINCT ip FROM logs ORDER BY id DESC")
+        cursor.execute("SELECT DISTINCT ip FROM action_logs ORDER BY id DESC")
         ips = [row[0] for row in cursor.fetchall()]
         
-        cursor.execute("SELECT DISTINCT path FROM logs ORDER BY path ASC")
-        paths = [row[0] for row in cursor.fetchall()]
+        cursor.execute("SELECT DISTINCT action FROM action_logs ORDER BY action ASC")
+        actions = [row[0] for row in cursor.fetchall()]
         
         conn.close()
-        return jsonify({"ips": ips, "paths": paths})
+        return jsonify({"ips": ips, "actions": actions})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1046,6 +994,12 @@ def api_compare():
                 os.remove(path_tender)
         except Exception:
             pass 
+        
+        # 记录操作日志
+        detail = f"{file_a.filename} vs {file_b.filename}"
+        if file_tender and file_tender.filename:
+            detail += f" (招标: {file_tender.filename})"
+        log_user_action("文件比对", detail)
             
         return jsonify({"status": "success", "data": results})
         
@@ -1171,6 +1125,7 @@ def api_data():
         df = pd.read_excel(target_filepath)
         df = df.fillna("")
         data = df.to_dict('records')
+        log_user_action("查询开标记录", f"日期: {date_str}，共 {len(data)} 条")
         return jsonify(data)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1202,6 +1157,8 @@ def api_scrape_start():
     thread = threading.Thread(target=run_auto_scrape_thread, args=(target_dates,))
     thread.daemon = True
     thread.start()
+    
+    log_user_action("启动数据采集", f"目标日期: {', '.join(date_strs)}")
     
     return jsonify({
         "status": "success", 
@@ -1290,14 +1247,14 @@ def scheduled_job():
                 
     log_scheduler(f"   [清理完成] 共删除了 {deleted_count} 个过期文件。")
 
-    # --- 3. 访客日志清理逻辑 (保留最近 7 天) ---
+    # --- 3. 操作日志清理逻辑 (保留最近 7 天) ---
     try:
         cleanup_date_limit = (today - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
-        log_scheduler(f"   [日志维护] 正在清理 {cleanup_date_limit} 之前的访客记录...")
+        log_scheduler(f"   [日志维护] 正在清理 {cleanup_date_limit} 之前的操作记录...")
         
         conn = sqlite3.connect(VISITOR_DB)
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM logs WHERE timestamp < ?", (cleanup_date_limit,))
+        cursor.execute("DELETE FROM action_logs WHERE timestamp < ?", (cleanup_date_limit,))
         deleted_rows = cursor.rowcount
         conn.commit()
         conn.close()
@@ -1352,6 +1309,7 @@ def send_chat():
         c.execute("INSERT INTO messages (uid, ip, content) VALUES (?, ?, ?)", (uid, ip, content))
         conn.commit()
         conn.close()
+        log_user_action("发送聊天消息", f"用户: {uid}")
         return jsonify({'status': 'success'})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)})

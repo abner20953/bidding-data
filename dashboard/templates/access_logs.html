@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>访客日志监控 - Smarter Tools</title>
+    <title>用户操作日志 - Smarter Tools</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -35,7 +35,7 @@
         }
 
         .container {
-            max-width: 1200px;
+            max-width: 1400px;
             margin: 0 auto;
         }
 
@@ -135,7 +135,6 @@
             border: 1px solid var(--card-border);
             border-radius: 16px;
             padding: 24px;
-            /* Reduced padding for more table space */
             backdrop-filter: blur(12px);
             box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
             overflow: hidden;
@@ -154,7 +153,6 @@
 
         th {
             background-color: rgba(249, 250, 251, 0.5);
-            /* Semi-transparent */
             color: var(--text-secondary);
             font-weight: 600;
             padding: 12px 16px;
@@ -198,14 +196,11 @@
             color: #065f46;
         }
 
-        .badge-method-get {
-            background-color: #e0e7ff;
-            color: #3730a3;
-        }
-
-        .badge-method-post {
-            background-color: #fce7f3;
-            color: #9d174d;
+        .badge-action {
+            background-color: #ede9fe;
+            color: #5b21b6;
+            font-size: 13px;
+            padding: 3px 10px;
         }
 
         .loading {
@@ -239,7 +234,7 @@
         <div class="header-section">
             <div class="page-title">
                 <a href="/all" class="back-link">← 返回导航</a>
-                <h1>访客日志监控</h1>
+                <h1>用户操作日志</h1>
             </div>
 
             <div class="toolbar">
@@ -247,8 +242,8 @@
                     <option value="" disabled selected>IP 地址 (加载中...)</option>
                 </select>
 
-                <select id="pathFilter">
-                    <option value="" disabled selected>访问路径 (加载中...)</option>
+                <select id="actionFilter">
+                    <option value="" disabled selected>操作类型 (加载中...)</option>
                 </select>
 
                 <input type="date" id="dateFilter" title="按日期筛选">
@@ -268,16 +263,17 @@
                 <table id="logsTable">
                     <thead>
                         <tr>
-                            <th style="width: 160px;">访问时间</th>
+                            <th style="width: 160px;">操作时间</th>
                             <th style="width: 140px;">IP 地址</th>
-                            <th style="width: 100px;">设备</th>
-                            <th style="width: 180px;">系统/浏览器</th>
-                            <th>访问路径</th>
+                            <th style="width: 80px;">设备</th>
+                            <th style="width: 160px;">系统/浏览器</th>
+                            <th style="width: 140px;">操作类型</th>
+                            <th>操作详情</th>
                         </tr>
                     </thead>
                     <tbody id="logsBody">
                         <tr>
-                            <td colspan="5" class="loading">正在加载日志数据...</td>
+                            <td colspan="6" class="loading">正在加载日志数据...</td>
                         </tr>
                     </tbody>
                 </table>
@@ -314,14 +310,14 @@
                     ipSelect.appendChild(option);
                 });
 
-                // Populate Path Select
-                const pathSelect = document.getElementById('pathFilter');
-                pathSelect.innerHTML = '<option value="all">全部访问路径</option>';
-                data.paths.forEach(path => {
+                // Populate Action Select
+                const actionSelect = document.getElementById('actionFilter');
+                actionSelect.innerHTML = '<option value="all">全部操作类型</option>';
+                (data.actions || []).forEach(action => {
                     const option = document.createElement('option');
-                    option.value = path;
-                    option.textContent = path;
-                    pathSelect.appendChild(option);
+                    option.value = action;
+                    option.textContent = action;
+                    actionSelect.appendChild(option);
                 });
 
             } catch (error) {
@@ -363,7 +359,7 @@
 
             // Get values
             const ip = document.getElementById('ipFilter').value;
-            const path = document.getElementById('pathFilter').value;
+            const action = document.getElementById('actionFilter').value;
             const date = document.getElementById('dateFilter').value;
 
             try {
@@ -372,7 +368,7 @@
                 const params = new URLSearchParams();
 
                 if (ip && ip !== 'all') params.append('ip', ip);
-                if (path && path !== 'all') params.append('path', path);
+                if (action && action !== 'all') params.append('action', action);
                 if (date) params.append('date', date);
 
                 if (params.toString()) url += '?' + params.toString();
@@ -381,12 +377,12 @@
                 const data = await response.json();
 
                 if (data.error) {
-                    tbody.innerHTML = `<tr><td colspan="5" class="loading" style="color:red">加载失败: ${data.error}</td></tr>`;
+                    tbody.innerHTML = `<tr><td colspan="6" class="loading" style="color:red">加载失败: ${data.error}</td></tr>`;
                     return;
                 }
 
                 if (data.length === 0) {
-                    tbody.innerHTML = `<tr><td colspan="5" class="loading">暂无符合条件的访客记录</td></tr>`;
+                    tbody.innerHTML = `<tr><td colspan="6" class="loading">暂无符合条件的操作记录</td></tr>`;
                     return;
                 }
 
@@ -401,23 +397,18 @@
                             <td style="font-family: monospace; font-weight:500;">${log.ip}</td>
                             <td><span class="badge ${deviceClass}">${deviceIcon} ${log.device}</span></td>
                             <td>
-                                <div style="font-weight:500; font-size:13px;">${log.os}</div>
-                                <div style="font-size:12px;color:#9ca3af">${log.browser}</div>
+                                <div style="font-weight:500; font-size:13px;">${log.os || ''}</div>
+                                <div style="font-size:12px;color:#9ca3af">${log.browser || ''}</div>
                             </td>
-                            <td>
-                                <div style="display:flex; align-items:center;">
-                                    <span class="badge ${log.method === 'GET' ? 'badge-method-get' : 'badge-method-post'}" 
-                                          style="font-size:10px; padding:1px 6px; margin-right:8px;">${log.method}</span>
-                                    <span style="font-family:monospace; color:#374151;">${log.path}</span>
-                                </div>
-                            </td>
+                            <td><span class="badge badge-action">${log.action}</span></td>
+                            <td style="font-size:13px; color:#374151; max-width:400px; word-break:break-all;">${log.detail || ''}</td>
                         </tr>
                     `;
                 }).join('');
 
             } catch (err) {
                 console.error(err);
-                tbody.innerHTML = `<tr><td colspan="5" class="loading" style="color:red">网络错误，请稍后重试</td></tr>`;
+                tbody.innerHTML = `<tr><td colspan="6" class="loading" style="color:red">网络错误，请稍后重试</td></tr>`;
             }
         }
     </script>
