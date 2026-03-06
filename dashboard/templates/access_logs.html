@@ -303,7 +303,7 @@
                 // Populate IP Select
                 const ipSelect = document.getElementById('ipFilter');
                 ipSelect.innerHTML = '<option value="all">全部 IP 地址</option>';
-                data.ips.forEach(ip => {
+                (data.ips || []).forEach(ip => {
                     const option = document.createElement('option');
                     option.value = ip;
                     option.textContent = ip;
@@ -322,6 +322,9 @@
 
             } catch (error) {
                 console.error('Failed to load filter options:', error);
+                // 即使加载失败也显示默认选项
+                document.getElementById('ipFilter').innerHTML = '<option value="all">全部 IP 地址</option>';
+                document.getElementById('actionFilter').innerHTML = '<option value="all">全部操作类型</option>';
             }
         }
 
