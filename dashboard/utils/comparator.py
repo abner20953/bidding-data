@@ -9,7 +9,6 @@ from pypinyin import pinyin, Style
 
 # --- 轻量级拼写检测器（基于 jieba 词库 + pypinyin） ---
 _jieba_initialized = False
-_pinyin_index = None  # {pinyin_tuple: [(word, freq), ...]}
 
 def _ensure_jieba():
     """确保 jieba 词库已加载"""
@@ -18,46 +17,21 @@ def _ensure_jieba():
         jieba.initialize()
         _jieba_initialized = True
 
-def _get_pinyin_index():
-    """懒加载拼音索引：pinyin_tuple → [(word, freq), ...]"""
-    global _pinyin_index
-    if _pinyin_index is not None:
-        return _pinyin_index
 
-    _ensure_jieba()
-    _pinyin_index = {}
-
-    for word, freq in jieba.dt.FREQ.items():
-        if len(word) < 2 or len(word) > 3:
-            continue
-        if not all('\u4e00' <= c <= '\u9fff' for c in word):
-            continue
-        try:
-            py = pinyin(word, style=Style.NORMAL)
-            key = tuple(p[0] for p in py)
-            if key not in _pinyin_index:
-                _pinyin_index[key] = []
-            _pinyin_index[key].append((word, freq))
-        except Exception:
-            continue
-
-    print(f"✅ 拼音索引构建完成，共 {len(_pinyin_index)} 个拼音组合")
-    return _pinyin_index
-
-def _detect_typos(text):
+def _detect_rare_words(text):
     """
-    轻量级中文拼写检测。
-    原理：jieba 分词后，对每个 2-3 字词检查是否在词库中。
-    如果不在词库中，通过拼音索引查找可能的正确写法。
-
-    返回: [(错误文本, 建议修正, 位置), ...]
+    轻量级生僻词/非标词检测。
+    原理：jieba 分词后，对每个 2-3 字中文词检查是否在通用词库中。
+    如果不在，则认为是生僻词、行业专有词或错别字。
+    
+    返回: [(生僻词文本, 位置), ...]
     """
     _ensure_jieba()
     if not text or len(text) < 2:
         return []
 
     words = list(jieba.cut(text))
-    errors = []
+    rare_words = []
     pos = 0
 
     for word in words:
@@ -65,30 +39,10 @@ def _detect_typos(text):
         # 只检查 2-3 字的中文词
         if wlen in (2, 3) and all('\u4e00' <= c <= '\u9fff' for c in word):
             if word not in jieba.dt.FREQ:
-                correction = _find_pinyin_correction(word)
-                if correction:
-                    errors.append((word, correction, pos))
+                rare_words.append((word, pos))
         pos += wlen
 
-    return errors
-
-def _find_pinyin_correction(wrong_word):
-    """在拼音索引中查找与 wrong_word 同拼音的高频已知词"""
-    index = _get_pinyin_index()
-
-    try:
-        py = pinyin(wrong_word, style=Style.NORMAL)
-        key = tuple(p[0] for p in py)
-    except Exception:
-        return None
-
-    candidates = index.get(key, [])
-    if not candidates:
-        return None
-
-    # 返回词频最高的候选
-    best = max(candidates, key=lambda x: x[1])
-    return best[0]
+    return rare_words
 
 class CollusionDetector:
     def __init__(self, tender_path):
@@ -281,7 +235,7 @@ class CollusionDetector:
                     })
                     processed_contents.add(sent)
 
-        # --- 策略 3: 共同拼写/语法错误检测（独立于招标文件，但排除招标文件原文） ---
+        # --- 策略 3: 共同罕见词/疑似错误检测（独立于招标文件，但排除招标文件原文） ---
         if check_spelling and filtered_sentences:
             checked = set()
             for sent in filtered_sentences:
@@ -289,11 +243,9 @@ class CollusionDetector:
                     continue
                 checked.add(sent)
                 try:
-                    errors = _detect_typos(sent)
-                    if errors:
-                        error_desc = '; '.join(
-                            [f'"{e[0]}"→"{e[1]}"' for e in errors[:3]]
-                        )
+                    rare_words = _detect_rare_words(sent)
+                    if rare_words:
+                        words_desc = '、'.join([f'"{w[0]}"' for w in rare_words[:3]])
                         page_a = self.find_page_for_text(sent, pages_a)
                         page_b = self.find_page_for_text(sent, pages_b)
                         collisions.append({
@@ -302,8 +254,8 @@ class CollusionDetector:
                             "text_b": sent,
                             "page_a": page_a,
                             "page_b": page_b,
-                            "badges": ["共同拼写错误"],
-                            "desc": f"两份文件共同的疑似错误: {error_desc}"
+                            "badges": ["生僻词/疑似错误"],
+                            "desc": f"两份文件共同出现的罕见词汇(或疑似错字): {words_desc}"
                         })
                 except Exception:
                     continue
