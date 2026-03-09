@@ -3,6 +3,7 @@ import re
 import os
 import gc
 from collections import Counter
+from difflib import SequenceMatcher
 
 class CollusionDetector:
     def __init__(self, tender_path):
@@ -51,7 +52,7 @@ class CollusionDetector:
             metadata = doc.metadata
             for page in doc:
                 raw = page.get_text()
-                pages_map.append((page.number + 1, raw))
+                pages_map.append((page.number + 1, raw, self.normalize(raw)))
                 full_text += raw
             doc.close()
         except Exception as e:
@@ -103,10 +104,53 @@ class CollusionDetector:
         # target_text is already normalized.
         # We need to normalize page content on the fly or pre-calc?
         # On the fly is slower but saves memory.
-        for page_num, raw_text in pages_map:
-            if target_text in self.normalize(raw_text):
+        for page_num, raw_text, norm_text in pages_map:
+            if target_text in norm_text:
                 return page_num
         return 0
+
+    def _find_similar_in_tender(self, sent, threshold=0.7):
+        """
+        在招标文件句子中查找与 sent 最相似的句子。
+        用于检测两份投标文件与招标文件的共同偏差（拼写错误、文字修改等）。
+        返回 (best_ratio, best_match, diffs)。
+        diffs 格式: [(招标原文片段, 投标文本片段), ...]
+        """
+        if not self.tender_sentences:
+            return 0, None, []
+
+        best_ratio = 0
+        best_match = None
+        len_sent = len(sent)
+
+        for tender_sent in self.tender_sentences:
+            len_tender = len(tender_sent)
+            if len_tender == 0:
+                continue
+            # 长度差异超过 30% 则跳过
+            if abs(len_sent - len_tender) / max(len_sent, len_tender) > 0.3:
+                continue
+
+            sm = SequenceMatcher(None, tender_sent, sent)
+            # quick_ratio() 是 O(n) 的快速上界，大部分不相似的句子在此被过滤
+            if sm.quick_ratio() < threshold:
+                continue
+            r = sm.ratio()
+            if r > best_ratio:
+                best_ratio = r
+                best_match = tender_sent
+
+        if best_ratio < threshold or not best_match:
+            return 0, None, []
+
+        # 计算具体差异
+        sm = SequenceMatcher(None, best_match, sent)
+        diffs = []
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag != 'equal':
+                diffs.append((best_match[i1:i2], sent[j1:j2]))
+
+        return best_ratio, best_match, diffs
 
     def find_collisions(self, path_a, path_b):
         """
@@ -115,8 +159,7 @@ class CollusionDetector:
         raw_text_a, pages_a, meta_a = self.extract_text_with_pages(path_a)
         raw_text_b, pages_b, meta_b = self.extract_text_with_pages(path_b)
         
-        norm_a = self.normalize(raw_text_a)
-        norm_b = self.normalize(raw_text_b) # Use only if needed for global comparison
+
         
         collisions = []
         
@@ -170,16 +213,20 @@ class CollusionDetector:
                  if len(sent) > 8: 
                     page_a = self.find_page_for_text(sent, pages_a)
                     page_b = self.find_page_for_text(sent, pages_b)
-                    
-                    # Improve desc depending on content
-                    desc = "发现非招标文件雷同语句"
+
                     badges = ["完全匹配"]
-                    
-                    # Detect Typo "蚊件"
-                    if "蚊件" in sent:
-                        desc = "发现共同的可疑错别字 (蚊件)"
-                        badges.append("拼写错误")
-                    
+                    desc = "发现非招标文件雷同语句"
+
+                    # 检测是否为招标文件内容的近似修改（共同差异/拼写错误）
+                    if self.tender_sentences:
+                        ratio, match, diffs = self._find_similar_in_tender(sent)
+                        if ratio > 0.7 and diffs:
+                            diff_parts = [f'"{ d[0] }"→"{ d[1] }"' for d in diffs if d[0] or d[1]]
+                            if diff_parts:
+                                diff_desc = '; '.join(diff_parts[:3])  # 最多展示3处差异
+                                badges = ["共同差异", "疑似修改"]
+                                desc = f"与招标文件对比发现共同偏差: {diff_desc}"
+
                     collisions.append({
                         "type": "text",
                         "text_a": sent, 
@@ -191,28 +238,7 @@ class CollusionDetector:
                     })
                     processed_contents.add(sent)
 
-        # --- 策略 3: 滑窗/片段 (针对 "蚊件" 且被断句切开的情况) ---
-        # 简单实现：检查特定高频错别字
-        keywords = ["蚊件"] 
-        
-        for kw in keywords:
-            kw_norm = self.normalize(kw)
-            if kw_norm in norm_a and kw_norm in norm_b:
-                # check exclusion
-                if kw_norm not in self.tender_full_text:
-                    # check if already covered
-                    if not any(kw_norm in c['text_a'] for c in collisions):
-                        page_a = self.find_page_for_text(kw_norm, pages_a)
-                        page_b = self.find_page_for_text(kw_norm, pages_b)
-                        collisions.append({
-                            "type": "text_fragment",
-                            "text_a": f"...{kw}...",
-                            "text_b": f"...{kw}...",
-                            "page_a": page_a,
-                            "page_b": page_b,
-                            "badges": ["关键词匹配"],
-                            "desc": f"发现可疑关键词: {kw}"
-                        })
+
 
         # --- Result Formatting ---
         return {
