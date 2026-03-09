@@ -12,3 +12,4 @@ datasketch
 PyMuPDF
 jieba
 gevent
+pypinyin
