@@ -258,6 +258,29 @@
                 </div>
             </div>
 
+            <div
+                style="margin: 20px 0; padding: 16px; background: rgba(255,255,255,0.5); border-radius: 12px; border: 1px solid #e5e7eb;">
+                <div style="font-weight: 600; margin-bottom: 10px; color: #374151; font-size: 0.9rem;">⛔ 检测选项</div>
+                <div style="display: flex; gap: 24px; flex-wrap: wrap;">
+                    <label
+                        style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 0.9rem; color: #4b5563;">
+                        <input type="checkbox" name="check_entity" value="1" checked style="width: 16px; height: 16px;">
+                        敏感实体雷同
+                    </label>
+                    <label
+                        style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 0.9rem; color: #4b5563;">
+                        <input type="checkbox" name="check_text" value="1" checked style="width: 16px; height: 16px;">
+                        句子完全雷同
+                    </label>
+                    <label
+                        style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 0.9rem; color: #4b5563;">
+                        <input type="checkbox" name="check_spelling" value="1" style="width: 16px; height: 16px;">
+                        共同拼写错误
+                        <span style="font-size: 0.75rem; color: #9ca3af;">(首次较慢)</span>
+                    </label>
+                </div>
+            </div>
+
             <div class="action-area">
                 <button type="submit" class="compare-btn" id="submit-btn">开始比对</button>
                 <div class="loader" id="loader"></div>
@@ -425,7 +448,6 @@
                 }
 
                 let suspicious_paras = [];
-                let common_errors = null;
                 let metadata = null;
 
                 if (Array.isArray(result.data)) {
@@ -433,7 +455,6 @@
                 } else {
                     suspicious_paras = result.data.paragraphs;
                     metadata = result.data.metadata;
-                    common_errors = result.data.common_errors;
                 }
 
                 countDisplay.textContent = suspicious_paras.length;
@@ -480,26 +501,7 @@
                     document.querySelector('.summary-card').after(div);
                 }
 
-                // Render Common Errors
-                if (common_errors && common_errors.sequence && common_errors.sequence.length > 0) {
-                    const errDiv = document.createElement('div');
-                    errDiv.className = 'common-error-banner';
-                    const example = common_errors.sequence[0];
-                    errDiv.innerHTML = `
-                        <div>
-                            <div class="common-error-title">
-                                🚨 发现共同的序号逻辑错误 (共 ${common_errors.sequence.length} 处)
-                            </div>
-                            <div style="margin-top:5px; font-size:0.9rem; color:#b91c1c;">
-                                两个文件均在类似位置跳过了序号 <strong>${example.missing}</strong> (期望 ${example.missing}, 实际 ${example.found})。
-                            </div>
-                            <div style="margin-top:5px; font-size:0.8rem; color:#666;">
-                                例：${escapeHtml(example.text_a)}
-                            </div>
-                        </div>
-                    `;
-                    document.querySelector('.summary-card').before(errDiv);
-                }
+
 
                 if (suspicious_paras.length === 0) {
                     list.innerHTML = '<p style="text-align:center; color:#6b7280; padding: 20px;">未发现可疑的雷同段落 🎉</p>';

@@ -984,7 +984,10 @@ def api_compare():
         # 此时归档文件已安全保存。
         # 注意: content is identical (verified by loopback copy or just assumed since we just saved it).
         
-        results = compare_documents(temp_a, temp_b, path_tender)
+        results = compare_documents(temp_a, temp_b, path_tender,
+                                     check_entity=request.form.get('check_entity') == '1',
+                                     check_text=request.form.get('check_text') == '1',
+                                     check_spelling=request.form.get('check_spelling') == '1')
         
         # 5. Clean up Temp Files Only (Archive remains)
         try:
