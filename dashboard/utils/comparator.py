@@ -242,42 +242,49 @@ class CollusionDetector:
             sentences_b = set(self.get_sentences(raw_text_b))
             
             common_sentences = sentences_a.intersection(sentences_b)
+            
+            # --- 统一排除招标文件内容 ---
+            filtered_sentences = set()
+            for sent in common_sentences:
+                is_tender = False
+                if self.tender_sentences: # 如果上传了招标文件
+                    if sent in self.tender_sentences or sent in self.tender_full_text:
+                        is_tender = True
+                    else:
+                        skel = self.get_skeleton(sent)
+                        if len(skel) > 1 and skel in self.tender_skeletons:
+                            is_tender = True
+                if not is_tender:
+                    filtered_sentences.add(sent)
 
         if check_text:
             processed_contents = set()
 
-            for sent in common_sentences:
+            for sent in filtered_sentences:
                 if sent in processed_contents: continue
                 
-                # Exclusion logic
-                if sent not in self.tender_sentences and sent not in self.tender_full_text:
-                     # Check Skeleton (Chinese only) to ignore numeric/symbol differences (User Request)
-                     skel = self.get_skeleton(sent)
-                     if len(skel) > 1 and skel in self.tender_skeletons:
-                         continue # Safe exclusion: textual content is identical to tender, only symbols/numbers differ
+                if len(sent) > 8: 
+                    page_a = self.find_page_for_text(sent, pages_a)
+                    page_b = self.find_page_for_text(sent, pages_b)
 
-                     if len(sent) > 8: 
-                        page_a = self.find_page_for_text(sent, pages_a)
-                        page_b = self.find_page_for_text(sent, pages_b)
+                    badges = ["完全匹配"]
+                    desc = "发现非招标文件雷同语句"
 
-                        badges = ["完全匹配"]
-                        desc = "发现非招标文件雷同语句"
+                    collisions.append({
+                        "type": "text",
+                        "text_a": sent, 
+                        "text_b": sent,
+                        "page_a": page_a,
+                        "page_b": page_b,
+                        "badges": badges,
+                        "desc": desc
+                    })
+                    processed_contents.add(sent)
 
-                        collisions.append({
-                            "type": "text",
-                            "text_a": sent, 
-                            "text_b": sent,
-                            "page_a": page_a,
-                            "page_b": page_b,
-                            "badges": badges,
-                            "desc": desc
-                        })
-                        processed_contents.add(sent)
-
-        # --- 策略 3: 共同拼写/语法错误检测（独立于招标文件） ---
-        if check_spelling and common_sentences:
+        # --- 策略 3: 共同拼写/语法错误检测（独立于招标文件，但排除招标文件原文） ---
+        if check_spelling and filtered_sentences:
             checked = set()
-            for sent in common_sentences:
+            for sent in filtered_sentences:
                 if sent in checked or len(sent) < 6:
                     continue
                 checked.add(sent)
