@@ -426,6 +426,17 @@ def api_visitor_log_options():
 
 # --- 路由配置 ---
 
+# --- 牛教授网站展示路由 ---
+@app.route('/niu')
+def niu_redirect():
+    return redirect('/niu/')
+
+@app.route('/niu/')
+@app.route('/niu/<path:filename>')
+def serve_niu_website(filename="index.html"):
+    niu_dir = os.path.join(BASE_DIR, '..', 'niu')
+    return send_from_directory(niu_dir, filename)
+
 @app.route('/')
 def index():
     user_agent = request.user_agent.string.lower()
