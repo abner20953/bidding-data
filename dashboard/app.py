@@ -1,4 +1,4 @@
-﻿from flask import Flask, jsonify, render_template, request, redirect, url_for, send_from_directory, session
+from flask import Flask, jsonify, render_template, request, redirect, url_for, send_from_directory, session
 from flask_apscheduler import APScheduler
 import pandas as pd
 import threading
@@ -430,6 +430,11 @@ def api_visitor_log_options():
 @app.route('/niu')
 def niu_redirect():
     return redirect('/niu/')
+
+@app.route('/niu_professor')
+def serve_niu_professor():
+    niu_dir = os.path.join(BASE_DIR, '..', 'niu')
+    return send_from_directory(niu_dir, "niu_professor.html")
 
 @app.route('/niu/')
 @app.route('/niu/<path:filename>')
