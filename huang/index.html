@@ -799,6 +799,163 @@
             .cert-grid { grid-template-columns: 1fr; }
             .eval-stat-grid { grid-template-columns: 1fr; }
         }
+
+        /* ========================================
+           BOOKING MODAL
+           ======================================== */
+        .btn-book {
+            background: linear-gradient(135deg, var(--color-gold-light), var(--color-gold));
+            color: var(--color-primary);
+            border: none;
+            padding: var(--space-2) var(--space-5);
+            border-radius: 100px;
+            font-size: var(--font-size-sm);
+            font-weight: var(--font-weight-bold);
+            cursor: pointer;
+            transition: all var(--transition-fast);
+            box-shadow: var(--shadow-sm);
+        }
+        .btn-book:hover {
+            transform: translateY(-2px);
+            box-shadow: var(--shadow-gold);
+        }
+        .nav-btn.btn-book {
+            margin-left: var(--space-4);
+        }
+
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(15, 23, 42, 0.85);
+            backdrop-filter: blur(8px);
+            z-index: 2000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            opacity: 0;
+            pointer-events: none;
+            transition: all var(--transition-base);
+        }
+        .modal-overlay.active {
+            opacity: 1;
+            pointer-events: auto;
+        }
+
+        .modal-content {
+            background: var(--color-bg);
+            width: 90%;
+            max-width: 500px;
+            border-radius: var(--radius-xl);
+            padding: var(--space-8);
+            position: relative;
+            transform: translateY(20px) scale(0.95);
+            transition: transform 0.4s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.4s;
+            box-shadow: var(--shadow-xl);
+            max-height: 85vh;
+            display: flex;
+            flex-direction: column;
+        }
+        .modal-overlay.active .modal-content {
+            transform: translateY(0) scale(1);
+        }
+
+        .modal-close {
+            position: absolute;
+            top: var(--space-4);
+            right: var(--space-4);
+            background: rgba(0,0,0,0.05);
+            border: none;
+            width: 36px;
+            height: 36px;
+            border-radius: var(--radius-full);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+            color: var(--color-text-muted);
+            transition: all var(--transition-fast);
+            line-height: 1;
+        }
+        .modal-close:hover {
+            background: rgba(0,0,0,0.1);
+            color: var(--color-text);
+        }
+
+        .modal-header {
+            text-align: center;
+            margin-bottom: var(--space-6);
+        }
+        .modal-title {
+            font-family: var(--font-serif);
+            font-size: var(--font-size-2xl);
+            color: var(--color-primary);
+            font-weight: var(--font-weight-bold);
+            margin-bottom: var(--space-2);
+        }
+        .modal-desc {
+            font-size: var(--font-size-sm);
+            color: var(--color-text-muted);
+            line-height: 1.6;
+        }
+
+        .calendar-list {
+            display: flex;
+            flex-direction: column;
+            gap: var(--space-3);
+            overflow-y: auto;
+            padding-right: var(--space-2);
+        }
+        .calendar-list::-webkit-scrollbar { width: 4px; }
+        .calendar-list::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 4px; }
+
+        .calendar-day {
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius-lg);
+            overflow: hidden;
+            display: flex;
+            background: var(--color-white);
+            box-shadow: var(--shadow-sm);
+        }
+        .day-header {
+            background: linear-gradient(135deg, var(--color-primary-light), var(--color-primary));
+            color: var(--color-white);
+            padding: var(--space-3);
+            text-align: center;
+            min-width: 80px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+        .day-header-date { font-weight: var(--font-weight-bold); font-size: var(--font-size-base); }
+        .day-header-week { font-size: var(--font-size-xs); opacity: 0.8; }
+        
+        .day-slots {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+        }
+        .slot {
+            padding: var(--space-3);
+            display: flex;
+            align-items: center;
+            font-size: var(--font-size-sm);
+            border-bottom: 1px solid var(--color-border);
+        }
+        .slot:last-child { border-bottom: none; }
+        
+        .slot-time { font-weight: var(--font-weight-semibold); color: var(--color-primary); width: 36px; }
+        .slot-content { flex: 1; color: var(--color-text-muted); margin: 0 var(--space-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; }
+        .slot-status {
+            background: rgba(202, 138, 4, 0.1);
+            color: var(--color-gold);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: var(--font-weight-bold);
+            flex-shrink: 0;
+            border: 1px solid rgba(202, 138, 4, 0.2);
+        }
     </style>
 </head>
 <body>
@@ -813,6 +970,7 @@
                 <li class="nav-item" data-target="evaluation">评标专家</li>
                 <li class="nav-item" data-target="experience">从业经历</li>
                 <li class="nav-item" data-target="teaching">教育身份</li>
+                <li><button class="nav-btn btn-book" onclick="openBookingModal()">预约合作</button></li>
             </ul>
         </div>
     </nav>
@@ -1056,6 +1214,20 @@
         </div>
     </footer>
 
+    <!-- BOOKING MODAL -->
+    <div class="modal-overlay" id="bookingModal" onclick="closeBookingModal()">
+        <div class="modal-content" onclick="event.stopPropagation()">
+            <button class="modal-close" onclick="closeBookingModal()">×</button>
+            <div class="modal-header">
+                <h3 class="modal-title">近期日程提示</h3>
+                <p class="modal-desc">黄老师近期行程已排满，暂无法接受新的预约。<br>以下为自动脱敏后的山西范围内部日程安排。</p>
+            </div>
+            <div class="calendar-list" id="calendarList">
+                <!-- Data injected via JS -->
+            </div>
+        </div>
+    </div>
+
     <!-- AOS JS -->
     <script src="https://unpkg.com/aos@2.3.1/dist/aos.js"></script>
     <script>
@@ -1092,6 +1264,79 @@
         }, { threshold: 0.3 });
 
         sections.forEach(section => observer.observe(section));
+
+        // Booking Modal Logic
+        function openBookingModal() {
+            document.getElementById('bookingModal').classList.add('active');
+            renderCalendar();
+            document.body.style.overflow = 'hidden';
+        }
+
+        function closeBookingModal() {
+            document.getElementById('bookingModal').classList.remove('active');
+            document.body.style.overflow = '';
+        }
+
+        function renderCalendar() {
+            const listObj = document.getElementById('calendarList');
+            if(listObj.innerHTML !== '') return;
+
+            const evalTasks = [
+                "太原市公安局视频解析联网评审", "山西省医疗保障局信息平台验收", "长治市发改委信息化规划评审",
+                "大同市政务云平台二期招投标", "晋中市校园安防项目验收", "运城市智慧城市技术方案论证", 
+                "临汾市财政局网络安全评估", "忻州市信创平台替代改造评审", "朔州市数字化医院建设项目评标",
+                "吕梁市大数据中心机房项目评审", "晋城市应急系统建设评标"
+            ];
+            
+            const teachTasks = [
+                "初二年级信息技术课程讲授", "全市中小学教师信息素养培训", "山西大学软件学院项目联调",
+                "校内中青年教师数字技能讲座", "中学生创客空间指导", "市信息技术教研组研讨活动"
+            ];
+            
+            const weeks = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+            
+            let html = '';
+            for(let i=1; i<=14; i++) {
+                let d = new Date();
+                d.setDate(d.getDate() + i);
+                let dateStr = (d.getMonth() + 1) + '/' + d.getDate();
+                let weekStr = weeks[d.getDay()];
+                
+                let t1, t2;
+                if(d.getDay() === 0 || d.getDay() === 6) {
+                    t1 = evalTasks[Math.floor(Math.random() * evalTasks.length)];
+                    t2 = "异地项目评审预留 / 整理材料";
+                } else {
+                    t1 = teachTasks[Math.floor(Math.random() * teachTasks.length)];
+                    t2 = evalTasks[Math.floor(Math.random() * evalTasks.length)];
+                }
+                
+                // Shuffle am/pm occasionally
+                if(Math.random() > 0.5) { let temp = t1; t1 = t2; t2 = temp; }
+                
+                html += `
+                    <div class="calendar-day">
+                        <div class="day-header">
+                            <span class="day-header-date">${dateStr}</span>
+                            <span class="day-header-week">${weekStr}</span>
+                        </div>
+                        <div class="day-slots">
+                            <div class="slot">
+                                <span class="slot-time">上午</span>
+                                <span class="slot-content">${t1}</span>
+                                <span class="slot-status">已满</span>
+                            </div>
+                            <div class="slot">
+                                <span class="slot-time">下午</span>
+                                <span class="slot-content">${t2}</span>
+                                <span class="slot-status">已满</span>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+            listObj.innerHTML = html;
+        }
     </script>
 
 </body>
