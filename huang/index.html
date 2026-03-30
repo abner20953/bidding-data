@@ -900,73 +900,92 @@
         }
 
         .calendar-list {
-            display: flex;
-            flex-direction: column;
-            gap: var(--space-4);
-            overflow-y: auto;
-            padding-right: var(--space-2);
+            margin-top: var(--space-4);
         }
-        .calendar-list::-webkit-scrollbar { width: 4px; }
-        .calendar-list::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 4px; }
-
-        .calendar-day {
+        .calendar-grid {
+            display: grid;
+            grid-template-columns: repeat(7, 1fr);
+            gap: 1px;
+            background: var(--color-border);
             border: 1px solid var(--color-border);
-            border-radius: var(--radius-lg);
+            border-radius: var(--radius-md);
             overflow: hidden;
-            display: flex;
-            background: var(--color-white);
-            box-shadow: var(--shadow-sm);
         }
-        .day-header {
+        .cal-header {
             background: linear-gradient(135deg, var(--color-primary-light), var(--color-primary));
             color: var(--color-white);
-            padding: var(--space-4) var(--space-5);
             text-align: center;
-            min-width: 90px;
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-        }
-        .day-header-date { font-weight: var(--font-weight-bold); font-size: var(--font-size-base); }
-        .day-header-week { font-size: var(--font-size-sm); opacity: 0.9; margin-top: 2px; }
-        
-        .day-slots {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-        }
-        .slot {
-            padding: var(--space-4) var(--space-5);
-            display: flex;
-            align-items: flex-start;
+            padding: var(--space-2) 0;
             font-size: var(--font-size-sm);
-            border-bottom: 1px solid var(--color-border);
-        }
-        .slot:last-child { border-bottom: none; }
-        
-        .slot-time { 
-            font-weight: var(--font-weight-semibold); 
-            color: var(--color-primary); 
-            min-width: 44px; 
-            margin-top: 2px;
-        }
-        .slot-content { 
-            flex: 1; 
-            color: var(--color-text); 
-            margin: 0 var(--space-4); 
-            line-height: 1.6;
-            font-size: 14px; 
-        }
-        .slot-status {
-            background: rgba(202, 138, 4, 0.1);
-            color: var(--color-gold);
-            padding: 4px 10px;
-            border-radius: 6px;
-            font-size: 12px;
             font-weight: var(--font-weight-bold);
-            flex-shrink: 0;
-            border: 1px solid rgba(202, 138, 4, 0.2);
-            margin-top: 2px;
+        }
+        .cal-cell {
+            background: var(--color-white);
+            min-height: 100px;
+            padding: 6px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            transition: background var(--transition-fast);
+        }
+        .cal-cell:hover {
+            background: var(--color-bg-alt);
+        }
+        .cal-cell.empty { background: #fbfbfc; }
+        .cal-date {
+            font-size: var(--font-size-sm);
+            font-weight: var(--font-weight-bold);
+            color: var(--color-text-muted);
+            margin-bottom: 2px;
+        }
+        .cal-cell.active-day .cal-date {
+            color: var(--color-primary);
+        }
+        .cal-cell.today .cal-date {
+            background: var(--color-accent);
+            color: var(--color-white);
+            width: 20px;
+            height: 20px;
+            border-radius: var(--radius-full);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-left: -2px;
+            margin-top: -2px;
+        }
+        .cal-task {
+            background: rgba(202, 138, 4, 0.1);
+            border-left: 3px solid var(--color-gold);
+            padding: 4px;
+            font-size: 11px;
+            color: var(--color-text);
+            border-radius: 2px;
+            line-height: 1.3;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+            word-break: break-all;
+        }
+        .cal-task.teach {
+            background: rgba(3, 105, 161, 0.1);
+            border-left-color: var(--color-accent);
+        }
+        .cal-status {
+            font-size: 10px;
+            color: #EF4444;
+            font-weight: bold;
+            margin-top: auto;
+            text-align: right;
+            padding-top: 2px;
+        }
+        .cal-month-title {
+            text-align: center;
+            font-size: var(--font-size-lg);
+            font-weight: var(--font-weight-bold);
+            color: var(--color-primary);
+            margin-bottom: var(--space-4);
+            font-family: var(--font-serif);
         }
     </style>
 </head>
@@ -1294,59 +1313,93 @@
             if(listObj.children.length > 0) return;
 
             const evalTasks = [
-                "太原市发改委政务云平台项目评标", "山西省公安厅异地数据灾备建设项目招标评审", "长治市卫健委医疗保障信息平台验收评估",
-                "大同市智慧城市二期大脑基础平台综合论证", "晋中市校园天网安防监控体系项目验收", "运城市智慧政务基础算力平台技术方案论证", 
-                "临汾市财政局核心网络安全等保评测与评估", "忻州市信创云平台替代核心改造论证会", "朔州市数字化医院HIS系统建设项目评标",
-                "吕梁市大数据中心机房与云联基础环境项目评审", "晋城市应急抢险智慧指挥系统建设工程评标", "太原理工大学科研算力集群采购项目论证"
+                "太原政务云评标", "公安数据灾备评审", "长治卫健委平台验收",
+                "大同智慧城市论证", "晋中校园天网验收", "运城算力平台论证", 
+                "临汾财政局等保评估", "忻州信创云替代", "朔州数字化医院评标",
+                "吕梁机房环境评审", "晋城应急指挥评标", "原理工科研集群采购"
             ];
             
             const teachTasks = [
-                "太原市第四十八中学初二年级信息技术课程讲授", "全省中小学骨干教师信息素养提升高级培训", "山西大学软件学院数字安全与密码学客座讲授",
-                "校内中青年骨干教师数字技能深化讲座", "中学生创客空间与少儿编程全国挑战赛指导", "太原市信息技术名师工作室公开教研课"
+                "信息技术课程讲授", "骨干教师信息素养培训", "密码学项目客座讲授",
+                "数字技能深化讲座", "创客挑战赛指导", "教研名师公开研讨课"
             ];
             
-            const weeks = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
-            
-            let html = '';
+            const today = new Date();
+            const year = today.getFullYear();
+            const month = today.getMonth();
+            const firstDay = new Date(year, month, 1).getDay(); // 0-6 (Sun-Sat)
+            const daysInMonth = new Date(year, month + 1, 0).getDate();
+
+            // Highlight target days from tomorrow for 14 days
+            let targetSlots = []; 
             for(let i=1; i<=14; i++) {
                 let d = new Date();
                 d.setDate(d.getDate() + i);
-                let dateStr = (d.getMonth() + 1) + '/' + d.getDate();
-                let weekStr = weeks[d.getDay()];
-                
-                let t1, t2;
-                if(d.getDay() === 0 || d.getDay() === 6) {
-                    t1 = evalTasks[Math.floor(Math.random() * evalTasks.length)];
-                    t2 = "异地项目评审预留 / 整理材料";
-                } else {
-                    t1 = teachTasks[Math.floor(Math.random() * teachTasks.length)];
-                    t2 = evalTasks[Math.floor(Math.random() * evalTasks.length)];
+                if(d.getMonth() === month) {
+                    targetSlots.push(d.getDate());
                 }
-                
-                // Shuffle am/pm occasionally
-                if(Math.random() > 0.5) { let temp = t1; t1 = t2; t2 = temp; }
-                
-                html += `
-                    <div class="calendar-day">
-                        <div class="day-header">
-                            <span class="day-header-date">${dateStr}</span>
-                            <span class="day-header-week">${weekStr}</span>
-                        </div>
-                        <div class="day-slots">
-                            <div class="slot">
-                                <span class="slot-time">上午</span>
-                                <span class="slot-content">${t1}</span>
-                                <span class="slot-status">已满</span>
-                            </div>
-                            <div class="slot">
-                                <span class="slot-time">下午</span>
-                                <span class="slot-content">${t2}</span>
-                                <span class="slot-status">已满</span>
-                            </div>
-                        </div>
-                    </div>
-                `;
             }
+
+            let html = `
+                <div class="cal-month-title">${year}年 ${month + 1}月 行程日历</div>
+                <div class="calendar-grid">
+            `;
+            
+            const weeks = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+            weeks.forEach(w => {
+                html += `<div class="cal-header">${w}</div>`;
+            });
+
+            let dayCount = 1;
+            // 5 or 6 rows = 35 or 42 cells. 35 is usually enough unless month starts on sat and has 31 days
+            let totalCells = (firstDay + daysInMonth > 35) ? 42 : 35;
+            
+            for(let i=0; i<totalCells; i++) {
+                if(i < firstDay || dayCount > daysInMonth) {
+                    html += `<div class="cal-cell empty"></div>`;
+                } else {
+                    let dateNum = dayCount;
+                    let content = '';
+                    let isTarget = targetSlots.includes(dateNum);
+                    let isToday = (dateNum === today.getDate());
+                    
+                    if(isTarget) {
+                        let isWeekend = (i%7 === 0 || i%7 === 6);
+                        let t1, t2;
+                        if(isWeekend) {
+                            t1 = evalTasks[Math.floor(Math.random() * evalTasks.length)];
+                            t2 = "文案材料整理";
+                        } else {
+                            if(Math.random() > 0.5) {
+                                t1 = teachTasks[Math.floor(Math.random() * teachTasks.length)];
+                                t2 = evalTasks[Math.floor(Math.random() * evalTasks.length)];
+                            } else {
+                                t1 = evalTasks[Math.floor(Math.random() * evalTasks.length)];
+                                t2 = teachTasks[Math.floor(Math.random() * teachTasks.length)];
+                            }
+                        }
+                        
+                        let t1c = t1.includes("课") || t1.includes("讲") || t1.includes("培") || t1.includes("导") ? 'teach' : '';
+                        let t2c = t2.includes("课") || t2.includes("讲") || t2.includes("培") || t2.includes("导") ? 'teach' : '';
+                        
+                        content = `
+                            <div class="cal-task ${t1c}">${t1}</div>
+                            <div class="cal-task ${t2c}">${t2}</div>
+                            <div class="cal-status">【全满】</div>
+                        `;
+                    }
+                    
+                    let cellClass = `cal-cell ${isTarget ? 'active-day' : ''} ${isToday ? 'today' : ''}`;
+                    html += `
+                        <div class="${cellClass}">
+                            <div class="cal-date">${dateNum}</div>
+                            ${content}
+                        </div>
+                    `;
+                    dayCount++;
+                }
+            }
+            html += '</div>';
             listObj.innerHTML = html;
         }
     </script>
