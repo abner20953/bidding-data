@@ -1313,20 +1313,28 @@
             if(listObj.children.length > 0) return;
 
             const evalTasks = [
-                "太原政务云评标", "公安数据灾备评审", "长治卫健委平台验收",
-                "大同智慧城市论证", "晋中校园天网验收", "运城算力平台论证", 
-                "临汾财政局等保评估", "忻州信创云替代", "朔州数字化医院评标",
-                "吕梁机房环境评审", "晋城应急指挥评标", "原理工科研集群采购"
+                "太原政务云平台评标", "省公安厅数据灾备评审", "长治卫健委系统验收",
+                "大同智慧城市综合论证", "晋中校园天网项目验收", "运城算力中心方案论证", 
+                "临汾财政局等保安全评估", "忻州政务信创云替代评审", "朔州智慧医院HIS评标",
+                "吕梁大数据中心机房评审", "晋城应急指挥系统评估", "高校科研算力集群采购论证"
             ];
             
             const teachTasks = [
-                "信息技术课程讲授", "骨干教师信息素养培训", "密码学项目客座讲授",
-                "数字技能深化讲座", "创客挑战赛指导", "教研名师公开研讨课"
+                "48中初二信息技术常态课", "初中信息科技学科公开课", "初中生创客与编程指导",
+                "初中教研名师示范课讲授"
             ];
             
             const weeks = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
             let headersHtml = '';
             let cellsHtml = '';
+            
+            let teachSlots = new Set();
+            // Pick 2 random slots out of 10 weekday slots for teaching (0 to 9)
+            while(teachSlots.size < 2) {
+                teachSlots.add(Math.floor(Math.random() * 10));
+            }
+
+            let weekdaySlotIdx = 0;
 
             for(let i=0; i<7; i++) {
                 let d = new Date();
@@ -1346,20 +1354,20 @@
                 let isWeekend = (dayOfWeek === 0 || dayOfWeek === 6);
                 
                 if(isWeekend) {
-                    t1 = evalTasks[Math.floor(Math.random() * evalTasks.length)];
-                    t2 = "文案材料整理";
+                    let et1 = evalTasks[Math.floor(Math.random() * evalTasks.length)];
+                    let et2 = evalTasks[Math.floor(Math.random() * evalTasks.length)];
+                    t1 = (Math.random() > 0.5) ? et1 : "标书评审预处理";
+                    t2 = (t1 === et1) ? "项目总结会议" : et2;
                 } else {
-                    if(Math.random() > 0.5) {
-                        t1 = teachTasks[Math.floor(Math.random() * teachTasks.length)];
-                        t2 = evalTasks[Math.floor(Math.random() * evalTasks.length)];
-                    } else {
-                        t1 = evalTasks[Math.floor(Math.random() * evalTasks.length)];
-                        t2 = teachTasks[Math.floor(Math.random() * teachTasks.length)];
-                    }
+                    let hasTeach1 = teachSlots.has(weekdaySlotIdx++);
+                    let hasTeach2 = teachSlots.has(weekdaySlotIdx++);
+                    
+                    t1 = hasTeach1 ? teachTasks[Math.floor(Math.random() * teachTasks.length)] : evalTasks[Math.floor(Math.random() * evalTasks.length)];
+                    t2 = hasTeach2 ? teachTasks[Math.floor(Math.random() * teachTasks.length)] : evalTasks[Math.floor(Math.random() * evalTasks.length)];
                 }
                 
-                let t1c = t1.includes("课") || t1.includes("讲") || t1.includes("培") || t1.includes("导") ? 'teach' : '';
-                let t2c = t2.includes("课") || t2.includes("讲") || t2.includes("培") || t2.includes("导") ? 'teach' : '';
+                let t1c = t1.includes("课") || t1.includes("指导") ? 'teach' : '';
+                let t2c = t2.includes("课") || t2.includes("指导") ? 'teach' : '';
                 
                 let cellClass = `cal-cell active-day ${i === 0 ? 'today' : ''}`;
                 
