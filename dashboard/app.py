@@ -442,6 +442,17 @@ def serve_niu_website(filename="index.html"):
     niu_dir = os.path.join(BASE_DIR, '..', 'niu')
     return send_from_directory(niu_dir, filename)
 
+# --- 黄老师网站展示路由 ---
+@app.route('/huang')
+def huang_redirect():
+    return redirect('/huang/')
+
+@app.route('/huang/')
+@app.route('/huang/<path:filename>')
+def serve_huang_website(filename="index.html"):
+    huang_dir = os.path.join(BASE_DIR, '..', 'huang')
+    return send_from_directory(huang_dir, filename)
+
 @app.route('/')
 def index():
     user_agent = request.user_agent.string.lower()
