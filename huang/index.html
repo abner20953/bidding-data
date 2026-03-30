@@ -1324,82 +1324,63 @@
                 "数字技能深化讲座", "创客挑战赛指导", "教研名师公开研讨课"
             ];
             
-            const today = new Date();
-            const year = today.getFullYear();
-            const month = today.getMonth();
-            const firstDay = new Date(year, month, 1).getDay(); // 0-6 (Sun-Sat)
-            const daysInMonth = new Date(year, month + 1, 0).getDate();
+            const weeks = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+            let headersHtml = '';
+            let cellsHtml = '';
 
-            // Highlight target days from tomorrow for 14 days
-            let targetSlots = []; 
-            for(let i=1; i<=14; i++) {
+            for(let i=0; i<7; i++) {
                 let d = new Date();
                 d.setDate(d.getDate() + i);
-                if(d.getMonth() === month) {
-                    targetSlots.push(d.getDate());
+                
+                let dayOfWeek = d.getDay();
+                let month = d.getMonth() + 1;
+                let date = d.getDate();
+                
+                let wStr = weeks[dayOfWeek];
+                if(i === 0) wStr = '今天';
+                if(i === 1) wStr = '明天';
+
+                headersHtml += `<div class="cal-header">${wStr}</div>`;
+                
+                let t1, t2;
+                let isWeekend = (dayOfWeek === 0 || dayOfWeek === 6);
+                
+                if(isWeekend) {
+                    t1 = evalTasks[Math.floor(Math.random() * evalTasks.length)];
+                    t2 = "文案材料整理";
+                } else {
+                    if(Math.random() > 0.5) {
+                        t1 = teachTasks[Math.floor(Math.random() * teachTasks.length)];
+                        t2 = evalTasks[Math.floor(Math.random() * evalTasks.length)];
+                    } else {
+                        t1 = evalTasks[Math.floor(Math.random() * evalTasks.length)];
+                        t2 = teachTasks[Math.floor(Math.random() * teachTasks.length)];
+                    }
                 }
+                
+                let t1c = t1.includes("课") || t1.includes("讲") || t1.includes("培") || t1.includes("导") ? 'teach' : '';
+                let t2c = t2.includes("课") || t2.includes("讲") || t2.includes("培") || t2.includes("导") ? 'teach' : '';
+                
+                let cellClass = `cal-cell active-day ${i === 0 ? 'today' : ''}`;
+                
+                cellsHtml += `
+                    <div class="${cellClass}">
+                        <div class="cal-date">${month}/${date}</div>
+                        <div class="cal-task ${t1c}">${t1}</div>
+                        <div class="cal-task ${t2c}">${t2}</div>
+                        <div class="cal-status">【约满】</div>
+                    </div>
+                `;
             }
 
             let html = `
-                <div class="cal-month-title">${year}年 ${month + 1}月 行程日历</div>
+                <div class="cal-month-title">近期一周行程排布</div>
                 <div class="calendar-grid">
+                    ${headersHtml}
+                    ${cellsHtml}
+                </div>
             `;
             
-            const weeks = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
-            weeks.forEach(w => {
-                html += `<div class="cal-header">${w}</div>`;
-            });
-
-            let dayCount = 1;
-            // 5 or 6 rows = 35 or 42 cells. 35 is usually enough unless month starts on sat and has 31 days
-            let totalCells = (firstDay + daysInMonth > 35) ? 42 : 35;
-            
-            for(let i=0; i<totalCells; i++) {
-                if(i < firstDay || dayCount > daysInMonth) {
-                    html += `<div class="cal-cell empty"></div>`;
-                } else {
-                    let dateNum = dayCount;
-                    let content = '';
-                    let isTarget = targetSlots.includes(dateNum);
-                    let isToday = (dateNum === today.getDate());
-                    
-                    if(isTarget) {
-                        let isWeekend = (i%7 === 0 || i%7 === 6);
-                        let t1, t2;
-                        if(isWeekend) {
-                            t1 = evalTasks[Math.floor(Math.random() * evalTasks.length)];
-                            t2 = "文案材料整理";
-                        } else {
-                            if(Math.random() > 0.5) {
-                                t1 = teachTasks[Math.floor(Math.random() * teachTasks.length)];
-                                t2 = evalTasks[Math.floor(Math.random() * evalTasks.length)];
-                            } else {
-                                t1 = evalTasks[Math.floor(Math.random() * evalTasks.length)];
-                                t2 = teachTasks[Math.floor(Math.random() * teachTasks.length)];
-                            }
-                        }
-                        
-                        let t1c = t1.includes("课") || t1.includes("讲") || t1.includes("培") || t1.includes("导") ? 'teach' : '';
-                        let t2c = t2.includes("课") || t2.includes("讲") || t2.includes("培") || t2.includes("导") ? 'teach' : '';
-                        
-                        content = `
-                            <div class="cal-task ${t1c}">${t1}</div>
-                            <div class="cal-task ${t2c}">${t2}</div>
-                            <div class="cal-status">【全满】</div>
-                        `;
-                    }
-                    
-                    let cellClass = `cal-cell ${isTarget ? 'active-day' : ''} ${isToday ? 'today' : ''}`;
-                    html += `
-                        <div class="${cellClass}">
-                            <div class="cal-date">${dateNum}</div>
-                            ${content}
-                        </div>
-                    `;
-                    dayCount++;
-                }
-            }
-            html += '</div>';
             listObj.innerHTML = html;
         }
     </script>
