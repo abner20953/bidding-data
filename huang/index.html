@@ -1279,7 +1279,7 @@
 
         function renderCalendar() {
             const listObj = document.getElementById('calendarList');
-            if(listObj.innerHTML !== '') return;
+            if(listObj.children.length > 0) return;
 
             const evalTasks = [
                 "太原市发改委政务云平台项目评标", "山西省公安厅异地数据灾备建设项目招标评审", "长治市卫健委医疗保障信息平台验收评估",
