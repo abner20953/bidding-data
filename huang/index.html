@@ -843,8 +843,8 @@
 
         .modal-content {
             background: var(--color-bg);
-            width: 90%;
-            max-width: 500px;
+            width: 95%;
+            max-width: 650px;
             border-radius: var(--radius-xl);
             padding: var(--space-8);
             position: relative;
@@ -902,7 +902,7 @@
         .calendar-list {
             display: flex;
             flex-direction: column;
-            gap: var(--space-3);
+            gap: var(--space-4);
             overflow-y: auto;
             padding-right: var(--space-2);
         }
@@ -920,15 +920,15 @@
         .day-header {
             background: linear-gradient(135deg, var(--color-primary-light), var(--color-primary));
             color: var(--color-white);
-            padding: var(--space-3);
+            padding: var(--space-4) var(--space-5);
             text-align: center;
-            min-width: 80px;
+            min-width: 90px;
             display: flex;
             flex-direction: column;
             justify-content: center;
         }
         .day-header-date { font-weight: var(--font-weight-bold); font-size: var(--font-size-base); }
-        .day-header-week { font-size: var(--font-size-xs); opacity: 0.8; }
+        .day-header-week { font-size: var(--font-size-sm); opacity: 0.9; margin-top: 2px; }
         
         .day-slots {
             flex: 1;
@@ -936,25 +936,37 @@
             flex-direction: column;
         }
         .slot {
-            padding: var(--space-3);
+            padding: var(--space-4) var(--space-5);
             display: flex;
-            align-items: center;
+            align-items: flex-start;
             font-size: var(--font-size-sm);
             border-bottom: 1px solid var(--color-border);
         }
         .slot:last-child { border-bottom: none; }
         
-        .slot-time { font-weight: var(--font-weight-semibold); color: var(--color-primary); width: 36px; }
-        .slot-content { flex: 1; color: var(--color-text-muted); margin: 0 var(--space-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; }
+        .slot-time { 
+            font-weight: var(--font-weight-semibold); 
+            color: var(--color-primary); 
+            min-width: 44px; 
+            margin-top: 2px;
+        }
+        .slot-content { 
+            flex: 1; 
+            color: var(--color-text); 
+            margin: 0 var(--space-4); 
+            line-height: 1.6;
+            font-size: 14px; 
+        }
         .slot-status {
             background: rgba(202, 138, 4, 0.1);
             color: var(--color-gold);
-            padding: 2px 6px;
-            border-radius: 4px;
+            padding: 4px 10px;
+            border-radius: 6px;
             font-size: 12px;
             font-weight: var(--font-weight-bold);
             flex-shrink: 0;
             border: 1px solid rgba(202, 138, 4, 0.2);
+            margin-top: 2px;
         }
     </style>
 </head>
