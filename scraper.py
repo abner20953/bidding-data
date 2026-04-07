@@ -195,71 +195,68 @@ def extract_region(location, title, purchaser, agency):
     """
     cities = ['太原', '大同', '朔州', '忻州', '阳泉', '吕梁', '晋中', '长治', '晋城', '临汾', '运城']
     
-    # 构建搜索池
-    search_pool = ""
-    if location and location != "未找到" and location != "待采集":
-        search_pool = location
-    else:
-        search_pool = f"{title} {purchaser} {agency}"
-    
     city_found = "未知市"
-    # 策略 A：优先从标题和采购人（核心信息）识别地级市
+    valid_location = location if location and location not in ["未找到", "待采集"] else ""
     core_info = f"{title} {purchaser}"
-    for city in cities:
-        if city in core_info:
-            city_found = f"{city}市"
-            break
+    full_text = f"{valid_location} {title} {purchaser} {agency}"
     
-    # 策略 B：若核心信息无结果，再从全文（包含开标地点和代理机构）识别
+    # 策略 A：优先从开标/评标地点提取地级市（最准确）
+    if valid_location:
+        for city in cities:
+            if city in valid_location:
+                city_found = f"{city}市"
+                break
+                
+    # 策略 B：若地点无结果，再从核心信息（标题、采购人）识别
     if city_found == "未知市":
         for city in cities:
-            if city in search_pool:
+            if city in core_info:
+                city_found = f"{city}市"
+                break
+                
+    # 策略 C：若前两者均无结果，从全文搜索
+    if city_found == "未知市":
+        for city in cities:
+            if city in full_text:
                 city_found = f"{city}市"
                 break
             
-    # 尝试匹配县/区/县级市
-    # 采用更严谨的正则，并先寻找县/区
-    potential_districts = re.findall(r"([\u4e00-\u9fa5]{2,6}(?:县|区))", search_pool)
-    # 如果没找到县区，再找县级市（需排除地级市）
-    if not potential_districts:
-        potential_districts = re.findall(r"([\u4e00-\u9fa5]{2,6}市)", search_pool)
-        
+    # 提取县/区：同样分为三个优先级进行匹配：1. 地点 2. 核心信息 3. 代理机构
     district_found = ""
-    # 噪声黑名单
     blacklist = ['山西省', '中国', '中共', '共产党', '委员会', '办公室', '采购', '项目', '招标', '代理']
     
-    # 合并搜索池，核心信息中的匹配项排在前面
-    all_districts = [d for d in potential_districts if d in core_info] + \
-                    [d for d in potential_districts if d not in core_info]
-
-    for d in all_districts:
-        temp_d = d
-        # 1. 检查是否为地级市
-        is_major_city = False
-        for city in cities:
-            if temp_d == f"{city}市" or temp_d == city:
-                is_major_city = True
-                break
-        if is_major_city: continue
-
-        # 2. 移除地理层级前缀干扰
-        # 先移除典型的“xx省”、“xx市”前缀
-        temp_d = re.sub(r"^(?:山西省|山西|省)", "", temp_d)
-        for city in cities:
-            temp_d = temp_d.replace(city, "").replace("市", "")
-        
-        # 3. 最终清洗：仅保留 县/区 字样前的核心字
-        clean_match = re.search(r"([\u4e00-\u9fa5]{2,4})(县|区|市)?$", temp_d)
-        if clean_match:
-            base_name = clean_match.group(1)
-            suffix = clean_match.group(2) or ""
-            # 如果后缀是“市”，按用户要求不填（即县级市只留名）
-            if suffix == "市": suffix = ""
+    def find_district(text):
+        if not text: return ""
+        potential_districts = re.findall(r"([\u4e00-\u9fa5]{2,6}(?:县|区))", text)
+        if not potential_districts:
+            potential_districts = re.findall(r"([\u4e00-\u9fa5]{2,6}市)", text)
             
-            # 过滤黑名单
-            if not any(b in base_name for b in blacklist) and len(base_name) >= 2:
-                district_found = base_name + suffix
-                break
+        for d in potential_districts:
+            temp_d = d
+            is_major_city = any((temp_d == f"{c}市" or temp_d == c) for c in cities)
+            if is_major_city: continue
+            
+            temp_d = re.sub(r"^(?:山西省|山西|省)", "", temp_d)
+            for city in cities:
+                temp_d = temp_d.replace(city, "").replace("市", "")
+                
+            clean_match = re.search(r"([\u4e00-\u9fa5]{2,4})(县|区|市)?$", temp_d)
+            if clean_match:
+                base_name = clean_match.group(1)
+                suffix = clean_match.group(2) or ""
+                if suffix == "市": suffix = ""
+                
+                if not any(b in base_name for b in blacklist) and len(base_name) >= 2:
+                    return base_name + suffix
+        return ""
+
+    # 按优先级尝试提取县区
+    if valid_location:
+        district_found = find_district(valid_location)
+    if not district_found:
+        district_found = find_district(core_info)
+    if not district_found:
+        district_found = find_district(agency)
 
     return city_found, district_found
 
