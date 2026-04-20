@@ -256,6 +256,7 @@ def edit_entry(entry_id=None):
 @knowledge_bp.route('/api/list')
 def api_list():
     query = request.args.get('q', '').strip()
+    exact_match = request.args.get('exact') == 'true'
     type_filter = request.args.get('type', '')
     tag_filter = request.args.get('tag', '')
     page = int(request.args.get('page', 1))
@@ -282,26 +283,31 @@ def api_list():
     
     search_terms = []
     if query:
-        # Use jieba.cut (Exact Mode) for better precision
-        # This prevents splitting "非营利" into "非", "营利", avoiding false positives for "营利"
-        seg_list = list(jieba.cut(query))
-        if seg_list:
-            sub_clauses = []
-            for term in seg_list:
-                term = term.strip()
-                if term and term not in STOPWORDS:
-                    search_terms.append(term)
-                    sub_clauses.append(f"(title LIKE ? OR content LIKE ? OR doc_number LIKE ?)")
-                    params.extend([f'%{term}%', f'%{term}%', f'%{term}%'])
-            
-            # If all terms were filtered (e.g. query was just "的"), fallback to original query to avoid empty WHERE
-            if not sub_clauses and query.strip():
-                 search_terms.append(query)
-                 sub_clauses.append(f"(title LIKE ? OR content LIKE ? OR doc_number LIKE ?)")
-                 params.extend([f'%{query}%', f'%{query}%', f'%{query}%'])
-
-            if sub_clauses:
-                sql += " AND (" + " AND ".join(sub_clauses) + ")"
+        if exact_match:
+            search_terms.append(query)
+            sql += " AND (title LIKE ? OR content LIKE ? OR doc_number LIKE ?)"
+            params.extend([f'%{query}%', f'%{query}%', f'%{query}%'])
+        else:
+            # Use jieba.cut (Exact Mode) for better precision
+            # This prevents splitting "非营利" into "非", "营利", avoiding false positives for "营利"
+            seg_list = list(jieba.cut(query))
+            if seg_list:
+                sub_clauses = []
+                for term in seg_list:
+                    term = term.strip()
+                    if term and term not in STOPWORDS:
+                        search_terms.append(term)
+                        sub_clauses.append(f"(title LIKE ? OR content LIKE ? OR doc_number LIKE ?)")
+                        params.extend([f'%{term}%', f'%{term}%', f'%{term}%'])
+                
+                # If all terms were filtered (e.g. query was just "的"), fallback to original query to avoid empty WHERE
+                if not sub_clauses and query.strip():
+                     search_terms.append(query)
+                     sub_clauses.append(f"(title LIKE ? OR content LIKE ? OR doc_number LIKE ?)")
+                     params.extend([f'%{query}%', f'%{query}%', f'%{query}%'])
+    
+                if sub_clauses:
+                    sql += " AND (" + " AND ".join(sub_clauses) + ")"
                 
     count_sql = "SELECT COUNT(*) FROM (" + sql + ")"
     total = conn.execute(count_sql, params).fetchone()[0]

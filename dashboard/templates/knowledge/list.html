@@ -177,6 +177,12 @@
                         <input type="text" id="searchInput" class="form-control border-start-0"
                             placeholder="搜索主题、内容或关键词..." style="font-size: 1rem;">
                     </div>
+                    <div class="form-check mt-2">
+                        <input class="form-check-input" type="checkbox" id="exactMatchCheckbox" style="cursor: pointer;">
+                        <label class="form-check-label text-muted small" for="exactMatchCheckbox" style="cursor: pointer; user-select: none;">
+                            精准词组匹配
+                        </label>
+                    </div>
                 </div>
                 <div class="col-md-3">
                     <!-- Tag Filter Button -->
@@ -409,6 +415,7 @@
             currentPage = page;
             const query = document.getElementById('searchInput').value.trim();
             const type = document.getElementById('typeFilter').value;
+            const exactMatch = document.getElementById('exactMatchCheckbox').checked;
             const container = document.getElementById('resultsList');
 
             // Tags
@@ -420,6 +427,7 @@
                 // Construct URL
                 let url = `/zhishi/api/list?page=${page}&q=${encodeURIComponent(query)}&type=${encodeURIComponent(type)}`;
                 if (tags) url += `&tag=${encodeURIComponent(tags)}`;
+                if (exactMatch) url += `&exact=true`;
 
                 const resp = await fetch(url);
                 const data = await resp.json();
