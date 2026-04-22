@@ -476,9 +476,13 @@
 
                 // Get current search query for highlighting
                 const query = document.getElementById('searchInput').value.trim();
+                const exactMatch = document.getElementById('exactMatchCheckbox').checked;
                 let viewUrl = `/zhishi/view/${item.uuid}`;
                 if (query) {
                     viewUrl += `?q=${encodeURIComponent(query)}`;
+                    if (exactMatch) {
+                        viewUrl += `&exact=true`;
+                    }
                 }
 
                 html += `

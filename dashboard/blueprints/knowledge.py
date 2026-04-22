@@ -208,16 +208,20 @@ def view_entry(entry_id):
     
     # Handle Search Highlighting
     query = request.args.get('q', '')
+    exact_match = request.args.get('exact') == 'true'
     highlight_tokens = []
     if query:
-        seg_list = list(jieba.cut_for_search(query))
-        highlight_tokens = [term.strip() for term in seg_list if term.strip()]
-        if not highlight_tokens:
-             highlight_tokens = [query]
-        
-        # Add full query for exact match prioritization
-        if query.strip() and query.strip() not in highlight_tokens:
-            highlight_tokens.append(query.strip())
+        if exact_match:
+            highlight_tokens = [query.strip()]
+        else:
+            seg_list = list(jieba.cut_for_search(query))
+            highlight_tokens = [term.strip() for term in seg_list if term.strip()]
+            if not highlight_tokens:
+                 highlight_tokens = [query]
+            
+            # Add full query for exact match prioritization
+            if query.strip() and query.strip() not in highlight_tokens:
+                highlight_tokens.append(query.strip())
         
     return render_template('detail.html', entry=dict(entry), comments=[dict(c) for c in comments], 
                            related_entries=[dict(r) for r in relations], highlight_tokens=highlight_tokens)
