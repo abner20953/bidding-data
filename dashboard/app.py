@@ -424,23 +424,7 @@ def api_visitor_log_options():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# --- 路由配置 ---
 
-# --- 牛教授网站展示路由 ---
-@app.route('/niu')
-def niu_redirect():
-    return redirect('/niu/')
-
-@app.route('/niu_professor')
-def serve_niu_professor():
-    niu_dir = os.path.join(BASE_DIR, '..', 'niu')
-    return send_from_directory(niu_dir, "niu_professor.html")
-
-@app.route('/niu/')
-@app.route('/niu/<path:filename>')
-def serve_niu_website(filename="index.html"):
-    niu_dir = os.path.join(BASE_DIR, '..', 'niu')
-    return send_from_directory(niu_dir, filename)
 
 # --- 黄老师网站展示路由 ---
 @app.route('/huang')
