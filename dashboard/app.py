@@ -46,11 +46,11 @@ if not os.path.exists(CHAT_DB):
 def verify_request_password(req):
     """
     Check if request contains valid admin password in JSON body or query args.
-    Returns (True, None) or (False, error_response).
+    Returns (True, None) or (False, response_tuple).
     """
     # Check JSON body
     if req.is_json:
-        data = req.get_json()
+        data = req.get_json(silent=True)
         if data and data.get('password') == ADMIN_PASSWORD:
             return True, None
             
@@ -58,7 +58,7 @@ def verify_request_password(req):
     if req.args.get('password') == ADMIN_PASSWORD:
         return True, None
         
-    return False, jsonify({"error": "Admin password required or invalid"}), 403
+    return False, (jsonify({"error": "Admin password required or invalid"}), 403)
 
 # --- EMERGENCY STARTUP CLEANUP (Fix for "No space left on device") ---
 def free_up_space():
@@ -943,6 +943,7 @@ def api_compare():
         return jsonify({"error": "未选择文件"}), 400
 
     # 2. Save temporarily using UUID to avoid Chinese filename issues
+    temp_paths = []
     try:
         def save_and_archive(file_obj):
             # Save to Temp
@@ -950,6 +951,7 @@ def api_compare():
             temp_filename = f"{uuid.uuid4()}{ext}"
             temp_path = os.path.join(app.config['UPLOAD_FOLDER'], temp_filename)
             file_obj.save(temp_path)
+            temp_paths.append(temp_path)
             
             # --- Archive Immediately (Ensure Persistence) ---
             # Returns the absolute path of the archived file
@@ -970,24 +972,12 @@ def api_compare():
         # 3. Validation: Check for duplicates
         # Compare actual archived paths. If they are the same path, it means MD5s were identical.
         if archive_a == archive_b:
-            # Cleanup temp files
-            try:
-                os.remove(temp_a)
-                os.remove(temp_b)
-                if path_tender: os.remove(path_tender)
-            except: pass
             return jsonify({"error": "投标文件A与投标文件B内容重复 (MD5一致)"}), 400
             
         if archive_tender:
             if archive_a == archive_tender:
-                 try:
-                    os.remove(temp_a); os.remove(temp_b); os.remove(path_tender)
-                 except: pass
                  return jsonify({"error": "投标文件A与招标文件内容重复 (MD5一致)"}), 400
             if archive_b == archive_tender:
-                 try:
-                    os.remove(temp_a); os.remove(temp_b); os.remove(path_tender)
-                 except: pass
                  return jsonify({"error": "投标文件B与招标文件内容重复 (MD5一致)"}), 400
             
         # 4. Process (Using Temp Files)
@@ -999,16 +989,7 @@ def api_compare():
                                      check_entity=request.form.get('check_entity') == '1',
                                      check_text=request.form.get('check_text') == '1',
                                      check_spelling=request.form.get('check_spelling') == '1')
-        
-        # 5. Clean up Temp Files Only (Archive remains)
-        try:
-            os.remove(temp_a)
-            os.remove(temp_b)
-            if path_tender:
-                os.remove(path_tender)
-        except Exception:
-            pass 
-        
+
         # 记录操作日志
         detail = f"{file_a.filename} vs {file_b.filename}"
         if file_tender and file_tender.filename:
@@ -1020,6 +1001,13 @@ def api_compare():
     except Exception as e:
         print(f"Error during comparison: {e}")
         return jsonify({"error": f"处理出错: {str(e)}"}), 500
+    finally:
+        for temp_path in temp_paths:
+            try:
+                if temp_path and os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
 
 @app.route('/api/dates')
 def api_dates():
@@ -1032,10 +1020,7 @@ def api_data():
         # Verify Password
         is_valid, error = verify_request_password(request)
         if not is_valid:
-            # Checking JSON explicitly for this endpoint as it might be called differently
-            data = request.get_json(silent=True)
-            if not data or data.get('password') != ADMIN_PASSWORD:
-                 return error
+            return error
 
         try:
             delete_all = request.args.get('all') == 'true'

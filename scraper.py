@@ -903,6 +903,9 @@ def run_scraper_for_date(target_date_str, callback=None):
             log(f"正在采集关键词: {full_keyword}")
             
             for page in range(1, MAX_PAGES + 1):
+                # 每次请求前强制延迟，防止关键词切换或翻页过快触发 WAF
+                time.sleep(5)
+                
                 params = build_search_url(page, start_time, end_time, full_keyword)
                 # log(f"Requesting page {page}...")
                 
@@ -955,8 +958,6 @@ def run_scraper_for_date(target_date_str, callback=None):
                 if len(list_items) < 20:
                     print(f"  检测到最后一页（仅 {len(list_items)} 条），停止翻页。")
                     break
-                
-                time.sleep(5) # 增加延迟以防 WAF 拦截自动采集时稍微温和一点
 
     log(f"共采集到 {len(raw_results)} 条原始记录。")
 
