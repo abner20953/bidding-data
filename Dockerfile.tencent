@@ -16,15 +16,17 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# 【核心优化 1】利用 Docker 缓存机制
-# 先只复制 requirements.txt，不复制代码
-# 这样只要依赖包列表没变，下面这步庞大的 pip install 就会直接使用缓存，瞬间完成
+# 【核心优化 1】单独安装并缓存极其庞大的 PyTorch CPU 版
+# 将其放在 COPY requirements.txt 之前，确保以后即使依赖包列表变动，也能永久复用这一层 170MB+ 的下载缓存
+# 使用阿里云 PyTorch 镜像源加速下载，若失败则 fallback 至官方源
+RUN pip install --no-cache-dir torch --index-url https://mirrors.aliyun.com/pytorch-wheels/cpu || \
+    pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu --default-timeout=1000
+
+# 【核心优化 2】利用 Docker 缓存机制处理业务依赖
 COPY requirements.txt .
 
-# 【核心优化 2】使用清华源加速 + 预先安装 CPU 版 PyTorch (节省 700MB+)
-# 腾讯云内网拉清华源极快；指定 CPU 版本避免下载庞大的显卡驱动
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
-    pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+# 使用清华源加速安装 requirements.txt 里的剩余包
+RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 # 【核心优化 3】使用国内镜像下载模型 (适配 Gitee 部署)
 # 由于 model_data 被 gitignore 了，我们不能 COPY。
