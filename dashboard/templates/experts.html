@@ -5,7 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>评标专家管理系统</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=202605212224">
+    <link rel="stylesheet" href="/static/css/style.css?v=202605212248">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         /* 专家管理页面的专属个性化样式 */
@@ -969,6 +969,55 @@
             background: linear-gradient(to bottom, var(--accent-color), #6366f1);
             opacity: 0.8;
         }
+
+        /* 模态框内身份证左右切换小箭头及指示器 */
+        .photo-nav-btn {
+            position: absolute;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 20px;
+            height: 24px;
+            background: rgba(15, 23, 42, 0.55);
+            color: white;
+            border: none;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 11px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.2s;
+            z-index: 10;
+            user-select: none;
+        }
+
+        .photo-nav-btn:hover {
+            background: var(--accent-color);
+        }
+
+        .photo-nav-prev {
+            left: 2px;
+        }
+
+        .photo-nav-next {
+            right: 2px;
+        }
+
+        .photo-indicator {
+            font-size: 11px;
+            color: var(--text-secondary);
+            text-align: center;
+            margin-top: 4px;
+            font-weight: 500;
+        }
+
+        /* 放大Overlay的悬浮切换按钮 hover 态样式 */
+        .zoom-btn-side:hover {
+            background: var(--accent-color) !important;
+            box-shadow: 0 0 15px rgba(14, 165, 233, 0.4);
+            transform: translateY(-50%) scale(1.05) !important;
+        }
     </style>
 </head>
 
@@ -1190,12 +1239,17 @@
             <div class="modal-body-scroll" style="padding: 24px;">
                 <div style="display: grid; grid-template-columns: 100px 1fr; gap: 20px; align-items: start; margin-bottom: 20px; padding: 16px; background: rgba(14, 165, 233, 0.05); border: 1px solid rgba(14, 165, 233, 0.1); border-radius: 12px; backdrop-filter: blur(4px);">
                     <!-- 照片区域 -->
-                    <div style="width: 100px; height: 130px; border-radius: 8px; overflow: hidden; background: #f1f5f9; border: 1px solid rgba(0, 0, 0, 0.06); display: flex; align-items: center; justify-content: center; flex-shrink: 0; box-shadow: var(--shadow-soft);">
-                        <img src="" id="detail-img" alt="身份证照片" style="width: 100%; height: 100%; object-fit: cover; cursor: zoom-in;" onerror="handleDetailImgError()">
-                        <div id="detail-img-error" style="display: none; flex-direction: column; align-items: center; justify-content: center; color: var(--text-secondary); font-size: 10px; padding: 8px; text-align: center; height: 100%;">
-                            <span style="font-size: 18px; margin-bottom: 4px;">⚠️</span>
-                            <span>无照片</span>
+                    <div style="display: flex; flex-direction: column; align-items: center; gap: 6px;">
+                        <div class="detail-photo-wrapper" style="position: relative; width: 100px; height: 130px; border-radius: 8px; overflow: hidden; background: #f1f5f9; border: 1px solid rgba(0, 0, 0, 0.06); display: flex; align-items: center; justify-content: center; flex-shrink: 0; box-shadow: var(--shadow-soft);">
+                            <img src="" id="detail-img" alt="身份证照片" style="width: 100%; height: 100%; object-fit: cover; cursor: zoom-in;" onerror="handleDetailImgError()">
+                            <div id="detail-img-error" style="display: none; flex-direction: column; align-items: center; justify-content: center; color: var(--text-secondary); font-size: 10px; padding: 8px; text-align: center; height: 100%;">
+                                <span style="font-size: 18px; margin-bottom: 4px;">⚠️</span>
+                                <span>无照片</span>
+                            </div>
+                            <button id="photo-prev-btn" class="photo-nav-btn photo-nav-prev" style="display: none;">&lt;</button>
+                            <button id="photo-next-btn" class="photo-nav-btn photo-nav-next" style="display: none;">&gt;</button>
                         </div>
+                        <div id="detail-photo-indicator" class="photo-indicator" style="display: none;">1 / 1</div>
                     </div>
                     <!-- 基础身份 -->
                     <div style="display: flex; flex-direction: column; gap: 8px; justify-content: center; height: 100%; padding-top: 4px;">
@@ -1258,8 +1312,14 @@
 
     <!-- 高清照片放大 Overlay -->
     <div class="zoom-overlay" id="zoom-overlay">
+        <button id="zoom-prev-btn" class="zoom-btn-side" style="display: none; position: absolute; left: 30px; top: 50%; transform: translateY(-50%); font-size: 30px; width: 60px; height: 60px; border-radius: 50%; background: rgba(255,255,255,0.15); border: 1px solid rgba(255,255,255,0.2); color: white; cursor: pointer; transition: all 0.2s; z-index: 2010;">&lt;</button>
+        
         <img src="" class="zoom-img" id="zoom-img" alt="高清身份证大图">
+        
+        <button id="zoom-next-btn" class="zoom-btn-side" style="display: none; position: absolute; right: 30px; top: 50%; transform: translateY(-50%); font-size: 30px; width: 60px; height: 60px; border-radius: 50%; background: rgba(255,255,255,0.15); border: 1px solid rgba(255,255,255,0.2); color: white; cursor: pointer; transition: all 0.2s; z-index: 2010;">&gt;</button>
+
         <div class="zoom-controls">
+            <span id="zoom-indicator" style="color: white; font-size: 13px; align-self: center; background: rgba(0,0,0,0.4); padding: 4px 12px; border-radius: 12px; display: none; margin-right: 8px;">1 / 1</span>
             <button class="zoom-btn" id="btn-rotate">↻ 旋转照片</button>
             <button class="zoom-btn" id="btn-close-zoom">关闭预览</button>
         </div>
@@ -1271,6 +1331,12 @@
         let currentExpertsData = [];
         let currentPage = 1;
         const pageSize = 50;
+
+        // 多图预览与切换状态缓存
+        let currentDetailPhotos = [];
+        let currentDetailPhotoIndex = 0;
+        let currentZoomPhotos = [];
+        let currentZoomPhotoIndex = 0;
 
         // 页面初始化加载
         document.addEventListener('DOMContentLoaded', () => {
@@ -1417,8 +1483,13 @@
                 
                 let avatarHtml = '';
                 if (item.photo_path) {
-                    avatarHtml = `<img src="${item.photo_path}" class="expert-avatar" alt="身份证" onclick="zoomPhoto('${item.photo_path}')" onerror="handleImgLoadError(this)">`;
-                } else {
+                    const photos = item.photo_path.split(',');
+                    const firstPhoto = photos.length > 0 ? photos[0].trim() : '';
+                    if (firstPhoto) {
+                        avatarHtml = `<img src="${firstPhoto}" class="expert-avatar" alt="身份证" onclick="zoomPhoto('${item.photo_path}', 0)" onerror="handleImgLoadError(this)">`;
+                    }
+                }
+                if (!avatarHtml) {
                     avatarHtml = `
                         <div class="expert-avatar-placeholder">
                             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1841,22 +1912,68 @@
                 if (companyEl) companyEl.innerText = item.company || '未知单位';
                 if (majorEl) majorEl.innerText = item.major || '未填专业';
                 
-                // 照片区域控制，不破坏 DOM 树
+                // 照片多图匹配与切换控制
                 const detailImg = document.getElementById('detail-img');
                 const errDiv = document.getElementById('detail-img-error');
+                const prevBtn = document.getElementById('photo-prev-btn');
+                const nextBtn = document.getElementById('photo-next-btn');
+                const indicator = document.getElementById('detail-photo-indicator');
                 
-                if (detailImg && errDiv) {
-                    if (item.photo_path) {
-                        detailImg.src = item.photo_path;
-                        detailImg.style.display = 'block';
-                        errDiv.style.display = 'none';
-                        detailImg.onclick = () => zoomPhoto(item.photo_path);
-                    } else {
-                        detailImg.src = '';
-                        detailImg.style.display = 'none';
-                        errDiv.style.display = 'flex';
+                currentDetailPhotos = item.photo_path ? item.photo_path.split(',') : [];
+                currentDetailPhotoIndex = 0;
+                
+                function updateDetailPhotoShow() {
+                    if (detailImg && errDiv) {
+                        if (currentDetailPhotos.length > 0) {
+                            const currentPath = currentDetailPhotos[currentDetailPhotoIndex].trim();
+                            detailImg.src = currentPath;
+                            detailImg.style.display = 'block';
+                            errDiv.style.display = 'none';
+                            detailImg.onclick = () => zoomPhoto(item.photo_path, currentDetailPhotoIndex);
+                            
+                            if (currentDetailPhotos.length > 1) {
+                                if (prevBtn) prevBtn.style.display = 'flex';
+                                if (nextBtn) nextBtn.style.display = 'flex';
+                                if (indicator) {
+                                    indicator.style.display = 'block';
+                                    indicator.innerText = `${currentDetailPhotoIndex + 1} / ${currentDetailPhotos.length}`;
+                                }
+                            } else {
+                                if (prevBtn) prevBtn.style.display = 'none';
+                                if (nextBtn) nextBtn.style.display = 'none';
+                                if (indicator) indicator.style.display = 'none';
+                            }
+                        } else {
+                            detailImg.src = '';
+                            detailImg.style.display = 'none';
+                            errDiv.style.display = 'flex';
+                            if (prevBtn) prevBtn.style.display = 'none';
+                            if (nextBtn) nextBtn.style.display = 'none';
+                            if (indicator) indicator.style.display = 'none';
+                        }
                     }
                 }
+                
+                if (prevBtn) {
+                    prevBtn.onclick = (e) => {
+                        e.stopPropagation();
+                        if (currentDetailPhotos.length > 1) {
+                            currentDetailPhotoIndex = (currentDetailPhotoIndex - 1 + currentDetailPhotos.length) % currentDetailPhotos.length;
+                            updateDetailPhotoShow();
+                        }
+                    };
+                }
+                if (nextBtn) {
+                    nextBtn.onclick = (e) => {
+                        e.stopPropagation();
+                        if (currentDetailPhotos.length > 1) {
+                            currentDetailPhotoIndex = (currentDetailPhotoIndex + 1) % currentDetailPhotos.length;
+                            updateDetailPhotoShow();
+                        }
+                    };
+                }
+                
+                updateDetailPhotoShow();
                 
                 // 整合完整 JSON
                 const rawJsonElement = document.getElementById('val-raw-json');
@@ -2055,13 +2172,59 @@
             });
         }
 
-        function zoomPhoto(path) {
+        function zoomPhoto(path, index = 0) {
             const overlay = document.getElementById('zoom-overlay');
             const zoomImg = document.getElementById('zoom-img');
+            const prevBtn = document.getElementById('zoom-prev-btn');
+            const nextBtn = document.getElementById('zoom-next-btn');
+            const indicator = document.getElementById('zoom-indicator');
+            
+            currentZoomPhotos = path ? path.split(',') : [];
+            currentZoomPhotoIndex = parseInt(index) || 0;
             
             currentRotation = 0;
             zoomImg.style.transform = 'none';
-            zoomImg.src = path;
+            
+            function updateZoomShow() {
+                if (currentZoomPhotos.length > 0) {
+                    const currentPath = currentZoomPhotos[currentZoomPhotoIndex].trim();
+                    zoomImg.src = currentPath;
+                    
+                    if (currentZoomPhotos.length > 1) {
+                        if (prevBtn) prevBtn.style.display = 'block';
+                        if (nextBtn) nextBtn.style.display = 'block';
+                        if (indicator) {
+                            indicator.style.display = 'inline-block';
+                            indicator.innerText = `${currentZoomPhotoIndex + 1} / ${currentZoomPhotos.length}`;
+                        }
+                    } else {
+                        if (prevBtn) prevBtn.style.display = 'none';
+                        if (nextBtn) nextBtn.style.display = 'none';
+                        if (indicator) indicator.style.display = 'none';
+                    }
+                }
+            }
+            
+            if (prevBtn) {
+                prevBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    if (currentZoomPhotos.length > 1) {
+                        currentZoomPhotoIndex = (currentZoomPhotoIndex - 1 + currentZoomPhotos.length) % currentZoomPhotos.length;
+                        updateZoomShow();
+                    }
+                };
+            }
+            if (nextBtn) {
+                nextBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    if (currentZoomPhotos.length > 1) {
+                        currentZoomPhotoIndex = (currentZoomPhotoIndex + 1) % currentZoomPhotos.length;
+                        updateZoomShow();
+                    }
+                };
+            }
+            
+            updateZoomShow();
             overlay.classList.add('active');
         }
 

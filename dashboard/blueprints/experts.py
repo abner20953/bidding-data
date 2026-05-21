@@ -209,27 +209,48 @@ def api_upload():
             photo_key = f"{name}_{phone}".lower()
             photo_path_db = None
             
-            matched_photo_file = None
-            # 优先精确查找
-            if photo_key in photos:
-                matched_photo_file = photos[photo_key]
-            else:
-                # 模糊查找：若文件名中同时包含了专家姓名与电话
-                for k, path in photos.items():
-                    if name.lower() in k and phone in k:
-                        matched_photo_file = path
-                        break
+            # 搜集所有符合条件的图片
+            matched_photos = []
             
-            if matched_photo_file:
-                # 复制图片到静态资源目录，并采用规范命名覆盖已有的照片
-                ext = os.path.splitext(matched_photo_file)[1].lower()
-                dest_filename = f"{name}_{phone}{ext}"
-                dest_path = os.path.join(photos_dest_dir, dest_filename)
+            # 1. 查找精确匹配
+            if photo_key in photos:
+                matched_photos.append(photos[photo_key])
+            
+            # 2. 查找模糊匹配（含有姓名和电话）
+            for k, path in photos.items():
+                if name.lower() in k and phone in k:
+                    if path not in matched_photos:
+                        matched_photos.append(path)
+            
+            if matched_photos:
+                # 排序机制：优先展示文件名（不含扩展名）以 `_1` 或 `-1` 结尾的照片，其他按序号递增
+                def get_photo_sort_key(path_str):
+                    fname = os.path.splitext(os.path.basename(path_str))[0].strip()
+                    # 匹配最后的 _数字 或者是 -数字（限制1-3位长度以避免误匹配手机号）
+                    match = re.search(r'[-_](\d{1,3})$', fname)
+                    if match:
+                        num = int(match.group(1))
+                        if num == 1:
+                            return (0, 0) # 优先级最高
+                        else:
+                            return (2, num) # 排在无序号之后，按数字升序
+                    else:
+                        return (1, 0) # 无序号后缀的排在第二位
                 
-                # 复制文件
-                shutil.copy2(matched_photo_file, dest_path)
-                photo_path_db = f"/static/uploads/expert_photos/{dest_filename}"
-                matched_photo_count += 1
+                matched_photos.sort(key=get_photo_sort_key)
+                
+                # 复制所有匹配的图片到静态资源目录
+                copied_paths = []
+                for p_file in matched_photos:
+                    ext = os.path.splitext(p_file)[1].lower()
+                    base_fname = os.path.splitext(os.path.basename(p_file))[0].strip().replace(" ", "").lower()
+                    dest_filename = f"{base_fname}{ext}"
+                    dest_path = os.path.join(photos_dest_dir, dest_filename)
+                    shutil.copy2(p_file, dest_path)
+                    copied_paths.append(f"/static/uploads/expert_photos/{dest_filename}")
+                    matched_photo_count += 1
+                
+                photo_path_db = ",".join(copied_paths)
             else:
                 # 若本次压缩包内未包含该专家的图片，则保持数据库已存在的旧图片路径，不抹除
                 c.execute("SELECT photo_path FROM experts WHERE name = ? AND phone = ?", (name, phone))
@@ -429,15 +450,18 @@ def api_delete():
         c.execute("SELECT photo_path FROM experts WHERE name = ? AND phone = ?", (name, phone))
         row = c.fetchone()
         if row and row[0]:
-            photo_path = row[0]
-            filename = os.path.basename(photo_path)
+            photo_paths = row[0].split(',')
             photos_dir = get_photos_dir()
-            physical_photo_path = os.path.join(photos_dir, filename)
-            if os.path.exists(physical_photo_path):
-                try:
-                    os.remove(physical_photo_path)
-                except Exception:
-                    pass
+            for p_path in photo_paths:
+                p_path = p_path.strip()
+                if p_path:
+                    filename = os.path.basename(p_path)
+                    physical_photo_path = os.path.join(photos_dir, filename)
+                    if os.path.exists(physical_photo_path):
+                        try:
+                            os.remove(physical_photo_path)
+                        except Exception:
+                            pass
         
         # 从数据库中物理删除
         c.execute("DELETE FROM experts WHERE name = ? AND phone = ?", (name, phone))
