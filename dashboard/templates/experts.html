@@ -1,0 +1,2077 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>评标专家管理系统</title>
+    <link rel="stylesheet" href="/static/css/style.css?v=202605212224">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        /* 专家管理页面的专属个性化样式 */
+        
+        /* 状态筛选下拉框样式 */
+        .filter-select {
+            background: rgba(255, 255, 255, 0.9);
+            border: 1px solid var(--card-border);
+            color: var(--text-primary);
+            padding: 14px 20px;
+            border-radius: 12px;
+            font-size: 14px;
+            outline: none;
+            transition: all 0.2s;
+            box-shadow: var(--shadow-soft);
+            cursor: pointer;
+            width: 150px;
+            backdrop-filter: blur(8px);
+        }
+
+        .filter-select:focus {
+            border-color: var(--accent-color);
+            box-shadow: 0 0 0 4px rgba(14, 165, 233, 0.15);
+            background: #fff;
+        }
+
+        /* 分页器容器（毛玻璃拟态） */
+        .pagination-bar {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 16px;
+            background: rgba(255, 255, 255, 0.45);
+            border: 1px solid var(--card-border);
+            border-radius: 14px;
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            box-shadow: var(--shadow-soft);
+            width: fit-content;
+            margin: 30px auto 10px auto;
+        }
+
+        .page-btn {
+            background: rgba(255, 255, 255, 0.6);
+            border: 1px solid var(--card-border);
+            color: var(--text-primary);
+            padding: 8px 16px;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .page-btn:hover:not(:disabled) {
+            background: var(--accent-color);
+            color: white;
+            border-color: var(--accent-color);
+            box-shadow: 0 4px 12px rgba(14, 165, 233, 0.2);
+        }
+
+        .page-btn:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+
+        .page-info {
+            font-size: 13px;
+            color: var(--text-secondary);
+            padding: 0 12px;
+            font-weight: 500;
+        }
+
+        .page-info strong {
+            color: var(--accent-color);
+        }
+
+        /* 卡片上的状态标签样式 */
+        .expert-tag-status {
+            font-size: 10px;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        .status-acquired {
+            background: rgba(16, 185, 129, 0.12);
+            color: #10b981;
+            border: 1px solid rgba(16, 185, 129, 0.2);
+        }
+        .status-failed {
+            background: rgba(239, 68, 68, 0.12);
+            color: #ef4444;
+            border: 1px solid rgba(239, 68, 68, 0.2);
+        }
+        .status-unacquired {
+            background: rgba(148, 163, 184, 0.12);
+            color: #64748b;
+            border: 1px solid rgba(148, 163, 184, 0.2);
+        }
+        
+        /* 毛玻璃 Tabs 导航栏 */
+        .glass-tabs {
+            display: flex;
+            gap: 8px;
+            margin: 20px 0 25px 0;
+            background: rgba(255, 255, 255, 0.45);
+            border: 1px solid var(--card-border);
+            padding: 6px;
+            border-radius: 14px;
+            width: fit-content;
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            box-shadow: var(--shadow-soft);
+        }
+
+        .tab-btn {
+            background: transparent;
+            border: none;
+            padding: 10px 22px;
+            border-radius: 10px;
+            font-size: 14px;
+            font-weight: 500;
+            color: var(--text-secondary);
+            cursor: pointer;
+            transition: all 0.25s ease;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            text-decoration: none;
+        }
+
+        .tab-btn:hover {
+            color: var(--text-primary);
+            background: rgba(255, 255, 255, 0.35);
+        }
+
+        .tab-btn.active {
+            color: white;
+            background: var(--accent-color);
+            box-shadow: 0 4px 12px rgba(14, 165, 233, 0.3);
+        }
+
+        /* 独立的面板卡片 */
+        .glass-card {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+            padding: 24px;
+            box-shadow: var(--shadow-soft);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            transition: all 0.3s;
+        }
+
+        .glass-card:hover {
+            box-shadow: var(--shadow-hover);
+        }
+
+        .card-title {
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+            padding-bottom: 10px;
+        }
+
+        /* 搜索与卡片展示 */
+        .search-bar-container {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 24px;
+        }
+
+        .search-input-wrapper {
+            position: relative;
+            flex: 1;
+        }
+
+        .search-input {
+            width: 100%;
+            background: rgba(255, 255, 255, 0.9);
+            border: 1px solid var(--card-border);
+            color: var(--text-primary);
+            padding: 14px 16px 14px 44px;
+            border-radius: 12px;
+            font-size: 14px;
+            outline: none;
+            transition: all 0.2s;
+            box-shadow: var(--shadow-soft);
+        }
+
+        .search-input:focus {
+            border-color: var(--accent-color);
+            box-shadow: 0 0 0 4px rgba(14, 165, 233, 0.15);
+            background: #fff;
+        }
+
+        .search-icon-svg {
+            position: absolute;
+            left: 14px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--text-secondary);
+            pointer-events: none;
+        }
+
+        .btn-search-main {
+            background: var(--accent-color);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            padding: 0 28px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            box-shadow: 0 4px 12px rgba(14, 165, 233, 0.2);
+        }
+
+        .btn-search-main:hover {
+            background: var(--accent-hover);
+            box-shadow: 0 6px 16px rgba(14, 165, 233, 0.3);
+        }
+
+        .experts-cards-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+            gap: 20px;
+        }
+
+        .expert-card {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+            padding: 20px;
+            display: flex;
+            gap: 16px;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            backdrop-filter: blur(8px);
+            box-shadow: var(--shadow-soft);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .expert-card:hover {
+            transform: translateY(-4px);
+            box-shadow: var(--shadow-hover);
+            background: rgba(255, 255, 255, 0.95);
+            border-color: rgba(14, 165, 233, 0.25);
+        }
+
+        .expert-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 4px;
+            height: 100%;
+            background: linear-gradient(to bottom, #0ea5e9, #10b981);
+            opacity: 0.8;
+        }
+
+        /* 身份证照片容器 */
+        .expert-avatar-container {
+            width: 90px;
+            height: 120px;
+            border-radius: 8px;
+            overflow: hidden;
+            background: #f1f5f9;
+            border: 1px solid rgba(0, 0, 0, 0.06);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+
+        .expert-avatar-container:hover {
+            transform: scale(1.04);
+        }
+
+        .expert-avatar {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .expert-avatar-placeholder {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-secondary);
+            font-size: 10px;
+            gap: 6px;
+            text-align: center;
+            padding: 8px;
+        }
+
+        .expert-avatar-placeholder svg {
+            color: #cbd5e1;
+        }
+
+        .expert-info {
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            flex: 1;
+            min-width: 0;
+        }
+
+        .expert-name-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 8px;
+        }
+
+        .expert-name {
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--text-primary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .expert-tag {
+            font-size: 10px;
+            background: rgba(14, 165, 233, 0.1);
+            color: var(--accent-color);
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-weight: 500;
+            white-space: nowrap;
+        }
+
+        .expert-meta-item {
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-bottom: 4px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .expert-meta-item span {
+            color: var(--text-primary);
+        }
+
+        .btn-detail {
+            background: transparent;
+            border: 1px solid rgba(14, 165, 233, 0.2);
+            color: var(--accent-color);
+            font-size: 11px;
+            padding: 4px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            align-self: flex-end;
+            margin-top: 8px;
+            transition: all 0.2s;
+        }
+
+        .btn-detail:hover {
+            background: var(--accent-color);
+            color: white;
+            border-color: var(--accent-color);
+        }
+
+        /* 没数据/加载中样式 */
+        .no-data {
+            text-align: center;
+            padding: 60px 20px;
+            background: var(--card-bg);
+            border: 1px dashed var(--card-border);
+            border-radius: 16px;
+            color: var(--text-secondary);
+            font-size: 14px;
+            width: 100%;
+        }
+
+        .no-data svg {
+            margin-bottom: 16px;
+            color: #cbd5e1;
+        }
+
+        .spinner {
+            width: 32px;
+            height: 32px;
+            border: 3px solid rgba(14, 165, 233, 0.1);
+            border-top-color: var(--accent-color);
+            border-radius: 50%;
+            animation: spin 1s infinite linear;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        /* 批量上传区排版 */
+        .upload-wrapper {
+            display: grid;
+            grid-template-columns: 1fr 380px;
+            gap: 24px;
+        }
+
+        @media (max-width: 900px) {
+            .upload-wrapper {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .upload-card-main {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 40px 24px;
+            text-align: center;
+        }
+
+        .upload-zone-large {
+            border: 2px dashed rgba(14, 165, 233, 0.35);
+            border-radius: 16px;
+            width: 100%;
+            max-width: 520px;
+            padding: 55px 20px;
+            text-align: center;
+            cursor: pointer;
+            background: rgba(14, 165, 233, 0.02);
+            transition: all 0.25s ease-in-out;
+            position: relative;
+            margin-bottom: 16px;
+        }
+
+        .upload-zone-large:hover, .upload-zone-large.dragover {
+            border-color: var(--accent-color);
+            background: rgba(14, 165, 233, 0.06);
+            transform: translateY(-2px);
+        }
+
+        .upload-icon-large {
+            font-size: 56px;
+            margin-bottom: 16px;
+            display: inline-block;
+            transition: transform 0.3s;
+        }
+
+        .upload-zone-large:hover .upload-icon-large {
+            transform: scale(1.08) translateY(-4px);
+        }
+
+        .upload-text-large {
+            font-size: 14px;
+            color: var(--text-primary);
+            line-height: 1.6;
+        }
+
+        .upload-text-large strong {
+            color: var(--accent-color);
+        }
+
+        .upload-subtext {
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-top: 6px;
+        }
+
+        /* 上传指南说明书 */
+        .guide-card {
+            background: rgba(255, 255, 255, 0.45);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+            padding: 24px;
+        }
+
+        .guide-item {
+            margin-bottom: 18px;
+            font-size: 12.5px;
+            color: var(--text-secondary);
+            line-height: 1.6;
+        }
+
+        .guide-item-title {
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 6px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .progress-container {
+            margin-top: 24px;
+            width: 100%;
+            max-width: 520px;
+            display: none;
+        }
+
+        .progress-bar-bg {
+            background: #e2e8f0;
+            border-radius: 6px;
+            height: 8px;
+            overflow: hidden;
+            width: 100%;
+        }
+
+        .progress-bar-fill {
+            background: linear-gradient(90deg, #0ea5e9, #10b981);
+            height: 100%;
+            width: 0%;
+            transition: width 0.1s ease;
+        }
+
+        .progress-text {
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-top: 8px;
+            text-align: right;
+        }
+
+        /* 数据维护与删除 */
+        .maintenance-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 24px;
+        }
+
+        @media (max-width: 640px) {
+            .maintenance-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .ops-card {
+            display: flex;
+            align-items: flex-start;
+            gap: 16px;
+            padding: 20px;
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+        }
+
+        .ops-icon {
+            font-size: 28px;
+            background: rgba(255, 255, 255, 0.8);
+            width: 52px;
+            height: 52px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: var(--shadow-soft);
+            flex-shrink: 0;
+        }
+
+        .ops-info {
+            flex: 1;
+        }
+
+        .ops-title {
+            font-size: 15px;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 6px;
+        }
+
+        .ops-desc {
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-bottom: 12px;
+            line-height: 1.5;
+        }
+
+        .action-btn-large {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 10px 20px;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            border: 1px solid transparent;
+            text-decoration: none;
+        }
+
+        .btn-backup {
+            background: rgba(16, 185, 129, 0.1);
+            color: var(--success-color);
+            border-color: rgba(16, 185, 129, 0.2);
+        }
+
+        .btn-backup:hover {
+            background: var(--success-color);
+            color: white;
+            box-shadow: 0 4px 12px rgba(16, 185, 129, 0.25);
+        }
+
+        .btn-clear {
+            background: rgba(239, 68, 68, 0.1);
+            color: #ef4444;
+            border-color: rgba(239, 68, 68, 0.2);
+        }
+
+        .btn-clear:hover {
+            background: #ef4444;
+            color: white;
+            box-shadow: 0 4px 12px rgba(239, 68, 68, 0.25);
+        }
+
+        /* 专家总览名单列表表格 */
+        .expert-table-wrapper {
+            width: 100%;
+            overflow-x: auto;
+            border-radius: 12px;
+            border: 1px solid rgba(0, 0, 0, 0.05);
+            background: rgba(255, 255, 255, 0.6);
+            backdrop-filter: blur(8px);
+            margin-top: 12px;
+        }
+
+        .expert-list-table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+            font-size: 13px;
+        }
+
+        .expert-list-table th, .expert-list-table td {
+            padding: 12px 16px;
+            border-bottom: 1px solid rgba(0, 0, 0, 0.04);
+            white-space: nowrap;
+        }
+
+        .expert-list-table th {
+            background: rgba(243, 244, 246, 0.8);
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .expert-list-table tr:hover td {
+            background: rgba(255, 255, 255, 0.7);
+        }
+
+        .expert-list-table td {
+            color: var(--text-secondary);
+            max-width: 250px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .expert-list-table .table-avatar {
+            width: 24px;
+            height: 32px;
+            object-fit: cover;
+            border-radius: 4px;
+            border: 1px solid rgba(0, 0, 0, 0.06);
+            vertical-align: middle;
+        }
+
+        .btn-table-delete {
+            background: rgba(239, 68, 68, 0.1);
+            color: #ef4444;
+            border: 1px solid rgba(239, 68, 68, 0.15);
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-size: 11px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-table-delete:hover {
+            background: #ef4444;
+            color: white;
+            border-color: #ef4444;
+            box-shadow: 0 2px 6px rgba(239, 68, 68, 0.2);
+        }
+
+        /* 模态框 (Modal) 详情面板样式 */
+        .modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(15, 23, 42, 0.45);
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            opacity: 0;
+            visibility: hidden;
+            pointer-events: none;
+            transition: opacity 0.3s ease, visibility 0.3s ease;
+        }
+
+        .modal.active {
+            opacity: 1;
+            visibility: visible;
+            pointer-events: auto;
+        }
+
+        .modal-container {
+            background: rgba(255, 255, 255, 0.96);
+            border: 1px solid var(--card-border);
+            border-radius: 20px;
+            width: 92%;
+            max-width: 860px;
+            max-height: 85vh;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.2);
+            transform: scale(0.96);
+            transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+            overflow: hidden;
+        }
+
+        .modal.active .modal-container {
+            transform: scale(1);
+        }
+
+        .modal-head {
+            padding: 20px 24px;
+            border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: rgba(255, 255, 255, 0.5);
+        }
+
+        .modal-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .modal-close {
+            background: transparent;
+            border: none;
+            font-size: 24px;
+            color: var(--text-secondary);
+            cursor: pointer;
+            transition: color 0.2s;
+            line-height: 1;
+        }
+
+        .modal-close:hover {
+            color: var(--text-primary);
+        }
+
+        .modal-body-scroll {
+            padding: 24px;
+            overflow-y: auto;
+            flex: 1;
+        }
+
+        .detail-sections-grid {
+            display: grid;
+            grid-template-columns: 180px 1fr;
+            gap: 24px;
+        }
+
+        @media (max-width: 768px) {
+            .detail-sections-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .detail-photo-side {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .detail-large-photo {
+            width: 100%;
+            aspect-ratio: 3/4;
+            border-radius: 12px;
+            overflow: hidden;
+            background: #f8fafc;
+            border: 1px solid rgba(0, 0, 0, 0.05);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: var(--shadow-soft);
+        }
+
+        .detail-large-photo img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            cursor: zoom-in;
+        }
+
+        .detail-info-main {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .info-group-box {
+            background: rgba(255, 255, 255, 0.65);
+            border: 1px solid rgba(0, 0, 0, 0.03);
+            border-radius: 12px;
+            padding: 16px;
+        }
+
+        .info-group-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--accent-color);
+            margin-bottom: 12px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .info-pairs-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+            gap: 12px;
+        }
+
+        .info-pair {
+            font-size: 13px;
+            line-height: 1.5;
+        }
+
+        .info-label {
+            color: var(--text-secondary);
+            margin-bottom: 2px;
+        }
+
+        .info-val {
+            color: var(--text-primary);
+            font-weight: 500;
+        }
+
+        .text-block-val {
+            font-size: 12px;
+            line-height: 1.6;
+            color: var(--text-primary);
+            background: #f8fafc;
+            padding: 12px;
+            border-radius: 8px;
+            white-space: pre-wrap;
+            border: 1px solid rgba(0, 0, 0, 0.02);
+            max-height: 180px;
+            overflow-y: auto;
+        }
+
+        /* 大图查看 Overlay */
+        .zoom-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(15, 23, 42, 0.9);
+            z-index: 2000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.25s ease;
+        }
+
+        .zoom-overlay.active {
+            opacity: 1;
+            pointer-events: auto;
+        }
+
+        .zoom-img {
+            max-width: 90%;
+            max-height: 90vh;
+            object-fit: contain;
+            border-radius: 8px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            transition: transform 0.3s;
+        }
+
+        .zoom-controls {
+            position: absolute;
+            bottom: 30px;
+            display: flex;
+            gap: 16px;
+        }
+
+        .zoom-btn {
+            background: rgba(255, 255, 255, 0.15);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            color: white;
+            padding: 8px 20px;
+            border-radius: 30px;
+            cursor: pointer;
+            backdrop-filter: blur(10px);
+            font-size: 13px;
+            transition: all 0.2s;
+        }
+
+        .zoom-btn:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+
+        /* 各专业统计卡片样式 */
+        .major-stat-card {
+            background: rgba(255, 255, 255, 0.55);
+            border: 1px solid var(--card-border);
+            border-radius: 12px;
+            padding: 16px;
+            box-shadow: var(--shadow-soft);
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            position: relative;
+            overflow: hidden;
+            transition: all 0.25s ease;
+            backdrop-filter: blur(8px);
+        }
+
+        .major-stat-card:hover {
+            transform: translateY(-2px);
+            box-shadow: var(--shadow-hover);
+            background: rgba(255, 255, 255, 0.85);
+            border-color: rgba(14, 165, 233, 0.2);
+        }
+
+        .major-stat-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 3px;
+            height: 100%;
+            background: linear-gradient(to bottom, var(--accent-color), #6366f1);
+            opacity: 0.8;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="app-container">
+        <!-- 顶部导航 -->
+        <header class="glass-header">
+            <div class="logo">
+                <span class="logo-icon">🧑‍🏫</span>
+                <h1>评标专家管理系统</h1>
+            </div>
+
+            <div class="controls">
+                <a href="/all" class="glass-btn has-text" style="text-decoration: none;" title="返回系统首页">
+                    <span>🏠</span> 导航首页
+                </a>
+            </div>
+        </header>
+
+        <!-- 功能模块：集成 Tab 导航 -->
+        <div class="glass-tabs">
+            <button class="tab-btn active" data-tab="search" onclick="switchTab('search')">
+                <span>🔍</span> 专家信息检索
+            </button>
+            <button class="tab-btn" data-tab="upload" onclick="switchTab('upload')">
+                <span>📥</span> 批量打包上传
+            </button>
+            <button class="tab-btn" data-tab="delete" onclick="switchTab('delete')">
+                <span>⚙️</span> 维护与删除
+            </button>
+        </div>
+
+        <!-- 专家信息检索面板 -->
+        <div id="panel-search" class="tab-panel">
+            <!-- 搜索框 -->
+            <div class="search-bar-container">
+                <div class="search-input-wrapper">
+                    <input type="text" class="search-input" id="search-input" placeholder="输入 姓名 / 手机号 / 专业 / 身份证号 模糊查询专家信息...">
+                    <svg class="search-icon-svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="11" cy="11" r="8"></circle>
+                        <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                    </svg>
+                </div>
+                <select class="filter-select" id="filter-status">
+                    <option value="">全部标记状态</option>
+                    <option value="已获取">已获取</option>
+                    <option value="无法登录">无法登录</option>
+                    <option value="未获取">未获取</option>
+                </select>
+                <button class="btn-search-main" id="btn-search">搜索专家</button>
+            </div>
+
+            <!-- 卡片展示区 -->
+            <div id="cards-container">
+                <div class="no-data">
+                    <div class="spinner" style="margin: 0 auto 16px;"></div>
+                    <p>正在读取评标专家数据...</p>
+                </div>
+            </div>
+
+            <!-- 分页器 -->
+            <div id="pagination-container" class="pagination-bar" style="display: none;"></div>
+        </div>
+
+        <!-- 批量打包上传面板 -->
+        <div id="panel-upload" class="tab-panel" style="display: none;">
+            <div class="upload-wrapper">
+                
+                <!-- 上传核心卡片 -->
+                <div class="glass-card upload-card-main">
+                    <div class="card-title" style="width: 100%;">
+                        <span>📥</span> 上传专家打包压缩包
+                    </div>
+                    
+                    <div class="upload-zone-large" id="drop-zone">
+                        <input type="file" id="file-input" accept=".zip" style="display: none;">
+                        <div class="upload-icon-large">📦</div>
+                        <div class="upload-text-large">
+                            将专家名单 <strong>.zip</strong> 压缩包拖至此处<br>
+                            或 <strong>点击选择文件</strong> 上传
+                        </div>
+                        <div class="upload-subtext">仅支持上传标准 ZIP 格式的打包压缩包</div>
+                    </div>
+
+                    <!-- 上传进度 -->
+                    <div class="progress-container" id="progress-container">
+                        <div class="progress-bar-bg">
+                            <div class="progress-bar-fill" id="progress-bar"></div>
+                        </div>
+                        <div class="progress-text" id="progress-text">准备上传... 0%</div>
+                    </div>
+                </div>
+
+                <!-- 导入规范说明 -->
+                <div class="guide-card">
+                    <div class="card-title" style="border-bottom: 1px solid rgba(0,0,0,0.05); padding-bottom: 10px; margin-bottom: 16px;">
+                        <span>📋</span> 压缩包导入规范指南
+                    </div>
+                    
+                    <div class="guide-item">
+                        <div class="guide-item-title">
+                            <span>📄</span> 1. Excel 信息表命名及格式
+                        </div>
+                        <div>压缩包内必须包含一个专家信息表（支持 <code>.xls</code> 或 <code>.xlsx</code> 格式），表中必须包含“<strong>姓名</strong>”和“<strong>电话</strong>”两列。系统自适应支持银行账号、工作简历、评标专业等丰富字段的提取与格式化持久存储。</div>
+                    </div>
+
+                    <div class="guide-item">
+                        <div class="guide-item-title">
+                            <span>🖼️</span> 2. 身份证照片命名规则
+                        </div>
+                        <div>身份证照片文件命名格式须为：“<strong>姓名_手机号.jpg</strong>” （如：张三_13800000000.jpg）。</div>
+                    </div>
+
+                    <div class="guide-item">
+                        <div class="guide-item-title">
+                            <span>🔄</span> 3. 追加与去重机制
+                        </div>
+                        <div>若上传已存在（姓名与手机号一致）的专家，系统将以新信息和新照片覆盖数据库中对应的老旧档案，否则将直接追加到数据库。</div>
+                    </div>
+
+                    <div class="guide-item">
+                        <div class="guide-item-title">
+                            <span>⚡</span> 4. 2核2G 性能限制友好
+                        </div>
+                        <div>系统后端采用流式解包与读取，完全过滤掉 macOS 隐藏文件等垃圾文件，内存占用极低。</div>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+
+        <!-- 数据维护与删除面板 -->
+        <div id="panel-delete" class="tab-panel" style="display: none;">
+            <!-- 顶部快捷管理工具 -->
+            <div class="maintenance-grid">
+                
+                <!-- 导出备份 -->
+                <div class="ops-card">
+                    <div class="ops-icon">💾</div>
+                    <div class="ops-info">
+                        <div class="ops-title">数据完整备份</div>
+                        <div class="ops-desc">打包并导出包含 SQLite 数据库及全部上传身份证照片的 ZIP 归档，便于本地留存备份。</div>
+                        <a href="/zj/api/backup" class="action-btn-large btn-backup">
+                            <span>💾</span> 导出完整数据备份 (.zip)
+                        </a>
+                    </div>
+                </div>
+
+                <!-- 清空数据 -->
+                <div class="ops-card">
+                    <div class="ops-icon">🗑️</div>
+                    <div class="ops-info">
+                        <div class="ops-title">一键清空专家库</div>
+                        <div class="ops-desc">一键从数据库物理清空所有评标专家档案，并删除服务器静态资源夹下全部身份证照。</div>
+                        <button class="action-btn-large btn-clear" id="btn-clear">
+                            <span>🗑️</span> 清空专家库与照片
+                        </button>
+                    </div>
+                </div>
+
+            </div>
+
+            <!-- 数据统计面板 -->
+            <div class="glass-card maintenance-table-card">
+                <div class="card-title">
+                    <span>📊</span> 评标专家数据库统计总览
+                </div>
+
+                <div class="statistics-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-top: 10px;">
+                    <div class="stat-card" style="background: rgba(14, 165, 233, 0.05); border: 1px solid rgba(14, 165, 233, 0.1); border-radius: 12px; padding: 20px; text-align: center; transition: transform 0.2s;">
+                        <div style="font-size: 24px; margin-bottom: 8px;">👥</div>
+                        <div style="font-size: 13px; color: var(--text-secondary);">专家总人数</div>
+                        <div id="stat-total-count" style="font-size: 28px; font-weight: 700; color: var(--accent-color); margin-top: 6px;">-</div>
+                    </div>
+                    <div class="stat-card" style="background: rgba(16, 185, 129, 0.05); border: 1px solid rgba(16, 185, 129, 0.1); border-radius: 12px; padding: 20px; text-align: center; transition: transform 0.2s;">
+                        <div style="font-size: 24px; margin-bottom: 8px;">📸</div>
+                        <div style="font-size: 13px; color: var(--text-secondary);">已关联身份证照</div>
+                        <div id="stat-photo-count" style="font-size: 28px; font-weight: 700; color: #10b981; margin-top: 6px;">-</div>
+                    </div>
+                    <div class="stat-card" style="background: rgba(245, 158, 11, 0.05); border: 1px solid rgba(245, 158, 11, 0.1); border-radius: 12px; padding: 20px; text-align: center; transition: transform 0.2s;">
+                        <div style="font-size: 24px; margin-bottom: 8px;">⚠️</div>
+                        <div style="font-size: 13px; color: var(--text-secondary);">缺失身份证照</div>
+                        <div id="stat-no-photo-count" style="font-size: 28px; font-weight: 700; color: #f59e0b; margin-top: 6px;">-</div>
+                    </div>
+                    <div class="stat-card" style="background: rgba(99, 102, 241, 0.05); border: 1px solid rgba(99, 102, 241, 0.1); border-radius: 12px; padding: 20px; text-align: center; transition: transform 0.2s;">
+                        <div style="font-size: 24px; margin-bottom: 8px;">🏢</div>
+                        <div style="font-size: 13px; color: var(--text-secondary);">涉及工作单位数</div>
+                        <div id="stat-company-count" style="font-size: 28px; font-weight: 700; color: #6366f1; margin-top: 6px;">-</div>
+                    </div>
+                </div>
+
+                <!-- 各专业专家人数分布 -->
+                <div style="margin-top: 30px; border-top: 1px solid rgba(0, 0, 0, 0.05); padding-top: 20px;">
+                    <div style="font-size: 14px; font-weight: 600; color: var(--text-primary); margin-bottom: 16px; display: flex; align-items: center; gap: 8px;">
+                        <span>🏷️</span> 各专业专家人数分布
+                    </div>
+                    <div id="stat-majors-container" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px;">
+                        <div style="grid-column: 1 / -1; text-align: center; color: var(--text-secondary); font-size: 13px; padding: 20px;">
+                            <div class="spinner" style="margin: 0 auto 12px; width: 24px; height: 24px; border-width: 2px;"></div>
+                            正在计算专业分布数据...
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- 专家富文本详情模态框 (Modal) -->
+    <div class="modal" id="detail-modal">
+        <div class="modal-container" style="max-width: 760px;">
+            <div class="modal-head">
+                <div class="modal-title">
+                    <span>📄</span> 专家完整档案 (原始 JSON 数据)
+                </div>
+                <button class="modal-close" id="modal-close">&times;</button>
+            </div>
+            
+            <div class="modal-body-scroll" style="padding: 24px;">
+                <div style="display: grid; grid-template-columns: 100px 1fr; gap: 20px; align-items: start; margin-bottom: 20px; padding: 16px; background: rgba(14, 165, 233, 0.05); border: 1px solid rgba(14, 165, 233, 0.1); border-radius: 12px; backdrop-filter: blur(4px);">
+                    <!-- 照片区域 -->
+                    <div style="width: 100px; height: 130px; border-radius: 8px; overflow: hidden; background: #f1f5f9; border: 1px solid rgba(0, 0, 0, 0.06); display: flex; align-items: center; justify-content: center; flex-shrink: 0; box-shadow: var(--shadow-soft);">
+                        <img src="" id="detail-img" alt="身份证照片" style="width: 100%; height: 100%; object-fit: cover; cursor: zoom-in;" onerror="handleDetailImgError()">
+                        <div id="detail-img-error" style="display: none; flex-direction: column; align-items: center; justify-content: center; color: var(--text-secondary); font-size: 10px; padding: 8px; text-align: center; height: 100%;">
+                            <span style="font-size: 18px; margin-bottom: 4px;">⚠️</span>
+                            <span>无照片</span>
+                        </div>
+                    </div>
+                    <!-- 基础身份 -->
+                    <div style="display: flex; flex-direction: column; gap: 8px; justify-content: center; height: 100%; padding-top: 4px;">
+                        <div style="display: flex; align-items: center; gap: 8px;">
+                            <span id="detail-title-name" style="font-size: 18px; font-weight: 700; color: var(--text-primary);">-</span>
+                            <span class="expert-tag">已入库专家</span>
+                        </div>
+                        <div style="font-size: 13px; color: var(--text-secondary); display: flex; align-items: center; gap: 6px;">
+                            📞 手机号: <span id="detail-title-phone" style="color: var(--text-primary); font-weight: 500;">-</span>
+                        </div>
+                        <div style="font-size: 13px; color: var(--text-secondary); display: flex; align-items: center; gap: 6px;">
+                            🏢 工作单位: <span id="detail-title-company" style="color: var(--text-primary); font-weight: 500;">-</span>
+                        </div>
+                        <div style="font-size: 13px; color: var(--text-secondary); display: flex; align-items: center; gap: 6px;">
+                            💼 专家专业: <span id="detail-title-major" style="color: var(--text-primary); font-weight: 500;">-</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 操作与管理工具栏 (删除与标记) -->
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; padding: 16px; background: rgba(255, 255, 255, 0.7); border: 1px solid var(--card-border); border-radius: 12px; backdrop-filter: blur(4px);">
+                    <!-- 标记修改区 -->
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <span style="font-size: 13px; font-weight: 600; color: var(--text-primary);">📌 标记状态:</span>
+                        <select class="filter-select" id="detail-status-select" style="padding: 8px 12px; border-radius: 8px; font-size: 13px; height: 36px; width: 120px; box-shadow: none;">
+                            <option value="未获取">未获取</option>
+                            <option value="已获取">已获取</option>
+                            <option value="无法登录">无法登录</option>
+                        </select>
+                        <button id="btn-save-status" style="background: var(--accent-color); border: none; color: white; font-size: 13px; padding: 8px 16px; border-radius: 8px; cursor: pointer; font-weight: 500; height: 36px; transition: all 0.2s;">保存修改</button>
+                        <span id="save-status-tip" style="font-size: 12px; color: #10b981; margin-left: 8px; display: none; align-items: center; gap: 4px;">✅ 已保存</span>
+                    </div>
+                    <!-- 物理删除区 -->
+                    <div>
+                        <button id="btn-detail-delete" style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.2); color: #ef4444; font-size: 13px; padding: 8px 16px; border-radius: 8px; cursor: pointer; font-weight: 500; height: 36px; display: flex; align-items: center; gap: 6px; transition: all 0.2s;">
+                            <span>🗑️</span> 删除专家
+                        </button>
+                    </div>
+                </div>
+
+                <!-- 专家备注区 -->
+                <div style="margin-bottom: 20px; padding: 16px; background: rgba(255, 255, 255, 0.7); border: 1px solid var(--card-border); border-radius: 12px; backdrop-filter: blur(4px);">
+                    <div style="font-size: 13px; font-weight: 600; color: var(--text-primary); margin-bottom: 8px; display: flex; align-items: center; gap: 4px;">
+                        <span>📝 专家备注:</span>
+                    </div>
+                    <textarea id="detail-remark-input" placeholder="输入专家的自定义备注信息（如登录密码、密保答案、临时问题、备用联系方式等）..." style="width: 100%; height: 60px; padding: 10px 12px; border: 1px solid var(--card-border); border-radius: 8px; font-size: 13px; resize: none; background: rgba(255, 255, 255, 0.5); color: var(--text-primary); outline: none; box-sizing: border-box; transition: border-color 0.2s;" onfocus="this.style.borderColor='var(--accent-color)'" onblur="this.style.borderColor='var(--card-border)'"></textarea>
+                </div>
+
+                <!-- 规整的 JSON 展示区域 -->
+                <div style="position: relative;">
+                    <div style="font-size: 13px; font-weight: 600; color: var(--accent-color); margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center;">
+                        <span>💻 规整 JSON 字段清单</span>
+                        <button id="btn-copy-json" style="background: rgba(14, 165, 233, 0.1); border: 1px solid rgba(14, 165, 233, 0.2); color: var(--accent-color); font-size: 11px; padding: 4px 12px; border-radius: 6px; cursor: pointer; transition: all 0.2s; font-weight: 500;">复制 JSON 数据</button>
+                    </div>
+                    <pre id="val-raw-json" style="background: #1e293b; padding: 18px; border-radius: 12px; font-family: 'Consolas', 'Courier New', monospace; font-size: 13px; color: #e2e8f0; overflow: auto; white-space: pre-wrap; word-break: break-all; max-height: 480px; border: 1px solid rgba(0, 0, 0, 0.15); line-height: 1.6; box-shadow: inset 0 2px 8px rgba(0,0,0,0.35);"></pre>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 高清照片放大 Overlay -->
+    <div class="zoom-overlay" id="zoom-overlay">
+        <img src="" class="zoom-img" id="zoom-img" alt="高清身份证大图">
+        <div class="zoom-controls">
+            <button class="zoom-btn" id="btn-rotate">↻ 旋转照片</button>
+            <button class="zoom-btn" id="btn-close-zoom">关闭预览</button>
+        </div>
+    </div>
+
+    <!-- JS 逻辑控制 -->
+    <script>
+        // 全量专家数据缓存
+        let currentExpertsData = [];
+        let currentPage = 1;
+        const pageSize = 50;
+
+        // 页面初始化加载
+        document.addEventListener('DOMContentLoaded', () => {
+            // 默认加载专家检索列表
+            fetchExperts('', '');
+            
+            // 绑定检索与筛选事件
+            const searchInput = document.getElementById('search-input');
+            const filterStatus = document.getElementById('filter-status');
+            const searchBtn = document.getElementById('btn-search');
+            
+            function executeSearch() {
+                fetchExperts(searchInput.value, filterStatus.value);
+            }
+            
+            searchBtn.addEventListener('click', executeSearch);
+            
+            searchInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    executeSearch();
+                }
+            });
+            
+            filterStatus.addEventListener('change', executeSearch);
+            
+            // 输入防抖模糊搜索
+            let debounceTimer;
+            searchInput.addEventListener('input', () => {
+                clearTimeout(debounceTimer);
+                debounceTimer = setTimeout(executeSearch, 350);
+            });
+            
+            // 模态框关闭绑定
+            document.getElementById('modal-close').addEventListener('click', closeDetailModal);
+            document.getElementById('detail-modal').addEventListener('click', (e) => {
+                if (e.target.id === 'detail-modal') closeDetailModal();
+            });
+
+            // 绑定拖拽上传
+            setupDragAndDrop();
+
+            // 绑定清空专家库
+            setupClearDatabase();
+
+            // 照片放大预览与旋转
+            setupPhotoZoom();
+        });
+
+        // 标签页切换逻辑
+        function switchTab(tabId) {
+            // 切换标签按钮激活状态
+            document.querySelectorAll('.tab-btn').forEach(btn => {
+                if (btn.getAttribute('data-tab') === tabId) {
+                    btn.classList.add('active');
+                } else {
+                    btn.classList.remove('active');
+                }
+            });
+            // 切换面板显示
+            document.querySelectorAll('.tab-panel').forEach(panel => {
+                if (panel.id === 'panel-' + tabId) {
+                    panel.style.display = 'block';
+                    if (tabId === 'delete') {
+                        fetchExpertsList();
+                    } else if (tabId === 'search') {
+                        fetchExperts(document.getElementById('search-input').value, document.getElementById('filter-status').value);
+                    }
+                } else {
+                    panel.style.display = 'none';
+                }
+            });
+        }
+
+        // ==================== 1. 专家检索逻辑 ====================
+        function fetchExperts(query, status = '') {
+            const container = document.getElementById('cards-container');
+            const paginator = document.getElementById('pagination-container');
+            
+            container.innerHTML = `
+                <div class="no-data">
+                    <div class="spinner" style="margin: 0 auto 16px;"></div>
+                    <p>正在查询评标专家，请稍候...</p>
+                </div>
+            `;
+            if (paginator) paginator.style.display = 'none';
+            
+            fetch(`/zj/api/search?q=${encodeURIComponent(query)}&status=${encodeURIComponent(status)}`)
+                .then(res => res.json())
+                .then(res => {
+                    if (res.success) {
+                        currentExpertsData = res.data;
+                        currentPage = 1; // 检索和切换状态后，页码重置为 1
+                        renderCards();
+                    } else {
+                        container.innerHTML = `<div class="no-data"><p>⚠️ 获取专家数据失败: ${res.error}</p></div>`;
+                    }
+                })
+                .catch(err => {
+                    container.innerHTML = `<div class="no-data"><p>⚠️ 网络错误，无法连接到后端</p></div>`;
+                    console.error(err);
+                });
+        }
+
+        function renderCards() {
+            const container = document.getElementById('cards-container');
+            const paginator = document.getElementById('pagination-container');
+            container.innerHTML = '';
+            
+            const data = currentExpertsData || [];
+            const total = data.length;
+            
+            if (total === 0) {
+                container.innerHTML = `
+                    <div class="no-data" style="width: 100%;">
+                        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="12" cy="12" r="10"></circle>
+                            <line x1="8" y1="12" x2="16" y2="12"></line>
+                        </svg>
+                        <p>未查询到匹配的专家记录。您可以点击“批量打包上传”标签导入数据。</p>
+                    </div>
+                `;
+                if (paginator) paginator.style.display = 'none';
+                return;
+            }
+
+            // 计算总页数
+            const totalPages = Math.ceil(total / pageSize);
+            // 修正页码边界
+            if (currentPage > totalPages) currentPage = totalPages;
+            if (currentPage < 1) currentPage = 1;
+
+            const startIndex = (currentPage - 1) * pageSize;
+            const endIndex = Math.min(startIndex + pageSize, total);
+            const pageData = data.slice(startIndex, endIndex);
+
+            const cardsGrid = document.createElement('div');
+            cardsGrid.className = 'experts-cards-grid';
+            cardsGrid.style.width = '100%';
+            
+            pageData.forEach((item, index) => {
+                const globalIndex = startIndex + index;
+                const card = document.createElement('div');
+                card.className = 'expert-card';
+                
+                let avatarHtml = '';
+                if (item.photo_path) {
+                    avatarHtml = `<img src="${item.photo_path}" class="expert-avatar" alt="身份证" onclick="zoomPhoto('${item.photo_path}')" onerror="handleImgLoadError(this)">`;
+                } else {
+                    avatarHtml = `
+                        <div class="expert-avatar-placeholder">
+                            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                                <circle cx="12" cy="7" r="4"></circle>
+                            </svg>
+                            <span>无照片</span>
+                        </div>
+                    `;
+                }
+
+                const unit = item.company || '未知单位';
+                const major = item.major || '未填专业';
+                
+                let statusTagHtml = '';
+                if (item.status === '已获取') {
+                    statusTagHtml = `<span class="expert-tag-status status-acquired">已获取</span>`;
+                } else if (item.status === '无法登录') {
+                    statusTagHtml = `<span class="expert-tag-status status-failed">无法登录</span>`;
+                } else {
+                    statusTagHtml = `<span class="expert-tag-status status-unacquired">未获取</span>`;
+                }
+                
+                card.innerHTML = `
+                    <div class="expert-avatar-container">
+                        ${avatarHtml}
+                    </div>
+                    <div class="expert-info">
+                        <div>
+                            <div class="expert-name-row">
+                                <span class="expert-name" title="${item.name}">${item.name}</span>
+                                <div style="display: flex; gap: 4px;">
+                                    <span class="expert-tag">评标专家</span>
+                                    ${statusTagHtml}
+                                </div>
+                            </div>
+                            <div class="expert-meta-item" title="${unit}">
+                                🏢 <span>${unit}</span>
+                            </div>
+                            <div class="expert-meta-item">
+                                📞 <span>${item.phone}</span>
+                            </div>
+                            <div class="expert-meta-item" title="${major}">
+                                💼 <span>${major}</span>
+                            </div>
+                        </div>
+                        <button class="btn-detail" onclick="showDetails(${globalIndex})">查看完整档案</button>
+                    </div>
+                `;
+                cardsGrid.appendChild(card);
+            });
+            
+            container.appendChild(cardsGrid);
+            renderPagination(totalPages);
+        }
+
+        function renderPagination(totalPages) {
+            const paginator = document.getElementById('pagination-container');
+            if (!paginator) return;
+            if (totalPages <= 1) {
+                paginator.style.display = 'none';
+                return;
+            }
+            
+            paginator.style.display = 'flex';
+            paginator.innerHTML = `
+                <button class="page-btn" id="btn-first-page" ${currentPage === 1 ? 'disabled' : ''}>首页</button>
+                <button class="page-btn" id="btn-prev-page" ${currentPage === 1 ? 'disabled' : ''}>上一页</button>
+                <span class="page-info">第 <strong>${currentPage}</strong> 页 / 共 <strong>${totalPages}</strong> 页</span>
+                <button class="page-btn" id="btn-next-page" ${currentPage === totalPages ? 'disabled' : ''}>下一页</button>
+                <button class="page-btn" id="btn-last-page" ${currentPage === totalPages ? 'disabled' : ''}>尾页</button>
+            `;
+            
+            document.getElementById('btn-first-page').addEventListener('click', () => {
+                currentPage = 1;
+                renderCards();
+            });
+            document.getElementById('btn-prev-page').addEventListener('click', () => {
+                if (currentPage > 1) {
+                    currentPage--;
+                    renderCards();
+                }
+            });
+            document.getElementById('btn-next-page').addEventListener('click', () => {
+                if (currentPage < totalPages) {
+                    currentPage++;
+                    renderCards();
+                }
+            });
+            document.getElementById('btn-last-page').addEventListener('click', () => {
+                currentPage = totalPages;
+                renderCards();
+            });
+        }
+
+        // ==================== 2. 批量上传逻辑 ====================
+        function setupDragAndDrop() {
+            const dropZone = document.getElementById('drop-zone');
+            const fileInput = document.getElementById('file-input');
+            const progressContainer = document.getElementById('progress-container');
+            const progressBar = document.getElementById('progress-bar');
+            const progressText = document.getElementById('progress-text');
+
+            dropZone.addEventListener('click', () => fileInput.click());
+            
+            dropZone.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                dropZone.classList.add('dragover');
+            });
+            
+            dropZone.addEventListener('dragleave', () => {
+                dropZone.classList.remove('dragover');
+            });
+            
+            dropZone.addEventListener('drop', (e) => {
+                e.preventDefault();
+                dropZone.classList.remove('dragover');
+                const files = e.dataTransfer.files;
+                if (files.length > 0) {
+                    handleUpload(files[0]);
+                }
+            });
+
+            fileInput.addEventListener('change', () => {
+                if (fileInput.files.length > 0) {
+                    handleUpload(fileInput.files[0]);
+                }
+            });
+
+            function handleUpload(file) {
+                if (!file.name.endsWith('.zip')) {
+                    alert('⚠️ 只允许上传 .zip 格式的压缩文件');
+                    return;
+                }
+
+                progressContainer.style.display = 'block';
+                progressBar.style.width = '0%';
+                progressText.innerText = '正在上传 0%...';
+
+                const formData = new FormData();
+                formData.append('file', file);
+
+                const xhr = new XMLHttpRequest();
+                xhr.open('POST', '/zj/api/upload', true);
+
+                xhr.upload.onprogress = (e) => {
+                    if (e.lengthComputable) {
+                        const percentComplete = Math.round((e.loaded / e.total) * 100);
+                        progressBar.style.width = percentComplete + '%';
+                        progressText.innerText = `正在上传 ${percentComplete}%...`;
+                        if (percentComplete >= 100) {
+                            progressText.innerText = '压缩包已上传完毕，后端正在解压并执行去重导入，请勿关闭或刷新本页面...';
+                        }
+                    }
+                };
+
+                xhr.onload = () => {
+                    if (xhr.status === 200) {
+                        const res = JSON.parse(xhr.responseText);
+                        progressBar.style.width = '100%';
+                        progressText.innerText = '导入成功！正在为您切换视图...';
+                        alert('✅ ' + res.message);
+                        
+                        // 导入成功后清空上传控件，自动跳回检索页面并加载最新数据
+                        fileInput.value = '';
+                        setTimeout(() => {
+                            switchTab('search');
+                        }, 1000);
+                    } else {
+                        let errorMsg = '上传失败';
+                        try {
+                            const res = JSON.parse(xhr.responseText);
+                            errorMsg = res.error || errorMsg;
+                        } catch(ex) {}
+                        progressBar.style.width = '0%';
+                        progressText.innerText = '导入失败: ' + errorMsg;
+                        alert('⚠️ 导入失败: ' + errorMsg);
+                    }
+                    setTimeout(() => {
+                        progressContainer.style.display = 'none';
+                    }, 4000);
+                };
+
+                xhr.onerror = () => {
+                    progressBar.style.width = '0%';
+                    progressText.innerText = '上传时发生网络错误';
+                    alert('⚠️ 网络异常，压缩包上传失败');
+                    setTimeout(() => {
+                        progressContainer.style.display = 'none';
+                    }, 4000);
+                };
+
+                xhr.send(formData);
+            }
+        }
+
+        // ==================== 3. 维护与删除逻辑 ====================
+        function fetchExpertsList() {
+            const totalCountEl = document.getElementById('stat-total-count');
+            const photoCountEl = document.getElementById('stat-photo-count');
+            const noPhotoCountEl = document.getElementById('stat-no-photo-count');
+            const companyCountEl = document.getElementById('stat-company-count');
+            const majorsContainer = document.getElementById('stat-majors-container');
+            
+            if (totalCountEl) totalCountEl.innerText = '加载中...';
+            if (photoCountEl) photoCountEl.innerText = '加载中...';
+            if (noPhotoCountEl) noPhotoCountEl.innerText = '加载中...';
+            if (companyCountEl) companyCountEl.innerText = '加载中...';
+            if (majorsContainer) {
+                majorsContainer.innerHTML = `
+                    <div style="grid-column: 1 / -1; text-align: center; color: var(--text-secondary); font-size: 13px; padding: 20px;">
+                        <div class="spinner" style="margin: 0 auto 12px; width: 24px; height: 24px; border-width: 2px;"></div>
+                        正在计算专业分布数据...
+                    </div>
+                `;
+            }
+
+            fetch('/zj/api/search')
+                .then(res => res.json())
+                .then(res => {
+                    if (res.success) {
+                        const data = res.data || [];
+                        const total = data.length;
+                        let photoCount = 0;
+                        const companies = new Set();
+                        
+                        // 统计各专业专家数量
+                        const majorCounts = {};
+                        
+                        data.forEach(item => {
+                            if (item.photo_path && item.photo_path.trim() !== '') {
+                                photoCount++;
+                            }
+                            if (item.company && item.company.trim() !== '') {
+                                companies.add(item.company.trim());
+                            }
+                            
+                            const majorStr = item.major ? item.major.trim() : '';
+                            if (!majorStr) {
+                                majorCounts['未填专业'] = (majorCounts['未填专业'] || 0) + 1;
+                            } else {
+                                const parts = majorStr.split(/[，,]/);
+                                const seenInThisExpert = new Set();
+                                parts.forEach(part => {
+                                    const cleanMajor = part.trim();
+                                    if (cleanMajor && !seenInThisExpert.has(cleanMajor)) {
+                                        seenInThisExpert.add(cleanMajor);
+                                        majorCounts[cleanMajor] = (majorCounts[cleanMajor] || 0) + 1;
+                                    }
+                                });
+                            }
+                        });
+                        
+                        const noPhotoCount = total - photoCount;
+                        const companyCount = companies.size;
+                        
+                        if (totalCountEl) totalCountEl.innerText = total;
+                        if (photoCountEl) photoCountEl.innerText = photoCount;
+                        if (noPhotoCountEl) noPhotoCountEl.innerText = noPhotoCount;
+                        if (companyCountEl) companyCountEl.innerText = companyCount;
+                        
+                        // 渲染各专业占比
+                        if (majorsContainer) {
+                            majorsContainer.innerHTML = '';
+                            const sortedMajors = Object.entries(majorCounts).sort((a, b) => {
+                                if (b[1] !== a[1]) {
+                                    return b[1] - a[1];
+                                }
+                                return a[0].localeCompare(b[0], 'zh');
+                            });
+                            
+                            if (sortedMajors.length === 0) {
+                                majorsContainer.innerHTML = `
+                                    <div style="grid-column: 1 / -1; text-align: center; color: var(--text-secondary); font-size: 13px; padding: 20px;">
+                                        暂无专业分布数据
+                                    </div>
+                                `;
+                            } else {
+                                sortedMajors.forEach(([majorName, count]) => {
+                                    const percentage = total > 0 ? Math.round((count / total) * 100) : 0;
+                                    const majorCard = document.createElement('div');
+                                    majorCard.className = 'major-stat-card';
+                                    majorCard.innerHTML = `
+                                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                                            <span style="font-size: 14px; font-weight: 600; color: var(--text-primary); display: flex; align-items: center; gap: 6px; padding-left: 4px;">
+                                                ${majorName}
+                                            </span>
+                                            <span style="font-size: 14px; font-weight: 700; color: var(--accent-color);">${count}人</span>
+                                        </div>
+                                        <div style="background: #e2e8f0; border-radius: 4px; height: 6px; overflow: hidden; width: 100%; margin-top: 4px;">
+                                            <div style="background: linear-gradient(90deg, var(--accent-color), #6366f1); height: 100%; width: ${percentage}%; border-radius: 4px; transition: width 0.5s ease-out;"></div>
+                                        </div>
+                                        <div style="display: flex; justify-content: space-between; font-size: 11px; color: var(--text-secondary);">
+                                            <span>占比</span>
+                                            <span>${percentage}%</span>
+                                        </div>
+                                    `;
+                                    majorsContainer.appendChild(majorCard);
+                                });
+                            }
+                        }
+                    } else {
+                        if (totalCountEl) totalCountEl.innerText = '⚠️ 失败';
+                        if (photoCountEl) photoCountEl.innerText = '⚠️ 失败';
+                        if (noPhotoCountEl) noPhotoCountEl.innerText = '⚠️ 失败';
+                        if (companyCountEl) companyCountEl.innerText = '⚠️ 失败';
+                        if (majorsContainer) {
+                            majorsContainer.innerHTML = `
+                                <div style="grid-column: 1 / -1; text-align: center; color: #ef4444; font-size: 13px; padding: 20px;">
+                                    ⚠️ 获取统计数据失败: ${res.error}
+                                </div>
+                            `;
+                        }
+                        console.error('获取统计数据失败:', res.error);
+                    }
+                })
+                .catch(err => {
+                    if (totalCountEl) totalCountEl.innerText = '⚠️ 错误';
+                    if (photoCountEl) photoCountEl.innerText = '⚠️ 错误';
+                    if (noPhotoCountEl) noPhotoCountEl.innerText = '⚠️ 错误';
+                    if (companyCountEl) companyCountEl.innerText = '⚠️ 错误';
+                    if (majorsContainer) {
+                        majorsContainer.innerHTML = `
+                            <div style="grid-column: 1 / -1; text-align: center; color: #ef4444; font-size: 13px; padding: 20px;">
+                                ⚠️ 网络错误，无法连接数据库统计
+                            </div>
+                        `;
+                    }
+                    console.error('网络错误，无法连接数据库统计:', err);
+                });
+        }
+
+        function setupClearDatabase() {
+            const clearBtn = document.getElementById('btn-clear');
+            clearBtn.addEventListener('click', () => {
+                if (confirm('⚠️ 极其危险的警告：此操作将清空专家数据库中的全部记录，并物理删除服务器上保存的所有身份证照片！此操作不可恢复。确定要清空吗？')) {
+                    const password = prompt('请输入清空确认密码：');
+                    if (password !== '108') {
+                        alert('❌ 密码错误或已取消操作，清空中止！');
+                        return;
+                    }
+                    if (confirm('请再次确认：您是否真的要清空所有专家档案和照片？')) {
+                        clearBtn.disabled = true;
+                        clearBtn.innerText = '正在清空专家数据...';
+                        
+                        fetch('/zj/api/clear', { 
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify({ password: password })
+                        })
+                            .then(res => res.json())
+                            .then(res => {
+                                clearBtn.disabled = false;
+                                clearBtn.innerHTML = '<span>🗑️</span> 清空专家库与照片';
+                                if (res.success) {
+                                    alert('✅ ' + res.message);
+                                    fetchExpertsList();
+                                } else {
+                                    alert('⚠️ 清空失败: ' + res.error);
+                                }
+                            })
+                            .catch(err => {
+                                clearBtn.disabled = false;
+                                clearBtn.innerHTML = '<span>🗑️</span> 清空专家库与照片';
+                                alert('⚠️ 网络错误，无法请求清空服务');
+                                console.error(err);
+                            });
+                    }
+                }
+            });
+        }
+
+        // ==================== 4. 辅助视觉控制逻辑 ====================
+        function handleImgLoadError(img) {
+            img.style.display = 'none';
+            const parent = img.parentNode;
+            parent.innerHTML = `
+                <div class="expert-avatar-placeholder">
+                    <span style="font-size: 16px;">⚠️</span>
+                    <span style="margin-top: 4px;">照片错误</span>
+                </div>
+            `;
+        }
+        
+        function handleDetailImgError() {
+            const img = document.getElementById('detail-img');
+            const errDiv = document.getElementById('detail-img-error');
+            if (img) img.style.display = 'none';
+            if (errDiv) errDiv.style.display = 'flex';
+        }
+
+        function showDetails(index) {
+            try {
+                const item = currentExpertsData[index];
+                if (!item) {
+                    alert('未找到该专家的缓存数据，请刷新重试');
+                    return;
+                }
+                const modal = document.getElementById('detail-modal');
+                if (!modal) return;
+                
+                // 强力控制模态框可见性与交互，确保兼容性
+                modal.classList.add('active');
+                modal.classList.add('visible');
+                modal.style.opacity = '1';
+                modal.style.visibility = 'visible';
+                modal.style.pointerEvents = 'auto';
+                modal.style.display = 'flex';
+                
+                // 填充顶部身份卡片
+                const nameEl = document.getElementById('detail-title-name');
+                const phoneEl = document.getElementById('detail-title-phone');
+                const companyEl = document.getElementById('detail-title-company');
+                const majorEl = document.getElementById('detail-title-major');
+                
+                if (nameEl) nameEl.innerText = item.name || '-';
+                if (phoneEl) phoneEl.innerText = item.phone || '-';
+                if (companyEl) companyEl.innerText = item.company || '未知单位';
+                if (majorEl) majorEl.innerText = item.major || '未填专业';
+                
+                // 照片区域控制，不破坏 DOM 树
+                const detailImg = document.getElementById('detail-img');
+                const errDiv = document.getElementById('detail-img-error');
+                
+                if (detailImg && errDiv) {
+                    if (item.photo_path) {
+                        detailImg.src = item.photo_path;
+                        detailImg.style.display = 'block';
+                        errDiv.style.display = 'none';
+                        detailImg.onclick = () => zoomPhoto(item.photo_path);
+                    } else {
+                        detailImg.src = '';
+                        detailImg.style.display = 'none';
+                        errDiv.style.display = 'flex';
+                    }
+                }
+                
+                // 整合完整 JSON
+                const rawJsonElement = document.getElementById('val-raw-json');
+                if (rawJsonElement) {
+                    rawJsonElement.innerText = JSON.stringify(item, null, 4);
+                }
+                
+                // 反显状态标记与备注信息
+                const statusSelect = document.getElementById('detail-status-select');
+                if (statusSelect) {
+                    statusSelect.value = item.status || '未获取';
+                }
+                const remarkInput = document.getElementById('detail-remark-input');
+                if (remarkInput) {
+                    remarkInput.value = item.remark || '';
+                }
+                const saveTip = document.getElementById('save-status-tip');
+                if (saveTip) {
+                    saveTip.style.display = 'none';
+                }
+
+                // 绑定保存标记与备注按钮事件
+                const saveStatusBtn = document.getElementById('btn-save-status');
+                if (saveStatusBtn) {
+                    const newSaveStatusBtn = saveStatusBtn.cloneNode(true);
+                    saveStatusBtn.parentNode.replaceChild(newSaveStatusBtn, saveStatusBtn);
+                    newSaveStatusBtn.addEventListener('click', () => {
+                        const newStatus = statusSelect ? statusSelect.value : '未获取';
+                        const newRemark = remarkInput ? remarkInput.value : '';
+                        newSaveStatusBtn.disabled = true;
+                        newSaveStatusBtn.innerText = '保存中...';
+
+                        fetch('/zj/api/update_status', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify({
+                                name: item.name,
+                                phone: item.phone,
+                                status: newStatus,
+                                remark: newRemark
+                            })
+                        })
+                        .then(res => res.json())
+                        .then(res => {
+                            newSaveStatusBtn.disabled = false;
+                            newSaveStatusBtn.innerText = '保存修改';
+                            if (res.success) {
+                                // 同步本地数据
+                                item.status = newStatus;
+                                item.remark = newRemark;
+                                // 重新渲染 JSON 文本展示
+                                if (rawJsonElement) {
+                                    rawJsonElement.innerText = JSON.stringify(item, null, 4);
+                                }
+                                // 显示已保存提示
+                                if (saveTip) {
+                                    saveTip.style.display = 'inline-flex';
+                                    setTimeout(() => {
+                                        saveTip.style.display = 'none';
+                                    }, 2000);
+                                }
+                                // 刷新列表中的卡片
+                                renderCards();
+                            } else {
+                                alert('⚠️ 保存修改失败：' + res.error);
+                            }
+                        })
+                        .catch(err => {
+                            newSaveStatusBtn.disabled = false;
+                            newSaveStatusBtn.innerText = '保存修改';
+                            alert('⚠️ 网络错误，保存修改失败');
+                            console.error(err);
+                        });
+                    });
+                }
+
+                // 绑定删除专家按钮事件
+                const deleteExpertBtn = document.getElementById('btn-detail-delete');
+                if (deleteExpertBtn) {
+                    const newDeleteExpertBtn = deleteExpertBtn.cloneNode(true);
+                    deleteExpertBtn.parentNode.replaceChild(newDeleteExpertBtn, deleteExpertBtn);
+                    newDeleteExpertBtn.addEventListener('click', () => {
+                        const pwd = prompt(`⚠️ 确定要物理删除专家 ${item.name} 及其身份证照吗？此操作不可恢复。\n请输入管理密码：`);
+                        if (pwd === null) {
+                            return;
+                        }
+                        if (pwd !== '108') {
+                            alert('❌ 密码错误，无权删除专家！');
+                            return;
+                        }
+                        
+                        newDeleteExpertBtn.disabled = true;
+                        newDeleteExpertBtn.innerText = '删除中...';
+
+                            fetch('/zj/api/delete', {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json'
+                                },
+                                body: JSON.stringify({
+                                    name: item.name,
+                                    phone: item.phone
+                                })
+                            })
+                            .then(res => res.json())
+                            .then(res => {
+                                newDeleteExpertBtn.disabled = false;
+                                newDeleteExpertBtn.innerText = '删除专家';
+                                if (res.success) {
+                                    closeDetailModal();
+                                    alert('✅ ' + res.message);
+                                    // 自动重新检索并刷新列表
+                                    const searchInput = document.getElementById('search-input');
+                                    const filterStatus = document.getElementById('filter-status');
+                                    fetchExperts(searchInput ? searchInput.value : '', filterStatus ? filterStatus.value : '');
+                                } else {
+                                    alert('⚠️ 删除专家失败：' + res.error);
+                                }
+                            })
+                            .catch(err => {
+                                newDeleteExpertBtn.disabled = false;
+                                newDeleteExpertBtn.innerText = '删除专家';
+                                alert('⚠️ 网络错误，删除专家失败');
+                                console.error(err);
+                            });
+                    });
+                }
+                
+                // 绑定复制按钮事件
+                const copyBtn = document.getElementById('btn-copy-json');
+                if (copyBtn) {
+                    // 先移除旧事件，避免重复绑定
+                    const newCopyBtn = copyBtn.cloneNode(true);
+                    copyBtn.parentNode.replaceChild(newCopyBtn, copyBtn);
+                    newCopyBtn.addEventListener('click', () => {
+                        navigator.clipboard.writeText(JSON.stringify(item, null, 4))
+                            .then(() => {
+                                const originalText = newCopyBtn.innerText;
+                                newCopyBtn.innerText = '✅ 已复制';
+                                newCopyBtn.style.background = 'rgba(16, 185, 129, 0.1)';
+                                newCopyBtn.style.color = '#10b981';
+                                newCopyBtn.style.borderColor = 'rgba(16, 185, 129, 0.2)';
+                                setTimeout(() => {
+                                    newCopyBtn.innerText = originalText;
+                                    newCopyBtn.style.background = 'rgba(14, 165, 233, 0.1)';
+                                    newCopyBtn.style.color = 'var(--accent-color)';
+                                    newCopyBtn.style.borderColor = 'rgba(14, 165, 233, 0.2)';
+                                }, 1500);
+                            })
+                            .catch(err => {
+                                alert('复制失败，请手动选择复制：' + err);
+                            });
+                    });
+                }
+                
+            } catch (err) {
+                alert('查看完整档案失败，错误：' + err.message);
+                console.error(err);
+            }
+        }
+
+        function closeDetailModal() {
+            const modal = document.getElementById('detail-modal');
+            if (modal) {
+                modal.classList.remove('active');
+                modal.classList.remove('visible');
+                modal.style.opacity = '';
+                modal.style.visibility = '';
+                modal.style.pointerEvents = '';
+                modal.style.display = '';
+            }
+        }
+
+        let currentRotation = 0;
+        function setupPhotoZoom() {
+            const overlay = document.getElementById('zoom-overlay');
+            const rotateBtn = document.getElementById('btn-rotate');
+            const closeBtn = document.getElementById('btn-close-zoom');
+            const zoomImg = document.getElementById('zoom-img');
+
+            closeBtn.addEventListener('click', () => {
+                overlay.classList.remove('active');
+            });
+
+            overlay.addEventListener('click', (e) => {
+                if (e.target.id === 'zoom-overlay') {
+                    overlay.classList.remove('active');
+                }
+            });
+
+            rotateBtn.addEventListener('click', () => {
+                currentRotation = (currentRotation + 90) % 360;
+                zoomImg.style.transform = `rotate(${currentRotation}deg)`;
+            });
+        }
+
+        function zoomPhoto(path) {
+            const overlay = document.getElementById('zoom-overlay');
+            const zoomImg = document.getElementById('zoom-img');
+            
+            currentRotation = 0;
+            zoomImg.style.transform = 'none';
+            zoomImg.src = path;
+            overlay.classList.add('active');
+        }
+
+        // 显式挂载 Window 属性以防全局作用域隔离
+        window.showDetails = showDetails;
+        window.closeDetailModal = closeDetailModal;
+        window.zoomPhoto = zoomPhoto;
+        window.handleImgLoadError = handleImgLoadError;
+        window.handleDetailImgError = handleDetailImgError;
+    </script>
+</body>
+
+</html>

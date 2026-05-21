@@ -13,3 +13,4 @@ PyMuPDF
 jieba
 gevent
 pypinyin
+lxml

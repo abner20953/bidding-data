@@ -918,6 +918,16 @@ try:
 except Exception as e:
     print(f"⚠️ Knowledge Base DB Init Failed: {e}")
 
+# --- Experts Blueprint ---
+from dashboard.blueprints.experts import experts_bp, init_db as init_experts_db
+app.register_blueprint(experts_bp)
+try:
+    with app.app_context():
+        init_experts_db()
+    print("✅ Experts DB Initialized")
+except Exception as e:
+    print(f"⚠️ Experts DB Init Failed: {e}")
+
 # --- 投标文件对比功能 ---
 
 @app.route('/bijiao')
