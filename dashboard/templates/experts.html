@@ -1351,6 +1351,9 @@
                             📞 手机号: <span id="detail-title-phone" style="color: var(--text-primary); font-weight: 500;">-</span>
                         </div>
                         <div style="font-size: 13px; color: var(--text-secondary); display: flex; align-items: center; gap: 6px;">
+                            🪪 身份证号: <span id="detail-title-idcard" style="color: var(--text-primary); font-weight: 500;">-</span>
+                        </div>
+                        <div style="font-size: 13px; color: var(--text-secondary); display: flex; align-items: center; gap: 6px;">
                             🏢 工作单位: <span id="detail-title-company" style="color: var(--text-primary); font-weight: 500;">-</span>
                         </div>
                         <div style="font-size: 13px; color: var(--text-secondary); display: flex; align-items: center; gap: 6px;">
@@ -2025,11 +2028,13 @@
                 // 填充顶部身份卡片
                 const nameEl = document.getElementById('detail-title-name');
                 const phoneEl = document.getElementById('detail-title-phone');
+                const idcardEl = document.getElementById('detail-title-idcard');
                 const companyEl = document.getElementById('detail-title-company');
                 const majorEl = document.getElementById('detail-title-major');
                 
                 if (nameEl) nameEl.innerText = item.name || '-';
                 if (phoneEl) phoneEl.innerText = item.phone || '-';
+                if (idcardEl) idcardEl.innerText = item.id_card || '未填身份证';
                 if (companyEl) companyEl.innerText = item.company || '未知单位';
                 if (majorEl) majorEl.innerText = item.major || '未填专业';
                 
