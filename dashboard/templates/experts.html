@@ -1420,7 +1420,7 @@
         // 全量专家数据缓存
         let currentExpertsData = [];
         let currentPage = 1;
-        const pageSize = 50;
+        const pageSize = 16;
 
         // 多图预览与切换状态缓存
         let currentDetailPhotos = [];
@@ -1597,7 +1597,7 @@
                     const photos = item.photo_path.split(',');
                     const firstPhoto = photos.length > 0 ? photos[0].trim() : '';
                     if (firstPhoto) {
-                        avatarHtml = `<img src="${firstPhoto}" class="expert-avatar" alt="身份证" onclick="zoomPhoto('${item.photo_path}', 0)" onerror="handleImgLoadError(this)">`;
+                        avatarHtml = `<img src="${firstPhoto}" class="expert-avatar" alt="身份证" onclick="zoomPhoto('${item.photo_path}', 0)" onerror="handleImgLoadError(this)" loading="lazy">`;
                     }
                 }
                 if (!avatarHtml) {

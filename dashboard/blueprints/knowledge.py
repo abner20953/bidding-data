@@ -73,6 +73,11 @@ def get_db():
 def init_db():
     db_path = get_db_path()
     conn = sqlite3.connect(db_path)
+    # 开启 WAL 模式以提升并发读写性能
+    try:
+        conn.execute('PRAGMA journal_mode=WAL;')
+    except Exception:
+        pass
     c = conn.cursor()
     
     # 1. 条目表

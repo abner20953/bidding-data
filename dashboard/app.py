@@ -32,6 +32,10 @@ CHAT_DB = os.path.join(DATA_DIR, 'chat.db')
 
 def init_chat_db():
     conn = sqlite3.connect(CHAT_DB)
+    try:
+        conn.execute('PRAGMA journal_mode=WAL;')
+    except Exception:
+        pass
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS messages
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -149,6 +153,10 @@ print(f"DEBUG: VISITOR_DB={VISITOR_DB}")
 def init_visitor_db():
     try:
         conn = sqlite3.connect(VISITOR_DB)
+        try:
+            conn.execute('PRAGMA journal_mode=WAL;')
+        except Exception:
+            pass
         cursor = conn.cursor()
         # 新表：记录用户实质性操作而非页面访问
         cursor.execute('''

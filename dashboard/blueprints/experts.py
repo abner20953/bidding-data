@@ -46,6 +46,11 @@ def init_db():
     """初始化数据库表结构"""
     db_path = get_db_path()
     conn = sqlite3.connect(db_path)
+    # 开启 WAL 模式以提升并发读写性能
+    try:
+        conn.execute('PRAGMA journal_mode=WAL;')
+    except Exception:
+        pass
     c = conn.cursor()
     # 专家信息表
     c.execute('''
@@ -67,6 +72,9 @@ def init_db():
     c.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_experts_name_phone ON experts(name, phone)')
     # 创建普通索引以支撑按状态高效筛选与快速排序
     c.execute('CREATE INDEX IF NOT EXISTS idx_experts_status ON experts(status)')
+    # 建立手机号与身份证号索引，加快高频精准/模糊匹配检索
+    c.execute('CREATE INDEX IF NOT EXISTS idx_experts_phone ON experts(phone)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_experts_id_card ON experts(id_card)')
     
     # 平滑升级旧数据库：增加 status 字段与 remark 字段
     try:
