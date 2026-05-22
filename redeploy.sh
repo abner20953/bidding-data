@@ -48,10 +48,13 @@ fi
 if [ ! -f "dashboard/visitor_logs.db" ]; then
     touch dashboard/visitor_logs.db
 fi
+if [ ! -f "experts.db" ]; then
+    touch experts.db
+fi
 
 echo "🔒 正在修正目录权限..."
 # 尝试将 file/uploads 目录及其内容的所有者设置为 UID 1000 (容器内用户)
-chown -R 1000:1000 file dashboard/static/uploads knowledge_base.db dashboard/visitor_logs.db 2>/dev/null || echo "⚠️ 自动修改权限失败"
+chown -R 1000:1000 file dashboard/static/uploads knowledge_base.db dashboard/visitor_logs.db experts.db 2>/dev/null || echo "⚠️ 自动修改权限失败"
 
 # 4. 重启容器
 echo "🔄 正在重启容器..."
@@ -67,6 +70,7 @@ docker run -d \
   -v $(pwd)/dashboard/static/uploads:/app/dashboard/static/uploads \
   -v $(pwd)/knowledge_base.db:/app/knowledge_base.db \
   -v $(pwd)/dashboard/visitor_logs.db:/app/dashboard/visitor_logs.db \
+  -v $(pwd)/experts.db:/app/experts.db \
   -v $(pwd):/app/tools \
   bidding-app
 
