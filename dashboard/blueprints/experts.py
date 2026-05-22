@@ -26,7 +26,9 @@ def get_db_path():
         base_dir = None
     if not base_dir:
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base_dir, '..', DB_NAME)
+    data_dir = os.path.join(base_dir, '..', 'data')
+    os.makedirs(data_dir, exist_ok=True)
+    return os.path.join(data_dir, DB_NAME)
 
 def get_photos_dir():
     """获取身份证照片存放的物理目录"""

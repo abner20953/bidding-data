@@ -33,7 +33,9 @@ def _log_action(action, detail=""):
     """记录用户实质性操作到 visitor_logs.db"""
     try:
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        visitor_db = os.path.join(base_dir, 'visitor_logs.db')
+        data_dir = os.path.join(base_dir, '..', 'data')
+        os.makedirs(data_dir, exist_ok=True)
+        visitor_db = os.path.join(data_dir, 'visitor_logs.db')
         ip = request.remote_addr
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         ua = request.user_agent
@@ -58,7 +60,9 @@ def get_db_path():
     base_dir = current_app.config.get('BASE_DIR')
     if not base_dir:
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base_dir, '..', DB_NAME)
+    data_dir = os.path.join(base_dir, '..', 'data')
+    os.makedirs(data_dir, exist_ok=True)
+    return os.path.join(data_dir, DB_NAME)
 
 def get_db():
     db_path = get_db_path()

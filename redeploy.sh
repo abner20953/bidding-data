@@ -41,20 +41,32 @@ if [ ! -d "dashboard/static/uploads" ]; then
     mkdir -p dashboard/static/uploads
 fi
 
-# Ensure DB files exist (otherwise Docker creates them as directories)
-if [ ! -f "knowledge_base.db" ]; then
-    touch knowledge_base.db
+# Ensure data directory exists and auto-migrate old DBs
+if [ ! -d "data" ]; then
+    echo "📂 创建数据目录 data..."
+    mkdir -p data
 fi
-if [ ! -f "dashboard/visitor_logs.db" ]; then
-    touch dashboard/visitor_logs.db
+
+if [ -f "experts.db" ]; then
+    echo "📦 自动迁移旧版 experts.db 到 data/ 目录..."
+    mv experts.db data/
 fi
-if [ ! -f "experts.db" ]; then
-    touch experts.db
+if [ -f "knowledge_base.db" ]; then
+    echo "📦 自动迁移旧版 knowledge_base.db 到 data/ 目录..."
+    mv knowledge_base.db data/
+fi
+if [ -f "dashboard/visitor_logs.db" ]; then
+    echo "📦 自动迁移旧版 visitor_logs.db 到 data/ 目录..."
+    mv dashboard/visitor_logs.db data/
+fi
+if [ -f "dashboard/chat.db" ]; then
+    echo "📦 自动迁移旧版 chat.db 到 data/ 目录..."
+    mv dashboard/chat.db data/
 fi
 
 echo "🔒 正在修正目录权限..."
-# 尝试将 file/uploads 目录及其内容的所有者设置为 UID 1000 (容器内用户)
-chown -R 1000:1000 file dashboard/static/uploads knowledge_base.db dashboard/visitor_logs.db experts.db 2>/dev/null || echo "⚠️ 自动修改权限失败"
+# 将 file/uploads/data 目录及其内容的所有者设置为 UID 1000 (容器内用户)
+chown -R 1000:1000 file dashboard/static/uploads data 2>/dev/null || echo "⚠️ 自动修改权限失败"
 
 # 4. 重启容器
 echo "🔄 正在重启容器..."
@@ -68,9 +80,7 @@ docker run -d \
   -v $(pwd)/results:/app/results \
   -v $(pwd)/file:/app/file \
   -v $(pwd)/dashboard/static/uploads:/app/dashboard/static/uploads \
-  -v $(pwd)/knowledge_base.db:/app/knowledge_base.db \
-  -v $(pwd)/dashboard/visitor_logs.db:/app/dashboard/visitor_logs.db \
-  -v $(pwd)/experts.db:/app/experts.db \
+  -v $(pwd)/data:/app/data \
   -v $(pwd):/app/tools \
   bidding-app
 

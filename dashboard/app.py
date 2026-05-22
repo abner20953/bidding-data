@@ -20,12 +20,15 @@ import json
 # 配置目录
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(BASE_DIR, '..', 'results')
+# 统一的数据库数据目录
+DATA_DIR = os.path.join(BASE_DIR, '..', 'data')
+os.makedirs(DATA_DIR, exist_ok=True)
 # 临时上传目录
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 
 # Admin Password Configuration
 ADMIN_PASSWORD = "108"
-CHAT_DB = os.path.join(BASE_DIR, 'chat.db')
+CHAT_DB = os.path.join(DATA_DIR, 'chat.db')
 
 def init_chat_db():
     conn = sqlite3.connect(CHAT_DB)
@@ -137,11 +140,8 @@ app.config['MAX_CONTENT_LENGTH'] = 300 * 1024 * 1024 # 300MB Limit
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 # --- 定时任务日志存储 (改为文件存储以解决多进程/线程问题) ---
-# --- 定时任务日志存储 (改为文件存储以解决多进程/线程问题) ---
 LOG_FILE = os.path.join(BASE_DIR, 'scheduler.log')
-print(f"DEBUG: BASE_DIR={BASE_DIR}")
-LOG_FILE = os.path.join(BASE_DIR, 'scheduler.log')
-VISITOR_DB = os.path.join(BASE_DIR, 'visitor_logs.db')
+VISITOR_DB = os.path.join(DATA_DIR, 'visitor_logs.db')
 print(f"DEBUG: BASE_DIR={BASE_DIR}")
 print(f"DEBUG: LOG_FILE={LOG_FILE}")
 print(f"DEBUG: VISITOR_DB={VISITOR_DB}")
