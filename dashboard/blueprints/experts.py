@@ -312,6 +312,7 @@ def api_search():
     name = request.args.get('name', '').strip()
     phone = request.args.get('phone', '').strip()
     id_card = request.args.get('id_card', '').strip()
+    company = request.args.get('company', '').strip()
     major = request.args.get('major', '').strip()
     status = request.args.get('status', '').strip()
     
@@ -349,6 +350,11 @@ def api_search():
         cleaned_id = id_card.replace(" ", "")
         conditions.append("id_card LIKE ?")
         params.append(f"%{cleaned_id}%")
+        
+    if company:
+        cleaned_company = company.replace(" ", "")
+        conditions.append("company LIKE ?")
+        params.append(f"%{cleaned_company}%")
         
     if major:
         cleaned_major = major.replace(" ", "")

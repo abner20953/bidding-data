@@ -191,7 +191,7 @@
         /* 独立搜索栏网格布局 */
         .search-bar-grid {
             display: grid;
-            grid-template-columns: repeat(4, 1fr);
+            grid-template-columns: repeat(5, 1fr);
             gap: 12px;
             flex: 1;
         }
@@ -264,9 +264,62 @@
                 align-items: center;
                 text-align: center;
             }
+            
+            /* 专家详情弹出模态框手机端响应式重写 */
+            .detail-header-grid {
+                grid-template-columns: 1fr !important;
+                justify-items: center;
+                text-align: center;
+                gap: 16px !important;
+                padding: 12px !important;
+            }
             .detail-photo-wrapper {
-                width: 150px !important;
-                height: 200px !important;
+                width: 120px !important;
+                height: 156px !important;
+            }
+            .detail-info-text {
+                align-items: center !important;
+                text-align: center !important;
+                width: 100%;
+            }
+            .detail-info-item {
+                justify-content: center !important;
+                text-align: center !important;
+                width: 100%;
+                word-break: break-all;
+            }
+            .detail-action-bar {
+                flex-direction: column !important;
+                align-items: stretch !important;
+                gap: 12px !important;
+                padding: 12px !important;
+            }
+            .detail-status-wrapper {
+                justify-content: center !important;
+                width: 100%;
+                gap: 6px !important;
+            }
+            .detail-status-select {
+                width: 100px !important;
+                padding: 6px 8px !important;
+                font-size: 12px !important;
+            }
+            #btn-save-status {
+                padding: 6px 12px !important;
+                font-size: 12px !important;
+            }
+            .detail-delete-wrapper {
+                justify-content: center !important;
+                width: 100%;
+            }
+            #btn-detail-delete {
+                width: 100%;
+                justify-content: center;
+                padding: 8px 12px !important;
+                font-size: 12px !important;
+            }
+            .detail-remark-box {
+                padding: 12px !important;
             }
             
             /* 原始 JSON 区防止撑爆 */
@@ -1108,6 +1161,208 @@
             box-shadow: 0 0 15px rgba(14, 165, 233, 0.4);
             transform: translateY(-50%) scale(1.05) !important;
         }
+
+        /* 专家详情弹出模态框新架构样式 */
+        .detail-header-grid {
+            display: grid;
+            grid-template-columns: 100px 1fr;
+            gap: 20px;
+            align-items: start;
+            margin-bottom: 20px;
+            padding: 16px;
+            background: rgba(14, 165, 233, 0.05);
+            border: 1px solid rgba(14, 165, 233, 0.1);
+            border-radius: 12px;
+            backdrop-filter: blur(4px);
+        }
+        .detail-photo-side-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 6px;
+        }
+        .detail-photo-wrapper {
+            position: relative;
+            width: 100px;
+            height: 130px;
+            border-radius: 8px;
+            overflow: hidden;
+            background: #f1f5f9;
+            border: 1px solid rgba(0, 0, 0, 0.06);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            box-shadow: var(--shadow-soft);
+        }
+        #detail-img-error {
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-secondary);
+            font-size: 10px;
+            padding: 8px;
+            text-align: center;
+            height: 100%;
+        }
+        #detail-img-error span:first-child {
+            font-size: 18px;
+            margin-bottom: 4px;
+        }
+        .detail-info-text {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            justify-content: center;
+            height: 100%;
+            padding-top: 4px;
+            min-width: 0;
+        }
+        .detail-info-item {
+            font-size: 13px;
+            color: var(--text-secondary);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-wrap: wrap;
+        }
+        .detail-title-val {
+            color: var(--text-primary);
+            font-weight: 500;
+        }
+        .detail-action-bar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding: 16px;
+            background: rgba(255, 255, 255, 0.7);
+            border: 1px solid var(--card-border);
+            border-radius: 12px;
+            backdrop-filter: blur(4px);
+        }
+        .detail-status-wrapper {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .detail-status-label {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+        .detail-status-select {
+            padding: 8px 12px;
+            border-radius: 8px;
+            font-size: 13px;
+            height: 36px;
+            width: 120px;
+            box-shadow: none;
+        }
+        #btn-save-status {
+            background: var(--accent-color);
+            border: none;
+            color: white;
+            font-size: 13px;
+            padding: 8px 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 500;
+            height: 36px;
+            transition: all 0.2s;
+        }
+        #btn-save-status:hover {
+            background: var(--accent-hover);
+        }
+        #save-status-tip {
+            font-size: 12px;
+            color: #10b981;
+            margin-left: 8px;
+            display: none;
+            align-items: center;
+            gap: 4px;
+        }
+        .detail-delete-wrapper {
+            display: flex;
+        }
+        #btn-detail-delete {
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid rgba(239, 68, 68, 0.2);
+            color: #ef4444;
+            font-size: 13px;
+            padding: 8px 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 500;
+            height: 36px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.2s;
+        }
+        #btn-detail-delete:hover {
+            background: #ef4444;
+            color: white;
+        }
+        .detail-remark-box {
+            margin-bottom: 20px;
+            padding: 16px;
+            background: rgba(255, 255, 255, 0.7);
+            border: 1px solid var(--card-border);
+            border-radius: 12px;
+            backdrop-filter: blur(4px);
+        }
+        .detail-remark-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        #detail-remark-input {
+            width: 100%;
+            height: 60px;
+            padding: 10px 12px;
+            border: 1px solid var(--card-border);
+            border-radius: 8px;
+            font-size: 13px;
+            resize: none;
+            background: rgba(255, 255, 255, 0.5);
+            color: var(--text-primary);
+            outline: none;
+            box-sizing: border-box;
+            transition: border-color 0.2s;
+        }
+        #detail-remark-input:focus {
+            border-color: var(--accent-color);
+        }
+        .detail-json-title-row {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--accent-color);
+            margin-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        #btn-copy-json {
+            background: rgba(14, 165, 233, 0.1);
+            border: 1px solid rgba(14, 165, 233, 0.2);
+            color: var(--accent-color);
+            font-size: 11px;
+            padding: 4px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-weight: 500;
+        }
+        #btn-copy-json:hover {
+            background: rgba(14, 165, 233, 0.2);
+        }
     </style>
 </head>
 
@@ -1153,6 +1408,9 @@
                     </div>
                     <div class="search-input-wrapper">
                         <input type="text" class="search-input" id="search-idcard" placeholder="🪪 身份证号 (模糊)...">
+                    </div>
+                    <div class="search-input-wrapper">
+                        <input type="text" class="search-input" id="search-company" placeholder="🏢 工作单位 (模糊)...">
                     </div>
                     <div class="search-input-wrapper">
                         <input type="text" class="search-input" id="search-major" placeholder="💼 专业领域 (模糊)...">
@@ -1327,13 +1585,13 @@
             </div>
             
             <div class="modal-body-scroll" style="padding: 24px;">
-                <div style="display: grid; grid-template-columns: 100px 1fr; gap: 20px; align-items: start; margin-bottom: 20px; padding: 16px; background: rgba(14, 165, 233, 0.05); border: 1px solid rgba(14, 165, 233, 0.1); border-radius: 12px; backdrop-filter: blur(4px);">
+                <div class="detail-header-grid">
                     <!-- 照片区域 -->
-                    <div style="display: flex; flex-direction: column; align-items: center; gap: 6px;">
-                        <div class="detail-photo-wrapper" style="position: relative; width: 100px; height: 130px; border-radius: 8px; overflow: hidden; background: #f1f5f9; border: 1px solid rgba(0, 0, 0, 0.06); display: flex; align-items: center; justify-content: center; flex-shrink: 0; box-shadow: var(--shadow-soft);">
+                    <div class="detail-photo-side-container">
+                        <div class="detail-photo-wrapper">
                             <img src="" id="detail-img" alt="身份证照片" style="width: 100%; height: 100%; object-fit: cover; cursor: zoom-in;" onerror="handleDetailImgError()">
-                            <div id="detail-img-error" style="display: none; flex-direction: column; align-items: center; justify-content: center; color: var(--text-secondary); font-size: 10px; padding: 8px; text-align: center; height: 100%;">
-                                <span style="font-size: 18px; margin-bottom: 4px;">⚠️</span>
+                            <div id="detail-img-error">
+                                <span>⚠️</span>
                                 <span>无照片</span>
                             </div>
                             <button id="photo-prev-btn" class="photo-nav-btn photo-nav-prev" style="display: none;">&lt;</button>
@@ -1342,60 +1600,60 @@
                         <div id="detail-photo-indicator" class="photo-indicator" style="display: none;">1 / 1</div>
                     </div>
                     <!-- 基础身份 -->
-                    <div style="display: flex; flex-direction: column; gap: 8px; justify-content: center; height: 100%; padding-top: 4px;">
+                    <div class="detail-info-text">
                         <div style="display: flex; align-items: center; gap: 8px;">
                             <span id="detail-title-name" style="font-size: 18px; font-weight: 700; color: var(--text-primary);">-</span>
                             <span class="expert-tag">已入库专家</span>
                         </div>
-                        <div style="font-size: 13px; color: var(--text-secondary); display: flex; align-items: center; gap: 6px;">
-                            📞 手机号: <span id="detail-title-phone" style="color: var(--text-primary); font-weight: 500;">-</span>
+                        <div class="detail-info-item">
+                            <span>📞 手机号:</span> <span id="detail-title-phone" class="detail-title-val">-</span>
                         </div>
-                        <div style="font-size: 13px; color: var(--text-secondary); display: flex; align-items: center; gap: 6px;">
-                            🪪 身份证号: <span id="detail-title-idcard" style="color: var(--text-primary); font-weight: 500;">-</span>
+                        <div class="detail-info-item">
+                            <span>🪪 身份证号:</span> <span id="detail-title-idcard" class="detail-title-val">-</span>
                         </div>
-                        <div style="font-size: 13px; color: var(--text-secondary); display: flex; align-items: center; gap: 6px;">
-                            🏢 工作单位: <span id="detail-title-company" style="color: var(--text-primary); font-weight: 500;">-</span>
+                        <div class="detail-info-item">
+                            <span>🏢 工作单位:</span> <span id="detail-title-company" class="detail-title-val">-</span>
                         </div>
-                        <div style="font-size: 13px; color: var(--text-secondary); display: flex; align-items: center; gap: 6px;">
-                            💼 专家专业: <span id="detail-title-major" style="color: var(--text-primary); font-weight: 500;">-</span>
+                        <div class="detail-info-item">
+                            <span>💼 专家专业:</span> <span id="detail-title-major" class="detail-title-val">-</span>
                         </div>
                     </div>
                 </div>
 
                 <!-- 操作与管理工具栏 (删除与标记) -->
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; padding: 16px; background: rgba(255, 255, 255, 0.7); border: 1px solid var(--card-border); border-radius: 12px; backdrop-filter: blur(4px);">
+                <div class="detail-action-bar">
                     <!-- 标记修改区 -->
-                    <div style="display: flex; align-items: center; gap: 8px;">
-                        <span style="font-size: 13px; font-weight: 600; color: var(--text-primary);">📌 标记状态:</span>
-                        <select class="filter-select" id="detail-status-select" style="padding: 8px 12px; border-radius: 8px; font-size: 13px; height: 36px; width: 120px; box-shadow: none;">
+                    <div class="detail-status-wrapper">
+                        <span class="detail-status-label">📌 标记状态:</span>
+                        <select class="filter-select detail-status-select" id="detail-status-select">
                             <option value="未获取">未获取</option>
                             <option value="已获取">已获取</option>
                             <option value="无法登录">无法登录</option>
                         </select>
-                        <button id="btn-save-status" style="background: var(--accent-color); border: none; color: white; font-size: 13px; padding: 8px 16px; border-radius: 8px; cursor: pointer; font-weight: 500; height: 36px; transition: all 0.2s;">保存修改</button>
-                        <span id="save-status-tip" style="font-size: 12px; color: #10b981; margin-left: 8px; display: none; align-items: center; gap: 4px;">✅ 已保存</span>
+                        <button id="btn-save-status">保存修改</button>
+                        <span id="save-status-tip">✅ 已保存</span>
                     </div>
                     <!-- 物理删除区 -->
-                    <div>
-                        <button id="btn-detail-delete" style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.2); color: #ef4444; font-size: 13px; padding: 8px 16px; border-radius: 8px; cursor: pointer; font-weight: 500; height: 36px; display: flex; align-items: center; gap: 6px; transition: all 0.2s;">
+                    <div class="detail-delete-wrapper">
+                        <button id="btn-detail-delete">
                             <span>🗑️</span> 删除专家
                         </button>
                     </div>
                 </div>
 
                 <!-- 专家备注区 -->
-                <div style="margin-bottom: 20px; padding: 16px; background: rgba(255, 255, 255, 0.7); border: 1px solid var(--card-border); border-radius: 12px; backdrop-filter: blur(4px);">
-                    <div style="font-size: 13px; font-weight: 600; color: var(--text-primary); margin-bottom: 8px; display: flex; align-items: center; gap: 4px;">
+                <div class="detail-remark-box">
+                    <div class="detail-remark-title">
                         <span>📝 专家备注:</span>
                     </div>
-                    <textarea id="detail-remark-input" placeholder="输入专家的自定义备注信息（如登录密码、密保答案、临时问题、备用联系方式等）..." style="width: 100%; height: 60px; padding: 10px 12px; border: 1px solid var(--card-border); border-radius: 8px; font-size: 13px; resize: none; background: rgba(255, 255, 255, 0.5); color: var(--text-primary); outline: none; box-sizing: border-box; transition: border-color 0.2s;" onfocus="this.style.borderColor='var(--accent-color)'" onblur="this.style.borderColor='var(--card-border)'"></textarea>
+                    <textarea id="detail-remark-input" placeholder="输入专家的自定义备注信息（如登录密码、密保答案、临时问题、备用联系方式等）..."></textarea>
                 </div>
 
                 <!-- 规整的 JSON 展示区域 -->
                 <div style="position: relative;">
-                    <div style="font-size: 13px; font-weight: 600; color: var(--accent-color); margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center;">
+                    <div class="detail-json-title-row">
                         <span>💻 规整 JSON 字段清单</span>
-                        <button id="btn-copy-json" style="background: rgba(14, 165, 233, 0.1); border: 1px solid rgba(14, 165, 233, 0.2); color: var(--accent-color); font-size: 11px; padding: 4px 12px; border-radius: 6px; cursor: pointer; transition: all 0.2s; font-weight: 500;">复制 JSON 数据</button>
+                        <button id="btn-copy-json">复制 JSON 数据</button>
                     </div>
                     <pre id="val-raw-json" style="background: #1e293b; padding: 18px; border-radius: 12px; font-family: 'Consolas', 'Courier New', monospace; font-size: 13px; color: #e2e8f0; overflow: auto; white-space: pre-wrap; word-break: break-all; max-height: 480px; border: 1px solid rgba(0, 0, 0, 0.15); line-height: 1.6; box-shadow: inset 0 2px 8px rgba(0,0,0,0.35);"></pre>
                 </div>
@@ -1434,12 +1692,13 @@
         // 页面初始化加载
         document.addEventListener('DOMContentLoaded', () => {
             // 默认加载专家检索列表
-            fetchExperts('', '', '', '', '');
+            fetchExperts('', '', '', '', '', '');
             
             // 绑定检索与筛选事件
             const searchName = document.getElementById('search-name');
             const searchPhone = document.getElementById('search-phone');
             const searchIdcard = document.getElementById('search-idcard');
+            const searchCompany = document.getElementById('search-company');
             const searchMajor = document.getElementById('search-major');
             const filterStatus = document.getElementById('filter-status');
             const searchBtn = document.getElementById('btn-search');
@@ -1449,6 +1708,7 @@
                     searchName.value,
                     searchPhone.value,
                     searchIdcard.value,
+                    searchCompany ? searchCompany.value : '',
                     searchMajor.value,
                     filterStatus.value
                 );
@@ -1458,7 +1718,7 @@
             
             // 绑定回车与输入防抖事件
             let debounceTimer;
-            [searchName, searchPhone, searchIdcard, searchMajor].forEach(input => {
+            [searchName, searchPhone, searchIdcard, searchCompany, searchMajor].forEach(input => {
                 if (input) {
                     input.addEventListener('keydown', (e) => {
                         if (e.key === 'Enter') {
@@ -1512,6 +1772,7 @@
                             document.getElementById('search-name').value,
                             document.getElementById('search-phone').value,
                             document.getElementById('search-idcard').value,
+                            document.getElementById('search-company') ? document.getElementById('search-company').value : '',
                             document.getElementById('search-major').value,
                             document.getElementById('filter-status').value
                         );
@@ -1523,7 +1784,7 @@
         }
 
         // ==================== 1. 专家检索逻辑 ====================
-        function fetchExperts(name = '', phone = '', idCard = '', major = '', status = '') {
+        function fetchExperts(name = '', phone = '', idCard = '', company = '', major = '', status = '') {
             const container = document.getElementById('cards-container');
             const paginator = document.getElementById('pagination-container');
             
@@ -1535,7 +1796,7 @@
             `;
             if (paginator) paginator.style.display = 'none';
             
-            const url = `/zj/api/search?name=${encodeURIComponent(name)}&phone=${encodeURIComponent(phone)}&id_card=${encodeURIComponent(idCard)}&major=${encodeURIComponent(major)}&status=${encodeURIComponent(status)}&_t=${Date.now()}`;
+            const url = `/zj/api/search?name=${encodeURIComponent(name)}&phone=${encodeURIComponent(phone)}&id_card=${encodeURIComponent(idCard)}&company=${encodeURIComponent(company)}&major=${encodeURIComponent(major)}&status=${encodeURIComponent(status)}&_t=${Date.now()}`;
             
             fetch(url)
                 .then(res => res.json())
@@ -2241,6 +2502,7 @@
                                         document.getElementById('search-name') ? document.getElementById('search-name').value : '',
                                         document.getElementById('search-phone') ? document.getElementById('search-phone').value : '',
                                         document.getElementById('search-idcard') ? document.getElementById('search-idcard').value : '',
+                                        document.getElementById('search-company') ? document.getElementById('search-company').value : '',
                                         document.getElementById('search-major') ? document.getElementById('search-major').value : '',
                                         document.getElementById('filter-status') ? document.getElementById('filter-status').value : ''
                                     );
