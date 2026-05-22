@@ -1539,7 +1539,7 @@
             `;
             if (paginator) paginator.style.display = 'none';
             
-            const url = `/zj/api/search?name=${encodeURIComponent(name)}&phone=${encodeURIComponent(phone)}&id_card=${encodeURIComponent(idCard)}&major=${encodeURIComponent(major)}&status=${encodeURIComponent(status)}`;
+            const url = `/zj/api/search?name=${encodeURIComponent(name)}&phone=${encodeURIComponent(phone)}&id_card=${encodeURIComponent(idCard)}&major=${encodeURIComponent(major)}&status=${encodeURIComponent(status)}&_t=${Date.now()}`;
             
             fetch(url)
                 .then(res => res.json())
