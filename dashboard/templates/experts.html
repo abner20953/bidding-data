@@ -188,6 +188,96 @@
             margin-bottom: 24px;
         }
 
+        /* 独立搜索栏网格布局 */
+        .search-bar-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 12px;
+            flex: 1;
+        }
+
+        .search-bar-grid .search-input {
+            padding-left: 16px !important;
+        }
+
+        /* 移动端与手机端全方位适配媒体查询 */
+        @media (max-width: 1024px) {
+            .search-bar-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+
+        @media (max-width: 768px) {
+            .search-bar-container {
+                flex-direction: column;
+                gap: 12px;
+            }
+            .search-bar-grid {
+                grid-template-columns: 1fr;
+                width: 100%;
+            }
+            .filter-select {
+                width: 100% !important;
+                padding: 12px 16px;
+            }
+            .btn-search-main {
+                width: 100% !important;
+                padding: 14px 20px;
+            }
+            
+            /* 专家卡片手机端布局优化 */
+            .experts-cards-grid {
+                grid-template-columns: 1fr !important;
+                gap: 16px;
+            }
+            .expert-card {
+                padding: 14px 12px !important;
+                gap: 12px !important;
+            }
+            .expert-avatar-container {
+                width: 80px !important;
+                height: 110px !important;
+            }
+            .expert-name {
+                font-size: 15px !important;
+            }
+            .expert-meta-item {
+                font-size: 11px !important;
+                margin-bottom: 2px !important;
+            }
+            
+            /* 详情模态框手机端适配 */
+            .modal-container {
+                width: 96% !important;
+                max-height: 90vh !important;
+            }
+            .modal-body-scroll {
+                padding: 16px !important;
+            }
+            .detail-sections-grid {
+                grid-template-columns: 1fr !important;
+                gap: 16px !important;
+            }
+            .detail-avatar-side {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                text-align: center;
+            }
+            .detail-photo-wrapper {
+                width: 150px !important;
+                height: 200px !important;
+            }
+            
+            /* 原始 JSON 区防止撑爆 */
+            #val-raw-json {
+                max-width: 100%;
+                word-break: break-all;
+                white-space: pre-wrap !important;
+                font-size: 11px !important;
+            }
+        }
+
         .search-input-wrapper {
             position: relative;
             flex: 1;
@@ -1054,12 +1144,19 @@
         <div id="panel-search" class="tab-panel">
             <!-- 搜索框 -->
             <div class="search-bar-container">
-                <div class="search-input-wrapper">
-                    <input type="text" class="search-input" id="search-input" placeholder="输入 姓名 / 手机号 / 专业 / 身份证号 模糊查询专家信息...">
-                    <svg class="search-icon-svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <circle cx="11" cy="11" r="8"></circle>
-                        <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-                    </svg>
+                <div class="search-bar-grid">
+                    <div class="search-input-wrapper">
+                        <input type="text" class="search-input" id="search-name" placeholder="🔍 姓名 (如: 刘 玄德)...">
+                    </div>
+                    <div class="search-input-wrapper">
+                        <input type="text" class="search-input" id="search-phone" placeholder="📞 手机号 (模糊)...">
+                    </div>
+                    <div class="search-input-wrapper">
+                        <input type="text" class="search-input" id="search-idcard" placeholder="🪪 身份证号 (模糊)...">
+                    </div>
+                    <div class="search-input-wrapper">
+                        <input type="text" class="search-input" id="search-major" placeholder="💼 专业领域 (模糊)...">
+                    </div>
                 </div>
                 <select class="filter-select" id="filter-status">
                     <option value="">全部标记状态</option>
@@ -1341,33 +1438,46 @@
         // 页面初始化加载
         document.addEventListener('DOMContentLoaded', () => {
             // 默认加载专家检索列表
-            fetchExperts('', '');
+            fetchExperts('', '', '', '', '');
             
             // 绑定检索与筛选事件
-            const searchInput = document.getElementById('search-input');
+            const searchName = document.getElementById('search-name');
+            const searchPhone = document.getElementById('search-phone');
+            const searchIdcard = document.getElementById('search-idcard');
+            const searchMajor = document.getElementById('search-major');
             const filterStatus = document.getElementById('filter-status');
             const searchBtn = document.getElementById('btn-search');
             
             function executeSearch() {
-                fetchExperts(searchInput.value, filterStatus.value);
+                fetchExperts(
+                    searchName.value,
+                    searchPhone.value,
+                    searchIdcard.value,
+                    searchMajor.value,
+                    filterStatus.value
+                );
             }
             
             searchBtn.addEventListener('click', executeSearch);
             
-            searchInput.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter') {
-                    executeSearch();
+            // 绑定回车与输入防抖事件
+            let debounceTimer;
+            [searchName, searchPhone, searchIdcard, searchMajor].forEach(input => {
+                if (input) {
+                    input.addEventListener('keydown', (e) => {
+                        if (e.key === 'Enter') {
+                            executeSearch();
+                        }
+                    });
+                    
+                    input.addEventListener('input', () => {
+                        clearTimeout(debounceTimer);
+                        debounceTimer = setTimeout(executeSearch, 350);
+                    });
                 }
             });
             
             filterStatus.addEventListener('change', executeSearch);
-            
-            // 输入防抖模糊搜索
-            let debounceTimer;
-            searchInput.addEventListener('input', () => {
-                clearTimeout(debounceTimer);
-                debounceTimer = setTimeout(executeSearch, 350);
-            });
             
             // 模态框关闭绑定
             document.getElementById('modal-close').addEventListener('click', closeDetailModal);
@@ -1402,7 +1512,13 @@
                     if (tabId === 'delete') {
                         fetchExpertsList();
                     } else if (tabId === 'search') {
-                        fetchExperts(document.getElementById('search-input').value, document.getElementById('filter-status').value);
+                        fetchExperts(
+                            document.getElementById('search-name').value,
+                            document.getElementById('search-phone').value,
+                            document.getElementById('search-idcard').value,
+                            document.getElementById('search-major').value,
+                            document.getElementById('filter-status').value
+                        );
                     }
                 } else {
                     panel.style.display = 'none';
@@ -1411,7 +1527,7 @@
         }
 
         // ==================== 1. 专家检索逻辑 ====================
-        function fetchExperts(query, status = '') {
+        function fetchExperts(name = '', phone = '', idCard = '', major = '', status = '') {
             const container = document.getElementById('cards-container');
             const paginator = document.getElementById('pagination-container');
             
@@ -1423,7 +1539,9 @@
             `;
             if (paginator) paginator.style.display = 'none';
             
-            fetch(`/zj/api/search?q=${encodeURIComponent(query)}&status=${encodeURIComponent(status)}`)
+            const url = `/zj/api/search?name=${encodeURIComponent(name)}&phone=${encodeURIComponent(phone)}&id_card=${encodeURIComponent(idCard)}&major=${encodeURIComponent(major)}&status=${encodeURIComponent(status)}`;
+            
+            fetch(url)
                 .then(res => res.json())
                 .then(res => {
                     if (res.success) {
@@ -1975,10 +2093,33 @@
                 
                 updateDetailPhotoShow();
                 
-                // 整合完整 JSON
+                // 整合完整 JSON (懒加载 details 并合并缓存)
                 const rawJsonElement = document.getElementById('val-raw-json');
                 if (rawJsonElement) {
-                    rawJsonElement.innerText = JSON.stringify(item, null, 4);
+                    if (item.details && Object.keys(item.details).length > 0) {
+                        rawJsonElement.innerText = JSON.stringify(item, null, 4);
+                    } else {
+                        rawJsonElement.innerText = "正在加载原始档案，请稍候...";
+                        fetch(`/zj/api/detail?name=${encodeURIComponent(item.name)}&phone=${encodeURIComponent(item.phone)}`)
+                            .then(res => res.json())
+                            .then(res => {
+                                if (res.success) {
+                                    item.details = res.details || {};
+                                    // 检查模态框当前显示的专家是否仍然是同一个，防止竞态条件导致渲染混乱
+                                    const currentModalName = document.getElementById('detail-title-name') ? document.getElementById('detail-title-name').innerText : '';
+                                    const currentModalPhone = document.getElementById('detail-title-phone') ? document.getElementById('detail-title-phone').innerText : '';
+                                    if (currentModalName === item.name && currentModalPhone === item.phone) {
+                                        rawJsonElement.innerText = JSON.stringify(item, null, 4);
+                                    }
+                                } else {
+                                    rawJsonElement.innerText = `⚠️ 原始档案加载失败: ${res.error}`;
+                                }
+                            })
+                            .catch(err => {
+                                rawJsonElement.innerText = `⚠️ 网络错误，原始档案加载失败`;
+                                console.error(err);
+                            });
+                    }
                 }
                 
                 // 反显状态标记与备注信息
@@ -2088,9 +2229,13 @@
                                     closeDetailModal();
                                     alert('✅ ' + res.message);
                                     // 自动重新检索并刷新列表
-                                    const searchInput = document.getElementById('search-input');
-                                    const filterStatus = document.getElementById('filter-status');
-                                    fetchExperts(searchInput ? searchInput.value : '', filterStatus ? filterStatus.value : '');
+                                    fetchExperts(
+                                        document.getElementById('search-name') ? document.getElementById('search-name').value : '',
+                                        document.getElementById('search-phone') ? document.getElementById('search-phone').value : '',
+                                        document.getElementById('search-idcard') ? document.getElementById('search-idcard').value : '',
+                                        document.getElementById('search-major') ? document.getElementById('search-major').value : '',
+                                        document.getElementById('filter-status') ? document.getElementById('filter-status').value : ''
+                                    );
                                 } else {
                                     alert('⚠️ 删除专家失败：' + res.error);
                                 }

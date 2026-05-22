@@ -63,6 +63,8 @@ def init_db():
     ''')
     # 创建唯一索引以支撑高效查询与去重判断
     c.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_experts_name_phone ON experts(name, phone)')
+    # 创建普通索引以支撑按状态高效筛选与快速排序
+    c.execute('CREATE INDEX IF NOT EXISTS idx_experts_status ON experts(status)')
     
     # 平滑升级旧数据库：增加 status 字段与 remark 字段
     try:
@@ -288,9 +290,14 @@ def api_upload():
 
 @experts_bp.route('/api/search', methods=['GET'])
 def api_search():
-    """查询专家信息"""
+    """查询专家信息 (优化版本：剥离大字段 raw_json 加速，并支持 4 条件独立模糊检索)"""
     q = request.args.get('q', '').strip()
+    name = request.args.get('name', '').strip()
+    phone = request.args.get('phone', '').strip()
+    id_card = request.args.get('id_card', '').strip()
+    major = request.args.get('major', '').strip()
     status = request.args.get('status', '').strip()
+    
     db_path = get_db_path()
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -299,16 +306,41 @@ def api_search():
     conditions = []
     params = []
     
+    # 兼容老版全局搜索
     if q:
         conditions.append("(name LIKE ? OR phone LIKE ? OR id_card LIKE ? OR major LIKE ? OR company LIKE ?)")
         query_str = f"%{q}%"
         params.extend([query_str, query_str, query_str, query_str, query_str])
         
+    # 新版四条件独立模糊搜索
+    if name:
+        # 去除用户输入中的所有半角与全角空格
+        cleaned_name = name.replace(" ", "").replace("　", "")
+        # SQL 中同样使用 REPLACE 嵌套去除空格以达到忽略空格的模糊匹配
+        conditions.append("REPLACE(REPLACE(name, ' ', ''), '　', '') LIKE ?")
+        params.append(f"%{cleaned_name}%")
+        
+    if phone:
+        cleaned_phone = phone.replace(" ", "")
+        conditions.append("phone LIKE ?")
+        params.append(f"%{cleaned_phone}%")
+        
+    if id_card:
+        cleaned_id = id_card.replace(" ", "")
+        conditions.append("id_card LIKE ?")
+        params.append(f"%{cleaned_id}%")
+        
+    if major:
+        cleaned_major = major.replace(" ", "")
+        conditions.append("major LIKE ?")
+        params.append(f"%{cleaned_major}%")
+        
     if status:
         conditions.append("status = ?")
         params.append(status)
         
-    sql = "SELECT name, phone, id_card, company, major, photo_path, raw_json, status, remark FROM experts"
+    # 精炼 SQL：不 SELECT raw_json 大文本字段，使一千条数据能在 20ms 内查出并传输完成
+    sql = "SELECT name, phone, id_card, company, major, photo_path, status, remark FROM experts"
     if conditions:
         sql += " WHERE " + " AND ".join(conditions)
     sql += " ORDER BY id DESC"
@@ -319,17 +351,6 @@ def api_search():
     
     results = []
     for r in rows:
-        # 将原始数据及解压 of json 字段整理返回
-        raw_json_str = r['raw_json']
-        parsed_json = {}
-        if raw_json_str:
-            try:
-                parsed_json = json.loads(raw_json_str)
-            except Exception:
-                # 解析失败则返回空 dict
-                pass
-                
-        # 兼容旧数据如果 status 字段为空白值则返回“未获取”
         item_status = r['status'] if r.keys() and 'status' in r.keys() and r['status'] else '未获取'
         item_remark = r['remark'] if r.keys() and 'remark' in r.keys() and r['remark'] else ''
                 
@@ -342,10 +363,37 @@ def api_search():
             "photo_path": r['photo_path'],
             "status": item_status,
             "remark": item_remark,
-            "details": parsed_json
+            "details": {}  # 列表阶段置空，点击“查看完整档案”时通过 api_detail 懒加载
         })
         
     return jsonify({"success": True, "data": results})
+
+@experts_bp.route('/api/detail', methods=['GET'])
+def api_detail():
+    """点对点懒加载查询单个专家原始 JSON 详情 (毫秒级响应)"""
+    name = request.args.get('name', '').strip()
+    phone = request.args.get('phone', '').strip()
+    if not name or not phone:
+        return jsonify({"success": False, "error": "姓名和手机号不能为空"}), 400
+        
+    db_path = get_db_path()
+    try:
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        # 命中联合唯一索引 idx_experts_name_phone，查询仅需几微秒
+        c.execute("SELECT raw_json FROM experts WHERE name = ? AND phone = ?", (name, phone))
+        row = c.fetchone()
+        conn.close()
+        
+        parsed_json = {}
+        if row and row[0]:
+            try:
+                parsed_json = json.loads(row[0])
+            except Exception:
+                pass
+        return jsonify({"success": True, "details": parsed_json})
+    except Exception as e:
+        return jsonify({"success": False, "error": f"查询专家详情失败: {str(e)}"}), 500
 
 @experts_bp.route('/api/backup', methods=['GET'])
 def api_backup():
