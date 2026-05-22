@@ -314,11 +314,14 @@ def api_search():
         
     # 新版四条件独立模糊搜索
     if name:
-        # 去除用户输入中的所有半角与全角空格
-        cleaned_name = name.replace(" ", "").replace("　", "")
-        # SQL 中同样使用 REPLACE 嵌套去除空格以达到忽略空格的模糊匹配
-        conditions.append("REPLACE(REPLACE(name, ' ', ''), '　', '') LIKE ?")
-        params.append(f"%{cleaned_name}%")
+        # 将输入按半角/全角空格拆分成多个关键词，支持如输入 "孟 霞" 模糊匹配 "孟艳霞"
+        name_parts = [p.strip() for p in re.split(r'[\s　]+', name) if p.strip()]
+        if name_parts:
+            name_conds = []
+            for part in name_parts:
+                name_conds.append("name LIKE ?")
+                params.append(f"%{part}%")
+            conditions.append(f"({' AND '.join(name_conds)})")
         
     if phone:
         cleaned_phone = phone.replace(" ", "")

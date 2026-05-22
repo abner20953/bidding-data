@@ -1146,7 +1146,7 @@
             <div class="search-bar-container">
                 <div class="search-bar-grid">
                     <div class="search-input-wrapper">
-                        <input type="text" class="search-input" id="search-name" placeholder="🔍 姓名 (如: 刘 玄德)...">
+                        <input type="text" class="search-input" id="search-name" placeholder="🔍 姓名...">
                     </div>
                     <div class="search-input-wrapper">
                         <input type="text" class="search-input" id="search-phone" placeholder="📞 手机号 (模糊)...">
@@ -1667,16 +1667,26 @@
         function renderPagination(totalPages) {
             const paginator = document.getElementById('pagination-container');
             if (!paginator) return;
-            if (totalPages <= 1) {
+            const data = currentExpertsData || [];
+            const total = data.length;
+            
+            if (total === 0) {
                 paginator.style.display = 'none';
                 return;
             }
             
             paginator.style.display = 'flex';
+            if (totalPages <= 1) {
+                paginator.innerHTML = `
+                    <span class="page-info">共 <strong>${total}</strong> 条记录 / 第 <strong>1</strong> 页</span>
+                `;
+                return;
+            }
+            
             paginator.innerHTML = `
                 <button class="page-btn" id="btn-first-page" ${currentPage === 1 ? 'disabled' : ''}>首页</button>
                 <button class="page-btn" id="btn-prev-page" ${currentPage === 1 ? 'disabled' : ''}>上一页</button>
-                <span class="page-info">第 <strong>${currentPage}</strong> 页 / 共 <strong>${totalPages}</strong> 页</span>
+                <span class="page-info">共 <strong>${total}</strong> 条记录 / 第 <strong>${currentPage}</strong> 页 / 共 <strong>${totalPages}</strong> 页</span>
                 <button class="page-btn" id="btn-next-page" ${currentPage === totalPages ? 'disabled' : ''}>下一页</button>
                 <button class="page-btn" id="btn-last-page" ${currentPage === totalPages ? 'disabled' : ''}>尾页</button>
             `;
