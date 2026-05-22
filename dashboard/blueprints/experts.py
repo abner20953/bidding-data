@@ -191,6 +191,9 @@ def api_upload():
         
         imported_count = 0
         matched_photo_count = 0
+        total_in_file = 0
+        added_count = 0
+        updated_count = 0
         photos_dest_dir = get_photos_dir()
         
         # 记录本次操作的时间
@@ -207,6 +210,8 @@ def api_upload():
             
             if not name or not phone:
                 continue
+                
+            total_in_file += 1
                 
             company = str(row.get(col_mapping.get('company', ''), '')).strip()
             id_card = str(row.get(col_mapping.get('id_card', ''), '')).strip()
@@ -276,6 +281,7 @@ def api_upload():
             
             if exist_record:
                 # 已经存在，执行更新操作
+                updated_count += 1
                 c.execute('''
                     UPDATE experts 
                     SET id_card = ?, company = ?, major = ?, photo_path = ?, raw_json = ?, created_at = ?
@@ -283,6 +289,7 @@ def api_upload():
                 ''', (id_card, company, major, photo_path_db, raw_json, now_time, exist_record[0]))
             else:
                 # 不存在，执行插入（追加）操作
+                added_count += 1
                 c.execute('''
                     INSERT INTO experts (name, phone, id_card, company, major, photo_path, raw_json, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -295,7 +302,7 @@ def api_upload():
         
         return jsonify({
             "success": True,
-            "message": f"成功导入/更新 {imported_count} 条专家信息，成功匹配并保存身份证照 {matched_photo_count} 张。"
+            "message": f"成功导入！文件中共解析出 {total_in_file} 位专家，其中实际新增上传 {added_count} 人，重复覆盖更新 {updated_count} 人，成功匹配并保存身份证照 {matched_photo_count} 张。"
         })
 
 @experts_bp.route('/api/search', methods=['GET'])
