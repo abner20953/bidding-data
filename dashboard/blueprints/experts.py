@@ -89,8 +89,125 @@ def init_db():
     except sqlite3.OperationalError:
         pass
         
+    # 初始化项目及参评专家关系数据库表
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_name TEXT NOT NULL UNIQUE,
+            process_time TEXT,
+            agent_name TEXT,
+            agent_dept TEXT,
+            created_at TEXT
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS project_experts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER,
+            expert_name TEXT NOT NULL,
+            expert_id_card TEXT NOT NULL,
+            expert_code TEXT,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+        )
+    ''')
+    # 建立高性能检索索引
+    c.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_name ON projects(project_name)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_project_experts_project_id ON project_experts(project_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_project_experts_id_card ON project_experts(expert_id_card)')
+        
     conn.commit()
     conn.close()
+
+def parse_and_import_md(file_path):
+    """解析并导入 Markdown 格式的项目评审与专家关系表 (流式读取逐行处理，对内存极度友好)"""
+    if not os.path.exists(file_path):
+        return 0, 0
+    
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    
+    now_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    project_imported = 0
+    expert_relations_imported = 0
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line_str = line.strip()
+                if not line_str.startswith('|') or not line_str.endswith('|'):
+                    continue
+                
+                # 过滤表头和表格分割线
+                if '项目名称' in line_str or ':---' in line_str:
+                    continue
+                
+                parts = [p.strip() for p in line_str.split('|')]
+                # 预期的 parts 格式: ['', 项目名称, 处理时间, 经办人姓名, 经办人部门, 评审专家列表, '']
+                if len(parts) < 6:
+                    continue
+                
+                project_name = parts[1]
+                process_time = parts[2]
+                agent_name = parts[3]
+                agent_dept = parts[4]
+                experts_cell = parts[5]
+                
+                if not project_name:
+                    continue
+                
+                # 插入或更新项目基本信息，如果项目已存在，更新其基本元数据
+                c.execute("SELECT id FROM projects WHERE project_name = ?", (project_name,))
+                row_exist = c.fetchone()
+                if row_exist:
+                    project_id = row_exist[0]
+                    c.execute('''
+                        UPDATE projects 
+                        SET process_time = ?, agent_name = ?, agent_dept = ?, created_at = ?
+                        WHERE id = ?
+                    ''', (process_time, agent_name, agent_dept, now_time, project_id))
+                    # 防重覆盖机制：清空该项目之前所有的旧评审专家关联
+                    c.execute("DELETE FROM project_experts WHERE project_id = ?", (project_id,))
+                else:
+                    c.execute('''
+                        INSERT INTO projects (project_name, process_time, agent_name, agent_dept, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                      ''', (project_name, process_time, agent_name, agent_dept, now_time))
+                    project_id = c.lastrowid
+                
+                project_imported += 1
+                
+                # 解析评审专家列表：通过 <br> 分隔
+                # 专家格式: 姓名 / 身份证号 / 专家编码
+                expert_items = re.split(r'<br\s*/?>', experts_cell, flags=re.IGNORECASE)
+                for item in expert_items:
+                    item = item.strip()
+                    if not item:
+                        continue
+                    
+                    exp_parts = [e.strip() for e in item.split('/')]
+                    if not exp_parts or not exp_parts[0]:
+                        continue
+                    
+                    exp_name = exp_parts[0]
+                    exp_id_card = exp_parts[1] if len(exp_parts) > 1 else ""
+                    exp_code = exp_parts[2] if len(exp_parts) > 2 else ""
+                    
+                    # 写入项目与专家关系
+                    c.execute('''
+                        INSERT INTO project_experts (project_id, expert_name, expert_id_card, expert_code)
+                        VALUES (?, ?, ?, ?)
+                    ''', (project_id, exp_name, exp_id_card, exp_code))
+                    expert_relations_imported += 1
+                    
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
+        
+    return project_imported, expert_relations_imported
 
 @experts_bp.route('/')
 def experts_view():
@@ -126,8 +243,9 @@ def api_upload():
         except Exception as e:
             return jsonify({"success": False, "error": f"解压压缩包失败: {str(e)}"}), 400
 
-        # 扫描解压目录，定位 Excel 表格与身份证照片
+        # 扫描解压目录，定位 Excel 表格、MD 项目关系与身份证照片
         excel_file = None
+        md_file = None
         photos = {} # 格式：{ "姓名_手机号": "图片绝对路径" }
         
         for root_dir, dirs, files in os.walk(temp_dir):
@@ -138,6 +256,8 @@ def api_upload():
                 full_path = os.path.join(root_dir, f)
                 if ext in ('.xls', '.xlsx'):
                     excel_file = full_path
+                elif ext == '.md':
+                    md_file = full_path
                 elif ext in ('.jpg', '.jpeg', '.png'):
                     # 转换为统一的“姓名_手机号”作为 Key，去除空格和后缀
                     base_name = os.path.splitext(f)[0].strip().replace(" ", "")
@@ -300,10 +420,155 @@ def api_upload():
         conn.commit()
         conn.close()
         
+        md_message = ""
+        if md_file:
+            try:
+                proj_count, rel_count = parse_and_import_md(md_file)
+                md_message = f" 另外检测到并成功导入项目关系文件，解析出 {proj_count} 个项目的评审信息，共关联参评专家 {rel_count} 人次。"
+            except Exception as e:
+                md_message = f" 但项目关系 MD 解析失败，错误: {str(e)}。"
+        
         return jsonify({
             "success": True,
-            "message": f"成功导入！文件中共解析出 {total_in_file} 位专家，其中实际新增上传 {added_count} 人，重复覆盖更新 {updated_count} 人，成功匹配并保存身份证照 {matched_photo_count} 张。"
+            "message": f"成功导入！文件中共解析出 {total_in_file} 位专家，其中实际新增上传 {added_count} 人，重复覆盖更新 {updated_count} 人，成功匹配并保存身份证照 {matched_photo_count} 张。{md_message}"
         })
+
+@experts_bp.route('/api/upload_md', methods=['POST'])
+def api_upload_md():
+    """单独上传并解析项目评审关系 MD 文件 (性能友好，内存低消耗)"""
+    if 'file' not in request.files:
+        return jsonify({"success": False, "error": "未选择任何文件"}), 400
+        
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"success": False, "error": "文件名不能为空"}), 400
+        
+    if not file.filename.endswith('.md'):
+        return jsonify({"success": False, "error": "只支持上传 .md 格式的 Markdown 文件"}), 400
+
+    # 使用临时文件保存并解析
+    with tempfile.TemporaryDirectory() as temp_dir:
+        md_path = os.path.join(temp_dir, 'temp_project.md')
+        file.save(md_path)
+        
+        try:
+            proj_count, rel_count = parse_and_import_md(md_path)
+            return jsonify({
+                "success": True,
+                "message": f"项目评审关系导入成功！共解析导入项目 {proj_count} 个，关联参评专家 {rel_count} 人次。"
+            })
+        except Exception as e:
+            return jsonify({"success": False, "error": f"解析项目关系 MD 文件失败: {str(e)}"}), 500
+
+@experts_bp.route('/api/search_projects', methods=['GET'])
+def api_search_projects():
+    """查询项目评审关系，支持项目名、参评专家姓名、身份证多条件模糊检索"""
+    project_name = request.args.get('project_name', '').strip()
+    expert_name = request.args.get('expert_name', '').strip()
+    expert_id_card = request.args.get('expert_id_card', '').strip()
+    
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    
+    conditions = []
+    params = []
+    
+    sql = """
+        SELECT DISTINCT p.id, p.project_name, p.process_time, p.agent_name, p.agent_dept, p.created_at
+        FROM projects p
+        LEFT JOIN project_experts pe ON p.id = pe.project_id
+    """
+    
+    if project_name:
+        conditions.append("p.project_name LIKE ?")
+        params.append(f"%{project_name}%")
+        
+    if expert_name:
+        conditions.append("pe.expert_name LIKE ?")
+        params.append(f"%{expert_name}%")
+        
+    if expert_id_card:
+        conditions.append("pe.expert_id_card LIKE ?")
+        params.append(f"%{expert_id_card}%")
+        
+    if conditions:
+        sql += " WHERE " + " AND ".join(conditions)
+        
+    sql += " ORDER BY p.id DESC"
+    
+    try:
+        c.execute(sql, params)
+        project_rows = c.fetchall()
+        
+        results = []
+        for p_row in project_rows:
+            p_id = p_row['id']
+            # 查询该项目下的全部专家
+            c.execute("""
+                SELECT expert_name, expert_id_card, expert_code 
+                FROM project_experts 
+                WHERE project_id = ?
+            """, (p_id,))
+            expert_rows = c.fetchall()
+            
+            experts_list = []
+            for e_row in expert_rows:
+                experts_list.append({
+                    "name": e_row['expert_name'],
+                    "id_card": e_row['expert_id_card'],
+                    "code": e_row['expert_code']
+                })
+                
+            results.append({
+                "id": p_id,
+                "project_name": p_row['project_name'],
+                "process_time": p_row['process_time'],
+                "agent_name": p_row['agent_name'],
+                "agent_dept": p_row['agent_dept'],
+                "created_at": p_row['created_at'],
+                "experts": experts_list
+            })
+            
+        return jsonify({"success": True, "data": results})
+    except Exception as e:
+        return jsonify({"success": False, "error": f"检索项目失败: {str(e)}"}), 500
+    finally:
+        conn.close()
+
+@experts_bp.route('/api/detail_by_idcard', methods=['GET'])
+def api_detail_by_idcard():
+    """根据专家身份证号，查询其在主专家库中的基础匹配数据（用于前端弹窗联动）"""
+    id_card = request.args.get('id_card', '').strip()
+    if not id_card:
+        return jsonify({"success": False, "error": "身份证号不能为空"}), 400
+        
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    
+    try:
+        c.execute("SELECT name, phone FROM experts WHERE id_card = ?", (id_card,))
+        row = c.fetchone()
+        
+        if row:
+            return jsonify({
+                "success": True,
+                "found": True,
+                "name": row[0],
+                "phone": row[1]
+            })
+        else:
+            return jsonify({
+                "success": True,
+                "found": False,
+                "message": "该专家暂未录入主专家库，无法查看完整档案。"
+            })
+    except Exception as e:
+        return jsonify({"success": False, "error": f"关联查询专家失败: {str(e)}"}), 500
+    finally:
+        conn.close()
 
 @experts_bp.route('/api/search', methods=['GET'])
 def api_search():

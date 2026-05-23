@@ -329,6 +329,18 @@
                 white-space: pre-wrap !important;
                 font-size: 11px !important;
             }
+            
+            /* 项目移动端自适应 */
+            .project-search-grid {
+                grid-template-columns: 1fr !important;
+            }
+            .project-meta-row {
+                flex-direction: column !important;
+                gap: 8px !important;
+            }
+            .project-card {
+                padding: 16px !important;
+            }
         }
 
         .search-input-wrapper {
@@ -1363,6 +1375,114 @@
         #btn-copy-json:hover {
             background: rgba(14, 165, 233, 0.2);
         }
+
+        /* 项目评审卡片与检索大屏幕样式 */
+        .project-search-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+            flex: 1;
+        }
+        .projects-list-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 20px;
+        }
+        .project-card {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+            padding: 24px;
+            position: relative;
+            overflow: hidden;
+            backdrop-filter: blur(8px);
+            box-shadow: var(--shadow-soft);
+            transition: all 0.3s ease;
+        }
+        .project-card:hover {
+            transform: translateY(-2px);
+            box-shadow: var(--shadow-hover);
+            border-color: rgba(14, 165, 233, 0.25);
+        }
+        .project-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 4px;
+            height: 100%;
+            background: linear-gradient(to bottom, #6366f1, #0ea5e9);
+            opacity: 0.8;
+        }
+        .project-card-title {
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 12px;
+            line-height: 1.5;
+        }
+        .project-meta-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 24px;
+            margin-bottom: 16px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid rgba(0, 0, 0, 0.04);
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+        .project-meta-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .project-meta-item span {
+            color: var(--text-primary);
+            font-weight: 500;
+        }
+        .project-experts-section {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .project-experts-label {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .project-experts-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .project-expert-tag {
+            font-size: 12px;
+            background: rgba(99, 102, 241, 0.08);
+            border: 1px solid rgba(99, 102, 241, 0.15);
+            color: #6366f1;
+            padding: 5px 14px;
+            border-radius: 20px;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .project-expert-tag:hover {
+            background: #6366f1;
+            color: white;
+            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.35);
+            transform: translateY(-1px) scale(1.03);
+        }
+        .project-expert-tag .expert-tag-idcard {
+            font-size: 10px;
+            opacity: 0.85;
+            font-weight: normal;
+        }
     </style>
 </head>
 
@@ -1386,6 +1506,9 @@
         <div class="glass-tabs">
             <button class="tab-btn active" data-tab="search" onclick="switchTab('search')">
                 <span>🔍</span> 专家信息检索
+            </button>
+            <button class="tab-btn" data-tab="projects" onclick="switchTab('projects')">
+                <span>📊</span> 项目评审查询
             </button>
             <button class="tab-btn" data-tab="upload" onclick="switchTab('upload')">
                 <span>📥</span> 批量打包上传
@@ -1435,6 +1558,32 @@
 
             <!-- 分页器 -->
             <div id="pagination-container" class="pagination-bar" style="display: none;"></div>
+        </div>
+
+        <!-- 项目评审查询面板 -->
+        <div id="panel-projects" class="tab-panel" style="display: none;">
+            <!-- 检索框 -->
+            <div class="search-bar-container">
+                <div class="project-search-grid">
+                    <div class="search-input-wrapper">
+                        <input type="text" class="search-input" id="search-project-name" placeholder="🔍 项目名称 (模糊)..." style="padding-left: 16px;">
+                    </div>
+                    <div class="search-input-wrapper">
+                        <input type="text" class="search-input" id="search-project-expert-name" placeholder="👤 参评专家姓名 (模糊)..." style="padding-left: 16px;">
+                    </div>
+                    <div class="search-input-wrapper">
+                        <input type="text" class="search-input" id="search-project-expert-idcard" placeholder="🪪 参评专家身份证号 (模糊)..." style="padding-left: 16px;">
+                    </div>
+                </div>
+                <button class="btn-search-main" id="btn-search-projects">搜索项目</button>
+            </div>
+
+            <!-- 项目展示区 -->
+            <div id="projects-container">
+                <div class="no-data">
+                    <p>暂无项目评审数据，请在上方输入检索条件或进行数据导入。</p>
+                </div>
+            </div>
         </div>
 
         <!-- 批量打包上传面板 -->
@@ -1495,6 +1644,40 @@
                 </div>
 
             </div>
+
+            <!-- 单独上传 MD 项目评审文件 -->
+            <div class="glass-card" style="margin-top: 24px;">
+                <div class="card-title">
+                    <span>📄</span> 单独上传项目评审关系 MD 文件
+                </div>
+                <div style="display: flex; gap: 24px; align-items: center; flex-wrap: wrap;">
+                    <div style="flex: 1; min-width: 280px;">
+                        <div class="upload-zone-large" id="drop-zone-md" style="padding: 30px 20px; max-width: 100%; margin-bottom: 0;">
+                            <input type="file" id="file-input-md" accept=".md" style="display: none;">
+                            <div class="upload-icon-large" style="font-size: 36px; margin-bottom: 8px;">📄</div>
+                            <div class="upload-text-large" style="font-size: 13px;">
+                                将项目与专家关系 <strong>.md</strong> 文件拖至此处，或 <strong>点击选择文件</strong> 上传
+                            </div>
+                        </div>
+                    </div>
+                    <div style="flex: 1; min-width: 280px; font-size: 13px; color: var(--text-secondary); line-height: 1.6;">
+                        <div style="font-weight: 600; color: var(--text-primary); margin-bottom: 6px; display: flex; align-items: center; gap: 6px;">
+                            <span>💡</span> MD 项目关系文件格式说明
+                        </div>
+                        <div>
+                            支持上传带有 Markdown 表格的项目参评专家关系文件。系统会自动读取各项目的<b>处理时间、经办人、经办人部门以及多位参评专家</b>。如果导入的项目名称已存在，系统会自动覆盖更新项目元数据并重新建立参评专家映射，保证数据准确无误。
+                        </div>
+                    </div>
+                </div>
+                <!-- 上传 MD 进度 -->
+                <div class="progress-container" id="progress-container-md" style="margin-top: 16px; max-width: 100%;">
+                    <div class="progress-bar-bg">
+                        <div class="progress-bar-fill" id="progress-bar-md"></div>
+                    </div>
+                    <div class="progress-text" id="progress-text-md">准备上传... 0%</div>
+                </div>
+            </div>
+
         </div>
 
         <!-- 数据维护与删除面板 -->
@@ -1749,6 +1932,10 @@
 
             // 照片放大预览与旋转
             setupPhotoZoom();
+
+            // 绑定项目评审检索与单独上传 MD 模块
+            setupProjectSearch();
+            setupUploadMd();
         });
 
         // 标签页切换逻辑
@@ -1767,6 +1954,12 @@
                     panel.style.display = 'block';
                     if (tabId === 'delete') {
                         fetchExpertsList();
+                    } else if (tabId === 'projects') {
+                        fetchProjects(
+                            document.getElementById('search-project-name').value,
+                            document.getElementById('search-project-expert-name').value,
+                            document.getElementById('search-project-expert-idcard').value
+                        );
                     } else if (tabId === 'search') {
                         fetchExperts(
                             document.getElementById('search-name').value,
@@ -2643,12 +2836,476 @@
             overlay.classList.add('active');
         }
 
+        // ==================== 项目评审查询及 MD 上传交互逻辑 ====================
+
+        function setupProjectSearch() {
+            const searchProjName = document.getElementById('search-project-name');
+            const searchProjExpert = document.getElementById('search-project-expert-name');
+            const searchProjIdcard = document.getElementById('search-project-expert-idcard');
+            const searchProjBtn = document.getElementById('btn-search-projects');
+            
+            if (!searchProjBtn) return;
+            
+            function executeProjSearch() {
+                fetchProjects(
+                    searchProjName.value,
+                    searchProjExpert.value,
+                    searchProjIdcard.value
+                );
+            }
+            
+            searchProjBtn.addEventListener('click', executeProjSearch);
+            
+            // 回车键与输入防抖绑定
+            let projDebounceTimer;
+            [searchProjName, searchProjExpert, searchProjIdcard].forEach(input => {
+                if (input) {
+                    input.addEventListener('keydown', (e) => {
+                        if (e.key === 'Enter') executeProjSearch();
+                    });
+                    input.addEventListener('input', () => {
+                        clearTimeout(projDebounceTimer);
+                        projDebounceTimer = setTimeout(executeProjSearch, 350);
+                    });
+                }
+            });
+        }
+
+        function fetchProjects(projectName = '', expertName = '', expertIdCard = '') {
+            const container = document.getElementById('projects-container');
+            if (!container) return;
+            
+            container.innerHTML = `
+                <div class="no-data">
+                    <div class="spinner" style="margin: 0 auto 16px;"></div>
+                    <p>正在检索项目评审数据，请稍候...</p>
+                </div>
+            `;
+            
+            const url = `/zj/api/search_projects?project_name=${encodeURIComponent(projectName)}&expert_name=${encodeURIComponent(expertName)}&expert_id_card=${encodeURIComponent(expertIdCard)}&_t=${Date.now()}`;
+            
+            fetch(url)
+                .then(res => res.json())
+                .then(res => {
+                    if (res.success) {
+                        renderProjectsList(res.data || []);
+                    } else {
+                        container.innerHTML = `
+                            <div class="no-data">
+                                <p>⚠️ 检索失败: ${res.error}</p>
+                            </div>
+                        `;
+                    }
+                })
+                .catch(err => {
+                    container.innerHTML = `
+                        <div class="no-data">
+                            <p>⚠️ 网络通信异常: ${err}</p>
+                        </div>
+                    `;
+                });
+        }
+
+        function renderProjectsList(projects) {
+            const container = document.getElementById('projects-container');
+            if (!container) return;
+            
+            if (!projects || projects.length === 0) {
+                container.innerHTML = `
+                    <div class="no-data">
+                        <p>没有找到符合条件的项目评审数据。</p>
+                    </div>
+                `;
+                return;
+            }
+            
+            let html = '<div class="projects-list-grid">';
+            projects.forEach(p => {
+                let expertsHtml = '';
+                if (p.experts && p.experts.length > 0) {
+                    p.experts.forEach(e => {
+                        expertsHtml += `
+                            <span class="project-expert-tag" onclick="openExpertDetailByIdCard('${e.id_card}', '${e.name}')" title="身份证: ${e.id_card}">
+                                👤 ${e.name} <span class="expert-tag-idcard">(${e.id_card ? e.id_card.slice(-4) : '无'})</span>
+                            </span>
+                        `;
+                    });
+                } else {
+                    expertsHtml = '<span style="font-size:12px; color:var(--text-secondary);">暂无关联专家数据</span>';
+                }
+                
+                html += `
+                    <div class="project-card">
+                        <div class="project-card-title">${p.project_name || '-'}</div>
+                        <div class="project-meta-row">
+                            <div class="project-meta-item">📅 处理时间: <span>${p.process_time || '-'}</span></div>
+                            <div class="project-meta-item">👤 经办人: <span>${p.agent_name || '-'}</span></div>
+                            <div class="project-meta-item">🏢 经办部门: <span>${p.agent_dept || '-'}</span></div>
+                        </div>
+                        <div class="project-experts-section">
+                            <div class="project-experts-label">👥 参评专家 (点击姓名查看档案):</div>
+                            <div class="project-experts-tags">
+                                ${expertsHtml}
+                            </div>
+                        </div>
+                    </div>
+                `;
+            });
+            html += '</div>';
+            container.innerHTML = html;
+        }
+
+        function openExpertDetailByIdCard(idCard, name) {
+            if (!idCard) {
+                alert('该参评专家的身份证号为空，无法查询匹配主库档案。');
+                return;
+            }
+            
+            fetch(`/zj/api/detail_by_idcard?id_card=${encodeURIComponent(idCard)}`)
+                .then(res => res.json())
+                .then(res => {
+                    if (res.success) {
+                        if (res.found) {
+                            // 主库存在此专家，我们构造一个基础的专家对象
+                            const tempItem = {
+                                name: res.name,
+                                phone: res.phone,
+                                id_card: idCard,
+                                company: '',
+                                major: '',
+                                photo_path: '',
+                                status: '未获取',
+                                remark: '',
+                                details: {}
+                            };
+                            
+                            // 优先在当前页面已加载的内存缓存中匹配，匹配成功可以免去额外网络加载头像和基本字段
+                            const cached = currentExpertsData.find(x => x.name === res.name && x.phone === res.phone);
+                            if (cached) {
+                                showExpertDetailDirectly(cached);
+                            } else {
+                                // 不在缓存，向后端精准检索单条大图路径及元数据以优化显示
+                                fetch(`/zj/api/search?name=${encodeURIComponent(res.name)}&phone=${encodeURIComponent(res.phone)}`)
+                                    .then(r => r.json())
+                                    .then(r => {
+                                        if (r.success && r.data && r.data.length > 0) {
+                                            showExpertDetailDirectly(r.data[0]);
+                                        } else {
+                                            showExpertDetailDirectly(tempItem);
+                                        }
+                                    })
+                                    .catch(() => {
+                                        showExpertDetailDirectly(tempItem);
+                                    });
+                            }
+                        } else {
+                            alert(`该参评专家【${name} (身份证: ${idCard})】当前仅存在于项目评审关系中，尚未录入主专家库，无法查看档案。`);
+                        }
+                    } else {
+                        alert(`查询主库专家失败: ${res.error}`);
+                    }
+                })
+                .catch(err => {
+                    alert(`网络请求异常: ${err}`);
+                });
+        }
+
+        function showExpertDetailDirectly(item) {
+            try {
+                if (!item) return;
+                const modal = document.getElementById('detail-modal');
+                if (!modal) return;
+                
+                modal.classList.add('active');
+                modal.classList.add('visible');
+                modal.style.opacity = '1';
+                modal.style.visibility = 'visible';
+                modal.style.pointerEvents = 'auto';
+                modal.style.display = 'flex';
+                
+                const nameEl = document.getElementById('detail-title-name');
+                const phoneEl = document.getElementById('detail-title-phone');
+                const idcardEl = document.getElementById('detail-title-idcard');
+                const companyEl = document.getElementById('detail-title-company');
+                const majorEl = document.getElementById('detail-title-major');
+                
+                if (nameEl) nameEl.innerText = item.name || '-';
+                if (phoneEl) phoneEl.innerText = item.phone || '-';
+                if (idcardEl) idcardEl.innerText = item.id_card || '未填身份证';
+                if (companyEl) companyEl.innerText = item.company || '未知单位';
+                if (majorEl) majorEl.innerText = item.major || '未填专业';
+                
+                const detailImg = document.getElementById('detail-img');
+                const errDiv = document.getElementById('detail-img-error');
+                const prevBtn = document.getElementById('photo-prev-btn');
+                const nextBtn = document.getElementById('photo-next-btn');
+                const indicator = document.getElementById('detail-photo-indicator');
+                
+                currentDetailPhotos = item.photo_path ? item.photo_path.split(',') : [];
+                currentDetailPhotoIndex = 0;
+                
+                function updateDetailPhotoShow() {
+                    if (detailImg && errDiv) {
+                        if (currentDetailPhotos.length > 0) {
+                            const currentPath = currentDetailPhotos[currentDetailPhotoIndex].trim();
+                            detailImg.src = currentPath;
+                            detailImg.style.display = 'block';
+                            errDiv.style.display = 'none';
+                            detailImg.onclick = () => zoomPhoto(item.photo_path, currentDetailPhotoIndex);
+                            
+                            if (currentDetailPhotos.length > 1) {
+                                if (prevBtn) prevBtn.style.display = 'flex';
+                                if (nextBtn) nextBtn.style.display = 'flex';
+                                if (indicator) {
+                                    indicator.style.display = 'block';
+                                    indicator.innerText = `${currentDetailPhotoIndex + 1} / ${currentDetailPhotos.length}`;
+                                }
+                            } else {
+                                if (prevBtn) prevBtn.style.display = 'none';
+                                if (nextBtn) nextBtn.style.display = 'none';
+                                if (indicator) indicator.style.display = 'none';
+                            }
+                        } else {
+                            detailImg.src = '';
+                            detailImg.style.display = 'none';
+                            errDiv.style.display = 'flex';
+                            if (prevBtn) prevBtn.style.display = 'none';
+                            if (nextBtn) nextBtn.style.display = 'none';
+                            if (indicator) indicator.style.display = 'none';
+                        }
+                    }
+                }
+                
+                if (prevBtn) {
+                    prevBtn.onclick = (e) => {
+                        e.stopPropagation();
+                        if (currentDetailPhotos.length > 1) {
+                            currentDetailPhotoIndex = (currentDetailPhotoIndex - 1 + currentDetailPhotos.length) % currentDetailPhotos.length;
+                            updateDetailPhotoShow();
+                        }
+                    };
+                }
+                if (nextBtn) {
+                    nextBtn.onclick = (e) => {
+                        e.stopPropagation();
+                        if (currentDetailPhotos.length > 1) {
+                            currentDetailPhotoIndex = (currentDetailPhotoIndex + 1) % currentDetailPhotos.length;
+                            updateDetailPhotoShow();
+                        }
+                    };
+                }
+                
+                updateDetailPhotoShow();
+                
+                const statusSelect = document.getElementById('detail-status-select');
+                const remarkInput = document.getElementById('detail-remark-input');
+                if (statusSelect) statusSelect.value = item.status || '未获取';
+                if (remarkInput) remarkInput.value = item.remark || '';
+                
+                const btnSave = document.getElementById('btn-save-status');
+                if (btnSave) {
+                    btnSave.onclick = () => {
+                        const statusVal = statusSelect ? statusSelect.value : '未获取';
+                        const remarkVal = remarkInput ? remarkInput.value : '';
+                        
+                        fetch('/zj/api/update_status', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                name: item.name,
+                                phone: item.phone,
+                                status: statusVal,
+                                remark: remarkVal
+                            })
+                        })
+                        .then(res => res.json())
+                        .then(res => {
+                            if (res.success) {
+                                item.status = statusVal;
+                                item.remark = remarkVal;
+                                const tip = document.getElementById('save-status-tip');
+                                if (tip) {
+                                    tip.style.display = 'inline-flex';
+                                    setTimeout(() => { tip.style.display = 'none'; }, 2000);
+                                }
+                                if (typeof fetchExperts === 'function') {
+                                    const cachedIdx = currentExpertsData.findIndex(x => x.name === item.name && x.phone === item.phone);
+                                    if (cachedIdx !== -1) {
+                                        currentExpertsData[cachedIdx].status = statusVal;
+                                        currentExpertsData[cachedIdx].remark = remarkVal;
+                                        renderExpertsGrid();
+                                    }
+                                }
+                            } else {
+                                alert(`保存失败: ${res.error}`);
+                            }
+                        });
+                    };
+                }
+                
+                const btnDelete = document.getElementById('btn-detail-delete');
+                if (btnDelete) {
+                    btnDelete.onclick = () => {
+                        if (confirm(`⚠️ 您确定要彻底物理删除专家【${item.name}】吗？删除后将无法恢复。`)) {
+                            fetch('/zj/api/delete', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ name: item.name, phone: item.phone })
+                            })
+                            .then(res => res.json())
+                            .then(res => {
+                                if (res.success) {
+                                    closeDetailModal();
+                                    if (typeof fetchExperts === 'function') {
+                                        const cachedIdx = currentExpertsData.findIndex(x => x.name === item.name && x.phone === item.phone);
+                                        if (cachedIdx !== -1) {
+                                            currentExpertsData.splice(cachedIdx, 1);
+                                            renderExpertsGrid();
+                                        }
+                                    }
+                                    alert(res.message);
+                                } else {
+                                    alert(`删除失败: ${res.error}`);
+                                }
+                            });
+                        }
+                    };
+                }
+                
+                const rawJsonElement = document.getElementById('val-raw-json');
+                if (rawJsonElement) {
+                    if (item.details && Object.keys(item.details).length > 0) {
+                        rawJsonElement.innerText = JSON.stringify(item, null, 4);
+                    } else {
+                        rawJsonElement.innerText = "正在加载原始档案，请稍候...";
+                        fetch(`/zj/api/detail?name=${encodeURIComponent(item.name)}&phone=${encodeURIComponent(item.phone)}`)
+                            .then(res => res.json())
+                            .then(res => {
+                                if (res.success) {
+                                    item.details = res.details || {};
+                                    const currentModalName = document.getElementById('detail-title-name') ? document.getElementById('detail-title-name').innerText : '';
+                                    const currentModalPhone = document.getElementById('detail-title-phone') ? document.getElementById('detail-title-phone').innerText : '';
+                                    if (currentModalName === item.name && currentModalPhone === item.phone) {
+                                        rawJsonElement.innerText = JSON.stringify(item, null, 4);
+                                    }
+                                } else {
+                                    rawJsonElement.innerText = `⚠️ 原始档案加载失败: ${res.error}`;
+                                }
+                            })
+                            .catch(err => {
+                                rawJsonElement.innerText = `⚠️ 请求网络异常: ${err}`;
+                            });
+                    }
+                }
+            } catch(e) {
+                console.error("showExpertDetailDirectly error", e);
+            }
+        }
+
+        // ==================== 单独上传 MD 交互逻辑 ====================
+        
+        function setupUploadMd() {
+            const dropZone = document.getElementById('drop-zone-md');
+            const fileInput = document.getElementById('file-input-md');
+            const progressContainer = document.getElementById('progress-container-md');
+            const progressBar = document.getElementById('progress-bar-md');
+            const progressText = document.getElementById('progress-text-md');
+            
+            if (!dropZone || !fileInput) return;
+            
+            dropZone.addEventListener('click', () => fileInput.click());
+            
+            dropZone.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                dropZone.classList.add('dragover');
+            });
+            
+            dropZone.addEventListener('dragleave', () => {
+                dropZone.classList.remove('dragover');
+            });
+            
+            dropZone.addEventListener('drop', (e) => {
+                e.preventDefault();
+                dropZone.classList.remove('dragover');
+                if (e.dataTransfer.files.length > 0) {
+                    handleMdUpload(e.dataTransfer.files[0]);
+                }
+            });
+            
+            fileInput.addEventListener('change', () => {
+                if (fileInput.files.length > 0) {
+                    handleMdUpload(fileInput.files[0]);
+                }
+            });
+            
+            function handleMdUpload(file) {
+                if (!file.name.endsWith('.md')) {
+                    alert('只支持上传 .md 格式的 Markdown 文件！');
+                    return;
+                }
+                
+                progressContainer.style.display = 'block';
+                progressBar.style.width = '0%';
+                progressText.innerText = '准备上传...';
+                
+                const formData = new FormData();
+                formData.append('file', file);
+                
+                const xhr = new XMLHttpRequest();
+                xhr.open('POST', '/zj/api/upload_md', true);
+                
+                xhr.upload.onprogress = (e) => {
+                    if (e.lengthComputable) {
+                        const percent = Math.round((e.loaded / e.total) * 100);
+                        progressBar.style.width = percent + '%';
+                        progressText.innerText = `正在上传并解析项目关系... ${percent}%`;
+                    }
+                };
+                
+                xhr.onload = () => {
+                    let result = { success: false, error: '未知上传错误' };
+                    try {
+                        result = JSON.parse(xhr.responseText);
+                    } catch (e) {}
+                    
+                    if (xhr.status === 200 && result.success) {
+                        progressBar.style.width = '100%';
+                        progressText.innerText = '解析入库成功！';
+                        alert(result.message);
+                        const activeTab = document.querySelector('.tab-btn.active');
+                        if (activeTab && activeTab.getAttribute('data-tab') === 'projects') {
+                            fetchProjects(
+                                document.getElementById('search-project-name').value,
+                                document.getElementById('search-project-expert-name').value,
+                                document.getElementById('search-project-expert-idcard').value
+                            );
+                        }
+                    } else {
+                        progressBar.style.width = '0%';
+                        progressText.innerText = '解析失败';
+                        alert(`上传失败: ${result.error || '服务器解析错误'}`);
+                    }
+                };
+                
+                xhr.onerror = () => {
+                    progressBar.style.width = '0%';
+                    progressText.innerText = '上传异常';
+                    alert('网络上传异常，请检查接口或云服务器连接！');
+                };
+                
+                xhr.send(formData);
+            }
+        }
+
         // 显式挂载 Window 属性以防全局作用域隔离
         window.showDetails = showDetails;
         window.closeDetailModal = closeDetailModal;
         window.zoomPhoto = zoomPhoto;
         window.handleImgLoadError = handleImgLoadError;
         window.handleDetailImgError = handleDetailImgError;
+        window.showExpertDetailDirectly = showExpertDetailDirectly;
+        window.openExpertDetailByIdCard = openExpertDetailByIdCard;
+        window.fetchProjects = fetchProjects;
     </script>
 </body>
 
