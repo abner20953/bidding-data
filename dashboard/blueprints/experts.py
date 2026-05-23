@@ -14,9 +14,37 @@ import json
 # 定义 Blueprint
 experts_bp = Blueprint('experts', __name__,
                        template_folder='../templates',
-                       url_prefix='/zj')
+                       url_prefix='/dlsgzs')
 
 DB_NAME = 'experts.db'
+
+# --- 操作日志工具 ---
+def _log_action(action, detail=""):
+    """记录用户实质性操作到 visitor_logs.db"""
+    try:
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        data_dir = os.path.join(base_dir, '..', 'data')
+        os.makedirs(data_dir, exist_ok=True)
+        visitor_db = os.path.join(data_dir, 'visitor_logs.db')
+        ip = request.remote_addr
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ua = request.user_agent
+        ua_string = ua.string
+        browser = f"{ua.browser} {ua.version}" if ua.browser else "Unknown"
+        os_info = "Unknown"
+        if 'Windows' in ua_string: os_info = 'Windows'
+        elif 'Android' in ua_string: os_info = 'Android'
+        elif 'iPhone' in ua_string or 'iPad' in ua_string: os_info = 'iOS'
+        elif 'Mac' in ua_string: os_info = 'MacOS'
+        elif 'Linux' in ua_string: os_info = 'Linux'
+        device = "Mobile" if ('Mobile' in ua_string or 'Android' in ua_string or 'iPhone' in ua_string) else "PC"
+        conn = sqlite3.connect(visitor_db)
+        conn.execute('INSERT INTO action_logs (ip, action, detail, timestamp, user_agent, browser, os, device) VALUES (?,?,?,?,?,?,?,?)',
+                     (ip, action, detail, timestamp, ua_string, browser, os_info, device))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Experts log_action error: {e}")
 
 def get_db_path():
     """获取 SQLite 数据库物理路径"""
@@ -213,6 +241,7 @@ def parse_and_import_md(file_path):
 @experts_bp.route('/')
 def experts_view():
     """评标专家管理主页（集成所有功能）"""
+    _log_action("访问评标专家管理系统", "访问主页")
     from flask import make_response
     response = make_response(render_template('experts.html'))
     response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
@@ -430,6 +459,7 @@ def api_upload():
             except Exception as e:
                 md_message = f" 但项目关系 MD 解析失败，错误: {str(e)}。"
         
+        _log_action("导入专家压缩包", f"解压出 {total_in_file} 位专家，新增 {added_count} 人，覆盖 {updated_count} 人。{md_message.strip()}")
         return jsonify({
             "success": True,
             "message": f"成功导入！文件中共解析出 {total_in_file} 位专家，其中实际新增上传 {added_count} 人，重复覆盖更新 {updated_count} 人，成功匹配并保存身份证照 {matched_photo_count} 张。{md_message}"
@@ -456,6 +486,7 @@ def api_upload_md():
         try:
             proj_added, proj_updated, rel_count = parse_and_import_md(md_path)
             proj_total = proj_added + proj_updated
+            _log_action("导入项目关系MD", f"导入项目 {proj_total} 个（新增 {proj_added} 个，覆盖 {proj_updated} 个），关联参评专家 {rel_count} 人次。")
             return jsonify({
                 "success": True,
                 "message": f"项目评审关系导入成功！共解析导入项目 {proj_total} 个（其中新增 {proj_added} 个，重复覆盖更新 {proj_updated} 个），关联参评专家 {rel_count} 人次。"
@@ -574,6 +605,7 @@ def api_search_projects():
                 "experts": experts_list
             })
             
+        _log_action("检索项目评审关系", f"条件: 项目名={project_name}, 专家={expert_name}, 身份证={expert_id_card}, 最低处理时间={min_year}，结果共 {total} 条")
         return jsonify({
             "success": True, 
             "data": results,
@@ -706,6 +738,7 @@ def api_search():
             "details": {}  # 列表阶段置空，点击“查看完整档案”时通过 api_detail 懒加载
         })
         
+    _log_action("检索评标专家", f"条件: 姓名={name}, 手机={phone}, 身份证={id_card}, 单位={company}, 专业={major}, 状态={status}，共 {len(results)} 条")
     return jsonify({"success": True, "data": results})
 
 @experts_bp.route('/api/detail', methods=['GET'])
@@ -731,6 +764,7 @@ def api_detail():
                 parsed_json = json.loads(row[0])
             except Exception:
                 pass
+        _log_action("查看专家详情", f"姓名: {name}, 电话: {phone}")
         return jsonify({"success": True, "details": parsed_json})
     except Exception as e:
         return jsonify({"success": False, "error": f"查询专家详情失败: {str(e)}"}), 500
@@ -778,6 +812,7 @@ def api_backup():
                         arcname = os.path.join("expert_photos", file)
                         zipf.write(file_path, arcname)
                         
+        _log_action("备份评标专家库", f"文件名: {zip_filename}")
         return send_file(zip_path, as_attachment=True, download_name=zip_filename)
     except Exception as e:
         return jsonify({"success": False, "error": f"生成备份压缩包失败: {str(e)}"}), 500
@@ -817,6 +852,7 @@ def api_clear():
                 except Exception:
                     pass
                     
+    _log_action("清空专家数据库", "清空了全部专家数据和照片")
     return jsonify({"success": True, "message": "评标专家数据库与所有照片已成功清空。"})
 
 @experts_bp.route('/api/delete', methods=['POST'])
@@ -856,6 +892,7 @@ def api_delete():
         conn.commit()
         conn.close()
         
+        _log_action("删除评标专家", f"专家姓名: {name}, 电话: {phone}")
         return jsonify({"success": True, "message": f"专家 {name} 及其身份证照已删除。"})
     except Exception as e:
         return jsonify({"success": False, "error": f"删除专家失败: {str(e)}"}), 500
@@ -883,6 +920,7 @@ def api_update_status():
         c.execute("UPDATE experts SET status = ?, remark = ? WHERE name = ? AND phone = ?", (status, remark, name, phone))
         conn.commit()
         conn.close()
+        _log_action("更新专家状态", f"专家姓名: {name}, 电话: {phone}, 新状态: {status}, 备注: {remark}")
         return jsonify({"success": True, "message": f"专家 {name} 的状态与备注已成功更新。"})
     except Exception as e:
         return jsonify({"success": False, "error": f"更新专家状态/备注失败: {str(e)}"}), 500

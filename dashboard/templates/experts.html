@@ -1698,7 +1698,7 @@
                     <div class="ops-info">
                         <div class="ops-title">数据完整备份</div>
                         <div class="ops-desc">打包并导出包含 SQLite 数据库及全部上传身份证照片的 ZIP 归档，便于本地留存备份。</div>
-                        <a href="/zj/api/backup" class="action-btn-large btn-backup">
+                        <a href="/dlsgzs/api/backup" class="action-btn-large btn-backup">
                             <span>💾</span> 导出完整数据备份 (.zip)
                         </a>
                     </div>
@@ -2013,7 +2013,7 @@
             `;
             if (paginator) paginator.style.display = 'none';
             
-            const url = `/zj/api/search?name=${encodeURIComponent(name)}&phone=${encodeURIComponent(phone)}&id_card=${encodeURIComponent(idCard)}&company=${encodeURIComponent(company)}&major=${encodeURIComponent(major)}&status=${encodeURIComponent(status)}&_t=${Date.now()}`;
+            const url = `/dlsgzs/api/search?name=${encodeURIComponent(name)}&phone=${encodeURIComponent(phone)}&id_card=${encodeURIComponent(idCard)}&company=${encodeURIComponent(company)}&major=${encodeURIComponent(major)}&status=${encodeURIComponent(status)}&_t=${Date.now()}`;
             
             fetch(url)
                 .then(res => res.json())
@@ -2235,7 +2235,7 @@
                 formData.append('file', file);
 
                 const xhr = new XMLHttpRequest();
-                xhr.open('POST', '/zj/api/upload', true);
+                xhr.open('POST', '/dlsgzs/api/upload', true);
 
                 xhr.upload.onprogress = (e) => {
                     if (e.lengthComputable) {
@@ -2309,7 +2309,7 @@
                 `;
             }
 
-            fetch('/zj/api/search')
+            fetch('/dlsgzs/api/search')
                 .then(res => res.json())
                 .then(res => {
                     if (res.success) {
@@ -2437,7 +2437,7 @@
                         clearBtn.disabled = true;
                         clearBtn.innerText = '正在清空专家数据...';
                         
-                        fetch('/zj/api/clear', { 
+                        fetch('/dlsgzs/api/clear', { 
                             method: 'POST',
                             headers: {
                                 'Content-Type': 'application/json'
@@ -2586,7 +2586,7 @@
                         rawJsonElement.innerText = JSON.stringify(item, null, 4);
                     } else {
                         rawJsonElement.innerText = "正在加载原始档案，请稍候...";
-                        fetch(`/zj/api/detail?name=${encodeURIComponent(item.name)}&phone=${encodeURIComponent(item.phone)}`)
+                        fetch(`/dlsgzs/api/detail?name=${encodeURIComponent(item.name)}&phone=${encodeURIComponent(item.phone)}`)
                             .then(res => res.json())
                             .then(res => {
                                 if (res.success) {
@@ -2633,7 +2633,7 @@
                         newSaveStatusBtn.disabled = true;
                         newSaveStatusBtn.innerText = '保存中...';
 
-                        fetch('/zj/api/update_status', {
+                        fetch('/dlsgzs/api/update_status', {
                             method: 'POST',
                             headers: {
                                 'Content-Type': 'application/json'
@@ -2697,7 +2697,7 @@
                         newDeleteExpertBtn.disabled = true;
                         newDeleteExpertBtn.innerText = '删除中...';
 
-                            fetch('/zj/api/delete', {
+                            fetch('/dlsgzs/api/delete', {
                                 method: 'POST',
                                 headers: {
                                     'Content-Type': 'application/json'
@@ -2944,7 +2944,7 @@
             if (paginator) paginator.style.display = 'none';
             
             currentProjectsPage = page;
-            const url = `/zj/api/search_projects?project_name=${encodeURIComponent(projectName)}&expert_name=${encodeURIComponent(expertName)}&expert_id_card=${encodeURIComponent(expertIdCard)}&page=${page}&limit=${projectsPageSize}&min_year=${encodeURIComponent(minYear)}&_t=${Date.now()}`;
+            const url = `/dlsgzs/api/search_projects?project_name=${encodeURIComponent(projectName)}&expert_name=${encodeURIComponent(expertName)}&expert_id_card=${encodeURIComponent(expertIdCard)}&page=${page}&limit=${projectsPageSize}&min_year=${encodeURIComponent(minYear)}&_t=${Date.now()}`;
             
             fetch(url)
                 .then(res => res.json())
@@ -3085,7 +3085,7 @@
                 return;
             }
             
-            fetch(`/zj/api/detail_by_idcard?id_card=${encodeURIComponent(idCard)}`)
+            fetch(`/dlsgzs/api/detail_by_idcard?id_card=${encodeURIComponent(idCard)}`)
                 .then(res => res.json())
                 .then(res => {
                     if (res.success) {
@@ -3109,7 +3109,7 @@
                                 showExpertDetailDirectly(cached);
                             } else {
                                 // 不在缓存，向后端精准检索单条大图路径及元数据以优化显示
-                                fetch(`/zj/api/search?name=${encodeURIComponent(res.name)}&phone=${encodeURIComponent(res.phone)}`)
+                                fetch(`/dlsgzs/api/search?name=${encodeURIComponent(res.name)}&phone=${encodeURIComponent(res.phone)}`)
                                     .then(r => r.json())
                                     .then(r => {
                                         if (r.success && r.data && r.data.length > 0) {
@@ -3232,7 +3232,7 @@
                         const statusVal = statusSelect ? statusSelect.value : '未获取';
                         const remarkVal = remarkInput ? remarkInput.value : '';
                         
-                        fetch('/zj/api/update_status', {
+                        fetch('/dlsgzs/api/update_status', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({
@@ -3271,7 +3271,7 @@
                 if (btnDelete) {
                     btnDelete.onclick = () => {
                         if (confirm(`⚠️ 您确定要彻底物理删除专家【${item.name}】吗？删除后将无法恢复。`)) {
-                            fetch('/zj/api/delete', {
+                            fetch('/dlsgzs/api/delete', {
                                 method: 'POST',
                                 headers: { 'Content-Type': 'application/json' },
                                 body: JSON.stringify({ name: item.name, phone: item.phone })
@@ -3302,7 +3302,7 @@
                         rawJsonElement.innerText = JSON.stringify(item, null, 4);
                     } else {
                         rawJsonElement.innerText = "正在加载原始档案，请稍候...";
-                        fetch(`/zj/api/detail?name=${encodeURIComponent(item.name)}&phone=${encodeURIComponent(item.phone)}`)
+                        fetch(`/dlsgzs/api/detail?name=${encodeURIComponent(item.name)}&phone=${encodeURIComponent(item.phone)}`)
                             .then(res => res.json())
                             .then(res => {
                                 if (res.success) {
@@ -3376,7 +3376,7 @@
                 formData.append('file', file);
                 
                 const xhr = new XMLHttpRequest();
-                xhr.open('POST', '/zj/api/upload_md', true);
+                xhr.open('POST', '/dlsgzs/api/upload_md', true);
                 
                 xhr.upload.onprogress = (e) => {
                     if (e.lengthComputable) {
