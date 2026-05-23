@@ -699,7 +699,7 @@
         /* 数据维护与删除 */
         .maintenance-grid {
             display: grid;
-            grid-template-columns: 1fr 1fr;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
             gap: 20px;
             margin-bottom: 24px;
         }
@@ -1713,6 +1713,25 @@
                         <button class="action-btn-large btn-clear" id="btn-clear">
                             <span>🗑️</span> 清空专家库与照片
                         </button>
+                    </div>
+                </div>
+
+                <!-- 项目默认查询时间配置 -->
+                <div class="ops-card">
+                    <div class="ops-icon">⚙️</div>
+                    <div class="ops-info" style="width: 100%;">
+                        <div class="ops-title">项目查询默认年份</div>
+                        <div class="ops-desc">设定进入项目评审查询界面时的默认筛选年份，设定后将作为系统的默认初始年份。</div>
+                        <div style="display: flex; gap: 12px; align-items: center; margin-top: 16px; width: 100%;">
+                            <select class="filter-select" id="config-default-proj-year" style="width: auto; flex-grow: 1; padding: 10px; border-radius: 8px; border: 1px solid var(--border-color); background: var(--bg-card); color: var(--text-primary);">
+                                <option value="2025">2025年及之后</option>
+                                <option value="2026">2026年及之后</option>
+                                <option value="">全部时间</option>
+                            </select>
+                            <button class="action-btn-large" id="btn-save-proj-config" style="margin: 0; padding: 10px 16px; font-size: 14px; background: var(--accent-gradient); border: none; color: white; border-radius: 8px; cursor: pointer; transition: all 0.3s; white-space: nowrap;">
+                                保存设置
+                            </button>
+                        </div>
                     </div>
                 </div>
 
@@ -2884,6 +2903,32 @@
                     });
                 }
             });
+
+            // 从 localStorage 中读取默认的年份配置并应用
+            const defaultYear = localStorage.getItem('default_project_min_year') ?? '2025';
+            if (filterProjTime) {
+                filterProjTime.value = defaultYear;
+            }
+
+            // 绑定维护页面中的保存设置按钮
+            const configDefaultYear = document.getElementById('config-default-proj-year');
+            const saveProjConfigBtn = document.getElementById('btn-save-proj-config');
+            if (configDefaultYear && saveProjConfigBtn) {
+                // 初始化配置页面的下拉框为当前 localStorage 中的值
+                configDefaultYear.value = defaultYear;
+                
+                saveProjConfigBtn.addEventListener('click', () => {
+                    const selectedYear = configDefaultYear.value;
+                    localStorage.setItem('default_project_min_year', selectedYear);
+                    
+                    // 实时同步更新项目查询页面的年份下拉框
+                    if (filterProjTime) {
+                        filterProjTime.value = selectedYear;
+                    }
+                    
+                    alert(`✅ 配置保存成功！项目查询的默认筛选年份已调整为：${selectedYear ? selectedYear + '年及之后' : '全部时间'}`);
+                });
+            }
         }
 
         let currentProjectsPage = 1;
