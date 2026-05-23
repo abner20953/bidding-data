@@ -1420,6 +1420,65 @@
             color: var(--text-primary);
             margin-bottom: 12px;
             line-height: 1.5;
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+        }
+        .project-view-btn {
+            font-size: 13px;
+            cursor: pointer;
+            color: var(--text-secondary);
+            opacity: 0.6;
+            transition: all 0.2s ease;
+            margin-left: 8px;
+            padding: 3px 6px;
+            border-radius: 6px;
+            background: rgba(0, 0, 0, 0.02);
+            border: 1px solid rgba(0, 0, 0, 0.05);
+            display: inline-flex;
+            align-items: center;
+            user-select: none;
+            gap: 4px;
+            font-weight: normal;
+        }
+        .project-view-btn:hover {
+            opacity: 1;
+            color: #0ea5e9;
+            background: rgba(14, 165, 233, 0.08);
+            border-color: rgba(14, 165, 233, 0.2);
+        }
+        .project-extra-details {
+            margin-top: 16px;
+            padding: 16px;
+            background: rgba(0, 0, 0, 0.015);
+            border-radius: 12px;
+            border-left: 3px solid #0ea5e9;
+            box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.01);
+            animation: projectSlideDown 0.2s ease-out;
+        }
+        @keyframes projectSlideDown {
+            from { opacity: 0; transform: translateY(-5px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .project-extra-item {
+            font-size: 13px;
+            margin-bottom: 8px;
+            color: var(--text-secondary);
+            display: flex;
+            align-items: flex-start;
+            line-height: 1.6;
+        }
+        .project-extra-item:last-child {
+            margin-bottom: 0;
+        }
+        .project-extra-label {
+            font-weight: 600;
+            color: var(--text-primary);
+            min-width: 100px;
+            flex-shrink: 0;
+        }
+        .project-extra-val {
+            word-break: break-all;
         }
         .project-meta-row {
             display: flex;
@@ -2999,12 +3058,34 @@
                 
                 html += `
                     <div class="project-card">
-                        <div class="project-card-title">${p.project_name || '-'}</div>
+                        <div class="project-card-title">
+                            <span>${p.project_name || '-'}</span>
+                            <button class="project-view-btn" onclick="toggleProjectExtraDetails(${p.id})" title="查看 Project Name/Code/ID 额外信息">
+                                👁️ 详情
+                            </button>
+                        </div>
                         <div class="project-meta-row">
                             <div class="project-meta-item">📅 处理时间: <span>${p.process_time || '-'}</span></div>
                             <div class="project-meta-item">👤 经办人: <span>${p.agent_name || '-'}</span></div>
                             <div class="project-meta-item">🏢 经办部门: <span>${p.agent_dept || '-'}</span></div>
                         </div>
+                        
+                        <!-- 隐藏的额外字段详情区 -->
+                        <div class="project-extra-details" id="project-extra-${p.id}" style="display: none;">
+                            <div class="project-extra-item">
+                                <div class="project-extra-label">Project Name:</div>
+                                <div class="project-extra-val">${p.project_name_en || '<span style="color:#aaa;">(未录入)</span>'}</div>
+                            </div>
+                            <div class="project-extra-item">
+                                <div class="project-extra-label">Project Code:</div>
+                                <div class="project-extra-val">${p.project_code || '<span style="color:#aaa;">(未录入)</span>'}</div>
+                            </div>
+                            <div class="project-extra-item">
+                                <div class="project-extra-label">Project ID:</div>
+                                <div class="project-extra-val">${p.project_id_str || '<span style="color:#aaa;">(未录入)</span>'}</div>
+                            </div>
+                        </div>
+                        
                         <div class="project-experts-section">
                             <div class="project-experts-label">👥 参评专家 (点击姓名查看档案):</div>
                             <div class="project-experts-tags">
@@ -3016,6 +3097,17 @@
             });
             html += '</div>';
             container.innerHTML = html;
+        }
+
+        function toggleProjectExtraDetails(id) {
+            const el = document.getElementById(`project-extra-${id}`);
+            if (el) {
+                if (el.style.display === 'none') {
+                    el.style.display = 'block';
+                } else {
+                    el.style.display = 'none';
+                }
+            }
         }
 
         function renderProjectsPagination(total, page, limit) {

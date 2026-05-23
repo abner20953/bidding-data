@@ -107,13 +107,11 @@ def init_db():
     # 平滑升级旧数据库：增加 status 字段与 remark 字段
     try:
         c.execute("ALTER TABLE experts ADD COLUMN status TEXT DEFAULT '未获取'")
-        conn.commit()
     except sqlite3.OperationalError:
         pass
 
     try:
         c.execute("ALTER TABLE experts ADD COLUMN remark TEXT DEFAULT ''")
-        conn.commit()
     except sqlite3.OperationalError:
         pass
         
@@ -125,6 +123,9 @@ def init_db():
             process_time TEXT,
             agent_name TEXT,
             agent_dept TEXT,
+            project_name_en TEXT,
+            project_code TEXT,
+            project_id_str TEXT,
             created_at TEXT
         )
     ''')
@@ -143,11 +144,27 @@ def init_db():
     c.execute('CREATE INDEX IF NOT EXISTS idx_project_experts_project_id ON project_experts(project_id)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_project_experts_id_card ON project_experts(expert_id_card)')
         
+    # 平滑升级旧项目的 projects 表：增加新字段
+    try:
+        c.execute("ALTER TABLE projects ADD COLUMN project_name_en TEXT")
+    except sqlite3.OperationalError:
+        pass
+        
+    try:
+        c.execute("ALTER TABLE projects ADD COLUMN project_code TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        c.execute("ALTER TABLE projects ADD COLUMN project_id_str TEXT")
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     conn.close()
 
 def parse_and_import_md(file_path):
-    """解析并导入 Markdown 格式的项目评审与专家关系表 (流式读取逐行处理，对内存极度友好)"""
+    """解析并导入 Markdown 格式的项目评审与专家关系表 (流式读取逐行处理，自适应新旧版表头，对内存极度友好)"""
     if not os.path.exists(file_path):
         return 0, 0, 0
     
@@ -161,6 +178,48 @@ def parse_and_import_md(file_path):
     expert_relations_imported = 0
     
     try:
+        # 第一步：先读取表头，以识别列名及其对应的索引
+        header_indices = {}
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line_str = line.strip()
+                if line_str.startswith('|') and line_str.endswith('|') and '项目名称' in line_str:
+                    # 表头行
+                    parts = [p.strip() for p in line_str.split('|')]
+                    for i, part in enumerate(parts):
+                        if not part:
+                            continue
+                        if '项目名称' in part:
+                            header_indices['project_name'] = i
+                        elif 'Project name' in part:
+                            header_indices['project_name_en'] = i
+                        elif 'Project code' in part or 'Project Code' in part:
+                            header_indices['project_code'] = i
+                        elif 'Project ID' in part or 'Project id' in part:
+                            header_indices['project_id_str'] = i
+                        elif '处理时间' in part:
+                            header_indices['process_time'] = i
+                        elif '经办人姓名' in part or ('经办人' in part and '部门' not in part):
+                            header_indices['agent_name'] = i
+                        elif '经办人部门' in part or '部门' in part:
+                            header_indices['agent_dept'] = i
+                        elif '评审专家' in part or '专家' in part:
+                            header_indices['experts'] = i
+                    break
+        
+        # 默认回退值（如果是旧版 MD 且没有在表头解析出来）
+        if 'project_name' not in header_indices:
+            header_indices['project_name'] = 1
+        if 'process_time' not in header_indices:
+            header_indices['process_time'] = 2
+        if 'agent_name' not in header_indices:
+            header_indices['agent_name'] = 3
+        if 'agent_dept' not in header_indices:
+            header_indices['agent_dept'] = 4
+        if 'experts' not in header_indices:
+            header_indices['experts'] = 5
+
+        # 第二步：逐行读取数据行并解析
         with open(file_path, 'r', encoding='utf-8') as f:
             for line in f:
                 line_str = line.strip()
@@ -172,42 +231,52 @@ def parse_and_import_md(file_path):
                     continue
                 
                 parts = [p.strip() for p in line_str.split('|')]
-                # 预期的 parts 格式: ['', 项目名称, 处理时间, 经办人姓名, 经办人部门, 评审专家列表, '']
-                if len(parts) < 6:
-                    continue
                 
-                project_name = parts[1]
-                process_time = parts[2]
-                agent_name = parts[3]
-                agent_dept = parts[4]
-                experts_cell = parts[5]
+                def get_val(key, default_val=None):
+                    idx = header_indices.get(key)
+                    if idx is not None and idx < len(parts):
+                        val = parts[idx]
+                        return val if val != '' else default_val
+                    return default_val
+
+                project_name = get_val('project_name', "")
+                process_time = get_val('process_time', "")
+                agent_name = get_val('agent_name', "")
+                agent_dept = get_val('agent_dept', "")
+                experts_cell = get_val('experts', "")
                 
+                # 新增的三个字段
+                project_name_en = get_val('project_name_en')
+                project_code = get_val('project_code')
+                project_id_str = get_val('project_id_str')
+
                 if not project_name:
                     continue
                 
-                # 插入或更新项目基本信息，如果项目已存在，更新其基本元数据
+                # 插入或更新项目基本信息
                 c.execute("SELECT id FROM projects WHERE project_name = ?", (project_name,))
                 row_exist = c.fetchone()
                 if row_exist:
                     project_id = row_exist[0]
                     c.execute('''
                         UPDATE projects 
-                        SET process_time = ?, agent_name = ?, agent_dept = ?, created_at = ?
+                        SET process_time = ?, agent_name = ?, agent_dept = ?, 
+                            project_name_en = ?, project_code = ?, project_id_str = ?, created_at = ?
                         WHERE id = ?
-                    ''', (process_time, agent_name, agent_dept, now_time, project_id))
-                    # 防重覆盖机制：清空该项目之前所有的旧评审专家关联
+                    ''', (process_time, agent_name, agent_dept, project_name_en, project_code, project_id_str, now_time, project_id))
+                    # 防重覆盖机制：清空旧参评专家关联
                     c.execute("DELETE FROM project_experts WHERE project_id = ?", (project_id,))
                     project_updated += 1
                 else:
                     c.execute('''
-                        INSERT INTO projects (project_name, process_time, agent_name, agent_dept, created_at)
-                        VALUES (?, ?, ?, ?, ?)
-                      ''', (project_name, process_time, agent_name, agent_dept, now_time))
+                        INSERT INTO projects (project_name, process_time, agent_name, agent_dept, 
+                                             project_name_en, project_code, project_id_str, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                      ''', (project_name, process_time, agent_name, agent_dept, project_name_en, project_code, project_id_str, now_time))
                     project_id = c.lastrowid
                     project_added += 1
                 
-                # 解析评审专家列表：通过 <br> 分隔
-                # 专家格式: 姓名 / 身份证号 / 专家编码
+                # 解析评审专家列表
                 expert_items = re.split(r'<br\s*/?>', experts_cell, flags=re.IGNORECASE)
                 for item in expert_items:
                     item = item.strip()
@@ -562,7 +631,8 @@ def api_search_projects():
         
         # 2. 精准分页拉取项目详情
         sql = """
-            SELECT DISTINCT p.id, p.project_name, p.process_time, p.agent_name, p.agent_dept, p.created_at
+            SELECT DISTINCT p.id, p.project_name, p.process_time, p.agent_name, p.agent_dept, p.created_at,
+                            p.project_name_en, p.project_code, p.project_id_str
             FROM projects p
             LEFT JOIN project_experts pe ON p.id = pe.project_id
         """
@@ -602,6 +672,9 @@ def api_search_projects():
                 "agent_name": p_row['agent_name'],
                 "agent_dept": p_row['agent_dept'],
                 "created_at": p_row['created_at'],
+                "project_name_en": p_row['project_name_en'] or "",
+                "project_code": p_row['project_code'] or "",
+                "project_id_str": p_row['project_id_str'] or "",
                 "experts": experts_list
             })
             
