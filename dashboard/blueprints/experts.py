@@ -121,14 +121,15 @@ def init_db():
 def parse_and_import_md(file_path):
     """解析并导入 Markdown 格式的项目评审与专家关系表 (流式读取逐行处理，对内存极度友好)"""
     if not os.path.exists(file_path):
-        return 0, 0
+        return 0, 0, 0
     
     db_path = get_db_path()
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
     
     now_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    project_imported = 0
+    project_added = 0
+    project_updated = 0
     expert_relations_imported = 0
     
     try:
@@ -168,14 +169,14 @@ def parse_and_import_md(file_path):
                     ''', (process_time, agent_name, agent_dept, now_time, project_id))
                     # 防重覆盖机制：清空该项目之前所有的旧评审专家关联
                     c.execute("DELETE FROM project_experts WHERE project_id = ?", (project_id,))
+                    project_updated += 1
                 else:
                     c.execute('''
                         INSERT INTO projects (project_name, process_time, agent_name, agent_dept, created_at)
                         VALUES (?, ?, ?, ?, ?)
                       ''', (project_name, process_time, agent_name, agent_dept, now_time))
                     project_id = c.lastrowid
-                
-                project_imported += 1
+                    project_added += 1
                 
                 # 解析评审专家列表：通过 <br> 分隔
                 # 专家格式: 姓名 / 身份证号 / 专家编码
@@ -207,7 +208,7 @@ def parse_and_import_md(file_path):
     finally:
         conn.close()
         
-    return project_imported, expert_relations_imported
+    return project_added, project_updated, expert_relations_imported
 
 @experts_bp.route('/')
 def experts_view():
@@ -423,8 +424,9 @@ def api_upload():
         md_message = ""
         if md_file:
             try:
-                proj_count, rel_count = parse_and_import_md(md_file)
-                md_message = f" 另外检测到并成功导入项目关系文件，解析出 {proj_count} 个项目的评审信息，共关联参评专家 {rel_count} 人次。"
+                proj_added, proj_updated, rel_count = parse_and_import_md(md_file)
+                proj_total = proj_added + proj_updated
+                md_message = f" 另外检测到并成功导入项目关系文件，共解析导入项目 {proj_total} 个（其中新增 {proj_added} 个，重复覆盖更新 {proj_updated} 个），共关联参评专家 {rel_count} 人次。"
             except Exception as e:
                 md_message = f" 但项目关系 MD 解析失败，错误: {str(e)}。"
         
@@ -452,10 +454,11 @@ def api_upload_md():
         file.save(md_path)
         
         try:
-            proj_count, rel_count = parse_and_import_md(md_path)
+            proj_added, proj_updated, rel_count = parse_and_import_md(md_path)
+            proj_total = proj_added + proj_updated
             return jsonify({
                 "success": True,
-                "message": f"项目评审关系导入成功！共解析导入项目 {proj_count} 个，关联参评专家 {rel_count} 人次。"
+                "message": f"项目评审关系导入成功！共解析导入项目 {proj_total} 个（其中新增 {proj_added} 个，重复覆盖更新 {proj_updated} 个），关联参评专家 {rel_count} 人次。"
             })
         except Exception as e:
             return jsonify({"success": False, "error": f"解析项目关系 MD 文件失败: {str(e)}"}), 500
