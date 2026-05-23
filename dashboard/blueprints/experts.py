@@ -509,8 +509,12 @@ def api_search_projects():
         params.append(f"%{expert_id_card}%")
         
     if min_year:
+        if len(min_year) == 4:
+            process_time_limit = f"{min_year}-01-01 00:00:00"
+        else:
+            process_time_limit = f"{min_year} 00:00:00"
         conditions.append("p.process_time >= ?")
-        params.append(f"{min_year}-01-01 00:00:00")
+        params.append(process_time_limit)
         
     # 1. 检索符合条件的 DISTINCT 项目总数
     count_sql = """
