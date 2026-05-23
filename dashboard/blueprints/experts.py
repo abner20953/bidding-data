@@ -254,16 +254,21 @@ def parse_and_import_md(file_path):
                     continue
                 
                 # 插入或更新项目基本信息
-                c.execute("SELECT id FROM projects WHERE project_name = ?", (project_name,))
+                c.execute("SELECT id, project_name_en, project_code, project_id_str FROM projects WHERE project_name = ?", (project_name,))
                 row_exist = c.fetchone()
                 if row_exist:
                     project_id = row_exist[0]
+                    # 如果上传的 MD 文件不包含新字段（旧版格式），则保留数据库中已有的这三个字段值，防止被覆盖为 NULL
+                    final_name_en = project_name_en if 'project_name_en' in header_indices else row_exist[1]
+                    final_code = project_code if 'project_code' in header_indices else row_exist[2]
+                    final_id_str = project_id_str if 'project_id_str' in header_indices else row_exist[3]
+                    
                     c.execute('''
                         UPDATE projects 
                         SET process_time = ?, agent_name = ?, agent_dept = ?, 
                             project_name_en = ?, project_code = ?, project_id_str = ?, created_at = ?
                         WHERE id = ?
-                    ''', (process_time, agent_name, agent_dept, project_name_en, project_code, project_id_str, now_time, project_id))
+                    ''', (process_time, agent_name, agent_dept, final_name_en, final_code, final_id_str, now_time, project_id))
                     # 防重覆盖机制：清空旧参评专家关联
                     c.execute("DELETE FROM project_experts WHERE project_id = ?", (project_id,))
                     project_updated += 1
