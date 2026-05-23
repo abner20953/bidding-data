@@ -462,10 +462,27 @@ def api_upload_md():
 
 @experts_bp.route('/api/search_projects', methods=['GET'])
 def api_search_projects():
-    """查询项目评审关系，支持项目名、参评专家姓名、身份证多条件模糊检索"""
+    """查询项目评审关系，支持项目名、参评专家姓名、身份证多条件模糊检索 (支持高性能分页)"""
     project_name = request.args.get('project_name', '').strip()
     expert_name = request.args.get('expert_name', '').strip()
     expert_id_card = request.args.get('expert_id_card', '').strip()
+    
+    # 提取分页参数
+    try:
+        page = int(request.args.get('page', '1'))
+        if page < 1:
+            page = 1
+    except ValueError:
+        page = 1
+        
+    try:
+        limit = int(request.args.get('limit', '20'))
+        if limit < 1:
+            limit = 20
+    except ValueError:
+        limit = 20
+        
+    offset = (page - 1) * limit
     
     db_path = get_db_path()
     conn = sqlite3.connect(db_path)
@@ -474,12 +491,6 @@ def api_search_projects():
     
     conditions = []
     params = []
-    
-    sql = """
-        SELECT DISTINCT p.id, p.project_name, p.process_time, p.agent_name, p.agent_dept, p.created_at
-        FROM projects p
-        LEFT JOIN project_experts pe ON p.id = pe.project_id
-    """
     
     if project_name:
         conditions.append("p.project_name LIKE ?")
@@ -493,13 +504,33 @@ def api_search_projects():
         conditions.append("pe.expert_id_card LIKE ?")
         params.append(f"%{expert_id_card}%")
         
+    # 1. 检索符合条件的 DISTINCT 项目总数
+    count_sql = """
+        SELECT COUNT(DISTINCT p.id)
+        FROM projects p
+        LEFT JOIN project_experts pe ON p.id = pe.project_id
+    """
     if conditions:
-        sql += " WHERE " + " AND ".join(conditions)
+        count_sql += " WHERE " + " AND ".join(conditions)
         
-    sql += " ORDER BY p.id DESC"
-    
     try:
-        c.execute(sql, params)
+        c.execute(count_sql, params)
+        total = c.fetchone()[0]
+        
+        # 2. 精准分页拉取项目详情
+        sql = """
+            SELECT DISTINCT p.id, p.project_name, p.process_time, p.agent_name, p.agent_dept, p.created_at
+            FROM projects p
+            LEFT JOIN project_experts pe ON p.id = pe.project_id
+        """
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY p.id DESC LIMIT ? OFFSET ?"
+        
+        query_params = list(params)
+        query_params.extend([limit, offset])
+        
+        c.execute(sql, query_params)
         project_rows = c.fetchall()
         
         results = []
@@ -531,7 +562,13 @@ def api_search_projects():
                 "experts": experts_list
             })
             
-        return jsonify({"success": True, "data": results})
+        return jsonify({
+            "success": True, 
+            "data": results,
+            "total": total,
+            "page": page,
+            "limit": limit
+        })
     except Exception as e:
         return jsonify({"success": False, "error": f"检索项目失败: {str(e)}"}), 500
     finally:

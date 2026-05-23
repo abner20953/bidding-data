@@ -1584,6 +1584,9 @@
                     <p>暂无项目评审数据，请在上方输入检索条件或进行数据导入。</p>
                 </div>
             </div>
+            
+            <!-- 项目分页器 -->
+            <div id="projects-pagination-container" class="pagination-bar" style="display: none; margin-top: 20px;"></div>
         </div>
 
         <!-- 批量打包上传面板 -->
@@ -2871,8 +2874,12 @@
             });
         }
 
-        function fetchProjects(projectName = '', expertName = '', expertIdCard = '') {
+        let currentProjectsPage = 1;
+        const projectsPageSize = 20;
+
+        function fetchProjects(projectName = '', expertName = '', expertIdCard = '', page = 1) {
             const container = document.getElementById('projects-container');
+            const paginator = document.getElementById('projects-pagination-container');
             if (!container) return;
             
             container.innerHTML = `
@@ -2881,14 +2888,17 @@
                     <p>正在检索项目评审数据，请稍候...</p>
                 </div>
             `;
+            if (paginator) paginator.style.display = 'none';
             
-            const url = `/zj/api/search_projects?project_name=${encodeURIComponent(projectName)}&expert_name=${encodeURIComponent(expertName)}&expert_id_card=${encodeURIComponent(expertIdCard)}&_t=${Date.now()}`;
+            currentProjectsPage = page;
+            const url = `/zj/api/search_projects?project_name=${encodeURIComponent(projectName)}&expert_name=${encodeURIComponent(expertName)}&expert_id_card=${encodeURIComponent(expertIdCard)}&page=${page}&limit=${projectsPageSize}&_t=${Date.now()}`;
             
             fetch(url)
                 .then(res => res.json())
                 .then(res => {
                     if (res.success) {
                         renderProjectsList(res.data || []);
+                        renderProjectsPagination(res.total || 0, res.page || 1, res.limit || 20);
                     } else {
                         container.innerHTML = `
                             <div class="no-data">
@@ -2953,6 +2963,66 @@
             });
             html += '</div>';
             container.innerHTML = html;
+        }
+
+        function renderProjectsPagination(total, page, limit) {
+            const paginator = document.getElementById('projects-pagination-container');
+            if (!paginator) return;
+            
+            if (total === 0) {
+                paginator.style.display = 'none';
+                return;
+            }
+            
+            const totalPages = Math.ceil(total / limit);
+            paginator.style.display = 'flex';
+            
+            if (totalPages <= 1) {
+                paginator.innerHTML = `
+                    <span class="page-info">共 <strong>${total}</strong> 条项目记录 / 共 <strong>1</strong> 页</span>
+                `;
+                return;
+            }
+            
+            paginator.innerHTML = `
+                <button class="page-btn" id="btn-proj-first" ${page === 1 ? 'disabled' : ''}>首页</button>
+                <button class="page-btn" id="btn-proj-prev" ${page === 1 ? 'disabled' : ''}>上一页</button>
+                <span class="page-info">共 <strong>${total}</strong> 条项目 / 第 <strong>${page}</strong> 页 / 共 <strong>${totalPages}</strong> 页</span>
+                <button class="page-btn" id="btn-proj-next" ${page === totalPages ? 'disabled' : ''}>下一页</button>
+                <button class="page-btn" id="btn-proj-last" ${page === totalPages ? 'disabled' : ''}>尾页</button>
+            `;
+            
+            document.getElementById('btn-proj-first').addEventListener('click', () => {
+                currentProjectsPage = 1;
+                executeProjPageSearch();
+            });
+            document.getElementById('btn-proj-prev').addEventListener('click', () => {
+                if (currentProjectsPage > 1) {
+                    currentProjectsPage--;
+                    executeProjPageSearch();
+                }
+            });
+            document.getElementById('btn-proj-next').addEventListener('click', () => {
+                if (currentProjectsPage < totalPages) {
+                    currentProjectsPage++;
+                    executeProjPageSearch();
+                }
+            });
+            document.getElementById('btn-proj-last').addEventListener('click', () => {
+                currentProjectsPage = totalPages;
+                executeProjPageSearch();
+            });
+            
+            function executeProjPageSearch() {
+                fetchProjects(
+                    document.getElementById('search-project-name').value,
+                    document.getElementById('search-project-expert-name').value,
+                    document.getElementById('search-project-expert-idcard').value,
+                    currentProjectsPage
+                );
+                // 翻页后平滑滚动回项目检索页面顶部，优化阅读体验
+                document.getElementById('panel-projects').scrollIntoView({ behavior: 'smooth' });
+            }
         }
 
         function openExpertDetailByIdCard(idCard, name) {
