@@ -537,7 +537,7 @@ def api_search_projects():
         """
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
-        sql += " ORDER BY p.id DESC LIMIT ? OFFSET ?"
+        sql += " ORDER BY p.process_time DESC, p.id DESC LIMIT ? OFFSET ?"
         
         query_params = list(params)
         query_params.extend([limit, offset])
