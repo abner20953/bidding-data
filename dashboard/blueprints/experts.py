@@ -466,6 +466,7 @@ def api_search_projects():
     project_name = request.args.get('project_name', '').strip()
     expert_name = request.args.get('expert_name', '').strip()
     expert_id_card = request.args.get('expert_id_card', '').strip()
+    min_year = request.args.get('min_year', '').strip()
     
     # 提取分页参数
     try:
@@ -503,6 +504,10 @@ def api_search_projects():
     if expert_id_card:
         conditions.append("pe.expert_id_card LIKE ?")
         params.append(f"%{expert_id_card}%")
+        
+    if min_year:
+        conditions.append("p.process_time >= ?")
+        params.append(f"{min_year}-01-01 00:00:00")
         
     # 1. 检索符合条件的 DISTINCT 项目总数
     count_sql = """

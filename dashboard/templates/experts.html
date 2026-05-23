@@ -1575,6 +1575,10 @@
                         <input type="text" class="search-input" id="search-project-expert-idcard" placeholder="🪪 参评专家身份证号 (模糊)..." style="padding-left: 16px;">
                     </div>
                 </div>
+                <select class="filter-select" id="filter-project-time" style="width: 160px;">
+                    <option value="2025">2025年及之后</option>
+                    <option value="">全部时间</option>
+                </select>
                 <button class="btn-search-main" id="btn-search-projects">搜索项目</button>
             </div>
 
@@ -1961,7 +1965,9 @@
                         fetchProjects(
                             document.getElementById('search-project-name').value,
                             document.getElementById('search-project-expert-name').value,
-                            document.getElementById('search-project-expert-idcard').value
+                            document.getElementById('search-project-expert-idcard').value,
+                            1,
+                            document.getElementById('filter-project-time') ? document.getElementById('filter-project-time').value : '2025'
                         );
                     } else if (tabId === 'search') {
                         fetchExperts(
@@ -2845,6 +2851,7 @@
             const searchProjName = document.getElementById('search-project-name');
             const searchProjExpert = document.getElementById('search-project-expert-name');
             const searchProjIdcard = document.getElementById('search-project-expert-idcard');
+            const filterProjTime = document.getElementById('filter-project-time');
             const searchProjBtn = document.getElementById('btn-search-projects');
             
             if (!searchProjBtn) return;
@@ -2853,11 +2860,16 @@
                 fetchProjects(
                     searchProjName.value,
                     searchProjExpert.value,
-                    searchProjIdcard.value
+                    searchProjIdcard.value,
+                    1,
+                    filterProjTime ? filterProjTime.value : '2025'
                 );
             }
             
             searchProjBtn.addEventListener('click', executeProjSearch);
+            if (filterProjTime) {
+                filterProjTime.addEventListener('change', executeProjSearch);
+            }
             
             // 回车键与输入防抖绑定
             let projDebounceTimer;
@@ -2877,7 +2889,7 @@
         let currentProjectsPage = 1;
         const projectsPageSize = 20;
 
-        function fetchProjects(projectName = '', expertName = '', expertIdCard = '', page = 1) {
+        function fetchProjects(projectName = '', expertName = '', expertIdCard = '', page = 1, minYear = '2025') {
             const container = document.getElementById('projects-container');
             const paginator = document.getElementById('projects-pagination-container');
             if (!container) return;
@@ -2891,7 +2903,7 @@
             if (paginator) paginator.style.display = 'none';
             
             currentProjectsPage = page;
-            const url = `/zj/api/search_projects?project_name=${encodeURIComponent(projectName)}&expert_name=${encodeURIComponent(expertName)}&expert_id_card=${encodeURIComponent(expertIdCard)}&page=${page}&limit=${projectsPageSize}&_t=${Date.now()}`;
+            const url = `/zj/api/search_projects?project_name=${encodeURIComponent(projectName)}&expert_name=${encodeURIComponent(expertName)}&expert_id_card=${encodeURIComponent(expertIdCard)}&page=${page}&limit=${projectsPageSize}&min_year=${encodeURIComponent(minYear)}&_t=${Date.now()}`;
             
             fetch(url)
                 .then(res => res.json())
@@ -3018,7 +3030,8 @@
                     document.getElementById('search-project-name').value,
                     document.getElementById('search-project-expert-name').value,
                     document.getElementById('search-project-expert-idcard').value,
-                    currentProjectsPage
+                    currentProjectsPage,
+                    document.getElementById('filter-project-time') ? document.getElementById('filter-project-time').value : '2025'
                 );
                 // 翻页后平滑滚动回项目检索页面顶部，优化阅读体验
                 document.getElementById('panel-projects').scrollIntoView({ behavior: 'smooth' });
@@ -3347,7 +3360,9 @@
                             fetchProjects(
                                 document.getElementById('search-project-name').value,
                                 document.getElementById('search-project-expert-name').value,
-                                document.getElementById('search-project-expert-idcard').value
+                                document.getElementById('search-project-expert-idcard').value,
+                                1,
+                                document.getElementById('filter-project-time') ? document.getElementById('filter-project-time').value : '2025'
                             );
                         }
                     } else {
