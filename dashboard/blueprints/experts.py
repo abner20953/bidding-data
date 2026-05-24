@@ -490,24 +490,93 @@ def api_upload():
                     base_fname = os.path.splitext(os.path.basename(p_file))[0].strip().replace(" ", "").lower()
                     dest_filename = f"{base_fname}{ext}"
                     dest_path = os.path.join(photos_dest_dir, dest_filename)
-                    # 采用安全的流式写入，确保物理文件名大小写与数据库中存储的一致（防止在Linux等大小写敏感系统上发生404图片无法访问的“照片错误”问题）
-                    # 同时也规避了 shutil.copy2 覆盖正被 Flask 读取锁定的同名图片时的 Permission 异常
+                    # 采用事务型原子性覆盖写入，确保物理文件名大小写与数据库中存储的一致（防止在Linux等大小写敏感系统上发生404图片无法访问的问题）
+                    # 同时也规避了写入时损坏/丢失原照片的风险。如果覆盖过程中出现任何错误，将自动回滚还原原照片，确保原有照片能够继续正常查看。
+                    backup_path = dest_path + ".bak"
+                    temp_write_path = dest_path + ".tmp"
+                    has_backup = False
+                    
                     try:
+                        # 1. 如果旧文件存在，先做备份重命名，不直接删除
                         if os.path.exists(dest_path):
+                            if os.path.exists(backup_path):
+                                try:
+                                    os.remove(backup_path)
+                                except Exception:
+                                    pass
+                            try:
+                                os.rename(dest_path, backup_path)
+                                has_backup = True
+                            except Exception:
+                                # 如果 rename 失败（如文件锁定），不进行移动，后面直接写 temp 并尝试覆盖
+                                pass
+                        
+                        # 2. 写入新图片内容到临时文件
+                        with open(p_file, 'rb') as f_src:
+                            img_content = f_src.read()
+                        with open(temp_write_path, 'wb') as f_dest:
+                            f_dest.write(img_content)
+                            f_dest.flush()
+                            try:
+                                os.fsync(f_dest.fileno())
+                            except Exception:
+                                pass
+                        
+                        # 3. 将临时文件重命名为目标照片文件
+                        if os.path.exists(dest_path) and not has_backup:
+                            # 如果之前重命名备份失败了，这里尝试删除旧照片
                             try:
                                 os.remove(dest_path)
                             except Exception:
                                 pass
-                        with open(p_file, 'rb') as f_src:
-                            img_content = f_src.read()
-                        with open(dest_path, 'wb') as f_dest:
-                            f_dest.write(img_content)
+                        
+                        os.rename(temp_write_path, dest_path)
+                        
+                        # 4. 成功后清理备份文件
+                        if has_backup and os.path.exists(backup_path):
+                            try:
+                                os.remove(backup_path)
+                            except Exception:
+                                pass
                     except Exception as e:
-                        # 兼容兜底
-                        try:
-                            shutil.copy2(p_file, dest_path)
-                        except Exception:
-                            pass
+                        # 发生异常，进行防丢失灾难恢复
+                        # 清理临时文件
+                        if os.path.exists(temp_write_path):
+                            try:
+                                os.remove(temp_write_path)
+                            except Exception:
+                                pass
+                        
+                        # 如果有备份，将备份还原为目标文件
+                        if has_backup and os.path.exists(backup_path):
+                            try:
+                                if os.path.exists(dest_path):
+                                    os.remove(dest_path)
+                            except Exception:
+                                pass
+                            try:
+                                os.rename(backup_path, dest_path)
+                            except Exception:
+                                try:
+                                    shutil.copy2(backup_path, dest_path)
+                                    os.remove(backup_path)
+                                except Exception:
+                                    pass
+                        
+                        # 兜底：如果 dest_path 确实不复存在，但备份还挂在旁边，强制把它恢复回去
+                        if not os.path.exists(dest_path) and os.path.exists(backup_path):
+                            try:
+                                shutil.copy2(backup_path, dest_path)
+                            except Exception:
+                                pass
+                        
+                        # 最终兜底：如果新文件写入失败，且还原旧文件也因极其诡异的错误失败，而 dest_path 还是缺失，
+                        # 则尝试最后一次使用原始 shutil.copy2 写入
+                        if not os.path.exists(dest_path):
+                            try:
+                                shutil.copy2(p_file, dest_path)
+                            except Exception:
+                                pass
                     copied_paths.append(f"/static/uploads/expert_photos/{dest_filename}")
                     matched_photo_count += 1
                 
