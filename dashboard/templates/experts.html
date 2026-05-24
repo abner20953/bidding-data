@@ -1854,7 +1854,7 @@
     </div>
 
     <!-- 专家标签管理模态框 -->
-    <div class="modal" id="tags-modal" style="display: none;">
+    <div class="modal" id="tags-modal">
         <div class="modal-container" style="max-width: 900px; width: 90%;">
             <div class="modal-head">
                 <div class="modal-title">
@@ -3727,7 +3727,7 @@
             
             // 1. 模态框开关
             btnManageTags.addEventListener('click', () => {
-                tagsModal.style.display = 'flex';
+                tagsModal.classList.add('active');
                 loadTagsList();
                 loadAllMajorsCache();
                 resetTagConfigPanel();
@@ -3735,14 +3735,14 @@
             
             if (tagsModalClose) {
                 tagsModalClose.addEventListener('click', () => {
-                    tagsModal.style.display = 'none';
+                    tagsModal.classList.remove('active');
                     loadSearchTags(); // 关闭时同步刷新搜索框的下拉标签选项
                 });
             }
             
             tagsModal.addEventListener('click', (e) => {
                 if (e.target.id === 'tags-modal') {
-                    tagsModal.style.display = 'none';
+                    tagsModal.classList.remove('active');
                     loadSearchTags();
                 }
             });
