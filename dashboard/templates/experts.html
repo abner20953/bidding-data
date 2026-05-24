@@ -2016,6 +2016,19 @@
                     </div>
                 </div>
 
+                <!-- 各标签下专家人数统计 -->
+                <div style="margin-top: 30px; border-top: 1px solid rgba(0, 0, 0, 0.05); padding-top: 20px;">
+                    <div style="font-size: 14px; font-weight: 600; color: var(--text-primary); margin-bottom: 16px; display: flex; align-items: center; gap: 8px;">
+                        <span>🏷️</span> 各标签下专家人数统计
+                    </div>
+                    <div id="stat-tags-container" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px;">
+                        <div style="grid-column: 1 / -1; text-align: center; color: var(--text-secondary); font-size: 13px; padding: 20px;">
+                            <div class="spinner" style="margin: 0 auto 12px; width: 24px; height: 24px; border-width: 2px;"></div>
+                            正在计算标签分布数据...
+                        </div>
+                    </div>
+                </div>
+
                 <!-- 各专业专家人数分布 -->
                 <div style="margin-top: 30px; border-top: 1px solid rgba(0, 0, 0, 0.05); padding-top: 20px;">
                     <div style="font-size: 14px; font-weight: 600; color: var(--text-primary); margin-bottom: 16px; display: flex; align-items: center; gap: 8px;">
@@ -2707,6 +2720,7 @@
             const noPhotoCountEl = document.getElementById('stat-no-photo-count');
             const companyCountEl = document.getElementById('stat-company-count');
             const majorsContainer = document.getElementById('stat-majors-container');
+            const tagsContainer = document.getElementById('stat-tags-container');
             
             if (totalCountEl) totalCountEl.innerText = '加载中...';
             if (photoCountEl) photoCountEl.innerText = '加载中...';
@@ -2717,6 +2731,14 @@
                     <div style="grid-column: 1 / -1; text-align: center; color: var(--text-secondary); font-size: 13px; padding: 20px;">
                         <div class="spinner" style="margin: 0 auto 12px; width: 24px; height: 24px; border-width: 2px;"></div>
                         正在计算专业分布数据...
+                    </div>
+                `;
+            }
+            if (tagsContainer) {
+                tagsContainer.innerHTML = `
+                    <div style="grid-column: 1 / -1; text-align: center; color: var(--text-secondary); font-size: 13px; padding: 20px;">
+                        <div class="spinner" style="margin: 0 auto 12px; width: 24px; height: 24px; border-width: 2px;"></div>
+                        正在计算标签分布数据...
                     </div>
                 `;
             }
@@ -2733,6 +2755,9 @@
                         // 统计各专业专家数量
                         const majorCounts = {};
                         
+                        // 统计各标签专家数量
+                        const tagCounts = {};
+
                         data.forEach(item => {
                             if (item.photo_path && item.photo_path.trim() !== '') {
                                 photoCount++;
@@ -2752,6 +2777,19 @@
                                     if (cleanMajor && !seenInThisExpert.has(cleanMajor)) {
                                         seenInThisExpert.add(cleanMajor);
                                         majorCounts[cleanMajor] = (majorCounts[cleanMajor] || 0) + 1;
+                                    }
+                                });
+                            }
+
+                            // 统计标签分布
+                            const tags = item.tags || [];
+                            if (tags.length === 0) {
+                                tagCounts['无标签'] = (tagCounts['无标签'] || 0) + 1;
+                            } else {
+                                tags.forEach(t => {
+                                    const cleanTag = t.trim();
+                                    if (cleanTag) {
+                                        tagCounts[cleanTag] = (tagCounts[cleanTag] || 0) + 1;
                                     }
                                 });
                             }
@@ -2805,6 +2843,47 @@
                                 });
                             }
                         }
+
+                        // 渲染各标签占比
+                        if (tagsContainer) {
+                            tagsContainer.innerHTML = '';
+                            const sortedTags = Object.entries(tagCounts).sort((a, b) => {
+                                if (b[1] !== a[1]) {
+                                    return b[1] - a[1];
+                                }
+                                return a[0].localeCompare(b[0], 'zh');
+                            });
+                            
+                            if (sortedTags.length === 0) {
+                                tagsContainer.innerHTML = `
+                                    <div style="grid-column: 1 / -1; text-align: center; color: var(--text-secondary); font-size: 13px; padding: 20px;">
+                                        暂无标签分布数据
+                                    </div>
+                                `;
+                            } else {
+                                sortedTags.forEach(([tagName, count]) => {
+                                    const percentage = total > 0 ? Math.round((count / total) * 100) : 0;
+                                    const tagCard = document.createElement('div');
+                                    tagCard.className = 'major-stat-card';
+                                    tagCard.innerHTML = `
+                                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                                            <span style="font-size: 14px; font-weight: 600; color: var(--text-primary); display: flex; align-items: center; gap: 6px; padding-left: 4px;">
+                                                🏷️ ${tagName}
+                                            </span>
+                                            <span style="font-size: 14px; font-weight: 700; color: #6366f1;">${count}人</span>
+                                        </div>
+                                        <div style="background: #e2e8f0; border-radius: 4px; height: 6px; overflow: hidden; width: 100%; margin-top: 4px;">
+                                            <div style="background: linear-gradient(90deg, #6366f1, #818cf8); height: 100%; width: ${percentage}%; border-radius: 4px; transition: width 0.5s ease-out;"></div>
+                                        </div>
+                                        <div style="display: flex; justify-content: space-between; font-size: 11px; color: var(--text-secondary);">
+                                            <span>占比</span>
+                                            <span>${percentage}%</span>
+                                        </div>
+                                    `;
+                                    tagsContainer.appendChild(tagCard);
+                                });
+                            }
+                        }
                     } else {
                         if (totalCountEl) totalCountEl.innerText = '⚠️ 失败';
                         if (photoCountEl) photoCountEl.innerText = '⚠️ 失败';
@@ -2812,6 +2891,13 @@
                         if (companyCountEl) companyCountEl.innerText = '⚠️ 失败';
                         if (majorsContainer) {
                             majorsContainer.innerHTML = `
+                                <div style="grid-column: 1 / -1; text-align: center; color: #ef4444; font-size: 13px; padding: 20px;">
+                                    ⚠️ 获取统计数据失败: ${res.error}
+                                </div>
+                            `;
+                        }
+                        if (tagsContainer) {
+                            tagsContainer.innerHTML = `
                                 <div style="grid-column: 1 / -1; text-align: center; color: #ef4444; font-size: 13px; padding: 20px;">
                                     ⚠️ 获取统计数据失败: ${res.error}
                                 </div>
@@ -2827,6 +2913,13 @@
                     if (companyCountEl) companyCountEl.innerText = '⚠️ 错误';
                     if (majorsContainer) {
                         majorsContainer.innerHTML = `
+                            <div style="grid-column: 1 / -1; text-align: center; color: #ef4444; font-size: 13px; padding: 20px;">
+                                ⚠️ 网络错误，无法连接数据库统计
+                            </div>
+                        `;
+                    }
+                    if (tagsContainer) {
+                        tagsContainer.innerHTML = `
                             <div style="grid-column: 1 / -1; text-align: center; color: #ef4444; font-size: 13px; padding: 20px;">
                                 ⚠️ 网络错误，无法连接数据库统计
                             </div>
