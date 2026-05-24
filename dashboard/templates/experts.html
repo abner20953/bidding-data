@@ -2515,8 +2515,6 @@
                 let tagsHtml = '';
                 if (item.tags && item.tags.length > 0) {
                     tagsHtml = item.tags.map(t => `<span class="custom-expert-tag" title="${t}">${t}</span>`).join('');
-                } else {
-                    tagsHtml = `<span class="expert-tag">评标专家</span>`;
                 }
                 
                 card.innerHTML = `
