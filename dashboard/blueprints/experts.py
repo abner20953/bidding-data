@@ -160,8 +160,69 @@ def init_db():
     except sqlite3.OperationalError:
         pass
 
+    # 标签管理与高性能倒排检索相关表
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tag_name TEXT UNIQUE NOT NULL,
+            created_at TEXT
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS tag_majors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tag_id INTEGER,
+            major_name TEXT NOT NULL
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS expert_majors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            expert_id INTEGER,
+            major_name TEXT NOT NULL
+        )
+    ''')
+    c.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_tags_name ON tags(tag_name)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_tag_majors_tag_id ON tag_majors(tag_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_tag_majors_name ON tag_majors(major_name)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_expert_majors_exp_id ON expert_majors(expert_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_expert_majors_name ON expert_majors(major_name)')
+
     conn.commit()
+
+    # 一次性历史专家专业同步到倒排表
+    try:
+        c.execute("SELECT COUNT(*) FROM expert_majors")
+        if c.fetchone()[0] == 0:
+            c.execute("SELECT COUNT(*) FROM experts")
+            if c.fetchone()[0] > 0:
+                print("🔄 正在初始化升级：同步历史专家专业到高性能倒排表中...")
+                c.execute("SELECT id, major FROM experts")
+                all_experts = c.fetchall()
+                for exp_id, major_str in all_experts:
+                    if major_str:
+                        majors = list(set([m.strip() for m in re.split(r'[,，]', major_str) if m.strip()]))
+                        for m in majors:
+                            c.execute("INSERT INTO expert_majors (expert_id, major_name) VALUES (?, ?)", (exp_id, m))
+                conn.commit()
+                print("✅ 历史专家专业同步初始化完成！")
+    except Exception as e:
+        print(f"⚠️ 历史专业同步初始化失败: {e}")
+
     conn.close()
+
+def sync_expert_majors(conn, expert_id, major_str):
+    """同步单个专家的专业到倒排表 (支持重写和更新)"""
+    try:
+        c = conn.cursor()
+        c.execute("DELETE FROM expert_majors WHERE expert_id = ?", (expert_id,))
+        if major_str:
+            # 兼容中文逗号和英文逗号切分，并去重
+            majors = list(set([m.strip() for m in re.split(r'[,，]', major_str) if m.strip()]))
+            for m in majors:
+                c.execute("INSERT INTO expert_majors (expert_id, major_name) VALUES (?, ?)", (expert_id, m))
+    except Exception as e:
+        print(f"Error syncing expert majors for ID {expert_id}: {e}")
 
 def parse_and_import_md(file_path):
     """解析并导入 Markdown 格式的项目评审与专家关系表 (流式读取逐行处理，自适应新旧版表头，对内存极度友好)"""
@@ -615,6 +676,7 @@ def api_upload():
                     SET id_card = ?, company = ?, major = ?, photo_path = ?, raw_json = ?, created_at = ?
                     WHERE id = ?
                 ''', (final_id_card, final_company, final_major, final_photo_path, final_raw_json, now_time, db_id))
+                sync_expert_majors(conn, db_id, final_major)
             else:
                 # 不存在，执行插入（追加）操作
                 added_count += 1
@@ -622,6 +684,8 @@ def api_upload():
                     INSERT INTO experts (name, phone, id_card, company, major, photo_path, raw_json, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (name, phone, id_card, company, major, photo_path_db, raw_json, now_time))
+                new_id = c.lastrowid
+                sync_expert_majors(conn, new_id, major)
                 
             imported_count += 1
 
@@ -893,6 +957,14 @@ def api_search():
         conditions.append("status = ?")
         params.append(status)
         
+    tag_ids_str = request.args.get('tag_ids', '').strip()
+    if tag_ids_str:
+        tag_id_list = [t.strip() for t in tag_ids_str.split(',') if t.strip().isdigit()]
+        if tag_id_list:
+            placeholders = ",".join(["?"] * len(tag_id_list))
+            conditions.append(f"id IN (SELECT DISTINCT em.expert_id FROM expert_majors em JOIN tag_majors tm ON em.major_name = tm.major_name WHERE tm.tag_id IN ({placeholders}))")
+            params.extend([int(tid) for tid in tag_id_list])
+        
     # 精炼 SQL：不 SELECT raw_json 大文本字段，使一千条数据能在 20ms 内查出并传输完成
     sql = "SELECT name, phone, id_card, company, major, photo_path, status, remark FROM experts"
     if conditions:
@@ -1018,6 +1090,7 @@ def api_clear():
         conn = sqlite3.connect(db_path)
         c = conn.cursor()
         c.execute('DELETE FROM experts')
+        c.execute('DELETE FROM expert_majors')
         conn.commit()
         conn.close()
     except Exception as e:
@@ -1069,6 +1142,8 @@ def api_delete():
                         except Exception:
                             pass
         
+        # 从倒排关系表中物理删除
+        c.execute("DELETE FROM expert_majors WHERE expert_id IN (SELECT id FROM experts WHERE name = ? AND phone = ?)", (name, phone))
         # 从数据库中物理删除
         c.execute("DELETE FROM experts WHERE name = ? AND phone = ?", (name, phone))
         conn.commit()
@@ -1106,4 +1181,134 @@ def api_update_status():
         return jsonify({"success": True, "message": f"专家 {name} 的状态与备注已成功更新。"})
     except Exception as e:
         return jsonify({"success": False, "error": f"更新专家状态/备注失败: {str(e)}"}), 500
+
+
+@experts_bp.route('/api/tags', methods=['GET', 'POST'])
+def api_tags():
+    db_path = get_db_path()
+    if request.method == 'GET':
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            
+            # 1. 查出所有标签
+            c.execute("SELECT id, tag_name, created_at FROM tags ORDER BY id DESC")
+            tags_rows = c.fetchall()
+            
+            tags_list = []
+            for t in tags_rows:
+                t_id = t['id']
+                # 2. 查出每个标签关联的小专业
+                c.execute("SELECT major_name FROM tag_majors WHERE tag_id = ?", (t_id,))
+                majors = [row['major_name'] for row in c.fetchall()]
+                tags_list.append({
+                    "id": t_id,
+                    "tag_name": t['tag_name'],
+                    "majors": majors,
+                    "created_at": t['created_at']
+                })
+            
+            conn.close()
+            return jsonify({"success": True, "tags": tags_list})
+        except Exception as e:
+            return jsonify({"success": False, "error": f"获取标签列表失败: {str(e)}"}), 500
+            
+    elif request.method == 'POST':
+        data = request.json or {}
+        tag_name = data.get('tag_name', '').strip()
+        majors = data.get('majors', [])
+        tag_id = data.get('tag_id')
+        
+        if not tag_name:
+            return jsonify({"success": False, "error": "标签名称不能为空"}), 400
+            
+        try:
+            conn = sqlite3.connect(db_path)
+            c = conn.cursor()
+            now_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            if tag_id:
+                # 更新模式
+                # 检查同名冲突（排除自身）
+                c.execute("SELECT id FROM tags WHERE tag_name = ? AND id != ?", (tag_name, tag_id))
+                if c.fetchone():
+                    conn.close()
+                    return jsonify({"success": False, "error": f"已存在同名的标签: {tag_name}"}), 400
+                    
+                c.execute("UPDATE tags SET tag_name = ? WHERE id = ?", (tag_name, tag_id))
+                c.execute("DELETE FROM tag_majors WHERE tag_id = ?", (tag_id,))
+                real_tag_id = tag_id
+                action_desc = "修改专家标签"
+            else:
+                # 新增模式
+                # 检查同名
+                c.execute("SELECT id FROM tags WHERE tag_name = ?", (tag_name,))
+                if c.fetchone():
+                    conn.close()
+                    return jsonify({"success": False, "error": f"已存在同名的标签: {tag_name}"}), 400
+                    
+                c.execute("INSERT INTO tags (tag_name, created_at) VALUES (?, ?)", (tag_name, now_time))
+                real_tag_id = c.lastrowid
+                action_desc = "创建专家标签"
+                
+            # 插入新的小专业关联关系
+            if majors:
+                # 去重且清洗
+                clean_majors = list(set([m.strip() for m in majors if m.strip()]))
+                for m in clean_majors:
+                    c.execute("INSERT INTO tag_majors (tag_id, major_name) VALUES (?, ?)", (real_tag_id, m))
+                    
+            conn.commit()
+            conn.close()
+            
+            _log_action(action_desc, f"标签: {tag_name}，包含专业共 {len(majors)} 个")
+            return jsonify({"success": True, "message": "保存标签成功！", "tag_id": real_tag_id})
+        except Exception as e:
+            return jsonify({"success": False, "error": f"保存标签失败: {str(e)}"}), 500
+
+@experts_bp.route('/api/tags/delete', methods=['POST'])
+def api_delete_tag():
+    data = request.json or {}
+    tag_id = data.get('tag_id')
+    if not tag_id:
+        return jsonify({"success": False, "error": "缺失标签ID参数"}), 400
+        
+    db_path = get_db_path()
+    try:
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        
+        # 查出标签名称用于日志记录
+        c.execute("SELECT tag_name FROM tags WHERE id = ?", (tag_id,))
+        row = c.fetchone()
+        tag_name = row[0] if row else f"ID_{tag_id}"
+        
+        # 删除主表记录
+        c.execute("DELETE FROM tags WHERE id = ?", (tag_id,))
+        # 手动清理关联表数据
+        c.execute("DELETE FROM tag_majors WHERE tag_id = ?", (tag_id,))
+        
+        conn.commit()
+        conn.close()
+        
+        _log_action("删除专家标签", f"标签: {tag_name}")
+        return jsonify({"success": True, "message": "标签已成功删除。"})
+    except Exception as e:
+        return jsonify({"success": False, "error": f"删除标签失败: {str(e)}"}), 500
+
+@experts_bp.route('/api/all_majors', methods=['GET'])
+def api_all_majors():
+    db_path = get_db_path()
+    try:
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        # 从倒排索引表中快速拉出所有非空的小专业
+        c.execute("SELECT DISTINCT major_name FROM expert_majors WHERE major_name != '' ORDER BY major_name ASC")
+        majors = [row[0] for row in c.fetchall()]
+        conn.close()
+        return jsonify({"success": True, "majors": majors})
+    except Exception as e:
+        return jsonify({"success": False, "error": f"获取专业列表失败: {str(e)}"}), 500
+
 

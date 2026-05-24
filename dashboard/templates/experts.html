@@ -1598,6 +1598,9 @@
                         <input type="text" class="search-input" id="search-major" placeholder="💼 专业领域 (模糊)...">
                     </div>
                 </div>
+                <select class="filter-select" id="filter-tag" style="min-width: 150px;">
+                    <option value="">全部专家标签</option>
+                </select>
                 <select class="filter-select" id="filter-status">
                     <option value="">全部标记状态</option>
                     <option value="已获取">已获取</option>
@@ -1790,6 +1793,18 @@
                     </div>
                 </div>
 
+                <!-- 专家标签管理 -->
+                <div class="ops-card">
+                    <div class="ops-icon">🏷️</div>
+                    <div class="ops-info">
+                        <div class="ops-title">专家标签管理</div>
+                        <div class="ops-desc">建立与维护专家的分类标签，将若干个具体专业小类归档到大标签下，用于快捷条件筛选检索。</div>
+                        <button class="action-btn-large btn-tags" id="btn-manage-tags" style="background: var(--accent-gradient); border: none; color: white;">
+                            <span>🏷️</span> 管理专家标签
+                        </button>
+                    </div>
+                </div>
+
             </div>
 
             <!-- 数据统计面板 -->
@@ -1836,6 +1851,78 @@
             </div>
         </div>
 
+    </div>
+
+    <!-- 专家标签管理模态框 -->
+    <div class="modal" id="tags-modal" style="display: none;">
+        <div class="modal-container" style="max-width: 900px; width: 90%;">
+            <div class="modal-head">
+                <div class="modal-title">
+                    <span>🏷️</span> 专家标签与专业关系管理
+                </div>
+                <button class="modal-close" id="tags-modal-close">&times;</button>
+            </div>
+            <div class="modal-body" style="padding: 20px; display: flex; gap: 24px; min-height: 480px; flex-wrap: wrap;">
+                <!-- 左侧标签列表 -->
+                <div style="flex: 1; min-width: 250px; border-right: 1px solid var(--border-color); padding-right: 16px; display: flex; flex-direction: column;">
+                    <div style="font-weight: 600; font-size: 14px; margin-bottom: 12px; color: var(--text-primary);">🏷️ 标签列表</div>
+                    
+                    <!-- 新建标签输入区 -->
+                    <div style="display: flex; gap: 8px; margin-bottom: 16px;">
+                        <input type="text" id="new-tag-name-input" class="search-input" placeholder="输入新标签名..." style="margin: 0; padding: 8px 12px; font-size: 13px;">
+                        <button class="action-btn-large" id="btn-add-tag-submit" style="margin:0; padding: 8px 14px; font-size: 13px; background: var(--accent-gradient); border:none; color:white; white-space:nowrap; cursor:pointer;">
+                            新建
+                        </button>
+                    </div>
+                    
+                    <!-- 标签渲染容器 -->
+                    <div id="tags-list-container" style="flex-grow: 1; overflow-y: auto; max-height: 350px; display: flex; flex-direction: column; gap: 6px;">
+                        <!-- 动态加载标签行 -->
+                        <div style="text-align: center; color: var(--text-secondary); padding: 20px; font-size: 12px;">加载中...</div>
+                    </div>
+                </div>
+                
+                <!-- 右侧专业配置面板 -->
+                <div style="flex: 2; min-width: 320px; display: flex; flex-direction: column;">
+                    <div id="tag-config-title" style="font-weight: 600; font-size: 14px; margin-bottom: 12px; color: var(--text-primary);">⚙️ 关联专业设置 (请先选择一个标签)</div>
+                    
+                    <div id="tag-config-panel-body" style="display: none; flex-direction: column; gap: 16px; flex-grow: 1;">
+                        <!-- 专业搜索选择器（联想选择） -->
+                        <div>
+                            <label style="font-size: 12px; color: var(--text-secondary); display: block; margin-bottom: 6px;">添加关联专业（可从库中选择，或直接输入新专业敲击回车绑定）：</label>
+                            <div style="display: flex; gap: 8px; position: relative;">
+                                <input type="text" id="major-search-input" class="search-input" placeholder="输入关键字搜索专业，或输入自定义专业后点击添加..." style="margin: 0; padding: 10px; font-size: 13px;">
+                                <button class="action-btn-large" id="btn-add-major-manual" style="margin:0; padding: 10px 16px; font-size: 13px; background: var(--text-primary); color: var(--bg-card); border:1px solid var(--border-color); white-space:nowrap; cursor:pointer;">
+                                    添加
+                                </button>
+                                <!-- 联想结果下拉浮层 -->
+                                <div id="major-autocomplete-list" style="display: none; position: absolute; top: 100%; left: 0; right: 0; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 8px; max-height: 200px; overflow-y: auto; z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.15);"></div>
+                            </div>
+                        </div>
+                        
+                        <!-- 已关联的专业小标签池 -->
+                        <div>
+                            <label style="font-size: 12px; color: var(--text-secondary); display: block; margin-bottom: 8px;">当前已绑定的专业（点击 ✖ 移除）：</label>
+                            <div id="associated-majors-pool" style="display: flex; flex-wrap: wrap; gap: 8px; max-height: 180px; overflow-y: auto; padding: 12px; border: 1px dashed var(--border-color); border-radius: 8px; background: rgba(0,0,0,0.02);">
+                                <!-- 动态小标签 -->
+                            </div>
+                        </div>
+                        
+                        <!-- 保存配置按钮 -->
+                        <div style="margin-top: auto; display: flex; justify-content: flex-end; padding-top: 16px; border-top: 1px solid var(--border-color);">
+                            <button class="action-btn-large" id="btn-save-tag-majors" style="margin: 0; padding: 10px 24px; font-size: 14px; background: var(--accent-gradient); border:none; color:white; font-weight:600; cursor:pointer;">
+                                保存专业关联
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <!-- 提示区域 -->
+                    <div id="tag-config-placeholder" style="flex-grow: 1; display: flex; align-items: center; justify-content: center; color: var(--text-secondary); font-size: 13px; border: 1px dashed var(--border-color); border-radius: 8px; padding: 40px; text-align: center;">
+                        👈 请在左侧列表中点击选择一个标签进行管理
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 
     <!-- 专家富文本详情模态框 (Modal) -->
@@ -1955,8 +2042,11 @@
 
         // 页面初始化加载
         document.addEventListener('DOMContentLoaded', () => {
+            // 加载搜索标签列表
+            loadSearchTags();
+            
             // 默认加载专家检索列表
-            fetchExperts('', '', '', '', '', '');
+            fetchExperts('', '', '', '', '', '', '');
             
             // 绑定检索与筛选事件
             const searchName = document.getElementById('search-name');
@@ -1965,6 +2055,7 @@
             const searchCompany = document.getElementById('search-company');
             const searchMajor = document.getElementById('search-major');
             const filterStatus = document.getElementById('filter-status');
+            const filterTag = document.getElementById('filter-tag');
             const searchBtn = document.getElementById('btn-search');
             
             function executeSearch() {
@@ -1974,7 +2065,8 @@
                     searchIdcard.value,
                     searchCompany ? searchCompany.value : '',
                     searchMajor.value,
-                    filterStatus.value
+                    filterStatus.value,
+                    filterTag ? filterTag.value : ''
                 );
             }
             
@@ -1998,6 +2090,7 @@
             });
             
             filterStatus.addEventListener('change', executeSearch);
+            if (filterTag) filterTag.addEventListener('change', executeSearch);
             
             // 模态框关闭绑定
             document.getElementById('modal-close').addEventListener('click', closeDetailModal);
@@ -2016,6 +2109,9 @@
 
             // 绑定项目评审检索与单独上传 MD 模块
             setupProjectSearch();
+
+            // 绑定专家标签管理模块
+            setupTagsManagement();
             setupUploadMd();
         });
 
@@ -2050,7 +2146,8 @@
                             document.getElementById('search-idcard').value,
                             document.getElementById('search-company') ? document.getElementById('search-company').value : '',
                             document.getElementById('search-major').value,
-                            document.getElementById('filter-status').value
+                            document.getElementById('filter-status').value,
+                            document.getElementById('filter-tag') ? document.getElementById('filter-tag').value : ''
                         );
                     }
                 } else {
@@ -2060,7 +2157,7 @@
         }
 
         // ==================== 1. 专家检索逻辑 ====================
-        function fetchExperts(name = '', phone = '', idCard = '', company = '', major = '', status = '') {
+        function fetchExperts(name = '', phone = '', idCard = '', company = '', major = '', status = '', tagIds = '') {
             const container = document.getElementById('cards-container');
             const paginator = document.getElementById('pagination-container');
             
@@ -2072,7 +2169,7 @@
             `;
             if (paginator) paginator.style.display = 'none';
             
-            const url = `/dlsgzs/api/search?name=${encodeURIComponent(name)}&phone=${encodeURIComponent(phone)}&id_card=${encodeURIComponent(idCard)}&company=${encodeURIComponent(company)}&major=${encodeURIComponent(major)}&status=${encodeURIComponent(status)}&_t=${Date.now()}`;
+            const url = `/dlsgzs/api/search?name=${encodeURIComponent(name)}&phone=${encodeURIComponent(phone)}&id_card=${encodeURIComponent(idCard)}&company=${encodeURIComponent(company)}&major=${encodeURIComponent(major)}&status=${encodeURIComponent(status)}&tag_ids=${encodeURIComponent(tagIds)}&_t=${Date.now()}`;
             
             fetch(url)
                 .then(res => res.json())
@@ -3521,6 +3618,349 @@
         window.zoomPhoto = zoomPhoto;
         window.handleImgLoadError = handleImgLoadError;
         window.handleDetailImgError = handleDetailImgError;
+        window.showExpertDetailDirectly = showExpertDetailDirectly;
+        window.openExpertDetailByIdCard = openExpertDetailByIdCard;
+        window.fetchProjects = fetchProjects;
+        
+        // ==================== 5. 专家标签管理模块 ====================
+        let allAvailableMajors = []; // 缓存系统内存在的所有专业小类
+        let currentEditingTag = null; // 当前正在编辑的标签对象
+        let selectedMajorsForTag = []; // 当前选中的关联专业小类数组
+
+        function loadSearchTags() {
+            fetch('/dlsgzs/api/tags')
+                .then(res => res.json())
+                .then(res => {
+                    if (res.success) {
+                        const filterTag = document.getElementById('filter-tag');
+                        if (filterTag) {
+                            filterTag.innerHTML = '<option value="">全部专家标签</option>';
+                            res.tags.forEach(tag => {
+                                const opt = document.createElement('option');
+                                opt.value = tag.id;
+                                opt.textContent = tag.tag_name;
+                                filterTag.appendChild(opt);
+                            });
+                        }
+                    }
+                })
+                .catch(err => console.error("加载搜索标签列表失败:", err));
+        }
+
+        function setupTagsManagement() {
+            const btnManageTags = document.getElementById('btn-manage-tags');
+            const tagsModal = document.getElementById('tags-modal');
+            const tagsModalClose = document.getElementById('tags-modal-close');
+            
+            if (!btnManageTags || !tagsModal) return;
+            
+            // 1. 模态框开关
+            btnManageTags.addEventListener('click', () => {
+                tagsModal.style.display = 'flex';
+                loadTagsList();
+                loadAllMajorsCache();
+                resetTagConfigPanel();
+            });
+            
+            tagsModalClose.addEventListener('click', () => {
+                tagsModal.style.display = 'none';
+                loadSearchTags(); // 关闭时同步刷新搜索框的下拉标签选项
+            });
+            
+            tagsModal.addEventListener('click', (e) => {
+                if (e.target.id === 'tags-modal') {
+                    tagsModal.style.display = 'none';
+                    loadSearchTags();
+                }
+            });
+            
+            // 2. 加载小专业列表缓存，以支持下拉联想
+            function loadAllMajorsCache() {
+                fetch('/dlsgzs/api/all_majors')
+                    .then(res => res.json())
+                    .then(res => {
+                        if (res.success) {
+                            allAvailableMajors = res.majors || [];
+                        }
+                    })
+                    .catch(err => console.error("缓存小专业列表失败:", err));
+            }
+            
+            // 3. 加载左侧标签列表
+            function loadTagsList() {
+                const container = document.getElementById('tags-list-container');
+                container.innerHTML = '<div style="text-align: center; color: var(--text-secondary); padding: 20px; font-size: 12px;">加载中...</div>';
+                
+                fetch('/dlsgzs/api/tags')
+                    .then(res => res.json())
+                    .then(res => {
+                        if (res.success) {
+                            container.innerHTML = '';
+                            if (res.tags.length === 0) {
+                                container.innerHTML = '<div style="text-align: center; color: var(--text-secondary); padding: 20px; font-size: 12px;">暂无标签，请输入名称创建</div>';
+                                return;
+                            }
+                            
+                            res.tags.forEach(tag => {
+                                const row = document.createElement('div');
+                                row.className = 'tag-item-row';
+                                row.style = 'display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; border-radius: 8px; background: rgba(0,0,0,0.02); border: 1px solid var(--border-color); cursor: pointer; transition: all 0.2s;';
+                                
+                                // 高亮选中态
+                                if (currentEditingTag && currentEditingTag.id === tag.id) {
+                                    row.style.background = 'var(--bg-card)';
+                                    row.style.borderColor = 'var(--accent-color)';
+                                    row.style.boxShadow = '0 0 8px rgba(14, 165, 233, 0.2)';
+                                }
+                                
+                                row.innerHTML = `
+                                    <span class="tag-name-text" style="font-size: 13px; font-weight: 500; color: var(--text-primary); flex-grow:1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+                                        ${tag.tag_name} <small style="color: var(--text-secondary); font-size: 11px;">(${tag.majors.length})</small>
+                                    </span>
+                                    <button class="btn-delete-tag-small" data-id="${tag.id}" style="background: none; border: none; color: #ef4444; cursor: pointer; font-size: 16px; padding: 0 4px; transition: transform 0.2s;">&times;</button>
+                                `;
+                                
+                                // 点击行激活编辑
+                                row.addEventListener('click', (e) => {
+                                    if (e.target.classList.contains('btn-delete-tag-small')) return;
+                                    selectTagForEdit(tag);
+                                    loadTagsList(); // 刷一下以更新高亮状态
+                                });
+                                
+                                // 删除标签小按钮
+                                row.querySelector('.btn-delete-tag-small').addEventListener('click', (e) => {
+                                    e.stopPropagation();
+                                    const tid = e.target.getAttribute('data-id');
+                                    if (confirm(`确认删除标签“${tag.tag_name}”吗？此操作不会影响专家原本的专业数据。`)) {
+                                        deleteTag(tid);
+                                    }
+                                });
+                                
+                                container.appendChild(row);
+                            });
+                        } else {
+                            container.innerHTML = `<div style="text-align: center; color: #ef4444; padding: 20px; font-size: 12px;">加载失败: ${res.error}</div>`;
+                        }
+                    })
+                    .catch(err => {
+                        container.innerHTML = '<div style="text-align: center; color: #ef4444; padding: 20px; font-size: 12px;">加载异常</div>';
+                        console.error(err);
+                    });
+            }
+            
+            // 4. 新增标签
+            const btnAddTagSubmit = document.getElementById('btn-add-tag-submit');
+            const newTagNameInput = document.getElementById('new-tag-name-input');
+            
+            btnAddTagSubmit.addEventListener('click', () => {
+                const name = newTagNameInput.value.trim();
+                if (!name) {
+                    alert('请输入标签名称！');
+                    return;
+                }
+                
+                fetch('/dlsgzs/api/tags', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ tag_name: name })
+                })
+                .then(res => res.json())
+                .then(res => {
+                    if (res.success) {
+                        newTagNameInput.value = '';
+                        loadTagsList();
+                        // 自动选中新创建的标签
+                        selectTagForEdit({ id: res.tag_id, tag_name: name, majors: [] });
+                    } else {
+                        alert(res.error || '创建标签失败');
+                    }
+                })
+                .catch(err => console.error(err));
+            });
+            
+            newTagNameInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') btnAddTagSubmit.click();
+            });
+            
+            // 5. 选中标签并初始化右侧面板
+            function selectTagForEdit(tag) {
+                currentEditingTag = tag;
+                selectedMajorsForTag = [...tag.majors];
+                
+                document.getElementById('tag-config-placeholder').style.display = 'none';
+                const bodyPanel = document.getElementById('tag-config-panel-body');
+                bodyPanel.style.display = 'flex';
+                
+                document.getElementById('tag-config-title').innerHTML = `⚙️ 标签 [ <span style="color:var(--accent-color);">${tag.tag_name}</span> ] 专业关联设置`;
+                
+                renderAssociatedMajors();
+            }
+            
+            // 6. 重置右侧面板为初始占位状态
+            function resetTagConfigPanel() {
+                currentEditingTag = null;
+                selectedMajorsForTag = [];
+                document.getElementById('tag-config-placeholder').style.display = 'flex';
+                document.getElementById('tag-config-panel-body').style.display = 'none';
+                document.getElementById('tag-config-title').innerText = '⚙️ 关联专业设置 (请先选择一个标签)';
+            }
+            
+            // 7. 渲染右侧小标签池
+            function renderAssociatedMajors() {
+                const pool = document.getElementById('associated-majors-pool');
+                pool.innerHTML = '';
+                
+                if (selectedMajorsForTag.length === 0) {
+                    pool.innerHTML = '<div style="color: var(--text-secondary); font-size: 12px; padding: 10px;">尚未绑定任何专业，请在上方添加</div>';
+                    return;
+                }
+                
+                selectedMajorsForTag.forEach((m, idx) => {
+                    const tagEl = document.createElement('span');
+                    tagEl.style = 'display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; background: rgba(14, 165, 233, 0.1); border: 1px solid rgba(14, 165, 233, 0.2); border-radius: 20px; font-size: 12px; color: var(--text-primary); cursor: pointer; transition: all 0.2s;';
+                    tagEl.innerHTML = `
+                        <span>${m}</span>
+                        <span class="btn-remove-major" data-idx="${idx}" style="font-weight:700; color:#ef4444; font-size:12px;">&times;</span>
+                    `;
+                    
+                    tagEl.addEventListener('click', () => {
+                        selectedMajorsForTag.splice(idx, 1);
+                        renderAssociatedMajors();
+                    });
+                    
+                    pool.appendChild(tagEl);
+                });
+            }
+            
+            // 8. 联想搜索与添加专业
+            const majorSearchInput = document.getElementById('major-search-input');
+            const autocompleteList = document.getElementById('major-autocomplete-list');
+            const btnAddMajorManual = document.getElementById('btn-add-major-manual');
+            
+            majorSearchInput.addEventListener('input', () => {
+                const val = majorSearchInput.value.trim().toLowerCase();
+                autocompleteList.innerHTML = '';
+                
+                if (!val) {
+                    autocompleteList.style.display = 'none';
+                    return;
+                }
+                
+                // 模糊匹配小专业列表
+                const matches = allAvailableMajors.filter(m => m.toLowerCase().includes(val));
+                if (matches.length === 0) {
+                    autocompleteList.style.display = 'none';
+                    return;
+                }
+                
+                autocompleteList.style.display = 'block';
+                matches.slice(0, 10).forEach(m => {
+                    const item = document.createElement('div');
+                    item.style = 'padding: 10px 12px; font-size: 13px; color: var(--text-primary); cursor: pointer; transition: background 0.2s; border-bottom: 1px solid rgba(0,0,0,0.02);';
+                    item.innerText = m;
+                    
+                    item.addEventListener('mouseenter', () => {
+                        item.style.background = 'rgba(14, 165, 233, 0.08)';
+                    });
+                    item.addEventListener('mouseleave', () => {
+                        item.style.background = 'none';
+                    });
+                    
+                    item.addEventListener('click', () => {
+                        addMajorToPool(m);
+                        majorSearchInput.value = '';
+                        autocompleteList.style.display = 'none';
+                    });
+                    
+                    autocompleteList.appendChild(item);
+                });
+            });
+            
+            // 点击空白处关闭联想列表
+            document.addEventListener('click', (e) => {
+                if (e.target !== majorSearchInput) {
+                    autocompleteList.style.display = 'none';
+                }
+            });
+            
+            // 添加专业进暂存池
+            function addMajorToPool(mName) {
+                const cleanName = mName.trim();
+                if (!cleanName) return;
+                
+                if (selectedMajorsForTag.includes(cleanName)) {
+                    return; // 已经存在了
+                }
+                
+                selectedMajorsForTag.push(cleanName);
+                renderAssociatedMajors();
+            }
+            
+            // 手动点击添加按钮
+            btnAddMajorManual.addEventListener('click', () => {
+                const val = majorSearchInput.value.trim();
+                if (val) {
+                    addMajorToPool(val);
+                    majorSearchInput.value = '';
+                    autocompleteList.style.display = 'none';
+                }
+            });
+            
+            majorSearchInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    btnAddMajorManual.click();
+                }
+            });
+            
+            // 9. 保存专业配置至后端
+            const btnSaveTagMajors = document.getElementById('btn-save-tag-majors');
+            btnSaveTagMajors.addEventListener('click', () => {
+                if (!currentEditingTag) return;
+                
+                fetch('/dlsgzs/api/tags', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        tag_id: currentEditingTag.id,
+                        tag_name: currentEditingTag.tag_name,
+                        majors: selectedMajorsForTag
+                    })
+                })
+                .then(res => res.json())
+                .then(res => {
+                    if (res.success) {
+                        alert('专业关联保存成功！');
+                        loadTagsList(); // 刷新一下左侧列表，以同步显示的关联数量统计
+                    } else {
+                        alert(res.error || '保存失败');
+                    }
+                })
+                .catch(err => console.error(err));
+            });
+            
+            // 10. 删除标签后端调用
+            function deleteTag(tId) {
+                fetch('/dlsgzs/api/tags/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ tag_id: tId })
+                })
+                .then(res => res.json())
+                .then(res => {
+                    if (res.success) {
+                        if (currentEditingTag && currentEditingTag.id == tId) {
+                            resetTagConfigPanel();
+                        }
+                        loadTagsList();
+                    } else {
+                        alert(res.error || '删除标签失败');
+                    }
+                })
+                .catch(err => console.error(err));
+            }
+        }
+
         window.showExpertDetailDirectly = showExpertDetailDirectly;
         window.openExpertDetailByIdCard = openExpertDetailByIdCard;
         window.fetchProjects = fetchProjects;
