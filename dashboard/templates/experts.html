@@ -2043,76 +2043,127 @@
         // 页面初始化加载
         document.addEventListener('DOMContentLoaded', () => {
             // 加载搜索标签列表
-            loadSearchTags();
-            
-            // 默认加载专家检索列表
-            fetchExperts('', '', '', '', '', '', '');
-            
-            // 绑定检索与筛选事件
-            const searchName = document.getElementById('search-name');
-            const searchPhone = document.getElementById('search-phone');
-            const searchIdcard = document.getElementById('search-idcard');
-            const searchCompany = document.getElementById('search-company');
-            const searchMajor = document.getElementById('search-major');
-            const filterStatus = document.getElementById('filter-status');
-            const filterTag = document.getElementById('filter-tag');
-            const searchBtn = document.getElementById('btn-search');
-            
-            function executeSearch() {
-                fetchExperts(
-                    searchName.value,
-                    searchPhone.value,
-                    searchIdcard.value,
-                    searchCompany ? searchCompany.value : '',
-                    searchMajor.value,
-                    filterStatus.value,
-                    filterTag ? filterTag.value : ''
-                );
+            try {
+                loadSearchTags();
+            } catch (e) {
+                console.error("加载搜索标签列表失败:", e);
             }
             
-            searchBtn.addEventListener('click', executeSearch);
+            // 默认加载专家检索列表
+            try {
+                fetchExperts('', '', '', '', '', '', '');
+            } catch (e) {
+                console.error("默认加载专家列表失败:", e);
+            }
             
-            // 绑定回车与输入防抖事件
-            let debounceTimer;
-            [searchName, searchPhone, searchIdcard, searchCompany, searchMajor].forEach(input => {
-                if (input) {
-                    input.addEventListener('keydown', (e) => {
-                        if (e.key === 'Enter') {
-                            executeSearch();
-                        }
-                    });
-                    
-                    input.addEventListener('input', () => {
-                        clearTimeout(debounceTimer);
-                        debounceTimer = setTimeout(executeSearch, 350);
-                    });
+            // 绑定检索与筛选事件
+            try {
+                const searchName = document.getElementById('search-name');
+                const searchPhone = document.getElementById('search-phone');
+                const searchIdcard = document.getElementById('search-idcard');
+                const searchCompany = document.getElementById('search-company');
+                const searchMajor = document.getElementById('search-major');
+                const filterStatus = document.getElementById('filter-status');
+                const filterTag = document.getElementById('filter-tag');
+                const searchBtn = document.getElementById('btn-search');
+                
+                function executeSearch() {
+                    fetchExperts(
+                        searchName ? searchName.value : '',
+                        searchPhone ? searchPhone.value : '',
+                        searchIdcard ? searchIdcard.value : '',
+                        searchCompany ? searchCompany.value : '',
+                        searchMajor ? searchMajor.value : '',
+                        filterStatus ? filterStatus.value : '',
+                        filterTag ? filterTag.value : ''
+                    );
                 }
-            });
-            
-            filterStatus.addEventListener('change', executeSearch);
-            if (filterTag) filterTag.addEventListener('change', executeSearch);
+                
+                if (searchBtn) {
+                    searchBtn.addEventListener('click', executeSearch);
+                }
+                
+                // 绑定回车与输入防抖事件
+                let debounceTimer;
+                const inputs = [searchName, searchPhone, searchIdcard, searchCompany, searchMajor];
+                inputs.forEach(input => {
+                    if (input) {
+                        input.addEventListener('keydown', (e) => {
+                            if (e.key === 'Enter') {
+                                executeSearch();
+                            }
+                        });
+                        
+                        input.addEventListener('input', () => {
+                            clearTimeout(debounceTimer);
+                            debounceTimer = setTimeout(executeSearch, 350);
+                        });
+                    }
+                });
+                
+                if (filterStatus) filterStatus.addEventListener('change', executeSearch);
+                if (filterTag) filterTag.addEventListener('change', executeSearch);
+            } catch (e) {
+                console.error("绑定检索与筛选事件失败:", e);
+            }
             
             // 模态框关闭绑定
-            document.getElementById('modal-close').addEventListener('click', closeDetailModal);
-            document.getElementById('detail-modal').addEventListener('click', (e) => {
-                if (e.target.id === 'detail-modal') closeDetailModal();
-            });
+            try {
+                const modalClose = document.getElementById('modal-close');
+                if (modalClose) {
+                    modalClose.addEventListener('click', closeDetailModal);
+                }
+                const detailModal = document.getElementById('detail-modal');
+                if (detailModal) {
+                    detailModal.addEventListener('click', (e) => {
+                        if (e.target.id === 'detail-modal') closeDetailModal();
+                    });
+                }
+            } catch (e) {
+                console.error("绑定详情模态框关闭事件失败:", e);
+            }
 
             // 绑定拖拽上传
-            setupDragAndDrop();
+            try {
+                setupDragAndDrop();
+            } catch (e) {
+                console.error("初始化拖拽上传模块失败:", e);
+            }
 
             // 绑定清空专家库
-            setupClearDatabase();
+            try {
+                setupClearDatabase();
+            } catch (e) {
+                console.error("初始化清空专家库模块失败:", e);
+            }
 
             // 照片放大预览与旋转
-            setupPhotoZoom();
+            try {
+                setupPhotoZoom();
+            } catch (e) {
+                console.error("初始化照片缩放模块失败:", e);
+            }
 
             // 绑定项目评审检索与单独上传 MD 模块
-            setupProjectSearch();
+            try {
+                setupProjectSearch();
+            } catch (e) {
+                console.error("初始化项目检索模块失败:", e);
+            }
 
             // 绑定专家标签管理模块
-            setupTagsManagement();
-            setupUploadMd();
+            try {
+                setupTagsManagement();
+            } catch (e) {
+                console.error("初始化专家标签管理模块失败:", e);
+            }
+
+            // 绑定上传MD模块
+            try {
+                setupUploadMd();
+            } catch (e) {
+                console.error("初始化上传MD模块失败:", e);
+            }
         });
 
         // 标签页切换逻辑
@@ -2582,6 +2633,10 @@
 
         function setupClearDatabase() {
             const clearBtn = document.getElementById('btn-clear');
+            if (!clearBtn) {
+                console.warn("未找到 #btn-clear 元素，跳过清空数据库模块绑定。");
+                return;
+            }
             clearBtn.addEventListener('click', () => {
                 if (confirm('⚠️ 极其危险的警告：此操作将清空专家数据库中的全部记录，并物理删除服务器上保存的所有身份证照片！此操作不可恢复。确定要清空吗？')) {
                     const password = prompt('请输入清空确认密码：');
@@ -2944,9 +2999,16 @@
             const closeBtn = document.getElementById('btn-close-zoom');
             const zoomImg = document.getElementById('zoom-img');
 
-            closeBtn.addEventListener('click', () => {
-                overlay.classList.remove('active');
-            });
+            if (!overlay) {
+                console.warn("未找到 #zoom-overlay 元素，跳过照片缩放模块绑定。");
+                return;
+            }
+
+            if (closeBtn) {
+                closeBtn.addEventListener('click', () => {
+                    overlay.classList.remove('active');
+                });
+            }
 
             overlay.addEventListener('click', (e) => {
                 if (e.target.id === 'zoom-overlay') {
@@ -2954,10 +3016,12 @@
                 }
             });
 
-            rotateBtn.addEventListener('click', () => {
-                currentRotation = (currentRotation + 90) % 360;
-                zoomImg.style.transform = `rotate(${currentRotation}deg)`;
-            });
+            if (rotateBtn && zoomImg) {
+                rotateBtn.addEventListener('click', () => {
+                    currentRotation = (currentRotation + 90) % 360;
+                    zoomImg.style.transform = `rotate(${currentRotation}deg)`;
+                });
+            }
         }
 
         function zoomPhoto(path, index = 0) {
@@ -3652,7 +3716,14 @@
             const tagsModal = document.getElementById('tags-modal');
             const tagsModalClose = document.getElementById('tags-modal-close');
             
-            if (!btnManageTags || !tagsModal) return;
+            if (!btnManageTags) {
+                console.warn("未找到 #btn-manage-tags 元素，跳过专家标签管理模块的绑定。");
+                return;
+            }
+            if (!tagsModal) {
+                console.warn("未找到 #tags-modal 元素，跳过专家标签管理模块的绑定。");
+                return;
+            }
             
             // 1. 模态框开关
             btnManageTags.addEventListener('click', () => {
@@ -3662,10 +3733,12 @@
                 resetTagConfigPanel();
             });
             
-            tagsModalClose.addEventListener('click', () => {
-                tagsModal.style.display = 'none';
-                loadSearchTags(); // 关闭时同步刷新搜索框的下拉标签选项
-            });
+            if (tagsModalClose) {
+                tagsModalClose.addEventListener('click', () => {
+                    tagsModal.style.display = 'none';
+                    loadSearchTags(); // 关闭时同步刷新搜索框的下拉标签选项
+                });
+            }
             
             tagsModal.addEventListener('click', (e) => {
                 if (e.target.id === 'tags-modal') {
@@ -3689,6 +3762,7 @@
             // 3. 加载左侧标签列表
             function loadTagsList() {
                 const container = document.getElementById('tags-list-container');
+                if (!container) return;
                 container.innerHTML = '<div style="text-align: center; color: var(--text-secondary); padding: 20px; font-size: 12px;">加载中...</div>';
                 
                 fetch('/dlsgzs/api/tags')
@@ -3728,13 +3802,16 @@
                                 });
                                 
                                 // 删除标签小按钮
-                                row.querySelector('.btn-delete-tag-small').addEventListener('click', (e) => {
-                                    e.stopPropagation();
-                                    const tid = e.target.getAttribute('data-id');
-                                    if (confirm(`确认删除标签“${tag.tag_name}”吗？此操作不会影响专家原本的专业数据。`)) {
-                                        deleteTag(tid);
-                                    }
-                                });
+                                const deleteBtn = row.querySelector('.btn-delete-tag-small');
+                                if (deleteBtn) {
+                                    deleteBtn.addEventListener('click', (e) => {
+                                        e.stopPropagation();
+                                        const tid = e.target.getAttribute('data-id');
+                                        if (confirm(`确认删除标签“${tag.tag_name}”吗？此操作不会影响专家原本的专业数据。`)) {
+                                            deleteTag(tid);
+                                        }
+                                    });
+                                }
                                 
                                 container.appendChild(row);
                             });
@@ -3752,46 +3829,52 @@
             const btnAddTagSubmit = document.getElementById('btn-add-tag-submit');
             const newTagNameInput = document.getElementById('new-tag-name-input');
             
-            btnAddTagSubmit.addEventListener('click', () => {
-                const name = newTagNameInput.value.trim();
-                if (!name) {
-                    alert('请输入标签名称！');
-                    return;
-                }
-                
-                fetch('/dlsgzs/api/tags', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ tag_name: name })
-                })
-                .then(res => res.json())
-                .then(res => {
-                    if (res.success) {
-                        newTagNameInput.value = '';
-                        loadTagsList();
-                        // 自动选中新创建的标签
-                        selectTagForEdit({ id: res.tag_id, tag_name: name, majors: [] });
-                    } else {
-                        alert(res.error || '创建标签失败');
+            if (btnAddTagSubmit && newTagNameInput) {
+                btnAddTagSubmit.addEventListener('click', () => {
+                    const name = newTagNameInput.value.trim();
+                    if (!name) {
+                        alert('请输入标签名称！');
+                        return;
                     }
-                })
-                .catch(err => console.error(err));
-            });
-            
-            newTagNameInput.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter') btnAddTagSubmit.click();
-            });
+                    
+                    fetch('/dlsgzs/api/tags', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ tag_name: name })
+                    })
+                    .then(res => res.json())
+                    .then(res => {
+                        if (res.success) {
+                            newTagNameInput.value = '';
+                            loadTagsList();
+                            // 自动选中新创建的标签
+                            selectTagForEdit({ id: res.tag_id, tag_name: name, majors: [] });
+                        } else {
+                            alert(res.error || '创建标签失败');
+                        }
+                    })
+                    .catch(err => console.error(err));
+                });
+                
+                newTagNameInput.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') btnAddTagSubmit.click();
+                });
+            }
             
             // 5. 选中标签并初始化右侧面板
             function selectTagForEdit(tag) {
                 currentEditingTag = tag;
                 selectedMajorsForTag = [...tag.majors];
                 
-                document.getElementById('tag-config-placeholder').style.display = 'none';
+                const placeholder = document.getElementById('tag-config-placeholder');
                 const bodyPanel = document.getElementById('tag-config-panel-body');
-                bodyPanel.style.display = 'flex';
+                const title = document.getElementById('tag-config-title');
                 
-                document.getElementById('tag-config-title').innerHTML = `⚙️ 标签 [ <span style="color:var(--accent-color);">${tag.tag_name}</span> ] 专业关联设置`;
+                if (placeholder) placeholder.style.display = 'none';
+                if (bodyPanel) bodyPanel.style.display = 'flex';
+                if (title) {
+                    title.innerHTML = `⚙️ 标签 [ <span style="color:var(--accent-color);">${tag.tag_name}</span> ] 专业关联设置`;
+                }
                 
                 renderAssociatedMajors();
             }
@@ -3800,14 +3883,19 @@
             function resetTagConfigPanel() {
                 currentEditingTag = null;
                 selectedMajorsForTag = [];
-                document.getElementById('tag-config-placeholder').style.display = 'flex';
-                document.getElementById('tag-config-panel-body').style.display = 'none';
-                document.getElementById('tag-config-title').innerText = '⚙️ 关联专业设置 (请先选择一个标签)';
+                const placeholder = document.getElementById('tag-config-placeholder');
+                const bodyPanel = document.getElementById('tag-config-panel-body');
+                const title = document.getElementById('tag-config-title');
+                
+                if (placeholder) placeholder.style.display = 'flex';
+                if (bodyPanel) bodyPanel.style.display = 'none';
+                if (title) title.innerText = '⚙️ 关联专业设置 (请先选择一个标签)';
             }
             
             // 7. 渲染右侧小标签池
             function renderAssociatedMajors() {
                 const pool = document.getElementById('associated-majors-pool');
+                if (!pool) return;
                 pool.innerHTML = '';
                 
                 if (selectedMajorsForTag.length === 0) {
@@ -3837,51 +3925,53 @@
             const autocompleteList = document.getElementById('major-autocomplete-list');
             const btnAddMajorManual = document.getElementById('btn-add-major-manual');
             
-            majorSearchInput.addEventListener('input', () => {
-                const val = majorSearchInput.value.trim().toLowerCase();
-                autocompleteList.innerHTML = '';
-                
-                if (!val) {
-                    autocompleteList.style.display = 'none';
-                    return;
-                }
-                
-                // 模糊匹配小专业列表
-                const matches = allAvailableMajors.filter(m => m.toLowerCase().includes(val));
-                if (matches.length === 0) {
-                    autocompleteList.style.display = 'none';
-                    return;
-                }
-                
-                autocompleteList.style.display = 'block';
-                matches.slice(0, 10).forEach(m => {
-                    const item = document.createElement('div');
-                    item.style = 'padding: 10px 12px; font-size: 13px; color: var(--text-primary); cursor: pointer; transition: background 0.2s; border-bottom: 1px solid rgba(0,0,0,0.02);';
-                    item.innerText = m;
+            if (majorSearchInput && autocompleteList) {
+                majorSearchInput.addEventListener('input', () => {
+                    const val = majorSearchInput.value.trim().toLowerCase();
+                    autocompleteList.innerHTML = '';
                     
-                    item.addEventListener('mouseenter', () => {
-                        item.style.background = 'rgba(14, 165, 233, 0.08)';
-                    });
-                    item.addEventListener('mouseleave', () => {
-                        item.style.background = 'none';
-                    });
-                    
-                    item.addEventListener('click', () => {
-                        addMajorToPool(m);
-                        majorSearchInput.value = '';
+                    if (!val) {
                         autocompleteList.style.display = 'none';
-                    });
+                        return;
+                    }
                     
-                    autocompleteList.appendChild(item);
+                    // 模糊匹配小专业列表
+                    const matches = allAvailableMajors.filter(m => m.toLowerCase().includes(val));
+                    if (matches.length === 0) {
+                        autocompleteList.style.display = 'none';
+                        return;
+                    }
+                    
+                    autocompleteList.style.display = 'block';
+                    matches.slice(0, 10).forEach(m => {
+                        const item = document.createElement('div');
+                        item.style = 'padding: 10px 12px; font-size: 13px; color: var(--text-primary); cursor: pointer; transition: background 0.2s; border-bottom: 1px solid rgba(0,0,0,0.02);';
+                        item.innerText = m;
+                        
+                        item.addEventListener('mouseenter', () => {
+                            item.style.background = 'rgba(14, 165, 233, 0.08)';
+                        });
+                        item.addEventListener('mouseleave', () => {
+                            item.style.background = 'none';
+                        });
+                        
+                        item.addEventListener('click', () => {
+                            addMajorToPool(m);
+                            majorSearchInput.value = '';
+                            autocompleteList.style.display = 'none';
+                        });
+                        
+                        autocompleteList.appendChild(item);
+                    });
                 });
-            });
-            
-            // 点击空白处关闭联想列表
-            document.addEventListener('click', (e) => {
-                if (e.target !== majorSearchInput) {
-                    autocompleteList.style.display = 'none';
-                }
-            });
+                
+                // 点击空白处关闭联想列表
+                document.addEventListener('click', (e) => {
+                    if (e.target !== majorSearchInput) {
+                        autocompleteList.style.display = 'none';
+                    }
+                });
+            }
             
             // 添加专业进暂存池
             function addMajorToPool(mName) {
@@ -3897,47 +3987,51 @@
             }
             
             // 手动点击添加按钮
-            btnAddMajorManual.addEventListener('click', () => {
-                const val = majorSearchInput.value.trim();
-                if (val) {
-                    addMajorToPool(val);
-                    majorSearchInput.value = '';
-                    autocompleteList.style.display = 'none';
-                }
-            });
-            
-            majorSearchInput.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter') {
-                    e.preventDefault();
-                    btnAddMajorManual.click();
-                }
-            });
+            if (btnAddMajorManual && majorSearchInput && autocompleteList) {
+                btnAddMajorManual.addEventListener('click', () => {
+                    const val = majorSearchInput.value.trim();
+                    if (val) {
+                        addMajorToPool(val);
+                        majorSearchInput.value = '';
+                        autocompleteList.style.display = 'none';
+                    }
+                });
+                
+                majorSearchInput.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') {
+                        e.preventDefault();
+                        btnAddMajorManual.click();
+                    }
+                });
+            }
             
             // 9. 保存专业配置至后端
             const btnSaveTagMajors = document.getElementById('btn-save-tag-majors');
-            btnSaveTagMajors.addEventListener('click', () => {
-                if (!currentEditingTag) return;
-                
-                fetch('/dlsgzs/api/tags', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        tag_id: currentEditingTag.id,
-                        tag_name: currentEditingTag.tag_name,
-                        majors: selectedMajorsForTag
+            if (btnSaveTagMajors) {
+                btnSaveTagMajors.addEventListener('click', () => {
+                    if (!currentEditingTag) return;
+                    
+                    fetch('/dlsgzs/api/tags', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            tag_id: currentEditingTag.id,
+                            tag_name: currentEditingTag.tag_name,
+                            majors: selectedMajorsForTag
+                        })
                     })
-                })
-                .then(res => res.json())
-                .then(res => {
-                    if (res.success) {
-                        alert('专业关联保存成功！');
-                        loadTagsList(); // 刷新一下左侧列表，以同步显示的关联数量统计
-                    } else {
-                        alert(res.error || '保存失败');
-                    }
-                })
-                .catch(err => console.error(err));
-            });
+                    .then(res => res.json())
+                    .then(res => {
+                        if (res.success) {
+                            alert('专业关联保存成功！');
+                            loadTagsList(); // 刷新一下左侧列表，以同步显示的关联数量统计
+                        } else {
+                            alert(res.error || '保存失败');
+                        }
+                    })
+                    .catch(err => console.error(err));
+                });
+            }
             
             // 10. 删除标签后端调用
             function deleteTag(tId) {
