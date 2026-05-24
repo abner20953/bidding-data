@@ -1670,6 +1670,8 @@
             box-shadow: var(--shadow-soft);
             backdrop-filter: blur(12px);
             -webkit-backdrop-filter: blur(12px);
+            position: relative;
+            z-index: 100;
         }
         
         .search-actions-row {
@@ -1745,6 +1747,10 @@
             min-height: 45px;
             box-sizing: border-box;
             position: relative;
+        }
+
+        .custom-multi-select.active {
+            z-index: 110;
         }
 
         .custom-multi-select.active .multi-select-trigger {
