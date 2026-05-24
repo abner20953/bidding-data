@@ -235,6 +235,12 @@
                 width: 100%;
                 gap: 8px;
             }
+            .custom-multi-select {
+                width: 100% !important;
+            }
+            .multi-select-trigger {
+                width: 100% !important;
+            }
             .btn-group {
                 flex-direction: column;
                 width: 100%;
@@ -1711,6 +1717,145 @@
         .btn-search-reset:active {
             transform: translateY(1px);
         }
+
+        /* 自定义多选下拉框 */
+        .custom-multi-select {
+            position: relative;
+            width: 220px;
+            user-select: none;
+            font-family: inherit;
+            display: inline-block;
+            vertical-align: middle;
+        }
+
+        .multi-select-trigger {
+            background: rgba(255, 255, 255, 0.9);
+            border: 1px solid var(--card-border);
+            color: var(--text-primary);
+            padding: 8px 32px 8px 12px;
+            border-radius: 12px;
+            font-size: 13px;
+            outline: none;
+            transition: all 0.2s;
+            box-shadow: var(--shadow-soft);
+            cursor: pointer;
+            backdrop-filter: blur(8px);
+            display: flex;
+            align-items: center;
+            min-height: 45px;
+            box-sizing: border-box;
+            position: relative;
+        }
+
+        .custom-multi-select.active .multi-select-trigger {
+            border-color: var(--accent-color);
+            box-shadow: 0 0 0 4px rgba(14, 165, 233, 0.15);
+            background: #fff;
+        }
+
+        .multi-select-placeholder {
+            color: var(--text-secondary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .multi-select-arrow {
+            position: absolute;
+            right: 12px;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 8px;
+            color: var(--text-secondary);
+            transition: transform 0.2s;
+        }
+
+        .custom-multi-select.active .multi-select-arrow {
+            transform: translateY(-50%) rotate(180deg);
+        }
+
+        .multi-select-tags-container {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            width: 100%;
+        }
+
+        /* 选中的微型徽标 */
+        .selected-tag-badge {
+            background: rgba(14, 165, 233, 0.08);
+            color: var(--accent-color);
+            border: 1px solid rgba(14, 165, 233, 0.2);
+            border-radius: 8px;
+            padding: 2px 6px;
+            font-size: 11px;
+            font-weight: 500;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .selected-tag-badge .remove-tag-badge-btn {
+            cursor: pointer;
+            font-weight: bold;
+            color: var(--accent-color);
+            opacity: 0.6;
+            transition: opacity 0.2s;
+        }
+
+        .selected-tag-badge .remove-tag-badge-btn:hover {
+            opacity: 1;
+        }
+
+        /* 毛玻璃多选下拉浮层 */
+        .multi-select-dropdown {
+            display: none;
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            background: rgba(255, 255, 255, 0.95);
+            border: 1px solid var(--card-border);
+            border-radius: 12px;
+            margin-top: 6px;
+            max-height: 250px;
+            overflow-y: auto;
+            z-index: 1000;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.08), 0 8px 10px -6px rgba(0, 0, 0, 0.05);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            padding: 6px;
+            box-sizing: border-box;
+        }
+
+        .custom-multi-select.active .multi-select-dropdown {
+            display: block;
+        }
+
+        /* 下拉项样式 */
+        .multi-select-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 10px;
+            border-radius: 8px;
+            font-size: 13px;
+            color: var(--text-primary);
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .multi-select-item:hover {
+            background: rgba(14, 165, 233, 0.06);
+            color: var(--accent-color);
+        }
+
+        .multi-select-checkbox {
+            width: 14px;
+            height: 14px;
+            accent-color: var(--accent-color);
+            cursor: pointer;
+        }
     </style>
 </head>
 
@@ -1773,9 +1918,16 @@
                 <!-- 第二行：下拉选择器及按钮操作区 -->
                 <div class="search-actions-row">
                     <div class="filter-group">
-                        <select class="filter-select" id="filter-tag">
-                            <option value="">全部专家标签</option>
-                        </select>
+                        <div class="custom-multi-select" id="multi-select-tag-wrapper">
+                            <div class="multi-select-trigger" id="tag-select-trigger">
+                                <span class="multi-select-placeholder" id="tag-select-placeholder">全部专家标签...</span>
+                                <div class="multi-select-tags-container" id="tag-select-badge-container" style="display: none;"></div>
+                                <span class="multi-select-arrow">▼</span>
+                            </div>
+                            <div class="multi-select-dropdown" id="tag-select-dropdown">
+                                <!-- 动态渲染带复选框的标签选项 -->
+                            </div>
+                        </div>
                         <select class="filter-select" id="filter-status">
                             <option value="">全部标记状态</option>
                             <option value="已获取">已获取</option>
@@ -2263,7 +2415,6 @@
                 const searchCompany = document.getElementById('search-company');
                 const searchMajor = document.getElementById('search-major');
                 const filterStatus = document.getElementById('filter-status');
-                const filterTag = document.getElementById('filter-tag');
                 const searchBtn = document.getElementById('btn-search');
                 const searchResetBtn = document.getElementById('btn-search-reset');
                 
@@ -2275,9 +2426,10 @@
                         searchCompany ? searchCompany.value : '',
                         searchMajor ? searchMajor.value : '',
                         filterStatus ? filterStatus.value : '',
-                        filterTag ? filterTag.value : ''
+                        selectedTagIds.join(',')
                     );
                 }
+                window.executeSearch = executeSearch;
                 
                 if (searchBtn) {
                     searchBtn.addEventListener('click', executeSearch);
@@ -2291,7 +2443,13 @@
                         if (searchCompany) searchCompany.value = '';
                         if (searchMajor) searchMajor.value = '';
                         if (filterStatus) filterStatus.value = '';
-                        if (filterTag) filterTag.value = '';
+                        
+                        // 重置多选标签状态
+                        selectedTagIds = [];
+                        const checkboxes = document.querySelectorAll('.multi-select-checkbox');
+                        checkboxes.forEach(cb => cb.checked = false);
+                        updateMultiSelectTrigger();
+                        
                         executeSearch();
                     });
                 }
@@ -2315,7 +2473,23 @@
                 });
                 
                 if (filterStatus) filterStatus.addEventListener('change', executeSearch);
-                if (filterTag) filterTag.addEventListener('change', executeSearch);
+
+                // 多选下拉框交互绑定
+                const multiWrapper = document.getElementById('multi-select-tag-wrapper');
+                const multiTrigger = document.getElementById('tag-select-trigger');
+                
+                if (multiTrigger && multiWrapper) {
+                    multiTrigger.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        multiWrapper.classList.toggle('active');
+                    });
+                }
+                
+                document.addEventListener('click', (e) => {
+                    if (multiWrapper && !multiWrapper.contains(e.target)) {
+                        multiWrapper.classList.remove('active');
+                    }
+                });
             } catch (e) {
                 console.error("绑定检索与筛选事件失败:", e);
             }
@@ -4018,24 +4192,112 @@
         let currentEditingTag = null; // 当前正在编辑的标签对象
         let selectedMajorsForTag = []; // 当前选中的关联专业小类数组
 
+        let selectedTagIds = []; // 存储当前选中的标签 ID 列表（String 类型）
+        let allSearchTagsCache = []; // 缓存从 API 获取的所有可用标签列表
+
         function loadSearchTags() {
             fetch('/dlsgzs/api/tags')
                 .then(res => res.json())
                 .then(res => {
                     if (res.success) {
-                        const filterTag = document.getElementById('filter-tag');
-                        if (filterTag) {
-                            filterTag.innerHTML = '<option value="">全部专家标签</option>';
-                            res.tags.forEach(tag => {
-                                const opt = document.createElement('option');
-                                opt.value = tag.id;
-                                opt.textContent = tag.tag_name;
-                                filterTag.appendChild(opt);
-                            });
-                        }
+                        allSearchTagsCache = res.tags || [];
+                        
+                        // 过滤掉已经不存在的已选 ID（比如标签被物理删除了）
+                        const validIds = allSearchTagsCache.map(t => String(t.id));
+                        selectedTagIds = selectedTagIds.filter(id => validIds.includes(id));
+                        
+                        // 渲染多选浮层列表和触发器
+                        renderMultiTagDropdown();
+                        updateMultiSelectTrigger();
                     }
                 })
                 .catch(err => console.error("加载搜索标签列表失败:", err));
+        }
+
+        function renderMultiTagDropdown() {
+            const dropdown = document.getElementById('tag-select-dropdown');
+            if (!dropdown) return;
+            dropdown.innerHTML = '';
+            
+            allSearchTagsCache.forEach(tag => {
+                const item = document.createElement('div');
+                item.className = 'multi-select-item';
+                const isChecked = selectedTagIds.includes(String(tag.id));
+                
+                item.innerHTML = `
+                    <input type="checkbox" class="multi-select-checkbox" data-id="${tag.id}" ${isChecked ? 'checked' : ''}>
+                    <span style="font-size: 13px; font-weight: 500;">${tag.tag_name}</span>
+                `;
+                
+                item.addEventListener('click', (e) => {
+                    if (e.target.type !== 'checkbox') {
+                        const checkbox = item.querySelector('.multi-select-checkbox');
+                        checkbox.checked = !checkbox.checked;
+                        toggleTagSelection(tag.id, checkbox.checked);
+                    }
+                });
+                
+                item.querySelector('.multi-select-checkbox').addEventListener('change', (e) => {
+                    toggleTagSelection(tag.id, e.target.checked);
+                });
+                
+                dropdown.appendChild(item);
+            });
+        }
+
+        function toggleTagSelection(tagId, isSelected) {
+            const idStr = String(tagId);
+            if (isSelected) {
+                if (!selectedTagIds.includes(idStr)) {
+                    selectedTagIds.push(idStr);
+                }
+            } else {
+                selectedTagIds = selectedTagIds.filter(id => id !== idStr);
+            }
+            updateMultiSelectTrigger();
+            if (typeof executeSearch === 'function') {
+                executeSearch();
+            }
+        }
+
+        function updateMultiSelectTrigger() {
+            const placeholder = document.getElementById('tag-select-placeholder');
+            const badgeContainer = document.getElementById('tag-select-badge-container');
+            
+            if (selectedTagIds.length === 0) {
+                if (placeholder) placeholder.style.display = 'block';
+                if (badgeContainer) {
+                    badgeContainer.style.display = 'none';
+                    badgeContainer.innerHTML = '';
+                }
+            } else {
+                if (placeholder) placeholder.style.display = 'none';
+                if (badgeContainer) {
+                    badgeContainer.style.display = 'flex';
+                    badgeContainer.innerHTML = '';
+                    
+                    selectedTagIds.forEach(id => {
+                        const matched = allSearchTagsCache.find(t => String(t.id) === id);
+                        if (matched) {
+                            const badge = document.createElement('div');
+                            badge.className = 'selected-tag-badge';
+                            badge.innerHTML = `
+                                <span>${matched.tag_name}</span>
+                                <span class="remove-tag-badge-btn" style="margin-left: 4px; font-weight: bold; cursor: pointer; color: var(--accent-color); font-size: 11px;">✖</span>
+                            `;
+                            
+                            badge.querySelector('.remove-tag-badge-btn').addEventListener('click', (e) => {
+                                e.stopPropagation();
+                                const checkbox = document.querySelector(`.multi-select-checkbox[data-id="${id}"]`);
+                                if (checkbox) checkbox.checked = false;
+                                toggleTagSelection(id, false);
+                            });
+                            
+                            badgeContainer.appendChild(badge);
+                        }
+                    });
+                }
+            }
         }
 
         function setupTagsManagement() {
