@@ -589,17 +589,32 @@ def api_upload():
                     photo_path_db = row_exist[0]
 
             # 追加与去重覆盖：使用传统 SELECT 判断在 SQLite 下最兼容安全
-            c.execute("SELECT id FROM experts WHERE name = ? AND phone = ?", (name, phone))
+            c.execute("SELECT id, id_card, company, major, photo_path, raw_json FROM experts WHERE name = ? AND phone = ?", (name, phone))
             exist_record = c.fetchone()
             
             if exist_record:
                 # 已经存在，执行更新操作
                 updated_count += 1
+                
+                db_id = exist_record[0]
+                db_id_card = exist_record[1]
+                db_company = exist_record[2]
+                db_major = exist_record[3]
+                db_photo_path = exist_record[4]
+                db_raw_json = exist_record[5]
+                
+                # 只有当新解析的字段非空时，才更新覆盖；若新解析为空（例如 Excel 中该字段为空或根本没有该列），则保留原数据库字段
+                final_id_card = id_card if id_card else db_id_card
+                final_company = company if company else db_company
+                final_major = major if major else db_major
+                final_photo_path = photo_path_db if photo_path_db else db_photo_path
+                final_raw_json = raw_json if raw_json else db_raw_json
+                
                 c.execute('''
                     UPDATE experts 
                     SET id_card = ?, company = ?, major = ?, photo_path = ?, raw_json = ?, created_at = ?
                     WHERE id = ?
-                ''', (id_card, company, major, photo_path_db, raw_json, now_time, exist_record[0]))
+                ''', (final_id_card, final_company, final_major, final_photo_path, final_raw_json, now_time, db_id))
             else:
                 # 不存在，执行插入（追加）操作
                 added_count += 1
