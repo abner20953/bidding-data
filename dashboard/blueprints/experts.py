@@ -353,8 +353,11 @@ def api_upload():
         photos = {} # 格式：{ "姓名_手机号": "图片绝对路径" }
         
         for root_dir, dirs, files in os.walk(temp_dir):
+            # 排除 Mac OS 特定的资源目录，防止里面同名的非图像垃圾元数据覆盖正常照片
+            if '__macosx' in root_dir.lower():
+                continue
             for f in files:
-                if f.startswith('._'): # 忽略 Mac OS 的临时隐藏文件
+                if f.startswith('._') or f.lower() == 'thumbs.db': # 忽略 Mac OS 的临时隐藏文件与 Windows 缩略图缓存
                     continue
                 ext = os.path.splitext(f)[1].lower()
                 full_path = os.path.join(root_dir, f)
@@ -487,7 +490,24 @@ def api_upload():
                     base_fname = os.path.splitext(os.path.basename(p_file))[0].strip().replace(" ", "").lower()
                     dest_filename = f"{base_fname}{ext}"
                     dest_path = os.path.join(photos_dest_dir, dest_filename)
-                    shutil.copy2(p_file, dest_path)
+                    # 采用安全的流式写入，确保物理文件名大小写与数据库中存储的一致（防止在Linux等大小写敏感系统上发生404图片无法访问的“照片错误”问题）
+                    # 同时也规避了 shutil.copy2 覆盖正被 Flask 读取锁定的同名图片时的 Permission 异常
+                    try:
+                        if os.path.exists(dest_path):
+                            try:
+                                os.remove(dest_path)
+                            except Exception:
+                                pass
+                        with open(p_file, 'rb') as f_src:
+                            img_content = f_src.read()
+                        with open(dest_path, 'wb') as f_dest:
+                            f_dest.write(img_content)
+                    except Exception as e:
+                        # 兼容兜底
+                        try:
+                            shutil.copy2(p_file, dest_path)
+                        except Exception:
+                            pass
                     copied_paths.append(f"/static/uploads/expert_photos/{dest_filename}")
                     matched_photo_count += 1
                 
