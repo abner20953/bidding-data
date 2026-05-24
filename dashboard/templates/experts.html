@@ -1542,6 +1542,44 @@
             opacity: 0.85;
             font-weight: normal;
         }
+
+        /* 标签管理专用按钮样式提升 */
+        .btn-accent-gradient {
+            background: linear-gradient(135deg, var(--accent-color) 0%, #0284c7 100%) !important;
+            color: #ffffff !important;
+            border: none !important;
+            border-radius: 8px !important;
+            box-shadow: 0 4px 12px rgba(14, 165, 233, 0.25) !important;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.2s ease !important;
+        }
+        .btn-accent-gradient:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 16px rgba(14, 165, 233, 0.35) !important;
+            background: linear-gradient(135deg, var(--accent-hover) 0%, #0369a1 100%) !important;
+        }
+        .btn-accent-gradient:active {
+            transform: translateY(1px);
+        }
+
+        .btn-dark-flat {
+            background: var(--text-primary) !important;
+            color: #ffffff !important;
+            border: 1px solid var(--text-primary) !important;
+            border-radius: 8px !important;
+            cursor: pointer;
+            font-weight: 500;
+            transition: all 0.2s ease !important;
+        }
+        .btn-dark-flat:hover {
+            background: #0f172a !important;
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(15, 23, 42, 0.15) !important;
+        }
+        .btn-dark-flat:active {
+            transform: translateY(1px);
+        }
     </style>
 </head>
 
@@ -1786,7 +1824,7 @@
                         <div class="ops-desc">设定进入项目评审查询界面时的默认筛选日期，设定后将在页面初次加载时自动作为筛选起点。</div>
                         <div style="display: flex; gap: 12px; align-items: center; margin-top: 16px; width: 100%;">
                             <input type="date" class="search-input" id="config-default-proj-year" style="width: auto; flex-grow: 1; padding: 10px; border-radius: 8px; border: 1px solid var(--border-color); background: var(--bg-card); color: var(--text-primary);">
-                            <button class="action-btn-large" id="btn-save-proj-config" style="margin: 0; padding: 10px 16px; font-size: 14px; background: var(--accent-gradient); border: none; color: white; border-radius: 8px; cursor: pointer; transition: all 0.3s; white-space: nowrap;">
+                            <button class="action-btn-large btn-accent-gradient" id="btn-save-proj-config" style="margin: 0; padding: 10px 16px; font-size: 14px; white-space: nowrap;">
                                 保存设置
                             </button>
                         </div>
@@ -1799,7 +1837,7 @@
                     <div class="ops-info">
                         <div class="ops-title">专家标签管理</div>
                         <div class="ops-desc">建立与维护专家的分类标签，将若干个具体专业小类归档到大标签下，用于快捷条件筛选检索。</div>
-                        <button class="action-btn-large btn-tags" id="btn-manage-tags" style="background: var(--accent-gradient); border: none; color: white;">
+                        <button class="action-btn-large btn-tags btn-accent-gradient" id="btn-manage-tags" style="padding: 10px 20px;">
                             <span>🏷️</span> 管理专家标签
                         </button>
                     </div>
@@ -1870,7 +1908,7 @@
                     <!-- 新建标签输入区 -->
                     <div style="display: flex; gap: 8px; margin-bottom: 16px;">
                         <input type="text" id="new-tag-name-input" class="search-input" placeholder="输入新标签名..." style="margin: 0; padding: 8px 12px; font-size: 13px;">
-                        <button class="action-btn-large" id="btn-add-tag-submit" style="margin:0; padding: 8px 14px; font-size: 13px; background: var(--accent-gradient); border:none; color:white; white-space:nowrap; cursor:pointer;">
+                        <button class="action-btn-large btn-accent-gradient" id="btn-add-tag-submit" style="margin:0; padding: 8px 14px; font-size: 13px; white-space:nowrap;">
                             新建
                         </button>
                     </div>
@@ -1892,7 +1930,7 @@
                             <label style="font-size: 12px; color: var(--text-secondary); display: block; margin-bottom: 6px;">添加关联专业（可从库中选择，或直接输入新专业敲击回车绑定）：</label>
                             <div style="display: flex; gap: 8px; position: relative;">
                                 <input type="text" id="major-search-input" class="search-input" placeholder="输入关键字搜索专业，或输入自定义专业后点击添加..." style="margin: 0; padding: 10px; font-size: 13px;">
-                                <button class="action-btn-large" id="btn-add-major-manual" style="margin:0; padding: 10px 16px; font-size: 13px; background: var(--text-primary); color: var(--bg-card); border:1px solid var(--border-color); white-space:nowrap; cursor:pointer;">
+                                <button class="action-btn-large btn-dark-flat" id="btn-add-major-manual" style="margin:0; padding: 10px 16px; font-size: 13px; white-space:nowrap;">
                                     添加
                                 </button>
                                 <!-- 联想结果下拉浮层 -->
@@ -1910,7 +1948,7 @@
                         
                         <!-- 保存配置按钮 -->
                         <div style="margin-top: auto; display: flex; justify-content: flex-end; padding-top: 16px; border-top: 1px solid var(--border-color);">
-                            <button class="action-btn-large" id="btn-save-tag-majors" style="margin: 0; padding: 10px 24px; font-size: 14px; background: var(--accent-gradient); border:none; color:white; font-weight:600; cursor:pointer;">
+                            <button class="action-btn-large btn-accent-gradient" id="btn-save-tag-majors" style="margin: 0; padding: 10px 24px; font-size: 14px; font-weight:600;">
                                 保存专业关联
                             </button>
                         </div>
