@@ -1580,6 +1580,41 @@
         .btn-dark-flat:active {
             transform: translateY(1px);
         }
+
+        /* 联想搜索结果下拉浮层样式 */
+        .major-autocomplete-dropdown {
+            display: none;
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            background: #ffffff !important;
+            border: 1px solid rgba(226, 232, 240, 0.9) !important;
+            border-radius: 10px !important;
+            max-height: 200px;
+            overflow-y: auto;
+            z-index: 1001 !important; /* 确保在模态框之上 */
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.08), 0 8px 10px -6px rgba(0, 0, 0, 0.05) !important;
+            margin-top: 4px;
+        }
+
+        .major-autocomplete-item {
+            padding: 10px 14px;
+            font-size: 13px;
+            color: var(--text-primary) !important;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            border-bottom: 1px solid rgba(226, 232, 240, 0.4);
+            text-align: left;
+        }
+        .major-autocomplete-item:last-child {
+            border-bottom: none;
+        }
+        .major-autocomplete-item:hover {
+            background: rgba(14, 165, 233, 0.06) !important;
+            color: var(--accent-hover) !important;
+            padding-left: 18px; /* 轻微右移微动画 */
+        }
     </style>
 </head>
 
@@ -1934,7 +1969,7 @@
                                     添加
                                 </button>
                                 <!-- 联想结果下拉浮层 -->
-                                <div id="major-autocomplete-list" style="display: none; position: absolute; top: 100%; left: 0; right: 0; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 8px; max-height: 200px; overflow-y: auto; z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.15);"></div>
+                                <div id="major-autocomplete-list" class="major-autocomplete-dropdown"></div>
                             </div>
                         </div>
                         
@@ -3983,15 +4018,8 @@
                     autocompleteList.style.display = 'block';
                     matches.slice(0, 10).forEach(m => {
                         const item = document.createElement('div');
-                        item.style = 'padding: 10px 12px; font-size: 13px; color: var(--text-primary); cursor: pointer; transition: background 0.2s; border-bottom: 1px solid rgba(0,0,0,0.02);';
+                        item.className = 'major-autocomplete-item';
                         item.innerText = m;
-                        
-                        item.addEventListener('mouseenter', () => {
-                            item.style.background = 'rgba(14, 165, 233, 0.08)';
-                        });
-                        item.addEventListener('mouseleave', () => {
-                            item.style.background = 'none';
-                        });
                         
                         item.addEventListener('click', () => {
                             addMajorToPool(m);
