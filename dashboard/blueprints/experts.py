@@ -965,8 +965,18 @@ def api_search():
             conditions.append(f"id IN (SELECT DISTINCT em.expert_id FROM expert_majors em JOIN tag_majors tm ON em.major_name = tm.major_name WHERE tm.tag_id IN ({placeholders}))")
             params.extend([int(tid) for tid in tag_id_list])
         
-    # 精炼 SQL：不 SELECT raw_json 大文本字段，使一千条数据能在 20ms 内查出并传输完成
-    sql = "SELECT name, phone, id_card, company, major, photo_path, status, remark FROM experts"
+    # 精炼 SQL：不 SELECT raw_json 大文本字段，并通过子查询获取每个专家所对应的标签字符串
+    sql = """
+        SELECT id, name, phone, id_card, company, major, photo_path, status, remark,
+               (
+                   SELECT GROUP_CONCAT(t.tag_name, ',')
+                   FROM expert_majors em
+                   JOIN tag_majors tm ON em.major_name = tm.major_name
+                   JOIN tags t ON tm.tag_id = t.id
+                   WHERE em.expert_id = experts.id
+               ) as tags_str
+        FROM experts
+    """
     if conditions:
         sql += " WHERE " + " AND ".join(conditions)
     sql += " ORDER BY id DESC"
@@ -979,6 +989,10 @@ def api_search():
     for r in rows:
         item_status = r['status'] if r.keys() and 'status' in r.keys() and r['status'] else '未获取'
         item_remark = r['remark'] if r.keys() and 'remark' in r.keys() and r['remark'] else ''
+        
+        tags_list = []
+        if r.keys() and 'tags_str' in r.keys() and r['tags_str']:
+            tags_list = list(set([t.strip() for t in r['tags_str'].split(',') if t.strip()]))
                 
         results.append({
             "name": r['name'],
@@ -989,6 +1003,7 @@ def api_search():
             "photo_path": r['photo_path'],
             "status": item_status,
             "remark": item_remark,
+            "tags": tags_list,
             "details": {}  # 列表阶段置空，点击“查看完整档案”时通过 api_detail 懒加载
         })
         
@@ -997,7 +1012,7 @@ def api_search():
 
 @experts_bp.route('/api/detail', methods=['GET'])
 def api_detail():
-    """点对点懒加载查询单个专家原始 JSON 详情 (毫秒级响应)"""
+    """点对点懒加载查询单个专家原始 JSON 详情与标签 (毫秒级响应)"""
     name = request.args.get('name', '').strip()
     phone = request.args.get('phone', '').strip()
     if not name or not phone:
@@ -1007,19 +1022,36 @@ def api_detail():
     try:
         conn = sqlite3.connect(db_path)
         c = conn.cursor()
-        # 命中联合唯一索引 idx_experts_name_phone，查询仅需几微秒
-        c.execute("SELECT raw_json FROM experts WHERE name = ? AND phone = ?", (name, phone))
+        
+        # 1. 命中联合唯一索引 idx_experts_name_phone，获取详情 json
+        c.execute("SELECT id, raw_json FROM experts WHERE name = ? AND phone = ?", (name, phone))
         row = c.fetchone()
-        conn.close()
         
         parsed_json = {}
-        if row and row[0]:
-            try:
-                parsed_json = json.loads(row[0])
-            except Exception:
-                pass
+        tags = []
+        if row:
+            expert_id = row[0]
+            if row[1]:
+                try:
+                    parsed_json = json.loads(row[1])
+                except Exception:
+                    pass
+            
+            # 2. 查询该专家匹配到的所有标签
+            c.execute("""
+                SELECT DISTINCT t.tag_name
+                FROM expert_majors em
+                JOIN tag_majors tm ON em.major_name = tm.major_name
+                JOIN tags t ON tm.tag_id = t.id
+                WHERE em.expert_id = ?
+            """, (expert_id,))
+            tag_rows = c.fetchall()
+            tags = [tr[0] for tr in tag_rows if tr[0]]
+            
+        conn.close()
+        
         _log_action("查看专家详情", f"姓名: {name}, 电话: {phone}")
-        return jsonify({"success": True, "details": parsed_json})
+        return jsonify({"success": True, "details": parsed_json, "tags": tags})
     except Exception as e:
         return jsonify({"success": False, "error": f"查询专家详情失败: {str(e)}"}), 500
 

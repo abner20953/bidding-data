@@ -224,6 +224,27 @@
                 width: 100% !important;
                 padding: 14px 20px;
             }
+            .search-actions-row {
+                flex-direction: column;
+                align-items: stretch;
+                margin-top: 12px;
+                gap: 12px;
+            }
+            .filter-group {
+                flex-direction: column;
+                width: 100%;
+                gap: 8px;
+            }
+            .btn-group {
+                flex-direction: column;
+                width: 100%;
+                gap: 8px;
+            }
+            .btn-search-reset {
+                width: 100% !important;
+                justify-content: center;
+                padding: 12px 20px;
+            }
             
             /* 专家卡片手机端布局优化 */
             .experts-cards-grid {
@@ -1615,6 +1636,81 @@
             color: var(--accent-hover) !important;
             padding-left: 18px; /* 轻微右移微动画 */
         }
+
+        /* 专家标签渲染样式 */
+        .custom-expert-tag {
+            font-size: 10px;
+            background: rgba(14, 165, 233, 0.08);
+            border: 1px solid rgba(14, 165, 233, 0.15);
+            color: var(--accent-color);
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-weight: 500;
+            white-space: nowrap;
+            max-width: 80px;
+            text-overflow: ellipsis;
+            overflow: hidden;
+            display: inline-block;
+            vertical-align: middle;
+        }
+
+        /* 搜索框新版两行自适应布局 */
+        .search-section-wrapper {
+            background: rgba(255, 255, 255, 0.45);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+            padding: 18px;
+            margin-bottom: 24px;
+            box-shadow: var(--shadow-soft);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+        }
+        
+        .search-actions-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 14px;
+            gap: 12px;
+        }
+
+        .filter-group {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .btn-group {
+            display: flex;
+            gap: 12px;
+        }
+
+        .btn-search-reset {
+            background: rgba(255, 255, 255, 0.6);
+            border: 1px solid var(--card-border);
+            color: var(--text-primary);
+            border-radius: 12px;
+            padding: 10px 24px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            box-shadow: var(--shadow-soft);
+        }
+
+        .btn-search-reset:hover {
+            background: rgba(241, 245, 249, 0.9);
+            border-color: rgba(0, 0, 0, 0.15);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+            transform: translateY(-1px);
+        }
+
+        .btn-search-reset:active {
+            transform: translateY(1px);
+        }
     </style>
 </head>
 
@@ -1653,7 +1749,9 @@
         <!-- 专家信息检索面板 -->
         <div id="panel-search" class="tab-panel">
             <!-- 搜索框 -->
-            <div class="search-bar-container">
+            <!-- 新版两行检索布局 -->
+            <div class="search-section-wrapper">
+                <!-- 第一行：输入检索字段 -->
                 <div class="search-bar-grid">
                     <div class="search-input-wrapper">
                         <input type="text" class="search-input" id="search-name" placeholder="🔍 姓名...">
@@ -1671,16 +1769,25 @@
                         <input type="text" class="search-input" id="search-major" placeholder="💼 专业领域 (模糊)...">
                     </div>
                 </div>
-                <select class="filter-select" id="filter-tag" style="min-width: 150px;">
-                    <option value="">全部专家标签</option>
-                </select>
-                <select class="filter-select" id="filter-status">
-                    <option value="">全部标记状态</option>
-                    <option value="已获取">已获取</option>
-                    <option value="无法登录">无法登录</option>
-                    <option value="未获取">未获取</option>
-                </select>
-                <button class="btn-search-main" id="btn-search">搜索专家</button>
+                
+                <!-- 第二行：下拉选择器及按钮操作区 -->
+                <div class="search-actions-row">
+                    <div class="filter-group">
+                        <select class="filter-select" id="filter-tag">
+                            <option value="">全部专家标签</option>
+                        </select>
+                        <select class="filter-select" id="filter-status">
+                            <option value="">全部标记状态</option>
+                            <option value="已获取">已获取</option>
+                            <option value="无法登录">无法登录</option>
+                            <option value="未获取">未获取</option>
+                        </select>
+                    </div>
+                    <div class="btn-group">
+                        <button class="btn-search-main btn-accent-gradient" id="btn-search">🔍 搜索专家</button>
+                        <button class="btn-search-reset" id="btn-search-reset">🔄 重置条件</button>
+                    </div>
+                </div>
             </div>
 
             <!-- 卡片展示区 -->
@@ -2041,6 +2148,12 @@
                         <div class="detail-info-item">
                             <span>💼 专家专业:</span> <span id="detail-title-major" class="detail-title-val">-</span>
                         </div>
+                        <div class="detail-info-item" id="detail-tags-row" style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px;">
+                            <span>🏷️ 专家标签:</span>
+                            <div id="detail-title-tags" style="display: flex; gap: 6px; flex-wrap: wrap;">
+                                <!-- 动态标签 -->
+                            </div>
+                        </div>
                     </div>
                 </div>
 
@@ -2139,6 +2252,7 @@
                 const filterStatus = document.getElementById('filter-status');
                 const filterTag = document.getElementById('filter-tag');
                 const searchBtn = document.getElementById('btn-search');
+                const searchResetBtn = document.getElementById('btn-search-reset');
                 
                 function executeSearch() {
                     fetchExperts(
@@ -2154,6 +2268,19 @@
                 
                 if (searchBtn) {
                     searchBtn.addEventListener('click', executeSearch);
+                }
+                
+                if (searchResetBtn) {
+                    searchResetBtn.addEventListener('click', () => {
+                        if (searchName) searchName.value = '';
+                        if (searchPhone) searchPhone.value = '';
+                        if (searchIdcard) searchIdcard.value = '';
+                        if (searchCompany) searchCompany.value = '';
+                        if (searchMajor) searchMajor.value = '';
+                        if (filterStatus) filterStatus.value = '';
+                        if (filterTag) filterTag.value = '';
+                        executeSearch();
+                    });
                 }
                 
                 // 绑定回车与输入防抖事件
@@ -2385,6 +2512,13 @@
                     statusTagHtml = `<span class="expert-tag-status status-unacquired">未获取</span>`;
                 }
                 
+                let tagsHtml = '';
+                if (item.tags && item.tags.length > 0) {
+                    tagsHtml = item.tags.map(t => `<span class="custom-expert-tag" title="${t}">${t}</span>`).join('');
+                } else {
+                    tagsHtml = `<span class="expert-tag">评标专家</span>`;
+                }
+                
                 card.innerHTML = `
                     <div class="expert-avatar-container">
                         ${avatarHtml}
@@ -2393,8 +2527,8 @@
                         <div>
                             <div class="expert-name-row">
                                 <span class="expert-name" title="${item.name}">${item.name}</span>
-                                <div style="display: flex; gap: 4px;">
-                                    <span class="expert-tag">评标专家</span>
+                                <div style="display: flex; gap: 4px; align-items: center; max-width: 60%; flex-wrap: wrap; justify-content: flex-end;">
+                                    ${tagsHtml}
                                     ${statusTagHtml}
                                 </div>
                             </div>
@@ -2769,6 +2903,25 @@
             if (errDiv) errDiv.style.display = 'flex';
         }
 
+        function renderDetailTags(tags) {
+            const tagsContainer = document.getElementById('detail-title-tags');
+            if (tagsContainer) {
+                tagsContainer.innerHTML = '';
+                const cleanTags = tags || [];
+                if (cleanTags.length > 0) {
+                    cleanTags.forEach(t => {
+                        const tagSpan = document.createElement('span');
+                        tagSpan.className = 'custom-expert-tag';
+                        tagSpan.innerText = t;
+                        tagSpan.title = t;
+                        tagsContainer.appendChild(tagSpan);
+                    });
+                } else {
+                    tagsContainer.innerHTML = '<span class="expert-tag" style="background: rgba(148, 163, 184, 0.1); color: #64748b;">暂无标签</span>';
+                }
+            }
+        }
+
         function showDetails(index) {
             try {
                 const item = currentExpertsData[index];
@@ -2799,6 +2952,9 @@
                 if (idcardEl) idcardEl.innerText = item.id_card || '未填身份证';
                 if (companyEl) companyEl.innerText = item.company || '未知单位';
                 if (majorEl) majorEl.innerText = item.major || '未填专业';
+                
+                // 渲染专家标签
+                renderDetailTags(item.tags);
                 
                 // 照片多图匹配与切换控制
                 const detailImg = document.getElementById('detail-img');
@@ -2875,11 +3031,13 @@
                             .then(res => {
                                 if (res.success) {
                                     item.details = res.details || {};
+                                    item.tags = res.tags || item.tags || [];
                                     // 检查模态框当前显示的专家是否仍然是同一个，防止竞态条件导致渲染混乱
                                     const currentModalName = document.getElementById('detail-title-name') ? document.getElementById('detail-title-name').innerText : '';
                                     const currentModalPhone = document.getElementById('detail-title-phone') ? document.getElementById('detail-title-phone').innerText : '';
                                     if (currentModalName === item.name && currentModalPhone === item.phone) {
                                         rawJsonElement.innerText = JSON.stringify(item, null, 4);
+                                        renderDetailTags(item.tags);
                                     }
                                 } else {
                                     rawJsonElement.innerText = `⚠️ 原始档案加载失败: ${res.error}`;
@@ -3485,6 +3643,9 @@
                 if (companyEl) companyEl.innerText = item.company || '未知单位';
                 if (majorEl) majorEl.innerText = item.major || '未填专业';
                 
+                // 渲染专家标签
+                renderDetailTags(item.tags);
+                
                 const detailImg = document.getElementById('detail-img');
                 const errDiv = document.getElementById('detail-img-error');
                 const prevBtn = document.getElementById('photo-prev-btn');
@@ -3633,10 +3794,12 @@
                             .then(res => {
                                 if (res.success) {
                                     item.details = res.details || {};
+                                    item.tags = res.tags || item.tags || [];
                                     const currentModalName = document.getElementById('detail-title-name') ? document.getElementById('detail-title-name').innerText : '';
                                     const currentModalPhone = document.getElementById('detail-title-phone') ? document.getElementById('detail-title-phone').innerText : '';
                                     if (currentModalName === item.name && currentModalPhone === item.phone) {
                                         rawJsonElement.innerText = JSON.stringify(item, null, 4);
+                                        renderDetailTags(item.tags);
                                     }
                                 } else {
                                     rawJsonElement.innerText = `⚠️ 原始档案加载失败: ${res.error}`;
