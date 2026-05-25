@@ -1,4 +1,4 @@
-from flask import Blueprint, render_template, request, jsonify, current_app, send_from_directory
+from flask import Blueprint, render_template, request, jsonify, current_app, send_from_directory, send_file
 import sqlite3
 import os
 import datetime
@@ -873,3 +873,115 @@ def api_search_titles():
         results.append(d)
         
     return jsonify(results)
+
+@knowledge_bp.route('/api/backup', methods=['GET'])
+def api_backup():
+    """将知识库 SQLite 数据库与所有上传插图打包为 zip 下载备份 (对 2G 内存友好)"""
+    import zipfile
+    import time
+    
+    base_dir = current_app.config.get('BASE_DIR')
+    if not base_dir:
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        
+    # 建立备份存放目录
+    backups_dir = os.path.join(base_dir, 'uploads', 'backups')
+    os.makedirs(backups_dir, exist_ok=True)
+    
+    # 清理 5 分钟前产生的老旧备份，保护磁盘不被撑爆
+    now = time.time()
+    for f in os.listdir(backups_dir):
+        fp = os.path.join(backups_dir, f)
+        if os.path.isfile(fp) and now - os.path.getmtime(fp) > 300:
+            try:
+                os.remove(fp)
+            except Exception:
+                pass
+
+    # 生成备份压缩包
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_filename = f"knowledge_backup_{timestamp}.zip"
+    zip_path = os.path.join(backups_dir, zip_filename)
+    
+    db_path = get_db_path()
+    static_uploads_dir = os.path.join(base_dir, 'static', 'uploads')
+    
+    try:
+        # 流式写入，对 2G 内存友好
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            # 1. 写入数据库文件
+            if os.path.exists(db_path):
+                zipf.write(db_path, "knowledge_base.db")
+            # 2. 写入 uploads 目录下的直接附件文件（防穿透到专家照片）
+            if os.path.exists(static_uploads_dir):
+                for file in os.listdir(static_uploads_dir):
+                    file_path = os.path.join(static_uploads_dir, file)
+                    if os.path.isfile(file_path):
+                        arcname = os.path.join("uploads", file)
+                        zipf.write(file_path, arcname)
+                        
+            # 3. 动态写入还原说明教程 README.txt
+            readme_text = """========================================================================
+                      知识库系统 - 数据还原教程 (README)
+========================================================================
+
+本文件是系统自动生成的完整备份还原指引。通过以下步骤，您可以将当前备份数据
+（数据库 + 插图附件）安全地还原到云服务器或本地运行环境。
+
+一、 备份包包含内容
+------------------------------------------------------------------------
+1. knowledge_base.db : 包含知识条目、评论、标签关联等所有数据库记录。
+2. uploads/          : 包含知识库上传的截图与插图附件。
+
+二、 还原到云服务器 (Docker 部署环境)
+------------------------------------------------------------------------
+如果您的云服务器是基于 Docker 构建的（默认标准环境），请按以下步骤操作：
+
+1. 准备工作：
+   请使用 SFTP（如 WinSCP 或 Termius）将解压后的 `knowledge_base.db` 以及 
+   `uploads/` 目录下的所有插图文件上传至云服务器的项目根目录下。
+
+2. 覆盖数据库文件：
+   将 `knowledge_base.db` 拷贝覆盖到项目目录下的 `data/knowledge_base.db`。
+   命令行操作示例：
+   cp knowledge_base.db ./data/knowledge_base.db
+
+3. 覆盖照片/附件文件：
+   将 `uploads/` 目录下的所有插图文件拷贝至项目目录下的 
+   `dashboard/static/uploads/` 文件夹中。
+   命令行操作示例：
+   cp -r uploads/* ./dashboard/static/uploads/
+
+4. 修复文件与目录权限：
+   为了防止容器内进程无权限读写覆盖的数据，请在项目根目录下修复权限：
+   chown -R 1000:1000 data/ dashboard/static/uploads/
+
+5. 重启应用容器：
+   在服务器终端运行以下命令重启服务以应用新数据：
+   docker restart bidding-app
+
+------------------------------------------------------------------------
+三、 还原到本地开发环境 (Python Flask 运行环境)
+------------------------------------------------------------------------
+如果您是在本地开发调试环境下运行：
+
+1. 覆盖数据库文件：
+   将解压出来的 `knowledge_base.db` 直接复制到本地项目根目录下的 `data/knowledge_base.db`。
+
+2. 覆盖照片/附件文件：
+   将解压出的 `uploads/` 文件夹内的文件复制到本地项目根目录下的 
+   `dashboard/static/uploads/` 目录下。
+
+3. 重新运行服务：
+   双击或运行 `run.py` 重新启动 Flask 开发服务器即可。
+
+========================================================================
+                      生成时间: {timestamp}
+========================================================================
+""".format(timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            zipf.writestr("数据还原教程_README.txt", readme_text)
+            
+        _log_action("备份知识库", f"文件名: {zip_filename}")
+        return send_file(zip_path, as_attachment=True, download_name=zip_filename)
+    except Exception as e:
+        return jsonify({"success": False, "error": f"生成备份压缩包失败: {str(e)}"}), 500
