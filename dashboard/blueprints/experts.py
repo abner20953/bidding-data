@@ -959,11 +959,21 @@ def api_search():
         
     tag_ids_str = request.args.get('tag_ids', '').strip()
     if tag_ids_str:
-        tag_id_list = [t.strip() for t in tag_ids_str.split(',') if t.strip().isdigit()]
-        if tag_id_list:
-            placeholders = ",".join(["?"] * len(tag_id_list))
-            conditions.append(f"id IN (SELECT DISTINCT em.expert_id FROM expert_majors em JOIN tag_majors tm ON em.major_name = tm.major_name WHERE tm.tag_id IN ({placeholders}))")
-            params.extend([int(tid) for tid in tag_id_list])
+        tag_id_list = [t.strip() for t in tag_ids_str.split(',') if t.strip()]
+        digit_ids = [t for t in tag_id_list if t.isdigit()]
+        has_unassigned = 'unassigned' in tag_id_list
+        
+        sub_conds = []
+        if digit_ids:
+            placeholders = ",".join(["?"] * len(digit_ids))
+            sub_conds.append(f"id IN (SELECT DISTINCT em.expert_id FROM expert_majors em JOIN tag_majors tm ON em.major_name = tm.major_name WHERE tm.tag_id IN ({placeholders}))")
+            params.extend([int(tid) for tid in digit_ids])
+            
+        if has_unassigned:
+            sub_conds.append("id NOT IN (SELECT DISTINCT em.expert_id FROM expert_majors em JOIN tag_majors tm ON em.major_name = tm.major_name)")
+            
+        if sub_conds:
+            conditions.append(f"({' OR '.join(sub_conds)})")
         
     # 精炼 SQL：不 SELECT raw_json 大文本字段，并通过子查询获取每个专家所对应的标签字符串
     sql = """

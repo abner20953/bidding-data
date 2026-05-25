@@ -4208,9 +4208,9 @@
                     if (res.success) {
                         allSearchTagsCache = res.tags || [];
                         
-                        // 过滤掉已经不存在的已选 ID（比如标签被物理删除了）
+                        // 过滤掉已经不存在的已选 ID（注意要保留 'unassigned'）
                         const validIds = allSearchTagsCache.map(t => String(t.id));
-                        selectedTagIds = selectedTagIds.filter(id => validIds.includes(id));
+                        selectedTagIds = selectedTagIds.filter(id => id === 'unassigned' || validIds.includes(id));
                         
                         // 渲染多选浮层列表和触发器
                         renderMultiTagDropdown();
@@ -4225,7 +4225,10 @@
             if (!dropdown) return;
             dropdown.innerHTML = '';
             
-            allSearchTagsCache.forEach(tag => {
+            // 拼装包含“无标签”虚拟选项的临时渲染列表
+            const tagsToRender = [{ id: 'unassigned', tag_name: '无标签' }, ...allSearchTagsCache];
+            
+            tagsToRender.forEach(tag => {
                 const item = document.createElement('div');
                 item.className = 'multi-select-item';
                 const isChecked = selectedTagIds.includes(String(tag.id));
@@ -4283,7 +4286,13 @@
                     badgeContainer.innerHTML = '';
                     
                     selectedTagIds.forEach(id => {
-                        const matched = allSearchTagsCache.find(t => String(t.id) === id);
+                        let matched = null;
+                        if (id === 'unassigned') {
+                            matched = { id: 'unassigned', tag_name: '无标签' };
+                        } else {
+                            matched = allSearchTagsCache.find(t => String(t.id) === id);
+                        }
+                        
                         if (matched) {
                             const badge = document.createElement('div');
                             badge.className = 'selected-tag-badge';
