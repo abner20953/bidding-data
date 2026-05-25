@@ -1107,6 +1107,66 @@ def api_backup():
                         file_path = os.path.join(root_dir, file)
                         arcname = os.path.join("expert_photos", file)
                         zipf.write(file_path, arcname)
+            # 3. 动态写入还原说明教程
+            readme_text = """========================================================================
+                      评标专家系统 - 数据还原教程 (README)
+========================================================================
+
+本文件是系统自动生成的完整备份还原指引。通过以下步骤，您可以将当前备份数据
+（数据库 + 专家照片）安全地还原到云服务器或本地运行环境。
+
+一、 备份包包含内容
+------------------------------------------------------------------------
+1. experts.db      : 包含专家信息、项目信息、专业标签等所有数据库记录。
+2. expert_photos/  : 包含专家身份证照片文件夹。
+
+二、 还原到云服务器 (Docker 部署环境)
+------------------------------------------------------------------------
+如果您的云服务器是基于 Docker 构建的（默认标准环境），请按以下步骤操作：
+
+1. 准备工作：
+   请使用 SFTP（如 WinSCP 或 Termius）将解压后的 `experts.db` 以及 
+   `expert_photos/` 目录下的所有照片上传至云服务器的项目根目录下。
+
+2. 覆盖数据库文件：
+   将 `experts.db` 拷贝覆盖到项目目录下的 `data/experts.db`。
+   命令行操作示例：
+   cp experts.db ./data/experts.db
+
+3. 覆盖照片文件：
+   将 `expert_photos/` 目录下的所有照片拷贝至项目目录下的 
+   `dashboard/static/uploads/expert_photos/` 文件夹中。
+   命令行操作示例：
+   cp -r expert_photos/* ./dashboard/static/uploads/expert_photos/
+
+4. 修复文件与目录权限：
+   为了防止容器内进程无权限读写覆盖的数据，请在项目根目录下修复权限：
+   chown -R 1000:1000 data/ dashboard/static/uploads/
+
+5. 重启应用容器：
+   在服务器终端运行以下命令重启服务以应用新数据：
+   docker restart bidding-app
+
+------------------------------------------------------------------------
+三、 还原到本地开发环境 (Python Flask 运行环境)
+------------------------------------------------------------------------
+如果您是在本地开发调试环境下运行：
+
+1. 覆盖数据库文件：
+   将解压出来的 `experts.db` 直接复制到本地项目根目录下的 `data/experts.db`。
+
+2. 覆盖照片文件：
+   将解压出的 `expert_photos/` 文件夹整体复制到本地项目根目录下的 
+   `dashboard/static/uploads/expert_photos/` 目录下。
+
+3. 重新运行服务：
+   双击或运行 `run.py` 重新启动 Flask 开发服务器即可。
+
+========================================================================
+                      生成时间: {timestamp}
+========================================================================
+""".format(timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            zipf.writestr("数据还原教程_README.txt", readme_text)
                         
         _log_action("备份评标专家库", f"文件名: {zip_filename}")
         return send_file(zip_path, as_attachment=True, download_name=zip_filename)
