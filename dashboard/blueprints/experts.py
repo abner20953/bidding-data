@@ -1040,8 +1040,8 @@ def api_search():
         params.append(int(project_count))
         
     if last_project_time:
-        conditions.append("last_project_time LIKE ?")
-        params.append(f"%{last_project_time}%")
+        conditions.append("last_project_time >= ? AND last_project_time IS NOT NULL AND last_project_time != ''")
+        params.append(last_project_time)
         
     tag_ids_str = request.args.get('tag_ids', '').strip()
     if tag_ids_str:
