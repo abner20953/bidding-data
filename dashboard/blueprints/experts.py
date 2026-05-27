@@ -70,6 +70,30 @@ def get_photos_dir():
     os.makedirs(photos_dir, exist_ok=True)
     return photos_dir
 
+def update_all_experts_stats(conn):
+    """通过高性能聚合 SQL 重新计算并写入所有专家的参评次数和最后一次参评时间"""
+    try:
+        c = conn.cursor()
+        update_sql = """
+        UPDATE experts 
+        SET 
+          project_count = COALESCE((
+            SELECT COUNT(DISTINCT pe.project_id) 
+            FROM project_experts pe 
+            WHERE pe.expert_id_card = experts.id_card AND pe.expert_id_card IS NOT NULL AND pe.expert_id_card != ''
+          ), 0),
+          last_project_time = (
+            SELECT MAX(p.process_time) 
+            FROM project_experts pe
+            JOIN projects p ON pe.project_id = p.id
+            WHERE pe.expert_id_card = experts.id_card AND pe.expert_id_card IS NOT NULL AND pe.expert_id_card != ''
+          )
+        """
+        c.execute(update_sql)
+        conn.commit()
+    except Exception as e:
+        print(f"Failed to update experts stats: {e}")
+
 def init_db():
     """初始化数据库表结构"""
     db_path = get_db_path()
@@ -93,6 +117,8 @@ def init_db():
             raw_json TEXT,
             status TEXT DEFAULT '未获取',
             remark TEXT DEFAULT '',
+            project_count INTEGER DEFAULT 0,
+            last_project_time TEXT,
             created_at TEXT
         )
     ''')
@@ -104,7 +130,7 @@ def init_db():
     c.execute('CREATE INDEX IF NOT EXISTS idx_experts_phone ON experts(phone)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_experts_id_card ON experts(id_card)')
     
-    # 平滑升级旧数据库：增加 status 字段与 remark 字段
+    # 平滑升级旧数据库：增加 status 字段与 remark 字段，以及参评统计字段
     try:
         c.execute("ALTER TABLE experts ADD COLUMN status TEXT DEFAULT '未获取'")
     except sqlite3.OperationalError:
@@ -112,6 +138,27 @@ def init_db():
 
     try:
         c.execute("ALTER TABLE experts ADD COLUMN remark TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        c.execute("ALTER TABLE experts ADD COLUMN project_count INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        c.execute("ALTER TABLE experts ADD COLUMN last_project_time TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    # 建立相应的索引以提升过滤速度
+    try:
+        c.execute('CREATE INDEX IF NOT EXISTS idx_experts_project_count ON experts(project_count)')
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        c.execute('CREATE INDEX IF NOT EXISTS idx_experts_last_project_time ON experts(last_project_time)')
     except sqlite3.OperationalError:
         pass
         
@@ -208,6 +255,12 @@ def init_db():
                 print("✅ 历史专家专业同步初始化完成！")
     except Exception as e:
         print(f"⚠️ 历史专业同步初始化失败: {e}")
+
+    # 一次性历史数据清洗重算
+    try:
+        update_all_experts_stats(conn)
+    except Exception as e:
+        print(f"⚠️ 历史专家参评统计初始化更新失败: {e}")
 
     conn.close()
 
@@ -701,6 +754,14 @@ def api_upload():
             except Exception as e:
                 md_message = f" 但项目关系 MD 解析失败，错误: {str(e)}。"
         
+        # 联动触发更新
+        try:
+            update_conn = sqlite3.connect(db_path)
+            update_all_experts_stats(update_conn)
+            update_conn.close()
+        except Exception as e:
+            print(f"Error updating expert stats after upload: {e}")
+
         _log_action("导入专家压缩包", f"解压出 {total_in_file} 位专家，新增 {added_count} 人，覆盖 {updated_count} 人。{md_message.strip()}")
         return jsonify({
             "success": True,
@@ -728,6 +789,13 @@ def api_upload_md():
         try:
             proj_added, proj_updated, rel_count = parse_and_import_md(md_path)
             proj_total = proj_added + proj_updated
+            # 联动触发更新
+            try:
+                update_conn = sqlite3.connect(get_db_path())
+                update_all_experts_stats(update_conn)
+                update_conn.close()
+            except Exception as e:
+                print(f"Error updating expert stats after upload_md: {e}")
             _log_action("导入项目关系MD", f"导入项目 {proj_total} 个（新增 {proj_added} 个，覆盖 {proj_updated} 个），关联参评专家 {rel_count} 人次。")
             return jsonify({
                 "success": True,
@@ -908,6 +976,10 @@ def api_search():
     major = request.args.get('major', '').strip()
     status = request.args.get('status', '').strip()
     
+    min_count = request.args.get('min_count', '').strip()
+    max_count = request.args.get('max_count', '').strip()
+    last_time_filter = request.args.get('last_time_filter', '').strip()
+    
     db_path = get_db_path()
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -957,6 +1029,28 @@ def api_search():
         conditions.append("status = ?")
         params.append(status)
         
+    if min_count.isdigit():
+        conditions.append("project_count >= ?")
+        params.append(int(min_count))
+        
+    if max_count.isdigit():
+        conditions.append("project_count <= ?")
+        params.append(int(max_count))
+        
+    if last_time_filter == 'none':
+        conditions.append("(last_project_time IS NULL OR last_project_time = '')")
+    elif last_time_filter == 'half_year':
+        six_months_ago = (datetime.datetime.now() - datetime.timedelta(days=180)).strftime("%Y-%m-%d %H:%M:%S")
+        conditions.append("last_project_time >= ?")
+        params.append(six_months_ago)
+    elif last_time_filter == 'one_year':
+        one_year_ago = (datetime.datetime.now() - datetime.timedelta(days=365)).strftime("%Y-%m-%d %H:%M:%S")
+        conditions.append("last_project_time >= ?")
+        params.append(one_year_ago)
+    elif last_time_filter.isdigit() and len(last_time_filter) == 4:
+        conditions.append("last_project_time LIKE ?")
+        params.append(f"{last_time_filter}%")
+        
     tag_ids_str = request.args.get('tag_ids', '').strip()
     if tag_ids_str:
         tag_id_list = [t.strip() for t in tag_ids_str.split(',') if t.strip()]
@@ -977,7 +1071,7 @@ def api_search():
         
     # 精炼 SQL：不 SELECT raw_json 大文本字段，并通过子查询获取每个专家所对应的标签字符串
     sql = """
-        SELECT id, name, phone, id_card, company, major, photo_path, status, remark,
+        SELECT id, name, phone, id_card, company, major, photo_path, status, remark, project_count, last_project_time,
                (
                    SELECT GROUP_CONCAT(t.tag_name, ',')
                    FROM expert_majors em
@@ -1014,6 +1108,8 @@ def api_search():
             "status": item_status,
             "remark": item_remark,
             "tags": tags_list,
+            "project_count": r['project_count'] if 'project_count' in r.keys() and r['project_count'] is not None else 0,
+            "last_project_time": r['last_project_time'] if 'last_project_time' in r.keys() else None,
             "details": {}  # 列表阶段置空，点击“查看完整档案”时通过 api_detail 懒加载
         })
         
