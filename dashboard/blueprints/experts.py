@@ -71,15 +71,22 @@ def get_photos_dir():
     return photos_dir
 
 def update_all_experts_stats(conn):
-    """通过高性能聚合 SQL 重新计算并写入所有专家的参评次数和最后一次参评时间"""
+    """通过高性能聚合 SQL 重新计算并写入所有专家的参评次数和最后一次参评时间 (同一天内多次参评合并计算为 1 次)"""
     try:
         c = conn.cursor()
         update_sql = """
         UPDATE experts 
         SET 
           project_count = COALESCE((
-            SELECT COUNT(DISTINCT pe.project_id) 
+            SELECT COUNT(DISTINCT 
+              CASE 
+                WHEN p.process_time IS NOT NULL AND LENGTH(TRIM(p.process_time)) >= 10 
+                THEN SUBSTR(TRIM(p.process_time), 1, 10)
+                ELSE 'empty_proj_' || p.id 
+              END
+            )
             FROM project_experts pe 
+            JOIN projects p ON pe.project_id = p.id
             WHERE pe.expert_id_card = experts.id_card AND pe.expert_id_card IS NOT NULL AND pe.expert_id_card != ''
           ), 0),
           last_project_time = (
