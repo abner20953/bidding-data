@@ -1940,23 +1940,8 @@
                             <option value="无法登录">无法登录</option>
                             <option value="未获取">未获取</option>
                         </select>
-                        <select class="filter-select" id="filter-project-count" style="width: 140px;">
-                            <option value="">全部参评次数</option>
-                            <option value="0">0 次参评</option>
-                            <option value="1_plus">1 次及以上</option>
-                            <option value="3_plus">3 次及以上</option>
-                            <option value="5_plus">5 次及以上</option>
-                            <option value="10_plus">10 次及以上</option>
-                        </select>
-                        <select class="filter-select" id="filter-last-time" style="width: 150px;">
-                            <option value="">全部最后参评</option>
-                            <option value="none">无参评记录</option>
-                            <option value="half_year">最近半年内</option>
-                            <option value="one_year">最近一年内</option>
-                            <option value="2026">2026 年参评</option>
-                            <option value="2025">2025 年参评</option>
-                            <option value="2024">2024 年及以前</option>
-                        </select>
+                        <input type="number" min="0" class="search-input" id="search-project-count" placeholder="📊 最少参评次数..." style="width: 140px; padding-left: 12px;">
+                        <input type="text" class="search-input" id="search-last-time" placeholder="🕒 最近参评(如:2026)..." style="width: 200px; padding-left: 12px;">
                     </div>
                     <div class="btn-group">
                         <button class="btn-search-main btn-accent-gradient" id="btn-search">🔍 搜索专家</button>
@@ -2438,8 +2423,8 @@
                 const searchCompany = document.getElementById('search-company');
                 const searchMajor = document.getElementById('search-major');
                 const filterStatus = document.getElementById('filter-status');
-                const filterProjectCount = document.getElementById('filter-project-count');
-                const filterLastTime = document.getElementById('filter-last-time');
+                const searchProjectCount = document.getElementById('search-project-count');
+                const searchLastTime = document.getElementById('search-last-time');
                 const searchBtn = document.getElementById('btn-search');
                 const searchResetBtn = document.getElementById('btn-search-reset');
                 
@@ -2452,8 +2437,8 @@
                         searchMajor ? searchMajor.value : '',
                         filterStatus ? filterStatus.value : '',
                         selectedTagIds.join(','),
-                        filterProjectCount ? filterProjectCount.value : '',
-                        filterLastTime ? filterLastTime.value : ''
+                        searchProjectCount ? searchProjectCount.value : '',
+                        searchLastTime ? searchLastTime.value : ''
                     );
                 }
                 window.executeSearch = executeSearch;
@@ -2470,8 +2455,8 @@
                         if (searchCompany) searchCompany.value = '';
                         if (searchMajor) searchMajor.value = '';
                         if (filterStatus) filterStatus.value = '';
-                        if (filterProjectCount) filterProjectCount.value = '';
-                        if (filterLastTime) filterLastTime.value = '';
+                        if (searchProjectCount) searchProjectCount.value = '';
+                        if (searchLastTime) searchLastTime.value = '';
                         
                         // 重置多选标签状态
                         selectedTagIds = [];
@@ -2485,7 +2470,7 @@
                 
                 // 绑定回车与输入防抖事件
                 let debounceTimer;
-                const inputs = [searchName, searchPhone, searchIdcard, searchCompany, searchMajor];
+                const inputs = [searchName, searchPhone, searchIdcard, searchCompany, searchMajor, searchProjectCount, searchLastTime];
                 inputs.forEach(input => {
                     if (input) {
                         input.addEventListener('keydown', (e) => {
@@ -2615,8 +2600,8 @@
                             document.getElementById('search-major').value,
                             document.getElementById('filter-status').value,
                             selectedTagIds.join(','),
-                            document.getElementById('filter-project-count') ? document.getElementById('filter-project-count').value : '',
-                            document.getElementById('filter-last-time') ? document.getElementById('filter-last-time').value : ''
+                            document.getElementById('search-project-count') ? document.getElementById('search-project-count').value : '',
+                            document.getElementById('search-last-time') ? document.getElementById('search-last-time').value : ''
                         );
                     }
                 } else {
@@ -2638,7 +2623,7 @@
             `;
             if (paginator) paginator.style.display = 'none';
             
-            const url = `/dlsgzs/api/search?name=${encodeURIComponent(name)}&phone=${encodeURIComponent(phone)}&id_card=${encodeURIComponent(idCard)}&company=${encodeURIComponent(company)}&major=${encodeURIComponent(major)}&status=${encodeURIComponent(status)}&tag_ids=${encodeURIComponent(tagIds)}&project_count_filter=${encodeURIComponent(projectCountFilter)}&last_time_filter=${encodeURIComponent(lastTimeFilter)}&_t=${Date.now()}`;
+            const url = `/dlsgzs/api/search?name=${encodeURIComponent(name)}&phone=${encodeURIComponent(phone)}&id_card=${encodeURIComponent(idCard)}&company=${encodeURIComponent(company)}&major=${encodeURIComponent(major)}&status=${encodeURIComponent(status)}&tag_ids=${encodeURIComponent(tagIds)}&project_count=${encodeURIComponent(projectCountFilter)}&last_project_time=${encodeURIComponent(lastTimeFilter)}&_t=${Date.now()}`;
             
             fetch(url)
                 .then(res => res.json())

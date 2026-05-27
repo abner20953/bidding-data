@@ -976,9 +976,8 @@ def api_search():
     major = request.args.get('major', '').strip()
     status = request.args.get('status', '').strip()
     
-    min_count = request.args.get('min_count', '').strip()
-    max_count = request.args.get('max_count', '').strip()
-    last_time_filter = request.args.get('last_time_filter', '').strip()
+    project_count = request.args.get('project_count', '').strip()
+    last_project_time = request.args.get('last_project_time', '').strip()
     
     db_path = get_db_path()
     conn = sqlite3.connect(db_path)
@@ -1029,27 +1028,13 @@ def api_search():
         conditions.append("status = ?")
         params.append(status)
         
-    if min_count.isdigit():
+    if project_count.isdigit():
         conditions.append("project_count >= ?")
-        params.append(int(min_count))
+        params.append(int(project_count))
         
-    if max_count.isdigit():
-        conditions.append("project_count <= ?")
-        params.append(int(max_count))
-        
-    if last_time_filter == 'none':
-        conditions.append("(last_project_time IS NULL OR last_project_time = '')")
-    elif last_time_filter == 'half_year':
-        six_months_ago = (datetime.datetime.now() - datetime.timedelta(days=180)).strftime("%Y-%m-%d %H:%M:%S")
-        conditions.append("last_project_time >= ?")
-        params.append(six_months_ago)
-    elif last_time_filter == 'one_year':
-        one_year_ago = (datetime.datetime.now() - datetime.timedelta(days=365)).strftime("%Y-%m-%d %H:%M:%S")
-        conditions.append("last_project_time >= ?")
-        params.append(one_year_ago)
-    elif last_time_filter.isdigit() and len(last_time_filter) == 4:
+    if last_project_time:
         conditions.append("last_project_time LIKE ?")
-        params.append(f"{last_time_filter}%")
+        params.append(f"%{last_project_time}%")
         
     tag_ids_str = request.args.get('tag_ids', '').strip()
     if tag_ids_str:
