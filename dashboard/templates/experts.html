@@ -2363,8 +2363,8 @@
                                 <span id="detail-title-name" style="font-size: 19px; font-weight: 700; color: var(--text-primary);">-</span>
                                 <span class="expert-tag" style="background: rgba(14, 165, 233, 0.1); color: var(--accent-color); font-weight: 600;">基本资料卡</span>
                             </div>
-                            <button id="btn-save-expert-profile" class="btn-search-main" style="border: none; background: #10b981; padding: 0 16px; border-radius: 6px; font-weight: 600; font-size: 13px; cursor: pointer; height: 32px; display: flex; align-items: center; gap: 4px; color: white; box-shadow: 0 2px 6px rgba(16, 185, 129, 0.2); margin: 0;">
-                                <span>💾</span> 保存基本资料
+                            <button id="btn-save-expert-profile" class="btn-search-main" style="border: none; background: var(--accent-color); padding: 0 16px; border-radius: 6px; font-weight: 600; font-size: 13px; cursor: pointer; height: 32px; display: flex; align-items: center; gap: 4px; color: white; box-shadow: 0 2px 6px rgba(14, 165, 233, 0.2); margin: 0;">
+                                <span>✏️</span> 编辑档案
                             </button>
                         </div>
                         <div class="detail-info-item" style="display: flex; align-items: center; gap: 12px; width: 100%;">
@@ -2411,7 +2411,7 @@
                         </div>
                     </div>
                     <textarea id="detail-remark-input" style="height: 80px; width: 100%; box-sizing: border-box; resize: none; border-radius: 6px; border: 1px solid var(--border-color); padding: 10px; font-size: 13px; outline: none; margin: 0;" placeholder="输入专家的自定义备注信息（如登录密码、密保答案、临时问题、备用联系方式等）..."></textarea>
-                    <div class="detail-remark-footer" style="display: flex; justify-content: flex-end; align-items: center; gap: 8px;">
+                    <div class="detail-remark-footer" style="display: none; justify-content: flex-end; align-items: center; gap: 8px;">
                         <span id="save-status-tip" style="color: #10b981; font-size: 12px; display: none; align-items: center; gap: 4px;">✅ 已成功保存标注与备注</span>
                         <button id="btn-save-status" style="height: 32px; padding: 0 16px; font-size: 13px; border-radius: 6px; background: var(--accent-color); border: none; color: white; cursor: pointer; font-weight: 600; display: flex; align-items: center; gap: 4px; box-shadow: 0 2px 6px rgba(14, 165, 233, 0.2); margin: 0;">
                             <span>💾</span> 保存标注与备注
@@ -3215,123 +3215,61 @@
             
             // 填充顶部身份卡片与输入框
             const nameEl = document.getElementById('detail-title-name');
-            const phoneInput = document.getElementById('detail-input-phone');
-            const idcardEl = document.getElementById('detail-title-idcard');
-            const companyInput = document.getElementById('detail-input-company');
-            const majorInput = document.getElementById('detail-input-major');
-            
-            if (nameEl) nameEl.innerText = item.name || '-';
-            if (phoneInput) phoneInput.value = item.phone || '';
-            if (idcardEl) idcardEl.innerText = item.id_card || '未填身份证';
-            if (companyInput) companyInput.value = item.company || '';
-            if (majorInput) majorInput.value = item.major || '';
-            
-            // 重置新照片选择
-            let selectedPhotoFile = null;
-            const photoFileInput = document.getElementById('detail-photo-file-input');
-            if (photoFileInput) photoFileInput.value = '';
-            
-            // 渲染专家标签
-            renderDetailTags(item.tags);
-            
-            // 照片多图匹配与切换控制
-            const detailImg = document.getElementById('detail-img');
-            const errDiv = document.getElementById('detail-img-error');
-            const prevBtn = document.getElementById('photo-prev-btn');
-            const nextBtn = document.getElementById('photo-next-btn');
-            const indicator = document.getElementById('detail-photo-indicator');
-            
-            currentDetailPhotos = item.photo_path ? item.photo_path.split(',') : [];
-            currentDetailPhotoIndex = 0;
-            
-            function updateDetailPhotoShow() {
-                if (detailImg && errDiv) {
-                    if (currentDetailPhotos.length > 0) {
-                        const currentPath = currentDetailPhotos[currentDetailPhotoIndex].trim();
-                        detailImg.src = currentPath;
-                        detailImg.style.display = 'block';
-                        errDiv.style.display = 'none';
-                        detailImg.onclick = () => zoomPhoto(item.photo_path, currentDetailPhotoIndex);
-                        
-                        if (currentDetailPhotos.length > 1) {
-                            if (prevBtn) prevBtn.style.display = 'flex';
-                            if (nextBtn) nextBtn.style.display = 'flex';
-                            if (indicator) {
-                                indicator.style.display = 'block';
-                                indicator.innerText = `${currentDetailPhotoIndex + 1} / ${currentDetailPhotos.length}`;
-                            }
-                        } else {
-                            if (prevBtn) prevBtn.style.display = 'none';
-                            if (nextBtn) nextBtn.style.display = 'none';
-                            if (indicator) indicator.style.display = 'none';
-                        }
+                        // 声明内部编辑状态和控件只读切换函数
+            let isDetailEditing = false;
+            function setModalEditable(editable) {
+                isDetailEditing = editable;
+                
+                if (phoneInput) {
+                    phoneInput.readOnly = !editable;
+                    phoneInput.style.background = editable ? 'var(--bg-card)' : 'rgba(241, 245, 249, 0.6)';
+                    phoneInput.style.cursor = editable ? 'text' : 'not-allowed';
+                }
+                if (companyInput) {
+                    companyInput.readOnly = !editable;
+                    companyInput.style.background = editable ? 'var(--bg-card)' : 'rgba(241, 245, 249, 0.6)';
+                    companyInput.style.cursor = editable ? 'text' : 'not-allowed';
+                }
+                if (majorInput) {
+                    majorInput.readOnly = !editable;
+                    majorInput.style.background = editable ? 'var(--bg-card)' : 'rgba(241, 245, 249, 0.6)';
+                    majorInput.style.cursor = editable ? 'text' : 'not-allowed';
+                }
+                const changePhotoBtn = document.getElementById('btn-change-photo');
+                if (changePhotoBtn) {
+                    changePhotoBtn.style.display = editable ? 'flex' : 'none';
+                }
+                const statusSelect = document.getElementById('detail-status-select');
+                if (statusSelect) {
+                    statusSelect.disabled = !editable;
+                    statusSelect.style.background = editable ? 'var(--bg-card)' : 'rgba(241, 245, 249, 0.6)';
+                    statusSelect.style.cursor = editable ? 'pointer' : 'not-allowed';
+                }
+                const remarkInput = document.getElementById('detail-remark-input');
+                if (remarkInput) {
+                    remarkInput.readOnly = !editable;
+                    remarkInput.style.background = editable ? 'var(--bg-card)' : 'rgba(241, 245, 249, 0.6)';
+                    remarkInput.style.cursor = editable ? 'text' : 'not-allowed';
+                }
+                
+                const editSaveBtn = document.getElementById('btn-save-expert-profile');
+                if (editSaveBtn) {
+                    if (editable) {
+                        editSaveBtn.innerHTML = '<span>💾</span> 保存修改';
+                        editSaveBtn.style.background = '#10b981';
+                        editSaveBtn.style.boxShadow = '0 2px 6px rgba(16, 185, 129, 0.2)';
                     } else {
-                        detailImg.src = '';
-                        detailImg.style.display = 'none';
-                        errDiv.style.display = 'flex';
-                        if (prevBtn) prevBtn.style.display = 'none';
-                        if (nextBtn) nextBtn.style.display = 'none';
-                        if (indicator) indicator.style.display = 'none';
+                        editSaveBtn.innerHTML = '<span>✏️</span> 编辑档案';
+                        editSaveBtn.style.background = 'var(--accent-color)';
+                        editSaveBtn.style.boxShadow = '0 2px 6px rgba(14, 165, 233, 0.2)';
                     }
                 }
             }
             
-            if (prevBtn) {
-                prevBtn.onclick = (e) => {
-                    e.stopPropagation();
-                    if (currentDetailPhotos.length > 1) {
-                        currentDetailPhotoIndex = (currentDetailPhotoIndex - 1 + currentDetailPhotos.length) % currentDetailPhotos.length;
-                        updateDetailPhotoShow();
-                    }
-                };
-            }
-            if (nextBtn) {
-                nextBtn.onclick = (e) => {
-                    e.stopPropagation();
-                    if (currentDetailPhotos.length > 1) {
-                        currentDetailPhotoIndex = (currentDetailPhotoIndex + 1) % currentDetailPhotos.length;
-                        updateDetailPhotoShow();
-                    }
-                };
-            }
+            // 默认设置为只读状态
+            setModalEditable(false);
             
-            updateDetailPhotoShow();
-            
-            // 绑定“更换照片”按钮事件
-            const changePhotoBtn = document.getElementById('btn-change-photo');
-            if (changePhotoBtn && photoFileInput) {
-                changePhotoBtn.onclick = (e) => {
-                    e.preventDefault();
-                    photoFileInput.click();
-                };
-                
-                photoFileInput.onchange = (e) => {
-                    const file = e.target.files[0];
-                    if (file) {
-                        const ext = file.name.split('.').pop().toLowerCase();
-                        if (!['jpg', 'jpeg', 'png'].includes(ext)) {
-                            alert('上传的照片格式不正确，仅支持 .jpg, .jpeg, .png');
-                            photoFileInput.value = '';
-                            return;
-                        }
-                        selectedPhotoFile = file;
-                        
-                        // 本地实时图片预览
-                        if (detailImg && errDiv) {
-                            detailImg.src = URL.createObjectURL(file);
-                            detailImg.style.display = 'block';
-                            errDiv.style.display = 'none';
-                            
-                            // 本地单图预览，隐藏多图指示器
-                            if (prevBtn) prevBtn.style.display = 'none';
-                            if (nextBtn) nextBtn.style.display = 'none';
-                            if (indicator) indicator.style.display = 'none';
-                        }
-                    }
-                };
-            }
-            
-            // 绑定“保存基本资料”按钮事件
+            // 绑定“编辑 / 保存”合一按钮事件
             const saveProfileBtn = document.getElementById('btn-save-expert-profile');
             if (saveProfileBtn) {
                 // clone node to clear previous listeners
@@ -3339,9 +3277,20 @@
                 saveProfileBtn.parentNode.replaceChild(newSaveProfileBtn, saveProfileBtn);
                 
                 newSaveProfileBtn.addEventListener('click', () => {
+                    if (!isDetailEditing) {
+                        // 如果当前是非编辑状态，点击切换为编辑状态
+                        setModalEditable(true);
+                        return;
+                    }
+                    
+                    // 如果当前是编辑状态，点击执行保存
                     const newPhoneVal = phoneInput ? phoneInput.value.trim() : '';
                     const companyVal = companyInput ? companyInput.value.trim() : '';
                     const majorVal = majorInput ? majorInput.value.trim() : '';
+                    const statusSelect = document.getElementById('detail-status-select');
+                    const newStatus = statusSelect ? statusSelect.value : '未获取';
+                    const remarkInput = document.getElementById('detail-remark-input');
+                    const newRemark = remarkInput ? remarkInput.value : '';
                     
                     if (!newPhoneVal) {
                         alert('手机号不能为空！');
@@ -3351,6 +3300,7 @@
                     newSaveProfileBtn.disabled = true;
                     newSaveProfileBtn.innerHTML = '保存中...';
                     
+                    // 1. 串行请求第一步：更新基本资料
                     const formData = new FormData();
                     formData.append('old_name', item.name || '');
                     formData.append('old_phone', item.phone || '');
@@ -3366,33 +3316,54 @@
                         body: formData
                     })
                     .then(res => res.json())
-                    .then(res => {
+                    .then(profileRes => {
+                        if (!profileRes.success) {
+                            throw new Error(profileRes.error || '保存基本资料失败');
+                        }
+                        // 2. 串行请求第二步：更新标注与备注 (使用最新的 newPhoneVal 去更新)
+                        return fetch('/dlsgzs/api/update_status', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify({
+                                name: item.name,
+                                phone: newPhoneVal,
+                                status: newStatus,
+                                remark: newRemark
+                            })
+                        }).then(res => res.json());
+                    })
+                    .then(statusRes => {
                         newSaveProfileBtn.disabled = false;
-                        newSaveProfileBtn.innerHTML = '<span>💾</span> 保存基本资料';
-                        if (res.success) {
-                            alert(res.message || '专家基本资料已成功保存！');
-                            closeDetailModal();
-                            // 重新加载列表数据
-                            if (typeof executeSearch === 'function') {
-                                executeSearch();
-                            } else if (typeof fetchExperts === 'function') {
-                                fetchExperts(
-                                    document.getElementById('search-name') ? document.getElementById('search-name').value : '',
-                                    document.getElementById('search-phone') ? document.getElementById('search-phone').value : '',
-                                    document.getElementById('search-idcard') ? document.getElementById('search-idcard').value : '',
-                                    document.getElementById('search-company') ? document.getElementById('search-company').value : '',
-                                    document.getElementById('search-major') ? document.getElementById('search-major').value : '',
-                                    document.getElementById('filter-status') ? document.getElementById('filter-status').value : ''
-                                );
-                            }
-                        } else {
-                            alert('⚠️ 保存基本资料失败：' + res.error);
+                        if (!statusRes.success) {
+                            throw new Error(statusRes.error || '保存状态与备注失败');
+                        }
+                        
+                        // 全部更新成功
+                        isDetailEditing = false;
+                        setModalEditable(false);
+                        alert('专家档案信息已成功保存！');
+                        closeDetailModal();
+                        
+                        // 重新加载列表数据
+                        if (typeof executeSearch === 'function') {
+                            executeSearch();
+                        } else if (typeof fetchExperts === 'function') {
+                            fetchExperts(
+                                document.getElementById('search-name') ? document.getElementById('search-name').value : '',
+                                document.getElementById('search-phone') ? document.getElementById('search-phone').value : '',
+                                document.getElementById('search-idcard') ? document.getElementById('search-idcard').value : '',
+                                document.getElementById('search-company') ? document.getElementById('search-company').value : '',
+                                document.getElementById('search-major') ? document.getElementById('search-major').value : '',
+                                document.getElementById('filter-status') ? document.getElementById('filter-status').value : ''
+                            );
                         }
                     })
                     .catch(err => {
                         newSaveProfileBtn.disabled = false;
-                        newSaveProfileBtn.innerHTML = '<span>💾</span> 保存基本资料';
-                        alert('⚠️ 网络连接错误，保存失败！');
+                        setModalEditable(true); // 出错后让页面保持在编辑状态，以便修正
+                        alert('⚠️ 保存失败：' + err.message);
                         console.error(err);
                     });
                 });
@@ -3441,68 +3412,7 @@
             const saveTip = document.getElementById('save-status-tip');
             if (saveTip) {
                 saveTip.style.display = 'none';
-            }
-            
-            // 绑定保存标记与备注按钮事件
-            const saveStatusBtn = document.getElementById('btn-save-status');
-            if (saveStatusBtn) {
-                const newSaveStatusBtn = saveStatusBtn.cloneNode(true);
-                saveStatusBtn.parentNode.replaceChild(newSaveStatusBtn, saveStatusBtn);
-                newSaveStatusBtn.addEventListener('click', () => {
-                    const newStatus = statusSelect ? statusSelect.value : '未获取';
-                    const newRemark = remarkInput ? remarkInput.value : '';
-                    newSaveStatusBtn.disabled = true;
-                    newSaveStatusBtn.innerText = '保存中...';
-                    
-                    fetch('/dlsgzs/api/update_status', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify({
-                            name: item.name,
-                            phone: item.phone,
-                            status: newStatus,
-                            remark: newRemark
-                        })
-                    })
-                    .then(res => res.json())
-                    .then(res => {
-                        newSaveStatusBtn.disabled = false;
-                        newSaveStatusBtn.innerText = '保存修改';
-                        if (res.success) {
-                            // 同步本地数据
-                            item.status = newStatus;
-                            item.remark = newRemark;
-                            // 重新渲染 JSON 文本展示
-                            if (rawJsonElement) {
-                                rawJsonElement.innerText = JSON.stringify(item, null, 4);
-                            }
-                            // 显示已保存提示
-                            if (saveTip) {
-                                saveTip.style.display = 'inline-flex';
-                                setTimeout(() => {
-                                    saveTip.style.display = 'none';
-                                }, 2000);
-                            }
-                            // 刷新列表中的卡片
-                            if (typeof renderCards === 'function') {
-                                renderCards();
-                            } else if (typeof renderExpertsGrid === 'function') {
-                                renderExpertsGrid();
-                            }
-                        } else {
-                            alert('⚠️ 保存修改失败：' + res.error);
                         }
-                    })
-                    .catch(err => {
-                        newSaveStatusBtn.disabled = false;
-                        newSaveStatusBtn.innerText = '保存修改';
-                        alert('⚠️ 网络错误，保存修改失败');
-                        console.error(err);
-                    });
-                });
-            }
             
             // 绑定删除专家按钮事件
             const deleteExpertBtn = document.getElementById('btn-detail-delete');
