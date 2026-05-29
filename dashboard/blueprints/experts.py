@@ -70,6 +70,16 @@ def get_photos_dir():
     os.makedirs(photos_dir, exist_ok=True)
     return photos_dir
 
+def get_db_conn():
+    """获取启用了 WAL 模式及 timeout=30 的 SQLite 连接"""
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path, timeout=30)
+    try:
+        conn.execute('PRAGMA journal_mode=WAL;')
+    except Exception:
+        pass
+    return conn
+
 def update_all_experts_stats(conn):
     """通过高性能聚合 SQL 重新计算并写入所有专家的参评次数和最后一次参评时间 (同一天内多次参评合并计算为 1 次)"""
     try:
@@ -101,175 +111,204 @@ def update_all_experts_stats(conn):
     except Exception as e:
         print(f"Failed to update experts stats: {e}")
 
+def update_expert_stats_by_idcard(conn, id_card):
+    """根据身份证号重新计算并更新单个专家的参评次数和最后一次参评时间 (同一天内多次参评合并计算为 1 次)"""
+    if not id_card:
+        return
+    try:
+        c = conn.cursor()
+        update_sql = """
+        UPDATE experts 
+        SET 
+          project_count = COALESCE((
+            SELECT COUNT(DISTINCT 
+              CASE 
+                WHEN p.process_time IS NOT NULL AND LENGTH(TRIM(p.process_time)) >= 10 
+                THEN SUBSTR(TRIM(p.process_time), 1, 10)
+                ELSE 'empty_proj_' || p.id 
+              END
+            )
+            FROM project_experts pe 
+            JOIN projects p ON pe.project_id = p.id
+            WHERE pe.expert_id_card = ? AND pe.expert_id_card IS NOT NULL AND pe.expert_id_card != ''
+          ), 0),
+          last_project_time = (
+            SELECT MAX(p.process_time) 
+            FROM project_experts pe
+            JOIN projects p ON pe.project_id = p.id
+            WHERE pe.expert_id_card = ? AND pe.expert_id_card IS NOT NULL AND pe.expert_id_card != ''
+          )
+        WHERE id_card = ?
+        """
+        c.execute(update_sql, (id_card, id_card, id_card))
+        conn.commit()
+    except Exception as e:
+        print(f"Failed to update expert stats for {id_card}: {e}")
+
 def init_db():
     """初始化数据库表结构"""
-    db_path = get_db_path()
-    conn = sqlite3.connect(db_path)
-    # 开启 WAL 模式以提升并发读写性能
+    conn = get_db_conn()
     try:
-        conn.execute('PRAGMA journal_mode=WAL;')
-    except Exception:
-        pass
-    c = conn.cursor()
-    # 专家信息表
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS experts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            phone TEXT NOT NULL,
-            id_card TEXT,
-            company TEXT,
-            major TEXT,
-            photo_path TEXT,
-            raw_json TEXT,
-            status TEXT DEFAULT '未获取',
-            remark TEXT DEFAULT '',
-            project_count INTEGER DEFAULT 0,
-            last_project_time TEXT,
-            created_at TEXT
-        )
-    ''')
-    # 创建唯一索引以支撑高效查询与去重判断
-    c.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_experts_name_phone ON experts(name, phone)')
-    # 创建普通索引以支撑按状态高效筛选与快速排序
-    c.execute('CREATE INDEX IF NOT EXISTS idx_experts_status ON experts(status)')
-    # 建立手机号与身份证号索引，加快高频精准/模糊匹配检索
-    c.execute('CREATE INDEX IF NOT EXISTS idx_experts_phone ON experts(phone)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_experts_id_card ON experts(id_card)')
-    
-    # 平滑升级旧数据库：增加 status 字段与 remark 字段，以及参评统计字段
-    try:
-        c.execute("ALTER TABLE experts ADD COLUMN status TEXT DEFAULT '未获取'")
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        c.execute("ALTER TABLE experts ADD COLUMN remark TEXT DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        c.execute("ALTER TABLE experts ADD COLUMN project_count INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        c.execute("ALTER TABLE experts ADD COLUMN last_project_time TEXT")
-    except sqlite3.OperationalError:
-        pass
-
-    # 建立相应的索引以提升过滤速度
-    try:
-        c.execute('CREATE INDEX IF NOT EXISTS idx_experts_project_count ON experts(project_count)')
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        c.execute('CREATE INDEX IF NOT EXISTS idx_experts_last_project_time ON experts(last_project_time)')
-    except sqlite3.OperationalError:
-        pass
+        c = conn.cursor()
+        # 专家信息表
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS experts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                phone TEXT NOT NULL,
+                id_card TEXT,
+                company TEXT,
+                major TEXT,
+                photo_path TEXT,
+                raw_json TEXT,
+                status TEXT DEFAULT '未获取',
+                remark TEXT DEFAULT '',
+                project_count INTEGER DEFAULT 0,
+                last_project_time TEXT,
+                created_at TEXT
+            )
+        ''')
+        # 创建唯一索引以支撑高效查询与去重判断
+        c.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_experts_name_phone ON experts(name, phone)')
+        # 创建普通索引以支撑按状态高效筛选与快速排序
+        c.execute('CREATE INDEX IF NOT EXISTS idx_experts_status ON experts(status)')
+        # 建立手机号与身份证号索引，加快高频精准/模糊匹配检索
+        c.execute('CREATE INDEX IF NOT EXISTS idx_experts_phone ON experts(phone)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_experts_id_card ON experts(id_card)')
         
-    # 初始化项目及参评专家关系数据库表
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS projects (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_name TEXT NOT NULL UNIQUE,
-            process_time TEXT,
-            agent_name TEXT,
-            agent_dept TEXT,
-            project_name_en TEXT,
-            project_code TEXT,
-            project_id_str TEXT,
-            created_at TEXT
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS project_experts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id INTEGER,
-            expert_name TEXT NOT NULL,
-            expert_id_card TEXT NOT NULL,
-            expert_code TEXT,
-            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
-        )
-    ''')
-    # 建立高性能检索索引
-    c.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_name ON projects(project_name)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_project_experts_project_id ON project_experts(project_id)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_project_experts_id_card ON project_experts(expert_id_card)')
-        
-    # 平滑升级旧项目的 projects 表：增加新字段
-    try:
-        c.execute("ALTER TABLE projects ADD COLUMN project_name_en TEXT")
-    except sqlite3.OperationalError:
-        pass
-        
-    try:
-        c.execute("ALTER TABLE projects ADD COLUMN project_code TEXT")
-    except sqlite3.OperationalError:
-        pass
+        # 平滑升级旧数据库：增加 status 字段与 remark 字段，以及参评统计字段
+        try:
+            c.execute("ALTER TABLE experts ADD COLUMN status TEXT DEFAULT '未获取'")
+        except sqlite3.OperationalError:
+            pass
 
-    try:
-        c.execute("ALTER TABLE projects ADD COLUMN project_id_str TEXT")
-    except sqlite3.OperationalError:
-        pass
+        try:
+            c.execute("ALTER TABLE experts ADD COLUMN remark TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
 
-    # 标签管理与高性能倒排检索相关表
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS tags (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tag_name TEXT UNIQUE NOT NULL,
-            created_at TEXT
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS tag_majors (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tag_id INTEGER,
-            major_name TEXT NOT NULL
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS expert_majors (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            expert_id INTEGER,
-            major_name TEXT NOT NULL
-        )
-    ''')
-    c.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_tags_name ON tags(tag_name)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_tag_majors_tag_id ON tag_majors(tag_id)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_tag_majors_name ON tag_majors(major_name)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_expert_majors_exp_id ON expert_majors(expert_id)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_expert_majors_name ON expert_majors(major_name)')
+        try:
+            c.execute("ALTER TABLE experts ADD COLUMN project_count INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
 
-    conn.commit()
+        try:
+            c.execute("ALTER TABLE experts ADD COLUMN last_project_time TEXT")
+        except sqlite3.OperationalError:
+            pass
 
-    # 一次性历史专家专业同步到倒排表
-    try:
-        c.execute("SELECT COUNT(*) FROM expert_majors")
-        if c.fetchone()[0] == 0:
-            c.execute("SELECT COUNT(*) FROM experts")
-            if c.fetchone()[0] > 0:
-                print("🔄 正在初始化升级：同步历史专家专业到高性能倒排表中...")
-                c.execute("SELECT id, major FROM experts")
-                all_experts = c.fetchall()
-                for exp_id, major_str in all_experts:
-                    if major_str:
-                        majors = list(set([m.strip() for m in re.split(r'[,，]', major_str) if m.strip()]))
-                        for m in majors:
-                            c.execute("INSERT INTO expert_majors (expert_id, major_name) VALUES (?, ?)", (exp_id, m))
-                conn.commit()
-                print("✅ 历史专家专业同步初始化完成！")
-    except Exception as e:
-        print(f"⚠️ 历史专业同步初始化失败: {e}")
+        # 建立相应的索引以提升过滤速度
+        try:
+            c.execute('CREATE INDEX IF NOT EXISTS idx_experts_project_count ON experts(project_count)')
+        except sqlite3.OperationalError:
+            pass
 
-    # 一次性历史数据清洗重算
-    try:
-        update_all_experts_stats(conn)
-    except Exception as e:
-        print(f"⚠️ 历史专家参评统计初始化更新失败: {e}")
+        try:
+            c.execute('CREATE INDEX IF NOT EXISTS idx_experts_last_project_time ON experts(last_project_time)')
+        except sqlite3.OperationalError:
+            pass
+            
+        # 初始化项目及参评专家关系数据库表
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_name TEXT NOT NULL UNIQUE,
+                process_time TEXT,
+                agent_name TEXT,
+                agent_dept TEXT,
+                project_name_en TEXT,
+                project_code TEXT,
+                project_id_str TEXT,
+                created_at TEXT
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS project_experts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER,
+                expert_name TEXT NOT NULL,
+                expert_id_card TEXT NOT NULL,
+                expert_code TEXT,
+                FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+            )
+        ''')
+        # 建立高性能检索索引
+        c.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_name ON projects(project_name)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_project_experts_project_id ON project_experts(project_id)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_project_experts_id_card ON project_experts(expert_id_card)')
+            
+        # 平滑升级旧项目的 projects 表：增加新字段
+        try:
+            c.execute("ALTER TABLE projects ADD COLUMN project_name_en TEXT")
+        except sqlite3.OperationalError:
+            pass
+            
+        try:
+            c.execute("ALTER TABLE projects ADD COLUMN project_code TEXT")
+        except sqlite3.OperationalError:
+            pass
 
-    conn.close()
+        try:
+            c.execute("ALTER TABLE projects ADD COLUMN project_id_str TEXT")
+        except sqlite3.OperationalError:
+            pass
+
+        # 标签管理与高性能倒排检索相关表
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS tags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tag_name TEXT UNIQUE NOT NULL,
+                created_at TEXT
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS tag_majors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tag_id INTEGER,
+                major_name TEXT NOT NULL
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS expert_majors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                expert_id INTEGER,
+                major_name TEXT NOT NULL
+            )
+        ''')
+        c.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_tags_name ON tags(tag_name)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_tag_majors_tag_id ON tag_majors(tag_id)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_tag_majors_name ON tag_majors(major_name)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_expert_majors_exp_id ON expert_majors(expert_id)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_expert_majors_name ON expert_majors(major_name)')
+
+        conn.commit()
+
+        # 一次性历史专家专业同步到倒排表
+        try:
+            c.execute("SELECT COUNT(*) FROM expert_majors")
+            if c.fetchone()[0] == 0:
+                c.execute("SELECT COUNT(*) FROM experts")
+                if c.fetchone()[0] > 0:
+                    print("🔄 正在初始化升级：同步历史专家专业到高性能倒排表中...")
+                    c.execute("SELECT id, major FROM experts")
+                    all_experts = c.fetchall()
+                    for exp_id, major_str in all_experts:
+                        if major_str:
+                            majors = list(set([m.strip() for m in re.split(r'[,，]', major_str) if m.strip()]))
+                            for m in majors:
+                                c.execute("INSERT INTO expert_majors (expert_id, major_name) VALUES (?, ?)", (exp_id, m))
+                    conn.commit()
+                    print("✅ 历史专家专业同步初始化完成！")
+        except Exception as e:
+            print(f"⚠️ 历史专业同步初始化失败: {e}")
+
+        # 一次性历史数据清洗重算
+        try:
+            update_all_experts_stats(conn)
+        except Exception as e:
+            print(f"⚠️ 历史专家参评统计初始化更新失败: {e}")
+    finally:
+        conn.close()
 
 def sync_expert_majors(conn, expert_id, major_str):
     """同步单个专家的专业到倒排表 (支持重写和更新)"""
@@ -289,8 +328,7 @@ def parse_and_import_md(file_path):
     if not os.path.exists(file_path):
         return 0, 0, 0
     
-    db_path = get_db_path()
-    conn = sqlite3.connect(db_path)
+    conn = get_db_conn()
     c = conn.cursor()
     
     now_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -533,10 +571,7 @@ def api_upload():
             return jsonify({"success": False, "error": "表格中必须包含“姓名”和“电话”两列，解析失败"}), 400
 
         # 写入数据库与照片复制
-        db_path = get_db_path()
-        conn = sqlite3.connect(db_path)
-        c = conn.cursor()
-        
+        conn = get_db_conn()
         imported_count = 0
         matched_photo_count = 0
         total_in_file = 0
@@ -547,210 +582,213 @@ def api_upload():
         # 记录本次操作的时间
         now_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        for _, row in df.iterrows():
-            name = str(row.get(col_mapping.get('name', ''), '')).strip()
-            phone = str(row.get(col_mapping.get('phone', ''), '')).strip()
-            
-            # 清理电话格式（去除非数字，去掉浮点数表示如 .0）
-            if phone.endswith('.0'):
-                phone = phone[:-2]
-            phone = re.sub(r'\D', '', phone)
-            
-            if not name or not phone:
-                continue
+        try:
+            c = conn.cursor()
+            for _, row in df.iterrows():
+                name = str(row.get(col_mapping.get('name', ''), '')).strip()
+                phone = str(row.get(col_mapping.get('phone', ''), '')).strip()
                 
-            total_in_file += 1
+                # 清理电话格式（去除非数字，去掉浮点数表示如 .0）
+                if phone.endswith('.0'):
+                    phone = phone[:-2]
+                phone = re.sub(r'\D', '', phone)
                 
-            company = str(row.get(col_mapping.get('company', ''), '')).strip()
-            id_card = str(row.get(col_mapping.get('id_card', ''), '')).strip()
-            if id_card.endswith('.0'):
-                id_card = id_card[:-2]
-                
-            major = str(row.get(col_mapping.get('major', ''), '')).strip()
-            raw_json = str(row.get(col_mapping.get('raw_json', ''), '')).strip()
-
-            # 照片关联与去重覆盖逻辑
-            # 照片可能命名为 "{姓名}_{手机号}.jpg"
-            photo_key = f"{name}_{phone}".lower()
-            photo_path_db = None
-            
-            # 搜集所有符合条件的图片
-            matched_photos = []
-            
-            # 1. 查找精确匹配
-            if photo_key in photos:
-                matched_photos.append(photos[photo_key])
-            
-            # 2. 查找模糊匹配（含有姓名和电话）
-            for k, path in photos.items():
-                if name.lower() in k and phone in k:
-                    if path not in matched_photos:
-                        matched_photos.append(path)
-            
-            if matched_photos:
-                # 排序机制：优先展示文件名（不含扩展名）以 `_1` 或 `-1` 结尾的照片，其他按序号递增
-                def get_photo_sort_key(path_str):
-                    fname = os.path.splitext(os.path.basename(path_str))[0].strip()
-                    # 匹配最后的 _数字 或者是 -数字（限制1-3位长度以避免误匹配手机号）
-                    match = re.search(r'[-_](\d{1,3})$', fname)
-                    if match:
-                        num = int(match.group(1))
-                        if num == 1:
-                            return (0, 0) # 优先级最高
-                        else:
-                            return (2, num) # 排在无序号之后，按数字升序
-                    else:
-                        return (1, 0) # 无序号后缀的排在第二位
-                
-                matched_photos.sort(key=get_photo_sort_key)
-                
-                # 复制所有匹配的图片到静态资源目录
-                copied_paths = []
-                for p_file in matched_photos:
-                    ext = os.path.splitext(p_file)[1].lower()
-                    base_fname = os.path.splitext(os.path.basename(p_file))[0].strip().replace(" ", "").lower()
-                    dest_filename = f"{base_fname}{ext}"
-                    dest_path = os.path.join(photos_dest_dir, dest_filename)
-                    # 采用事务型原子性覆盖写入，确保物理文件名大小写与数据库中存储的一致（防止在Linux等大小写敏感系统上发生404图片无法访问的问题）
-                    # 同时也规避了写入时损坏/丢失原照片的风险。如果覆盖过程中出现任何错误，将自动回滚还原原照片，确保原有照片能够继续正常查看。
-                    backup_path = dest_path + ".bak"
-                    temp_write_path = dest_path + ".tmp"
-                    has_backup = False
+                if not name or not phone:
+                    continue
                     
-                    try:
-                        # 1. 如果旧文件存在，先做备份重命名，不直接删除
-                        if os.path.exists(dest_path):
-                            if os.path.exists(backup_path):
+                total_in_file += 1
+                    
+                company = str(row.get(col_mapping.get('company', ''), '')).strip()
+                id_card = str(row.get(col_mapping.get('id_card', ''), '')).strip()
+                if id_card.endswith('.0'):
+                    id_card = id_card[:-2]
+                    
+                major = str(row.get(col_mapping.get('major', ''), '')).strip()
+                raw_json = str(row.get(col_mapping.get('raw_json', ''), '')).strip()
+
+                # 照片关联与去重覆盖逻辑
+                # 照片可能命名为 "{姓名}_{手机号}.jpg"
+                photo_key = f"{name}_{phone}".lower()
+                photo_path_db = None
+                
+                # 搜集所有符合条件的图片
+                matched_photos = []
+                
+                # 1. 查找精确匹配
+                if photo_key in photos:
+                    matched_photos.append(photos[photo_key])
+                
+                # 2. 查找模糊匹配（含有姓名和电话）
+                for k, path in photos.items():
+                    if name.lower() in k and phone in k:
+                        if path not in matched_photos:
+                            matched_photos.append(path)
+                
+                if matched_photos:
+                    # 排序机制：优先展示文件名（不含扩展名）以 `_1` 或 `-1` 结尾的照片，其他按序号递增
+                    def get_photo_sort_key(path_str):
+                        fname = os.path.splitext(os.path.basename(path_str))[0].strip()
+                        # 匹配最后的 _数字 或者是 -数字（限制1-3位长度以避免误匹配手机号）
+                        match = re.search(r'[-_](\d{1,3})$', fname)
+                        if match:
+                            num = int(match.group(1))
+                            if num == 1:
+                                return (0, 0) # 优先级最高
+                            else:
+                                return (2, num) # 排在无序号之后，按数字升序
+                        else:
+                            return (1, 0) # 无序号后缀的排在第二位
+                    
+                    matched_photos.sort(key=get_photo_sort_key)
+                    
+                    # 复制所有匹配的图片到静态资源目录
+                    copied_paths = []
+                    for p_file in matched_photos:
+                        ext = os.path.splitext(p_file)[1].lower()
+                        base_fname = os.path.splitext(os.path.basename(p_file))[0].strip().replace(" ", "").lower()
+                        dest_filename = f"{base_fname}{ext}"
+                        dest_path = os.path.join(photos_dest_dir, dest_filename)
+                        # 采用事务型原子性覆盖写入，确保物理文件名大小写与数据库中存储的一致（防止在Linux等大小写敏感系统上发生404图片无法访问的问题）
+                        # 同时也规避了写入时损坏/丢失原照片的风险。如果覆盖过程中出现任何错误，将自动回滚还原原照片，确保原有照片能够继续正常查看。
+                        backup_path = dest_path + ".bak"
+                        temp_write_path = dest_path + ".tmp"
+                        has_backup = False
+                        
+                        try:
+                            # 1. 如果旧文件存在，先做备份重命名，不直接删除
+                            if os.path.exists(dest_path):
+                                if os.path.exists(backup_path):
+                                    try:
+                                        os.remove(backup_path)
+                                    except Exception:
+                                        pass
+                                try:
+                                    os.rename(dest_path, backup_path)
+                                    has_backup = True
+                                except Exception:
+                                    # 如果 rename 失败（如文件锁定），不进行移动，后面直接写 temp 并尝试覆盖
+                                    pass
+                            
+                            # 2. 写入新图片内容到临时文件
+                            with open(p_file, 'rb') as f_src:
+                                img_content = f_src.read()
+                            with open(temp_write_path, 'wb') as f_dest:
+                                f_dest.write(img_content)
+                                f_dest.flush()
+                                try:
+                                    os.fsync(f_dest.fileno())
+                                except Exception:
+                                    pass
+                            
+                            # 3. 将临时文件重命名为目标照片文件
+                            if os.path.exists(dest_path) and not has_backup:
+                                # 如果之前重命名备份失败了，这里尝试删除旧照片
+                                try:
+                                    os.remove(dest_path)
+                                except Exception:
+                                    pass
+                            
+                            os.rename(temp_write_path, dest_path)
+                            
+                            # 4. 成功后清理备份文件
+                            if has_backup and os.path.exists(backup_path):
                                 try:
                                     os.remove(backup_path)
                                 except Exception:
                                     pass
-                            try:
-                                os.rename(dest_path, backup_path)
-                                has_backup = True
-                            except Exception:
-                                # 如果 rename 失败（如文件锁定），不进行移动，后面直接写 temp 并尝试覆盖
-                                pass
-                        
-                        # 2. 写入新图片内容到临时文件
-                        with open(p_file, 'rb') as f_src:
-                            img_content = f_src.read()
-                        with open(temp_write_path, 'wb') as f_dest:
-                            f_dest.write(img_content)
-                            f_dest.flush()
-                            try:
-                                os.fsync(f_dest.fileno())
-                            except Exception:
-                                pass
-                        
-                        # 3. 将临时文件重命名为目标照片文件
-                        if os.path.exists(dest_path) and not has_backup:
-                            # 如果之前重命名备份失败了，这里尝试删除旧照片
-                            try:
-                                os.remove(dest_path)
-                            except Exception:
-                                pass
-                        
-                        os.rename(temp_write_path, dest_path)
-                        
-                        # 4. 成功后清理备份文件
-                        if has_backup and os.path.exists(backup_path):
-                            try:
-                                os.remove(backup_path)
-                            except Exception:
-                                pass
-                    except Exception as e:
-                        # 发生异常，进行防丢失灾难恢复
-                        # 清理临时文件
-                        if os.path.exists(temp_write_path):
-                            try:
-                                os.remove(temp_write_path)
-                            except Exception:
-                                pass
-                        
-                        # 如果有备份，将备份还原为目标文件
-                        if has_backup and os.path.exists(backup_path):
-                            try:
-                                if os.path.exists(dest_path):
-                                    os.remove(dest_path)
-                            except Exception:
-                                pass
-                            try:
-                                os.rename(backup_path, dest_path)
-                            except Exception:
+                        except Exception as e:
+                            # 发生异常，进行防丢失灾难恢复
+                            # 清理临时文件
+                            if os.path.exists(temp_write_path):
+                                try:
+                                    os.remove(temp_write_path)
+                                except Exception:
+                                    pass
+                            
+                            # 如果有备份，将备份还原为目标文件
+                            if has_backup and os.path.exists(backup_path):
+                                try:
+                                    if os.path.exists(dest_path):
+                                        os.remove(dest_path)
+                                except Exception:
+                                    pass
+                                try:
+                                    os.rename(backup_path, dest_path)
+                                except Exception:
+                                    try:
+                                        shutil.copy2(backup_path, dest_path)
+                                        os.remove(backup_path)
+                                    except Exception:
+                                        pass
+                            
+                            # 兜底：如果 dest_path 确实不复存在，但备份还挂在旁边，强制把它恢复回去
+                            if not os.path.exists(dest_path) and os.path.exists(backup_path):
                                 try:
                                     shutil.copy2(backup_path, dest_path)
-                                    os.remove(backup_path)
                                 except Exception:
                                     pass
-                        
-                        # 兜底：如果 dest_path 确实不复存在，但备份还挂在旁边，强制把它恢复回去
-                        if not os.path.exists(dest_path) and os.path.exists(backup_path):
-                            try:
-                                shutil.copy2(backup_path, dest_path)
-                            except Exception:
-                                pass
-                        
-                        # 最终兜底：如果新文件写入失败，且还原旧文件也因极其诡异的错误失败，而 dest_path 还是缺失，
-                        # 则尝试最后一次使用原始 shutil.copy2 写入
-                        if not os.path.exists(dest_path):
-                            try:
-                                shutil.copy2(p_file, dest_path)
-                            except Exception:
-                                pass
-                    copied_paths.append(f"/static/uploads/expert_photos/{dest_filename}")
-                    matched_photo_count += 1
-                
-                photo_path_db = ",".join(copied_paths)
-            else:
-                # 若本次压缩包内未包含该专家的图片，则保持数据库已存在的旧图片路径，不抹除
-                c.execute("SELECT photo_path FROM experts WHERE name = ? AND phone = ?", (name, phone))
-                row_exist = c.fetchone()
-                if row_exist:
-                    photo_path_db = row_exist[0]
+                            
+                            # 最终兜底：如果新文件写入失败，且还原旧文件也因极其诡异的错误失败，而 dest_path 还是缺失，
+                            # 则尝试最后一次使用原始 shutil.copy2 写入
+                            if not os.path.exists(dest_path):
+                                try:
+                                    shutil.copy2(p_file, dest_path)
+                                except Exception:
+                                    pass
+                        copied_paths.append(f"/static/uploads/expert_photos/{dest_filename}")
+                        matched_photo_count += 1
+                    
+                    photo_path_db = ",".join(copied_paths)
+                else:
+                    # 若本次压缩包内未包含该专家的图片，则保持数据库已存在的旧图片路径，不抹除
+                    c.execute("SELECT photo_path FROM experts WHERE name = ? AND phone = ?", (name, phone))
+                    row_exist = c.fetchone()
+                    if row_exist:
+                        photo_path_db = row_exist[0]
 
-            # 追加与去重覆盖：使用传统 SELECT 判断在 SQLite 下最兼容安全
-            c.execute("SELECT id, id_card, company, major, photo_path, raw_json FROM experts WHERE name = ? AND phone = ?", (name, phone))
-            exist_record = c.fetchone()
-            
-            if exist_record:
-                # 已经存在，执行更新操作
-                updated_count += 1
+                # 追加与去重覆盖：使用传统 SELECT 判断在 SQLite 下最兼容安全
+                c.execute("SELECT id, id_card, company, major, photo_path, raw_json FROM experts WHERE name = ? AND phone = ?", (name, phone))
+                exist_record = c.fetchone()
                 
-                db_id = exist_record[0]
-                db_id_card = exist_record[1]
-                db_company = exist_record[2]
-                db_major = exist_record[3]
-                db_photo_path = exist_record[4]
-                db_raw_json = exist_record[5]
-                
-                # 只有当新解析的字段非空时，才更新覆盖；若新解析为空（例如 Excel 中该字段为空或根本没有该列），则保留原数据库字段
-                final_id_card = id_card if id_card else db_id_card
-                final_company = company if company else db_company
-                final_major = major if major else db_major
-                final_photo_path = photo_path_db if photo_path_db else db_photo_path
-                final_raw_json = raw_json if raw_json else db_raw_json
-                
-                c.execute('''
-                    UPDATE experts 
-                    SET id_card = ?, company = ?, major = ?, photo_path = ?, raw_json = ?, created_at = ?
-                    WHERE id = ?
-                ''', (final_id_card, final_company, final_major, final_photo_path, final_raw_json, now_time, db_id))
-                sync_expert_majors(conn, db_id, final_major)
-            else:
-                # 不存在，执行插入（追加）操作
-                added_count += 1
-                c.execute('''
-                    INSERT INTO experts (name, phone, id_card, company, major, photo_path, raw_json, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (name, phone, id_card, company, major, photo_path_db, raw_json, now_time))
-                new_id = c.lastrowid
-                sync_expert_majors(conn, new_id, major)
-                
-            imported_count += 1
+                if exist_record:
+                    # 已经存在，执行更新操作
+                    updated_count += 1
+                    
+                    db_id = exist_record[0]
+                    db_id_card = exist_record[1]
+                    db_company = exist_record[2]
+                    db_major = exist_record[3]
+                    db_photo_path = exist_record[4]
+                    db_raw_json = exist_record[5]
+                    
+                    # 只有当新解析的字段非空时，才更新覆盖；若新解析为空（例如 Excel 中该字段为空或根本没有该列），则保留原数据库字段
+                    final_id_card = id_card if id_card else db_id_card
+                    final_company = company if company else db_company
+                    final_major = major if major else db_major
+                    final_photo_path = photo_path_db if photo_path_db else db_photo_path
+                    final_raw_json = raw_json if raw_json else db_raw_json
+                    
+                    c.execute('''
+                        UPDATE experts 
+                        SET id_card = ?, company = ?, major = ?, photo_path = ?, raw_json = ?, created_at = ?
+                        WHERE id = ?
+                    ''', (final_id_card, final_company, final_major, final_photo_path, final_raw_json, now_time, db_id))
+                    sync_expert_majors(conn, db_id, final_major)
+                else:
+                    # 不存在，执行插入（追加）操作
+                    added_count += 1
+                    c.execute('''
+                        INSERT INTO experts (name, phone, id_card, company, major, photo_path, raw_json, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                      ''', (name, phone, id_card, company, major, photo_path_db, raw_json, now_time))
+                    new_id = c.lastrowid
+                    sync_expert_majors(conn, new_id, major)
+                    
+                imported_count += 1
 
-        conn.commit()
-        conn.close()
+            conn.commit()
+        finally:
+            conn.close()
         
         md_message = ""
         if md_file:
@@ -763,9 +801,11 @@ def api_upload():
         
         # 联动触发更新
         try:
-            update_conn = sqlite3.connect(db_path)
-            update_all_experts_stats(update_conn)
-            update_conn.close()
+            update_conn = get_db_conn()
+            try:
+                update_all_experts_stats(update_conn)
+            finally:
+                update_conn.close()
         except Exception as e:
             print(f"Error updating expert stats after upload: {e}")
 
@@ -798,9 +838,11 @@ def api_upload_md():
             proj_total = proj_added + proj_updated
             # 联动触发更新
             try:
-                update_conn = sqlite3.connect(get_db_path())
-                update_all_experts_stats(update_conn)
-                update_conn.close()
+                update_conn = get_db_conn()
+                try:
+                    update_all_experts_stats(update_conn)
+                finally:
+                    update_conn.close()
             except Exception as e:
                 print(f"Error updating expert stats after upload_md: {e}")
             _log_action("导入项目关系MD", f"导入项目 {proj_total} 个（新增 {proj_added} 个，覆盖 {proj_updated} 个），关联参评专家 {rel_count} 人次。")
@@ -836,44 +878,43 @@ def api_search_projects():
         
     offset = (page - 1) * limit
     
-    db_path = get_db_path()
-    conn = sqlite3.connect(db_path)
+    conn = get_db_conn()
     conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    
-    conditions = []
-    params = []
-    
-    if project_name:
-        conditions.append("p.project_name LIKE ?")
-        params.append(f"%{project_name}%")
-        
-    if expert_name:
-        conditions.append("pe.expert_name LIKE ?")
-        params.append(f"%{expert_name}%")
-        
-    if expert_id_card:
-        conditions.append("pe.expert_id_card LIKE ?")
-        params.append(f"%{expert_id_card}%")
-        
-    if min_year:
-        if len(min_year) == 4:
-            process_time_limit = f"{min_year}-01-01 00:00:00"
-        else:
-            process_time_limit = f"{min_year} 00:00:00"
-        conditions.append("p.process_time >= ?")
-        params.append(process_time_limit)
-        
-    # 1. 检索符合条件的 DISTINCT 项目总数
-    count_sql = """
-        SELECT COUNT(DISTINCT p.id)
-        FROM projects p
-        LEFT JOIN project_experts pe ON p.id = pe.project_id
-    """
-    if conditions:
-        count_sql += " WHERE " + " AND ".join(conditions)
-        
     try:
+        c = conn.cursor()
+        
+        conditions = []
+        params = []
+        
+        if project_name:
+            conditions.append("p.project_name LIKE ?")
+            params.append(f"%{project_name}%")
+            
+        if expert_name:
+            conditions.append("pe.expert_name LIKE ?")
+            params.append(f"%{expert_name}%")
+            
+        if expert_id_card:
+            conditions.append("pe.expert_id_card LIKE ?")
+            params.append(f"%{expert_id_card}%")
+            
+        if min_year:
+            if len(min_year) == 4:
+                process_time_limit = f"{min_year}-01-01 00:00:00"
+            else:
+                process_time_limit = f"{min_year} 00:00:00"
+            conditions.append("p.process_time >= ?")
+            params.append(process_time_limit)
+            
+        # 1. 检索符合条件的 DISTINCT 项目总数
+        count_sql = """
+            SELECT COUNT(DISTINCT p.id)
+            FROM projects p
+            LEFT JOIN project_experts pe ON p.id = pe.project_id
+        """
+        if conditions:
+            count_sql += " WHERE " + " AND ".join(conditions)
+            
         c.execute(count_sql, params)
         total = c.fetchone()[0]
         
@@ -895,24 +936,31 @@ def api_search_projects():
         project_rows = c.fetchall()
         
         results = []
-        for p_row in project_rows:
-            p_id = p_row['id']
-            # 查询该项目下的全部专家
-            c.execute("""
-                SELECT expert_name, expert_id_card, expert_code 
+        project_ids = [p_row['id'] for p_row in project_rows]
+        
+        # 批量拉取所有相关项目的专家数据，消除 N+1 查询性能瓶颈
+        experts_map = {}
+        if project_ids:
+            placeholders = ",".join(["?"] * len(project_ids))
+            c.execute(f"""
+                SELECT project_id, expert_name, expert_id_card, expert_code 
                 FROM project_experts 
-                WHERE project_id = ?
-            """, (p_id,))
+                WHERE project_id IN ({placeholders})
+            """, project_ids)
             expert_rows = c.fetchall()
-            
-            experts_list = []
             for e_row in expert_rows:
-                experts_list.append({
+                p_id = e_row['project_id']
+                if p_id not in experts_map:
+                    experts_map[p_id] = []
+                experts_map[p_id].append({
                     "name": e_row['expert_name'],
                     "id_card": e_row['expert_id_card'],
                     "code": e_row['expert_code']
                 })
-                
+        
+        for p_row in project_rows:
+            p_id = p_row['id']
+            experts_list = experts_map.get(p_id, [])
             results.append({
                 "id": p_id,
                 "project_name": p_row['project_name'],
@@ -946,11 +994,9 @@ def api_detail_by_idcard():
     if not id_card:
         return jsonify({"success": False, "error": "身份证号不能为空"}), 400
         
-    db_path = get_db_path()
-    conn = sqlite3.connect(db_path)
-    c = conn.cursor()
-    
+    conn = get_db_conn()
     try:
+        c = conn.cursor()
         c.execute("SELECT name, phone FROM experts WHERE id_card = ?", (id_card,))
         row = c.fetchone()
         
@@ -986,100 +1032,100 @@ def api_search():
     project_count = request.args.get('project_count', '').strip()
     last_project_time = request.args.get('last_project_time', '').strip()
     
-    db_path = get_db_path()
-    conn = sqlite3.connect(db_path)
+    conn = get_db_conn()
     conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    
-    conditions = []
-    params = []
-    
-    # 兼容老版全局搜索
-    if q:
-        conditions.append("(name LIKE ? OR phone LIKE ? OR id_card LIKE ? OR major LIKE ? OR company LIKE ?)")
-        query_str = f"%{q}%"
-        params.extend([query_str, query_str, query_str, query_str, query_str])
+    try:
+        c = conn.cursor()
+        conditions = []
+        params = []
         
-    # 新版四条件独立模糊搜索
-    if name:
-        # 将输入按半角/全角空格拆分成多个关键词，支持如输入 "孟 霞" 模糊匹配 "孟艳霞"
-        name_parts = [p.strip() for p in re.split(r'[\s　]+', name) if p.strip()]
-        if name_parts:
-            name_conds = []
-            for part in name_parts:
-                name_conds.append("name LIKE ?")
-                params.append(f"%{part}%")
-            conditions.append(f"({' AND '.join(name_conds)})")
-        
-    if phone:
-        cleaned_phone = phone.replace(" ", "")
-        conditions.append("phone LIKE ?")
-        params.append(f"%{cleaned_phone}%")
-        
-    if id_card:
-        cleaned_id = id_card.replace(" ", "")
-        conditions.append("id_card LIKE ?")
-        params.append(f"%{cleaned_id}%")
-        
-    if company:
-        cleaned_company = company.replace(" ", "")
-        conditions.append("company LIKE ?")
-        params.append(f"%{cleaned_company}%")
-        
-    if major:
-        cleaned_major = major.replace(" ", "")
-        conditions.append("major LIKE ?")
-        params.append(f"%{cleaned_major}%")
-        
-    if status:
-        conditions.append("status = ?")
-        params.append(status)
-        
-    if project_count.isdigit():
-        conditions.append("project_count >= ?")
-        params.append(int(project_count))
-        
-    if last_project_time:
-        conditions.append("last_project_time >= ? AND last_project_time IS NOT NULL AND last_project_time != ''")
-        params.append(last_project_time)
-        
-    tag_ids_str = request.args.get('tag_ids', '').strip()
-    if tag_ids_str:
-        tag_id_list = [t.strip() for t in tag_ids_str.split(',') if t.strip()]
-        digit_ids = [t for t in tag_id_list if t.isdigit()]
-        has_unassigned = 'unassigned' in tag_id_list
-        
-        sub_conds = []
-        if digit_ids:
-            placeholders = ",".join(["?"] * len(digit_ids))
-            sub_conds.append(f"id IN (SELECT DISTINCT em.expert_id FROM expert_majors em JOIN tag_majors tm ON em.major_name = tm.major_name WHERE tm.tag_id IN ({placeholders}))")
-            params.extend([int(tid) for tid in digit_ids])
+        # 兼容老版全局搜索
+        if q:
+            conditions.append("(name LIKE ? OR phone LIKE ? OR id_card LIKE ? OR major LIKE ? OR company LIKE ?)")
+            query_str = f"%{q}%"
+            params.extend([query_str, query_str, query_str, query_str, query_str])
             
-        if has_unassigned:
-            sub_conds.append("id NOT IN (SELECT DISTINCT em.expert_id FROM expert_majors em JOIN tag_majors tm ON em.major_name = tm.major_name)")
+        # 新版四条件独立模糊搜索
+        if name:
+            # 将输入按半角/全角空格拆分成多个关键词，支持如输入 "孟 霞" 模糊匹配 "孟艳霞"
+            name_parts = [p.strip() for p in re.split(r'[\s　]+', name) if p.strip()]
+            if name_parts:
+                name_conds = []
+                for part in name_parts:
+                    name_conds.append("name LIKE ?")
+                    params.append(f"%{part}%")
+                conditions.append(f"({' AND '.join(name_conds)})")
             
-        if sub_conds:
-            conditions.append(f"({' OR '.join(sub_conds)})")
+        if phone:
+            cleaned_phone = phone.replace(" ", "")
+            conditions.append("phone LIKE ?")
+            params.append(f"%{cleaned_phone}%")
+            
+        if id_card:
+            cleaned_id = id_card.replace(" ", "")
+            conditions.append("id_card LIKE ?")
+            params.append(f"%{cleaned_id}%")
+            
+        if company:
+            cleaned_company = company.replace(" ", "")
+            conditions.append("company LIKE ?")
+            params.append(f"%{cleaned_company}%")
+            
+        if major:
+            cleaned_major = major.replace(" ", "")
+            conditions.append("major LIKE ?")
+            params.append(f"%{cleaned_major}%")
+            
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+            
+        if project_count.isdigit():
+            conditions.append("project_count >= ?")
+            params.append(int(project_count))
+            
+        if last_project_time:
+            conditions.append("last_project_time >= ? AND last_project_time IS NOT NULL AND last_project_time != ''")
+            params.append(last_project_time)
+            
+        tag_ids_str = request.args.get('tag_ids', '').strip()
+        if tag_ids_str:
+            tag_id_list = [t.strip() for t in tag_ids_str.split(',') if t.strip()]
+            digit_ids = [t for t in tag_id_list if t.isdigit()]
+            has_unassigned = 'unassigned' in tag_id_list
+            
+            sub_conds = []
+            if digit_ids:
+                placeholders = ",".join(["?"] * len(digit_ids))
+                sub_conds.append(f"id IN (SELECT DISTINCT em.expert_id FROM expert_majors em JOIN tag_majors tm ON em.major_name = tm.major_name WHERE tm.tag_id IN ({placeholders}))")
+                params.extend([int(tid) for tid in digit_ids])
+                
+            if has_unassigned:
+                sub_conds.append("id NOT IN (SELECT DISTINCT em.expert_id FROM expert_majors em JOIN tag_majors tm ON em.major_name = tm.major_name)")
+                
+            if sub_conds:
+                conditions.append(f"({' OR '.join(sub_conds)})")
+            
+        # 精炼 SQL：不 SELECT raw_json 大文本字段，并通过子查询获取每个专家所对应的标签字符串
+        sql = """
+            SELECT id, name, phone, id_card, company, major, photo_path, status, remark, project_count, last_project_time,
+                   (
+                       SELECT GROUP_CONCAT(t.tag_name, ',')
+                       FROM expert_majors em
+                       JOIN tag_majors tm ON em.major_name = tm.major_name
+                       JOIN tags t ON tm.tag_id = t.id
+                       WHERE em.expert_id = experts.id
+                   ) as tags_str
+            FROM experts
+        """
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY id DESC"
         
-    # 精炼 SQL：不 SELECT raw_json 大文本字段，并通过子查询获取每个专家所对应的标签字符串
-    sql = """
-        SELECT id, name, phone, id_card, company, major, photo_path, status, remark, project_count, last_project_time,
-               (
-                   SELECT GROUP_CONCAT(t.tag_name, ',')
-                   FROM expert_majors em
-                   JOIN tag_majors tm ON em.major_name = tm.major_name
-                   JOIN tags t ON tm.tag_id = t.id
-                   WHERE em.expert_id = experts.id
-               ) as tags_str
-        FROM experts
-    """
-    if conditions:
-        sql += " WHERE " + " AND ".join(conditions)
-    sql += " ORDER BY id DESC"
-    
-    c.execute(sql, params)
-    rows = c.fetchall()
-    conn.close()
+        c.execute(sql, params)
+        rows = c.fetchall()
+    finally:
+        conn.close()
     
     results = []
     for r in rows:
@@ -1116,9 +1162,8 @@ def api_detail():
     if not name or not phone:
         return jsonify({"success": False, "error": "姓名和手机号不能为空"}), 400
         
-    db_path = get_db_path()
+    conn = get_db_conn()
     try:
-        conn = sqlite3.connect(db_path)
         c = conn.cursor()
         
         # 1. 命中联合唯一索引 idx_experts_name_phone，获取详情 json
@@ -1146,12 +1191,12 @@ def api_detail():
             tag_rows = c.fetchall()
             tags = [tr[0] for tr in tag_rows if tr[0]]
             
-        conn.close()
-        
         _log_action("查看专家详情", f"姓名: {name}, 电话: {phone}")
         return jsonify({"success": True, "details": parsed_json, "tags": tags})
     except Exception as e:
         return jsonify({"success": False, "error": f"查询专家详情失败: {str(e)}"}), 500
+    finally:
+        conn.close()
 
 @experts_bp.route('/api/backup', methods=['GET'])
 def api_backup():
@@ -1275,16 +1320,20 @@ def api_clear():
         return jsonify({"success": False, "error": "安全校验失败：清空密码错误或无权限"}), 403
 
     # 1. 清空数据库表
-    db_path = get_db_path()
+    conn = get_db_conn()
     try:
-        conn = sqlite3.connect(db_path)
         c = conn.cursor()
         c.execute('DELETE FROM experts')
         c.execute('DELETE FROM expert_majors')
+        c.execute('DELETE FROM projects')
+        c.execute('DELETE FROM project_experts')
+        c.execute('DELETE FROM tags')
+        c.execute('DELETE FROM tag_majors')
         conn.commit()
-        conn.close()
     except Exception as e:
         return jsonify({"success": False, "error": f"清空数据库失败: {str(e)}"}), 500
+    finally:
+        conn.close()
         
     # 2. 删除存储的照片文件
     photos_dir = get_photos_dir()
@@ -1310,39 +1359,46 @@ def api_delete():
     if not name or not phone:
         return jsonify({"success": False, "error": "姓名和手机号不能为空"}), 400
         
-    db_path = get_db_path()
+    conn = get_db_conn()
     try:
-        conn = sqlite3.connect(db_path)
         c = conn.cursor()
         
-        # 查找图片路径并从磁盘删除
-        c.execute("SELECT photo_path FROM experts WHERE name = ? AND phone = ?", (name, phone))
+        # 查找图片路径与身份证号
+        c.execute("SELECT photo_path, id_card FROM experts WHERE name = ? AND phone = ?", (name, phone))
         row = c.fetchone()
-        if row and row[0]:
-            photo_paths = row[0].split(',')
-            photos_dir = get_photos_dir()
-            for p_path in photo_paths:
-                p_path = p_path.strip()
-                if p_path:
-                    filename = os.path.basename(p_path)
-                    physical_photo_path = os.path.join(photos_dir, filename)
-                    if os.path.exists(physical_photo_path):
-                        try:
-                            os.remove(physical_photo_path)
-                        except Exception:
-                            pass
+        if row:
+            photo_path = row[0]
+            id_card = row[1]
+            if photo_path:
+                photo_paths = photo_path.split(',')
+                photos_dir = get_photos_dir()
+                for p_path in photo_paths:
+                    p_path = p_path.strip()
+                    if p_path:
+                        filename = os.path.basename(p_path)
+                        physical_photo_path = os.path.join(photos_dir, filename)
+                        if os.path.exists(physical_photo_path):
+                            try:
+                                os.remove(physical_photo_path)
+                            except Exception:
+                                pass
+            
+            # 从项目评审专家关联表中删除该专家的评审记录
+            if id_card:
+                c.execute("DELETE FROM project_experts WHERE expert_id_card = ?", (id_card,))
         
         # 从倒排关系表中物理删除
         c.execute("DELETE FROM expert_majors WHERE expert_id IN (SELECT id FROM experts WHERE name = ? AND phone = ?)", (name, phone))
         # 从数据库中物理删除
         c.execute("DELETE FROM experts WHERE name = ? AND phone = ?", (name, phone))
         conn.commit()
-        conn.close()
         
         _log_action("删除评标专家", f"专家姓名: {name}, 电话: {phone}")
-        return jsonify({"success": True, "message": f"专家 {name} 及其身份证照已删除。"})
+        return jsonify({"success": True, "message": f"专家 {name} 及其相关照片与参评记录已删除。"})
     except Exception as e:
         return jsonify({"success": False, "error": f"删除专家失败: {str(e)}"}), 500
+    finally:
+        conn.close()
 
 
 @experts_bp.route('/api/update_status', methods=['POST'])
@@ -1360,17 +1416,17 @@ def api_update_status():
     if status not in ['已获取', '无法登录', '未获取']:
         return jsonify({"success": False, "error": "无效的标记状态，必须为：已获取、无法登录、未获取之一"}), 400
         
-    db_path = get_db_path()
+    conn = get_db_conn()
     try:
-        conn = sqlite3.connect(db_path)
         c = conn.cursor()
         c.execute("UPDATE experts SET status = ?, remark = ? WHERE name = ? AND phone = ?", (status, remark, name, phone))
         conn.commit()
-        conn.close()
         _log_action("更新专家状态", f"专家姓名: {name}, 电话: {phone}, 新状态: {status}, 备注: {remark}")
         return jsonify({"success": True, "message": f"专家 {name} 的状态与备注已成功更新。"})
     except Exception as e:
         return jsonify({"success": False, "error": f"更新专家状态/备注失败: {str(e)}"}), 500
+    finally:
+        conn.close()
 
 
 @experts_bp.route('/api/update_expert_profile', methods=['POST'])
@@ -1389,16 +1445,14 @@ def api_update_expert_profile():
     if not new_phone:
         return jsonify({"success": False, "error": "新的电话号码不能为空"}), 400
         
-    db_path = get_db_path()
+    conn = get_db_conn()
     try:
-        conn = sqlite3.connect(db_path)
         c = conn.cursor()
         
         # 1. 查找此专家是否存在
         c.execute("SELECT id, phone, photo_path FROM experts WHERE name = ? AND phone = ?", (old_name, old_phone))
         row = c.fetchone()
         if not row:
-            conn.close()
             return jsonify({"success": False, "error": f"未找到专家 {old_name} ({old_phone})"}), 404
             
         expert_id = row[0]
@@ -1410,7 +1464,6 @@ def api_update_expert_profile():
             c.execute("SELECT id FROM experts WHERE name = ? AND phone = ?", (old_name, new_phone))
             conflict = c.fetchone()
             if conflict:
-                conn.close()
                 return jsonify({"success": False, "error": f"修改失败：已存在相同姓名（{old_name}）和电话（{new_phone}）的其他专家，请核对后重试。"}), 409
                 
         # 3. 处理照片更换
@@ -1420,7 +1473,6 @@ def api_update_expert_profile():
             # 校验后缀
             ext = os.path.splitext(photo_file.filename)[1].lower()
             if ext not in ['.jpg', '.jpeg', '.png']:
-                conn.close()
                 return jsonify({"success": False, "error": "上传的照片格式不正确，仅支持 .jpg, .jpeg, .png"}), 400
                 
             # 保存新照片
@@ -1456,26 +1508,29 @@ def api_update_expert_profile():
         # 5. 同步倒排专业表
         sync_expert_majors(conn, expert_id, major)
         
-        # 6. 重算专家参评统计
-        update_all_experts_stats(conn)
+        # 6. 获取身份证号重算单个专家参评统计（代替耗时的全表重算）
+        c.execute("SELECT id_card FROM experts WHERE id = ?", (expert_id,))
+        row_id_card = c.fetchone()
+        if row_id_card and row_id_card[0]:
+            update_expert_stats_by_idcard(conn, row_id_card[0])
         
         conn.commit()
-        conn.close()
         
         _log_action("修改专家基本信息", f"专家姓名: {old_name}, 新电话: {new_phone}, 新单位: {company}, 新专业: {major}")
         return jsonify({"success": True, "message": f"专家 {old_name} 的个人资料已成功修改。"})
         
     except Exception as e:
         return jsonify({"success": False, "error": f"更新专家信息失败: {str(e)}"}), 500
+    finally:
+        conn.close()
 
 
 @experts_bp.route('/api/tags', methods=['GET', 'POST'])
 def api_tags():
-    db_path = get_db_path()
     if request.method == 'GET':
+        conn = get_db_conn()
+        conn.row_factory = sqlite3.Row
         try:
-            conn = sqlite3.connect(db_path)
-            conn.row_factory = sqlite3.Row
             c = conn.cursor()
             
             # 1. 查出所有标签
@@ -1495,10 +1550,11 @@ def api_tags():
                     "created_at": t['created_at']
                 })
             
-            conn.close()
             return jsonify({"success": True, "tags": tags_list})
         except Exception as e:
             return jsonify({"success": False, "error": f"获取标签列表失败: {str(e)}"}), 500
+        finally:
+            conn.close()
             
     elif request.method == 'POST':
         data = request.json or {}
@@ -1509,8 +1565,8 @@ def api_tags():
         if not tag_name:
             return jsonify({"success": False, "error": "标签名称不能为空"}), 400
             
+        conn = get_db_conn()
         try:
-            conn = sqlite3.connect(db_path)
             c = conn.cursor()
             now_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             
@@ -1519,7 +1575,6 @@ def api_tags():
                 # 检查同名冲突（排除自身）
                 c.execute("SELECT id FROM tags WHERE tag_name = ? AND id != ?", (tag_name, tag_id))
                 if c.fetchone():
-                    conn.close()
                     return jsonify({"success": False, "error": f"已存在同名的标签: {tag_name}"}), 400
                     
                 c.execute("UPDATE tags SET tag_name = ? WHERE id = ?", (tag_name, tag_id))
@@ -1531,7 +1586,6 @@ def api_tags():
                 # 检查同名
                 c.execute("SELECT id FROM tags WHERE tag_name = ?", (tag_name,))
                 if c.fetchone():
-                    conn.close()
                     return jsonify({"success": False, "error": f"已存在同名的标签: {tag_name}"}), 400
                     
                 c.execute("INSERT INTO tags (tag_name, created_at) VALUES (?, ?)", (tag_name, now_time))
@@ -1546,12 +1600,13 @@ def api_tags():
                     c.execute("INSERT INTO tag_majors (tag_id, major_name) VALUES (?, ?)", (real_tag_id, m))
                     
             conn.commit()
-            conn.close()
             
             _log_action(action_desc, f"标签: {tag_name}，包含专业共 {len(majors)} 个")
             return jsonify({"success": True, "message": "保存标签成功！", "tag_id": real_tag_id})
         except Exception as e:
             return jsonify({"success": False, "error": f"保存标签失败: {str(e)}"}), 500
+        finally:
+            conn.close()
 
 @experts_bp.route('/api/tags/delete', methods=['POST'])
 def api_delete_tag():
@@ -1560,9 +1615,8 @@ def api_delete_tag():
     if not tag_id:
         return jsonify({"success": False, "error": "缺失标签ID参数"}), 400
         
-    db_path = get_db_path()
+    conn = get_db_conn()
     try:
-        conn = sqlite3.connect(db_path)
         c = conn.cursor()
         
         # 查出标签名称用于日志记录
@@ -1576,25 +1630,26 @@ def api_delete_tag():
         c.execute("DELETE FROM tag_majors WHERE tag_id = ?", (tag_id,))
         
         conn.commit()
-        conn.close()
         
         _log_action("删除专家标签", f"标签: {tag_name}")
         return jsonify({"success": True, "message": "标签已成功删除。"})
     except Exception as e:
         return jsonify({"success": False, "error": f"删除标签失败: {str(e)}"}), 500
+    finally:
+        conn.close()
 
 @experts_bp.route('/api/all_majors', methods=['GET'])
 def api_all_majors():
-    db_path = get_db_path()
+    conn = get_db_conn()
     try:
-        conn = sqlite3.connect(db_path)
         c = conn.cursor()
         # 从倒排索引表中快速拉出所有非空的小专业
         c.execute("SELECT DISTINCT major_name FROM expert_majors WHERE major_name != '' ORDER BY major_name ASC")
         majors = [row[0] for row in c.fetchall()]
-        conn.close()
         return jsonify({"success": True, "majors": majors})
     except Exception as e:
         return jsonify({"success": False, "error": f"获取专业列表失败: {str(e)}"}), 500
+    finally:
+        conn.close()
 
 
