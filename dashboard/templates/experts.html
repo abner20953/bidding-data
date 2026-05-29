@@ -3128,6 +3128,435 @@
                 });
         }
 
+        function setupDetailModal(item) {
+            if (!item) return;
+            const modal = document.getElementById('detail-modal');
+            if (!modal) return;
+            
+            // 强力控制模态框可见性与交互，确保兼容性
+            modal.classList.add('active');
+            modal.classList.add('visible');
+            modal.style.opacity = '1';
+            modal.style.visibility = 'visible';
+            modal.style.pointerEvents = 'auto';
+            modal.style.display = 'flex';
+            
+            // 填充顶部身份卡片与输入框
+            const nameEl = document.getElementById('detail-title-name');
+            const phoneInput = document.getElementById('detail-input-phone');
+            const idcardEl = document.getElementById('detail-title-idcard');
+            const companyInput = document.getElementById('detail-input-company');
+            const majorInput = document.getElementById('detail-input-major');
+            
+            if (nameEl) nameEl.innerText = item.name || '-';
+            if (phoneInput) phoneInput.value = item.phone || '';
+            if (idcardEl) idcardEl.innerText = item.id_card || '未填身份证';
+            if (companyInput) companyInput.value = item.company || '';
+            if (majorInput) majorInput.value = item.major || '';
+            
+            // 重置新照片选择
+            let selectedPhotoFile = null;
+            const photoFileInput = document.getElementById('detail-photo-file-input');
+            if (photoFileInput) photoFileInput.value = '';
+            
+            // 渲染专家标签
+            renderDetailTags(item.tags);
+            
+            // 照片多图匹配与切换控制
+            const detailImg = document.getElementById('detail-img');
+            const errDiv = document.getElementById('detail-img-error');
+            const prevBtn = document.getElementById('photo-prev-btn');
+            const nextBtn = document.getElementById('photo-next-btn');
+            const indicator = document.getElementById('detail-photo-indicator');
+            
+            currentDetailPhotos = item.photo_path ? item.photo_path.split(',') : [];
+            currentDetailPhotoIndex = 0;
+            
+            function updateDetailPhotoShow() {
+                if (detailImg && errDiv) {
+                    if (currentDetailPhotos.length > 0) {
+                        const currentPath = currentDetailPhotos[currentDetailPhotoIndex].trim();
+                        detailImg.src = currentPath;
+                        detailImg.style.display = 'block';
+                        errDiv.style.display = 'none';
+                        detailImg.onclick = () => zoomPhoto(item.photo_path, currentDetailPhotoIndex);
+                        
+                        if (currentDetailPhotos.length > 1) {
+                            if (prevBtn) prevBtn.style.display = 'flex';
+                            if (nextBtn) nextBtn.style.display = 'flex';
+                            if (indicator) {
+                                indicator.style.display = 'block';
+                                indicator.innerText = `${currentDetailPhotoIndex + 1} / ${currentDetailPhotos.length}`;
+                            }
+                        } else {
+                            if (prevBtn) prevBtn.style.display = 'none';
+                            if (nextBtn) nextBtn.style.display = 'none';
+                            if (indicator) indicator.style.display = 'none';
+                        }
+                    } else {
+                        detailImg.src = '';
+                        detailImg.style.display = 'none';
+                        errDiv.style.display = 'flex';
+                        if (prevBtn) prevBtn.style.display = 'none';
+                        if (nextBtn) nextBtn.style.display = 'none';
+                        if (indicator) indicator.style.display = 'none';
+                    }
+                }
+            }
+            
+            if (prevBtn) {
+                prevBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    if (currentDetailPhotos.length > 1) {
+                        currentDetailPhotoIndex = (currentDetailPhotoIndex - 1 + currentDetailPhotos.length) % currentDetailPhotos.length;
+                        updateDetailPhotoShow();
+                    }
+                };
+            }
+            if (nextBtn) {
+                nextBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    if (currentDetailPhotos.length > 1) {
+                        currentDetailPhotoIndex = (currentDetailPhotoIndex + 1) % currentDetailPhotos.length;
+                        updateDetailPhotoShow();
+                    }
+                };
+            }
+            
+            updateDetailPhotoShow();
+            
+            // 绑定“更换照片”按钮事件
+            const changePhotoBtn = document.getElementById('btn-change-photo');
+            if (changePhotoBtn && photoFileInput) {
+                changePhotoBtn.onclick = (e) => {
+                    e.preventDefault();
+                    photoFileInput.click();
+                };
+                
+                photoFileInput.onchange = (e) => {
+                    const file = e.target.files[0];
+                    if (file) {
+                        const ext = file.name.split('.').pop().toLowerCase();
+                        if (!['jpg', 'jpeg', 'png'].includes(ext)) {
+                            alert('上传的照片格式不正确，仅支持 .jpg, .jpeg, .png');
+                            photoFileInput.value = '';
+                            return;
+                        }
+                        selectedPhotoFile = file;
+                        
+                        // 本地实时图片预览
+                        if (detailImg && errDiv) {
+                            detailImg.src = URL.createObjectURL(file);
+                            detailImg.style.display = 'block';
+                            errDiv.style.display = 'none';
+                            
+                            // 本地单图预览，隐藏多图指示器
+                            if (prevBtn) prevBtn.style.display = 'none';
+                            if (nextBtn) nextBtn.style.display = 'none';
+                            if (indicator) indicator.style.display = 'none';
+                        }
+                    }
+                };
+            }
+            
+            // 绑定“保存基本资料”按钮事件
+            const saveProfileBtn = document.getElementById('btn-save-expert-profile');
+            if (saveProfileBtn) {
+                // clone node to clear previous listeners
+                const newSaveProfileBtn = saveProfileBtn.cloneNode(true);
+                saveProfileBtn.parentNode.replaceChild(newSaveProfileBtn, saveProfileBtn);
+                
+                newSaveProfileBtn.addEventListener('click', () => {
+                    const newPhoneVal = phoneInput ? phoneInput.value.trim() : '';
+                    const companyVal = companyInput ? companyInput.value.trim() : '';
+                    const majorVal = majorInput ? majorInput.value.trim() : '';
+                    
+                    if (!newPhoneVal) {
+                        alert('手机号不能为空！');
+                        return;
+                    }
+                    
+                    newSaveProfileBtn.disabled = true;
+                    newSaveProfileBtn.innerHTML = '保存中...';
+                    
+                    const formData = new FormData();
+                    formData.append('old_name', item.name || '');
+                    formData.append('old_phone', item.phone || '');
+                    formData.append('new_phone', newPhoneVal);
+                    formData.append('company', companyVal);
+                    formData.append('major', majorVal);
+                    if (selectedPhotoFile) {
+                        formData.append('photo_file', selectedPhotoFile);
+                    }
+                    
+                    fetch('/dlsgzs/api/update_expert_profile', {
+                        method: 'POST',
+                        body: formData
+                    })
+                    .then(res => res.json())
+                    .then(res => {
+                        newSaveProfileBtn.disabled = false;
+                        newSaveProfileBtn.innerHTML = '<span>💾</span> 保存基本资料';
+                        if (res.success) {
+                            alert(res.message || '专家基本资料已成功保存！');
+                            closeDetailModal();
+                            // 重新加载列表数据
+                            if (typeof executeSearch === 'function') {
+                                executeSearch();
+                            } else if (typeof fetchExperts === 'function') {
+                                fetchExperts(
+                                    document.getElementById('search-name') ? document.getElementById('search-name').value : '',
+                                    document.getElementById('search-phone') ? document.getElementById('search-phone').value : '',
+                                    document.getElementById('search-idcard') ? document.getElementById('search-idcard').value : '',
+                                    document.getElementById('search-company') ? document.getElementById('search-company').value : '',
+                                    document.getElementById('search-major') ? document.getElementById('search-major').value : '',
+                                    document.getElementById('filter-status') ? document.getElementById('filter-status').value : ''
+                                );
+                            }
+                        } else {
+                            alert('⚠️ 保存基本资料失败：' + res.error);
+                        }
+                    })
+                    .catch(err => {
+                        newSaveProfileBtn.disabled = false;
+                        newSaveProfileBtn.innerHTML = '<span>💾</span> 保存基本资料';
+                        alert('⚠️ 网络连接错误，保存失败！');
+                        console.error(err);
+                    });
+                });
+            }
+            
+            // 整合完整 JSON (懒加载 details 并合并缓存)
+            const rawJsonElement = document.getElementById('val-raw-json');
+            if (rawJsonElement) {
+                if (item.details && Object.keys(item.details).length > 0) {
+                    rawJsonElement.innerText = JSON.stringify(item, null, 4);
+                } else {
+                    rawJsonElement.innerText = "正在加载原始档案，请稍候...";
+                    fetch(`/dlsgzs/api/detail?name=${encodeURIComponent(item.name)}&phone=${encodeURIComponent(item.phone)}`)
+                        .then(res => res.json())
+                        .then(res => {
+                            if (res.success) {
+                                item.details = res.details || {};
+                                item.tags = res.tags || item.tags || [];
+                                // 检查模态框当前显示的专家是否仍然是同一个，防止竞态条件导致渲染混乱
+                                const currentModalName = document.getElementById('detail-title-name') ? document.getElementById('detail-title-name').innerText : '';
+                                const currentModalPhone = document.getElementById('detail-input-phone') ? document.getElementById('detail-input-phone').value : '';
+                                if (currentModalName === item.name && currentModalPhone === item.phone) {
+                                    rawJsonElement.innerText = JSON.stringify(item, null, 4);
+                                    renderDetailTags(item.tags);
+                                }
+                            } else {
+                                rawJsonElement.innerText = `⚠️ 原始档案加载失败: ${res.error}`;
+                            }
+                        })
+                        .catch(err => {
+                            rawJsonElement.innerText = `⚠️ 网络错误，原始档案加载失败`;
+                            console.error(err);
+                        });
+                }
+            }
+            
+            // 反显状态标记与备注信息
+            const statusSelect = document.getElementById('detail-status-select');
+            if (statusSelect) {
+                statusSelect.value = item.status || '未获取';
+            }
+            const remarkInput = document.getElementById('detail-remark-input');
+            if (remarkInput) {
+                remarkInput.value = item.remark || '';
+            }
+            const saveTip = document.getElementById('save-status-tip');
+            if (saveTip) {
+                saveTip.style.display = 'none';
+            }
+            
+            // 绑定保存标记与备注按钮事件
+            const saveStatusBtn = document.getElementById('btn-save-status');
+            if (saveStatusBtn) {
+                const newSaveStatusBtn = saveStatusBtn.cloneNode(true);
+                saveStatusBtn.parentNode.replaceChild(newSaveStatusBtn, saveStatusBtn);
+                newSaveStatusBtn.addEventListener('click', () => {
+                    const newStatus = statusSelect ? statusSelect.value : '未获取';
+                    const newRemark = remarkInput ? remarkInput.value : '';
+                    newSaveStatusBtn.disabled = true;
+                    newSaveStatusBtn.innerText = '保存中...';
+                    
+                    fetch('/dlsgzs/api/update_status', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            name: item.name,
+                            phone: item.phone,
+                            status: newStatus,
+                            remark: newRemark
+                        })
+                    })
+                    .then(res => res.json())
+                    .then(res => {
+                        newSaveStatusBtn.disabled = false;
+                        newSaveStatusBtn.innerText = '保存修改';
+                        if (res.success) {
+                            // 同步本地数据
+                            item.status = newStatus;
+                            item.remark = newRemark;
+                            // 重新渲染 JSON 文本展示
+                            if (rawJsonElement) {
+                                rawJsonElement.innerText = JSON.stringify(item, null, 4);
+                            }
+                            // 显示已保存提示
+                            if (saveTip) {
+                                saveTip.style.display = 'inline-flex';
+                                setTimeout(() => {
+                                    saveTip.style.display = 'none';
+                                }, 2000);
+                            }
+                            // 刷新列表中的卡片
+                            if (typeof renderCards === 'function') {
+                                renderCards();
+                            } else if (typeof renderExpertsGrid === 'function') {
+                                renderExpertsGrid();
+                            }
+                        } else {
+                            alert('⚠️ 保存修改失败：' + res.error);
+                        }
+                    })
+                    .catch(err => {
+                        newSaveStatusBtn.disabled = false;
+                        newSaveStatusBtn.innerText = '保存修改';
+                        alert('⚠️ 网络错误，保存修改失败');
+                        console.error(err);
+                    });
+                });
+            }
+            
+            // 绑定删除专家按钮事件
+            const deleteExpertBtn = document.getElementById('btn-detail-delete');
+            if (deleteExpertBtn) {
+                const newDeleteExpertBtn = deleteExpertBtn.cloneNode(true);
+                deleteExpertBtn.parentNode.replaceChild(newDeleteExpertBtn, deleteExpertBtn);
+                newDeleteExpertBtn.addEventListener('click', () => {
+                    const pwd = prompt(`⚠️ 确定要物理删除专家 ${item.name} 及其身份证照吗？此操作不可恢复。\n请输入管理密码：`);
+                    if (pwd === null) {
+                        return;
+                    }
+                    if (pwd !== '108') {
+                        alert('❌ 密码错误，无权删除专家！');
+                        return;
+                    }
+                    
+                    newDeleteExpertBtn.disabled = true;
+                    newDeleteExpertBtn.innerText = '删除中...';
+                    
+                    fetch('/dlsgzs/api/delete', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            name: item.name,
+                            phone: item.phone
+                        })
+                    })
+                    .then(res => res.json())
+                    .then(res => {
+                        newDeleteExpertBtn.disabled = false;
+                        newDeleteExpertBtn.innerText = '删除专家';
+                        if (res.success) {
+                            closeDetailModal();
+                            alert('✅ ' + res.message);
+                            // 自动重新检索并刷新列表
+                            if (typeof executeSearch === 'function') {
+                                executeSearch();
+                            } else if (typeof fetchExperts === 'function') {
+                                fetchExperts(
+                                    document.getElementById('search-name') ? document.getElementById('search-name').value : '',
+                                    document.getElementById('search-phone') ? document.getElementById('search-phone').value : '',
+                                    document.getElementById('search-idcard') ? document.getElementById('search-idcard').value : '',
+                                    document.getElementById('search-company') ? document.getElementById('search-company').value : '',
+                                    document.getElementById('search-major') ? document.getElementById('search-major').value : '',
+                                    document.getElementById('filter-status') ? document.getElementById('filter-status').value : ''
+                                );
+                            }
+                        } else {
+                            alert('⚠️ 删除专家失败：' + res.error);
+                        }
+                    })
+                    .catch(err => {
+                        newDeleteExpertBtn.disabled = false;
+                        newDeleteExpertBtn.innerText = '删除专家';
+                        alert('⚠️ 网络错误，删除专家失败');
+                        console.error(err);
+                    });
+                });
+            }
+            
+            // 绑定复制按钮事件
+            const copyBtn = document.getElementById('btn-copy-json');
+            if (copyBtn) {
+                const newCopyBtn = copyBtn.cloneNode(true);
+                copyBtn.parentNode.replaceChild(newCopyBtn, copyBtn);
+                newCopyBtn.addEventListener('click', () => {
+                    navigator.clipboard.writeText(JSON.stringify(item, null, 4))
+                        .then(() => {
+                            const originalText = newCopyBtn.innerText;
+                            newCopyBtn.innerText = '✅ 已复制';
+                            newCopyBtn.style.background = 'rgba(16, 185, 129, 0.1)';
+                            newCopyBtn.style.color = '#10b981';
+                            newCopyBtn.style.borderColor = 'rgba(16, 185, 129, 0.2)';
+                            setTimeout(() => {
+                                newCopyBtn.innerText = originalText;
+                                newCopyBtn.style.background = '';
+                                newCopyBtn.style.color = '';
+                                newCopyBtn.style.borderColor = '';
+                            }, 2000);
+                        })
+                        .catch(err => {
+                            alert('复制失败，请手动选择复制：' + err);
+                        });
+                });
+            }
+            
+            // 绑定穿透参评项目检索按钮事件
+            const drillProjectBtn = document.getElementById('btn-detail-project-drill');
+            if (drillProjectBtn) {
+                const newDrillProjectBtn = drillProjectBtn.cloneNode(true);
+                drillProjectBtn.parentNode.replaceChild(newDrillProjectBtn, drillProjectBtn);
+                newDrillProjectBtn.addEventListener('click', () => {
+                    // 1. 关闭当前的专家档案模态框
+                    closeDetailModal();
+                    
+                    // 2. 填充项目评审查询输入框
+                    const projExpertNameInput = document.getElementById('search-project-expert-name');
+                    const projExpertIdcardInput = document.getElementById('search-project-expert-idcard');
+                    const projNameInput = document.getElementById('search-project-name');
+                    
+                    if (projExpertNameInput) projExpertNameInput.value = item.name || '';
+                    if (projExpertIdcardInput) projExpertIdcardInput.value = item.id_card || '';
+                    if (projNameInput) projNameInput.value = ''; // 清空可能残留的项目名称过滤
+                    
+                    // 3. 自动切换到“项目评审关系”选项卡并自动检索
+                    switchTab('projects');
+                });
+            }
+        }
+
+        function showDetails(index) {
+            try {
+                const item = currentExpertsData[index];
+                if (!item) {
+                    alert('未找到该专家的缓存数据，请刷新重试');
+                    return;
+                }
+                setupDetailModal(item);
+            } catch (err) {
+                alert('查看完整档案失败，错误：' + err.message);
+                console.error(err);
+            }
+        }
+
         function setupClearDatabase() {
             const clearBtn = document.getElementById('btn-clear');
             if (!clearBtn) {
@@ -3212,211 +3641,6 @@
             }
         }
 
-        function showDetails(index) {
-            try {
-                const item = currentExpertsData[index];
-                if (!item) {
-                    alert('未找到该专家的缓存数据，请刷新重试');
-                    return;
-                }
-                const modal = document.getElementById('detail-modal');
-                if (!modal) return;
-                
-                // 强力控制模态框可见性与交互，确保兼容性
-                modal.classList.add('active');
-                modal.classList.add('visible');
-                modal.style.opacity = '1';
-                modal.style.visibility = 'visible';
-                modal.style.pointerEvents = 'auto';
-                modal.style.display = 'flex';
-                
-                // 填充顶部身份卡片
-                const nameEl = document.getElementById('detail-title-name');
-                const phoneEl = document.getElementById('detail-title-phone');
-                const idcardEl = document.getElementById('detail-title-idcard');
-                const companyEl = document.getElementById('detail-title-company');
-                const majorEl = document.getElementById('detail-title-major');
-                
-                if (nameEl) nameEl.innerText = item.name || '-';
-                if (phoneEl) phoneEl.innerText = item.phone || '-';
-                if (idcardEl) idcardEl.innerText = item.id_card || '未填身份证';
-                if (companyEl) companyEl.innerText = item.company || '未知单位';
-                if (majorEl) majorEl.innerText = item.major || '未填专业';
-                
-                // 渲染专家标签
-                renderDetailTags(item.tags);
-                
-                // 照片多图匹配与切换控制
-                const detailImg = document.getElementById('detail-img');
-                const errDiv = document.getElementById('detail-img-error');
-                const prevBtn = document.getElementById('photo-prev-btn');
-                const nextBtn = document.getElementById('photo-next-btn');
-                const indicator = document.getElementById('detail-photo-indicator');
-                
-                currentDetailPhotos = item.photo_path ? item.photo_path.split(',') : [];
-                currentDetailPhotoIndex = 0;
-                
-                function updateDetailPhotoShow() {
-                    if (detailImg && errDiv) {
-                        if (currentDetailPhotos.length > 0) {
-                            const currentPath = currentDetailPhotos[currentDetailPhotoIndex].trim();
-                            detailImg.src = currentPath;
-                            detailImg.style.display = 'block';
-                            errDiv.style.display = 'none';
-                            detailImg.onclick = () => zoomPhoto(item.photo_path, currentDetailPhotoIndex);
-                            
-                            if (currentDetailPhotos.length > 1) {
-                                if (prevBtn) prevBtn.style.display = 'flex';
-                                if (nextBtn) nextBtn.style.display = 'flex';
-                                if (indicator) {
-                                    indicator.style.display = 'block';
-                                    indicator.innerText = `${currentDetailPhotoIndex + 1} / ${currentDetailPhotos.length}`;
-                                }
-                            } else {
-                                if (prevBtn) prevBtn.style.display = 'none';
-                                if (nextBtn) nextBtn.style.display = 'none';
-                                if (indicator) indicator.style.display = 'none';
-                            }
-                        } else {
-                            detailImg.src = '';
-                            detailImg.style.display = 'none';
-                            errDiv.style.display = 'flex';
-                            if (prevBtn) prevBtn.style.display = 'none';
-                            if (nextBtn) nextBtn.style.display = 'none';
-                            if (indicator) indicator.style.display = 'none';
-                        }
-                    }
-                }
-                
-                if (prevBtn) {
-                    prevBtn.onclick = (e) => {
-                        e.stopPropagation();
-                        if (currentDetailPhotos.length > 1) {
-                            currentDetailPhotoIndex = (currentDetailPhotoIndex - 1 + currentDetailPhotos.length) % currentDetailPhotos.length;
-                            updateDetailPhotoShow();
-                        }
-                    };
-                }
-                if (nextBtn) {
-                    nextBtn.onclick = (e) => {
-                        e.stopPropagation();
-                        if (currentDetailPhotos.length > 1) {
-                            currentDetailPhotoIndex = (currentDetailPhotoIndex + 1) % currentDetailPhotos.length;
-                            updateDetailPhotoShow();
-                        }
-                    };
-                }
-                
-                updateDetailPhotoShow();
-                
-                // 整合完整 JSON (懒加载 details 并合并缓存)
-                const rawJsonElement = document.getElementById('val-raw-json');
-                if (rawJsonElement) {
-                    if (item.details && Object.keys(item.details).length > 0) {
-                        rawJsonElement.innerText = JSON.stringify(item, null, 4);
-                    } else {
-                        rawJsonElement.innerText = "正在加载原始档案，请稍候...";
-                        fetch(`/dlsgzs/api/detail?name=${encodeURIComponent(item.name)}&phone=${encodeURIComponent(item.phone)}`)
-                            .then(res => res.json())
-                            .then(res => {
-                                if (res.success) {
-                                    item.details = res.details || {};
-                                    item.tags = res.tags || item.tags || [];
-                                    // 检查模态框当前显示的专家是否仍然是同一个，防止竞态条件导致渲染混乱
-                                    const currentModalName = document.getElementById('detail-title-name') ? document.getElementById('detail-title-name').innerText : '';
-                                    const currentModalPhone = document.getElementById('detail-title-phone') ? document.getElementById('detail-title-phone').innerText : '';
-                                    if (currentModalName === item.name && currentModalPhone === item.phone) {
-                                        rawJsonElement.innerText = JSON.stringify(item, null, 4);
-                                        renderDetailTags(item.tags);
-                                    }
-                                } else {
-                                    rawJsonElement.innerText = `⚠️ 原始档案加载失败: ${res.error}`;
-                                }
-                            })
-                            .catch(err => {
-                                rawJsonElement.innerText = `⚠️ 网络错误，原始档案加载失败`;
-                                console.error(err);
-                            });
-                    }
-                }
-                
-                // 反显状态标记与备注信息
-                const statusSelect = document.getElementById('detail-status-select');
-                if (statusSelect) {
-                    statusSelect.value = item.status || '未获取';
-                }
-                const remarkInput = document.getElementById('detail-remark-input');
-                if (remarkInput) {
-                    remarkInput.value = item.remark || '';
-                }
-                const saveTip = document.getElementById('save-status-tip');
-                if (saveTip) {
-                    saveTip.style.display = 'none';
-                }
-
-                // 绑定保存标记与备注按钮事件
-                const saveStatusBtn = document.getElementById('btn-save-status');
-                if (saveStatusBtn) {
-                    const newSaveStatusBtn = saveStatusBtn.cloneNode(true);
-                    saveStatusBtn.parentNode.replaceChild(newSaveStatusBtn, saveStatusBtn);
-                    newSaveStatusBtn.addEventListener('click', () => {
-                        const newStatus = statusSelect ? statusSelect.value : '未获取';
-                        const newRemark = remarkInput ? remarkInput.value : '';
-                        newSaveStatusBtn.disabled = true;
-                        newSaveStatusBtn.innerText = '保存中...';
-
-                        fetch('/dlsgzs/api/update_status', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json'
-                            },
-                            body: JSON.stringify({
-                                name: item.name,
-                                phone: item.phone,
-                                status: newStatus,
-                                remark: newRemark
-                            })
-                        })
-                        .then(res => res.json())
-                        .then(res => {
-                            newSaveStatusBtn.disabled = false;
-                            newSaveStatusBtn.innerText = '保存修改';
-                            if (res.success) {
-                                // 同步本地数据
-                                item.status = newStatus;
-                                item.remark = newRemark;
-                                // 重新渲染 JSON 文本展示
-                                if (rawJsonElement) {
-                                    rawJsonElement.innerText = JSON.stringify(item, null, 4);
-                                }
-                                // 显示已保存提示
-                                if (saveTip) {
-                                    saveTip.style.display = 'inline-flex';
-                                    setTimeout(() => {
-                                        saveTip.style.display = 'none';
-                                    }, 2000);
-                                }
-                                // 刷新列表中的卡片
-                                renderCards();
-                            } else {
-                                alert('⚠️ 保存修改失败：' + res.error);
-                            }
-                        })
-                        .catch(err => {
-                            newSaveStatusBtn.disabled = false;
-                            newSaveStatusBtn.innerText = '保存修改';
-                            alert('⚠️ 网络错误，保存修改失败');
-                            console.error(err);
-                        });
-                    });
-                }
-
-                // 绑定删除专家按钮事件
-                const deleteExpertBtn = document.getElementById('btn-detail-delete');
-                if (deleteExpertBtn) {
-                    const newDeleteExpertBtn = deleteExpertBtn.cloneNode(true);
-                    deleteExpertBtn.parentNode.replaceChild(newDeleteExpertBtn, deleteExpertBtn);
-                    newDeleteExpertBtn.addEventListener('click', () => {
                         const pwd = prompt(`⚠️ 确定要物理删除专家 ${item.name} 及其身份证照吗？此操作不可恢复。\n请输入管理密码：`);
                         if (pwd === null) {
                             return;
@@ -3935,195 +4159,7 @@
         function showExpertDetailDirectly(item) {
             try {
                 if (!item) return;
-                const modal = document.getElementById('detail-modal');
-                if (!modal) return;
-                
-                modal.classList.add('active');
-                modal.classList.add('visible');
-                modal.style.opacity = '1';
-                modal.style.visibility = 'visible';
-                modal.style.pointerEvents = 'auto';
-                modal.style.display = 'flex';
-                
-                const nameEl = document.getElementById('detail-title-name');
-                const phoneEl = document.getElementById('detail-title-phone');
-                const idcardEl = document.getElementById('detail-title-idcard');
-                const companyEl = document.getElementById('detail-title-company');
-                const majorEl = document.getElementById('detail-title-major');
-                
-                if (nameEl) nameEl.innerText = item.name || '-';
-                if (phoneEl) phoneEl.innerText = item.phone || '-';
-                if (idcardEl) idcardEl.innerText = item.id_card || '未填身份证';
-                if (companyEl) companyEl.innerText = item.company || '未知单位';
-                if (majorEl) majorEl.innerText = item.major || '未填专业';
-                
-                // 渲染专家标签
-                renderDetailTags(item.tags);
-                
-                const detailImg = document.getElementById('detail-img');
-                const errDiv = document.getElementById('detail-img-error');
-                const prevBtn = document.getElementById('photo-prev-btn');
-                const nextBtn = document.getElementById('photo-next-btn');
-                const indicator = document.getElementById('detail-photo-indicator');
-                
-                currentDetailPhotos = item.photo_path ? item.photo_path.split(',') : [];
-                currentDetailPhotoIndex = 0;
-                
-                function updateDetailPhotoShow() {
-                    if (detailImg && errDiv) {
-                        if (currentDetailPhotos.length > 0) {
-                            const currentPath = currentDetailPhotos[currentDetailPhotoIndex].trim();
-                            detailImg.src = currentPath;
-                            detailImg.style.display = 'block';
-                            errDiv.style.display = 'none';
-                            detailImg.onclick = () => zoomPhoto(item.photo_path, currentDetailPhotoIndex);
-                            
-                            if (currentDetailPhotos.length > 1) {
-                                if (prevBtn) prevBtn.style.display = 'flex';
-                                if (nextBtn) nextBtn.style.display = 'flex';
-                                if (indicator) {
-                                    indicator.style.display = 'block';
-                                    indicator.innerText = `${currentDetailPhotoIndex + 1} / ${currentDetailPhotos.length}`;
-                                }
-                            } else {
-                                if (prevBtn) prevBtn.style.display = 'none';
-                                if (nextBtn) nextBtn.style.display = 'none';
-                                if (indicator) indicator.style.display = 'none';
-                            }
-                        } else {
-                            detailImg.src = '';
-                            detailImg.style.display = 'none';
-                            errDiv.style.display = 'flex';
-                            if (prevBtn) prevBtn.style.display = 'none';
-                            if (nextBtn) nextBtn.style.display = 'none';
-                            if (indicator) indicator.style.display = 'none';
-                        }
-                    }
-                }
-                
-                if (prevBtn) {
-                    prevBtn.onclick = (e) => {
-                        e.stopPropagation();
-                        if (currentDetailPhotos.length > 1) {
-                            currentDetailPhotoIndex = (currentDetailPhotoIndex - 1 + currentDetailPhotos.length) % currentDetailPhotos.length;
-                            updateDetailPhotoShow();
-                        }
-                    };
-                }
-                if (nextBtn) {
-                    nextBtn.onclick = (e) => {
-                        e.stopPropagation();
-                        if (currentDetailPhotos.length > 1) {
-                            currentDetailPhotoIndex = (currentDetailPhotoIndex + 1) % currentDetailPhotos.length;
-                            updateDetailPhotoShow();
-                        }
-                    };
-                }
-                
-                updateDetailPhotoShow();
-                
-                const statusSelect = document.getElementById('detail-status-select');
-                const remarkInput = document.getElementById('detail-remark-input');
-                if (statusSelect) statusSelect.value = item.status || '未获取';
-                if (remarkInput) remarkInput.value = item.remark || '';
-                
-                const btnSave = document.getElementById('btn-save-status');
-                if (btnSave) {
-                    btnSave.onclick = () => {
-                        const statusVal = statusSelect ? statusSelect.value : '未获取';
-                        const remarkVal = remarkInput ? remarkInput.value : '';
-                        
-                        fetch('/dlsgzs/api/update_status', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                                name: item.name,
-                                phone: item.phone,
-                                status: statusVal,
-                                remark: remarkVal
-                            })
-                        })
-                        .then(res => res.json())
-                        .then(res => {
-                            if (res.success) {
-                                item.status = statusVal;
-                                item.remark = remarkVal;
-                                const tip = document.getElementById('save-status-tip');
-                                if (tip) {
-                                    tip.style.display = 'inline-flex';
-                                    setTimeout(() => { tip.style.display = 'none'; }, 2000);
-                                }
-                                if (typeof fetchExperts === 'function') {
-                                    const cachedIdx = currentExpertsData.findIndex(x => x.name === item.name && x.phone === item.phone);
-                                    if (cachedIdx !== -1) {
-                                        currentExpertsData[cachedIdx].status = statusVal;
-                                        currentExpertsData[cachedIdx].remark = remarkVal;
-                                        renderExpertsGrid();
-                                    }
-                                }
-                            } else {
-                                alert(`保存失败: ${res.error}`);
-                            }
-                        });
-                    };
-                }
-                
-                const btnDelete = document.getElementById('btn-detail-delete');
-                if (btnDelete) {
-                    btnDelete.onclick = () => {
-                        if (confirm(`⚠️ 您确定要彻底物理删除专家【${item.name}】吗？删除后将无法恢复。`)) {
-                            fetch('/dlsgzs/api/delete', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ name: item.name, phone: item.phone })
-                            })
-                            .then(res => res.json())
-                            .then(res => {
-                                if (res.success) {
-                                    closeDetailModal();
-                                    if (typeof fetchExperts === 'function') {
-                                        const cachedIdx = currentExpertsData.findIndex(x => x.name === item.name && x.phone === item.phone);
-                                        if (cachedIdx !== -1) {
-                                            currentExpertsData.splice(cachedIdx, 1);
-                                            renderExpertsGrid();
-                                        }
-                                    }
-                                    alert(res.message);
-                                } else {
-                                    alert(`删除失败: ${res.error}`);
-                                }
-                            });
-                        }
-                    };
-                }
-                
-                const rawJsonElement = document.getElementById('val-raw-json');
-                if (rawJsonElement) {
-                    if (item.details && Object.keys(item.details).length > 0) {
-                        rawJsonElement.innerText = JSON.stringify(item, null, 4);
-                    } else {
-                        rawJsonElement.innerText = "正在加载原始档案，请稍候...";
-                        fetch(`/dlsgzs/api/detail?name=${encodeURIComponent(item.name)}&phone=${encodeURIComponent(item.phone)}`)
-                            .then(res => res.json())
-                            .then(res => {
-                                if (res.success) {
-                                    item.details = res.details || {};
-                                    item.tags = res.tags || item.tags || [];
-                                    const currentModalName = document.getElementById('detail-title-name') ? document.getElementById('detail-title-name').innerText : '';
-                                    const currentModalPhone = document.getElementById('detail-title-phone') ? document.getElementById('detail-title-phone').innerText : '';
-                                    if (currentModalName === item.name && currentModalPhone === item.phone) {
-                                        rawJsonElement.innerText = JSON.stringify(item, null, 4);
-                                        renderDetailTags(item.tags);
-                                    }
-                                } else {
-                                    rawJsonElement.innerText = `⚠️ 原始档案加载失败: ${res.error}`;
-                                }
-                            })
-                            .catch(err => {
-                                rawJsonElement.innerText = `⚠️ 请求网络异常: ${err}`;
-                            });
-                    }
-                }
+                setupDetailModal(item);
             } catch(e) {
                 console.error("showExpertDetailDirectly error", e);
             }

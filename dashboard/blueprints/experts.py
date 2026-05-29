@@ -1373,6 +1373,102 @@ def api_update_status():
         return jsonify({"success": False, "error": f"更新专家状态/备注失败: {str(e)}"}), 500
 
 
+@experts_bp.route('/api/update_expert_profile', methods=['POST'])
+def api_update_expert_profile():
+    """更新评标专家的基本资料 (包括手机号、单位、专业及照片文件)"""
+    # 接收 multipart/form-data
+    old_name = request.form.get('old_name', '').strip()
+    old_phone = request.form.get('old_phone', '').strip()
+    new_phone = request.form.get('new_phone', '').strip()
+    company = request.form.get('company', '').strip()
+    major = request.form.get('major', '').strip()
+    
+    if not old_name or not old_phone:
+        return jsonify({"success": False, "error": "定位专家的旧姓名与旧电话号码不能为空"}), 400
+        
+    if not new_phone:
+        return jsonify({"success": False, "error": "新的电话号码不能为空"}), 400
+        
+    db_path = get_db_path()
+    try:
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        
+        # 1. 查找此专家是否存在
+        c.execute("SELECT id, phone, photo_path FROM experts WHERE name = ? AND phone = ?", (old_name, old_phone))
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            return jsonify({"success": False, "error": f"未找到专家 {old_name} ({old_phone})"}), 404
+            
+        expert_id = row[0]
+        db_phone = row[1]
+        db_photo_path = row[2]
+        
+        # 2. 如果新手机号变了，校验是否与其他专家冲突（唯一联合索引 idx_experts_name_phone）
+        if new_phone != old_phone:
+            c.execute("SELECT id FROM experts WHERE name = ? AND phone = ?", (old_name, new_phone))
+            conflict = c.fetchone()
+            if conflict:
+                conn.close()
+                return jsonify({"success": False, "error": f"修改失败：已存在相同姓名（{old_name}）和电话（{new_phone}）的其他专家，请核对后重试。"}), 409
+                
+        # 3. 处理照片更换
+        new_photo_path = db_photo_path
+        photo_file = request.files.get('photo_file')
+        if photo_file and photo_file.filename != '':
+            # 校验后缀
+            ext = os.path.splitext(photo_file.filename)[1].lower()
+            if ext not in ['.jpg', '.jpeg', '.png']:
+                conn.close()
+                return jsonify({"success": False, "error": "上传的照片格式不正确，仅支持 .jpg, .jpeg, .png"}), 400
+                
+            # 保存新照片
+            photos_dir = get_photos_dir()
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{old_name}_{new_phone}_uploaded_{timestamp}{ext}".lower()
+            dest_path = os.path.join(photos_dir, filename)
+            
+            photo_file.save(dest_path)
+            new_photo_path = f"/static/uploads/expert_photos/{filename}"
+            
+            # 删除老照片（为了防止爆盘，如果在 uploads 下且不等于新照片就删除）
+            if db_photo_path:
+                old_paths = db_photo_path.split(',')
+                for p_path in old_paths:
+                    p_path = p_path.strip()
+                    if p_path:
+                        old_filename = os.path.basename(p_path)
+                        old_physical_path = os.path.join(photos_dir, old_filename)
+                        if os.path.exists(old_physical_path):
+                            try:
+                                os.remove(old_physical_path)
+                            except Exception:
+                                pass
+                                
+        # 4. 执行更新
+        c.execute("""
+            UPDATE experts 
+            SET phone = ?, company = ?, major = ?, photo_path = ? 
+            WHERE id = ?
+        """, (new_phone, company, major, new_photo_path, expert_id))
+        
+        # 5. 同步倒排专业表
+        sync_expert_majors(conn, expert_id, major)
+        
+        # 6. 重算专家参评统计
+        update_all_experts_stats(conn)
+        
+        conn.commit()
+        conn.close()
+        
+        _log_action("修改专家基本信息", f"专家姓名: {old_name}, 新电话: {new_phone}, 新单位: {company}, 新专业: {major}")
+        return jsonify({"success": True, "message": f"专家 {old_name} 的个人资料已成功修改。"})
+        
+    except Exception as e:
+        return jsonify({"success": False, "error": f"更新专家信息失败: {str(e)}"}), 500
+
+
 @experts_bp.route('/api/tags', methods=['GET', 'POST'])
 def api_tags():
     db_path = get_db_path()
