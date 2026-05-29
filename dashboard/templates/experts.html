@@ -277,6 +277,7 @@
             .modal-container {
                 width: 96% !important;
                 max-height: none !important;
+                margin: 12px auto !important;
             }
             .modal-body-scroll {
                 padding: 16px !important;
@@ -298,55 +299,103 @@
                 justify-items: center;
                 text-align: center;
                 gap: 16px !important;
-                padding: 12px !important;
+                padding: 14px !important;
+            }
+            .detail-photo-side-container {
+                width: 100% !important;
+                align-items: center !important;
             }
             .detail-photo-wrapper {
-                width: 120px !important;
-                height: 156px !important;
+                width: 110px !important;
+                height: 145px !important;
             }
             .detail-info-text {
-                align-items: center !important;
-                text-align: center !important;
+                align-items: stretch !important;
+                text-align: left !important;
                 width: 100%;
             }
-            .detail-info-item {
-                justify-content: center !important;
+            .detail-profile-header-row {
+                flex-direction: column !important;
+                align-items: center !important;
+                gap: 10px !important;
+                width: 100%;
                 text-align: center !important;
+            }
+            .detail-profile-header-row #btn-save-expert-profile {
+                width: 100% !important;
+                justify-content: center !important;
+            }
+            .detail-info-item {
+                flex-direction: column !important;
+                align-items: stretch !important;
+                gap: 6px !important;
                 width: 100%;
                 word-break: break-all;
             }
-            .detail-action-bar {
+            .detail-info-item > span:first-child {
+                min-width: 0 !important;
+                text-align: left !important;
+                align-self: flex-start;
+            }
+            .detail-idcard-val-container {
+                width: 100% !important;
+            }
+            .detail-remark-box {
+                padding: 14px !important;
+            }
+            .detail-remark-header {
+                flex-direction: column !important;
+                align-items: flex-start !important;
+                gap: 10px !important;
+            }
+            .detail-remark-header .detail-status-wrapper {
+                width: 100% !important;
+                justify-content: flex-start !important;
+                gap: 8px !important;
+                margin: 0 !important;
+            }
+            .detail-status-select {
+                flex-grow: 1 !important;
+                width: auto !important;
+            }
+            .detail-remark-footer {
+                flex-direction: column-reverse !important;
+                align-items: stretch !important;
+                gap: 8px !important;
+                width: 100%;
+            }
+            .detail-remark-footer #btn-save-status {
+                width: 100% !important;
+                justify-content: center !important;
+            }
+            .detail-remark-footer #save-status-tip {
+                text-align: center;
+                display: inline-block;
+                width: 100%;
+            }
+            .detail-footer-actions {
                 flex-direction: column !important;
                 align-items: stretch !important;
                 gap: 12px !important;
                 padding: 12px !important;
             }
-            .detail-status-wrapper {
+            .detail-footer-actions > div {
+                width: 100% !important;
+                display: flex;
+            }
+            #btn-detail-project-drill, #btn-detail-delete {
+                width: 100% !important;
                 justify-content: center !important;
-                width: 100%;
-                gap: 6px !important;
             }
-            .detail-status-select {
-                width: 100px !important;
-                padding: 6px 8px !important;
-                font-size: 12px !important;
+            .detail-json-title-row {
+                flex-direction: column !important;
+                align-items: flex-start !important;
+                gap: 8px !important;
             }
-            #btn-save-status {
-                padding: 6px 12px !important;
-                font-size: 12px !important;
-            }
-            .detail-delete-wrapper {
-                justify-content: center !important;
-                width: 100%;
-            }
-            #btn-detail-delete {
-                width: 100%;
-                justify-content: center;
+            #btn-copy-json {
+                width: 100% !important;
                 padding: 8px 12px !important;
-                font-size: 12px !important;
-            }
-            .detail-remark-box {
-                padding: 12px !important;
+                text-align: center !important;
             }
             
             /* 原始 JSON 区防止撑爆 */
@@ -2309,7 +2358,7 @@
                     </div>
                     <!-- 基础身份 -->
                     <div class="detail-info-text" style="display: flex; flex-direction: column; gap: 14px; flex-grow: 1; padding-top: 0;">
-                        <div style="display: flex; align-items: center; justify-content: space-between; border-bottom: 1px dashed var(--border-color); padding-bottom: 10px; margin-bottom: 2px;">
+                        <div class="detail-profile-header-row" style="display: flex; align-items: center; justify-content: space-between; border-bottom: 1px dashed var(--border-color); padding-bottom: 10px; margin-bottom: 2px;">
                             <div style="display: flex; align-items: center; gap: 8px;">
                                 <span id="detail-title-name" style="font-size: 19px; font-weight: 700; color: var(--text-primary);">-</span>
                                 <span class="expert-tag" style="background: rgba(14, 165, 233, 0.1); color: var(--accent-color); font-weight: 600;">基本资料卡</span>
@@ -2324,8 +2373,10 @@
                         </div>
                         <div class="detail-info-item" style="display: flex; align-items: center; gap: 12px; width: 100%;">
                             <span style="min-width: 80px; font-weight: 600; color: var(--text-secondary); font-size: 13px;">🪪 身份证号:</span>
-                            <span id="detail-title-idcard" class="detail-title-val" style="color: var(--text-secondary); background: #f8fafc; padding: 6px 12px; border-radius: 6px; font-family: monospace; font-size: 13px; border: 1px solid #e2e8f0; min-height: 22px; display: inline-flex; align-items: center; flex-grow: 1; box-sizing: border-box;">-</span>
-                            <span style="font-size: 11px; color: #94a3b8; margin-left: 4px;">🔒 (不可修改)</span>
+                            <div class="detail-idcard-val-container" style="display: flex; align-items: center; gap: 8px; flex-grow: 1; min-width: 0;">
+                                <span id="detail-title-idcard" class="detail-title-val" style="color: var(--text-secondary); background: #f8fafc; padding: 6px 12px; border-radius: 6px; font-family: monospace; font-size: 13px; border: 1px solid #e2e8f0; min-height: 36px; display: inline-flex; align-items: center; flex-grow: 1; box-sizing: border-box;">-</span>
+                                <span style="font-size: 11px; color: #94a3b8; white-space: nowrap;">🔒 (不可修改)</span>
+                            </div>
                         </div>
                         <div class="detail-info-item" style="display: flex; align-items: center; gap: 12px; width: 100%;">
                             <span style="min-width: 80px; font-weight: 600; color: var(--text-secondary); font-size: 13px;">🏢 工作单位:</span>
@@ -2346,7 +2397,7 @@
 
                 <!-- 专家标注与备注 Card -->
                 <div class="detail-remark-box" style="display: flex; flex-direction: column; gap: 12px; padding: 20px; background: rgba(255, 255, 255, 0.7); border: 1px solid var(--card-border); border-radius: 12px; margin-bottom: 16px;">
-                    <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px dashed var(--border-color); padding-bottom: 8px;">
+                    <div class="detail-remark-header" style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px dashed var(--border-color); padding-bottom: 8px;">
                         <div class="detail-remark-title" style="margin-bottom: 0; font-size: 14px; font-weight: 700; color: var(--text-primary);">
                             <span>📝 专家标注与备注</span>
                         </div>
@@ -2360,7 +2411,7 @@
                         </div>
                     </div>
                     <textarea id="detail-remark-input" style="height: 80px; width: 100%; box-sizing: border-box; resize: none; border-radius: 6px; border: 1px solid var(--border-color); padding: 10px; font-size: 13px; outline: none; margin: 0;" placeholder="输入专家的自定义备注信息（如登录密码、密保答案、临时问题、备用联系方式等）..."></textarea>
-                    <div style="display: flex; justify-content: flex-end; align-items: center; gap: 8px;">
+                    <div class="detail-remark-footer" style="display: flex; justify-content: flex-end; align-items: center; gap: 8px;">
                         <span id="save-status-tip" style="color: #10b981; font-size: 12px; display: none; align-items: center; gap: 4px;">✅ 已成功保存标注与备注</span>
                         <button id="btn-save-status" style="height: 32px; padding: 0 16px; font-size: 13px; border-radius: 6px; background: var(--accent-color); border: none; color: white; cursor: pointer; font-weight: 600; display: flex; align-items: center; gap: 4px; box-shadow: 0 2px 6px rgba(14, 165, 233, 0.2); margin: 0;">
                             <span>💾</span> 保存标注与备注
@@ -2369,7 +2420,7 @@
                 </div>
 
                 <!-- 辅助底栏功能操作区 (删除与穿透) -->
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; padding: 12px 16px; background: rgba(0,0,0,0.02); border: 1px solid var(--card-border); border-radius: 12px;">
+                <div class="detail-footer-actions" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; padding: 12px 16px; background: rgba(0,0,0,0.02); border: 1px solid var(--card-border); border-radius: 12px;">
                     <div style="display: flex; gap: 8px;">
                         <button id="btn-detail-project-drill" class="btn-search-main btn-accent-gradient" style="border: none; padding: 0 16px; border-radius: 8px; font-weight: 600; font-size: 13px; cursor: pointer; height: 36px; display: flex; align-items: center; gap: 6px; color: white; margin: 0;">
                             <span>🔍</span> 参评项目检索 (一键穿透)
