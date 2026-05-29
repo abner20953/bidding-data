@@ -2411,7 +2411,7 @@
                         </div>
                     </div>
                     <textarea id="detail-remark-input" style="height: 80px; width: 100%; box-sizing: border-box; resize: none; border-radius: 6px; border: 1px solid var(--border-color); padding: 10px; font-size: 13px; outline: none; margin: 0;" placeholder="输入专家的自定义备注信息（如登录密码、密保答案、临时问题、备用联系方式等）..."></textarea>
-                    <div class="detail-remark-footer" style="display: none; justify-content: flex-end; align-items: center; gap: 8px;">
+                    <div class="detail-remark-footer" style="display: flex; justify-content: flex-end; align-items: center; gap: 8px;">
                         <span id="save-status-tip" style="color: #10b981; font-size: 12px; display: none; align-items: center; gap: 4px;">✅ 已成功保存标注与备注</span>
                         <button id="btn-save-status" style="height: 32px; padding: 0 16px; font-size: 13px; border-radius: 6px; background: var(--accent-color); border: none; color: white; cursor: pointer; font-weight: 600; display: flex; align-items: center; gap: 4px; box-shadow: 0 2px 6px rgba(14, 165, 233, 0.2); margin: 0;">
                             <span>💾</span> 保存标注与备注
@@ -3331,7 +3331,7 @@
                 };
             }
 
-            // 声明内部编辑状态和控件只读切换函数
+            // 声明内部编辑状态和控件只读切换函数 (仅用于基本资料)
             let isDetailEditing = false;
             function setModalEditable(editable) {
                 isDetailEditing = editable;
@@ -3355,37 +3355,25 @@
                 if (changePhotoBtn) {
                     changePhotoBtn.style.display = editable ? 'flex' : 'none';
                 }
-                const statusSelect = document.getElementById('detail-status-select');
-                if (statusSelect) {
-                    statusSelect.disabled = !editable;
-                    statusSelect.style.background = editable ? 'var(--bg-card)' : 'rgba(241, 245, 249, 0.6)';
-                    statusSelect.style.cursor = editable ? 'pointer' : 'not-allowed';
-                }
-                const remarkInput = document.getElementById('detail-remark-input');
-                if (remarkInput) {
-                    remarkInput.readOnly = !editable;
-                    remarkInput.style.background = editable ? 'var(--bg-card)' : 'rgba(241, 245, 249, 0.6)';
-                    remarkInput.style.cursor = editable ? 'text' : 'not-allowed';
-                }
                 
                 const editSaveBtn = document.getElementById('btn-save-expert-profile');
                 if (editSaveBtn) {
                     if (editable) {
-                        editSaveBtn.innerHTML = '<span>💾</span> 保存修改';
+                        editSaveBtn.innerHTML = '<span>💾</span> 保存资料';
                         editSaveBtn.style.background = '#10b981';
                         editSaveBtn.style.boxShadow = '0 2px 6px rgba(16, 185, 129, 0.2)';
                     } else {
-                        editSaveBtn.innerHTML = '<span>✏️</span> 编辑档案';
+                        editSaveBtn.innerHTML = '<span>✏️</span> 编辑资料';
                         editSaveBtn.style.background = 'var(--accent-color)';
                         editSaveBtn.style.boxShadow = '0 2px 6px rgba(14, 165, 233, 0.2)';
                     }
                 }
             }
             
-            // 默认设置为只读状态
+            // 默认设置基本资料为只读状态 (标注和备注默认随时可修改)
             setModalEditable(false);
             
-            // 绑定“编辑 / 保存”合一按钮事件
+            // 绑定“编辑 / 保存基本资料”按钮事件
             const saveProfileBtn = document.getElementById('btn-save-expert-profile');
             if (saveProfileBtn) {
                 // clone node to clear previous listeners
@@ -3403,10 +3391,6 @@
                     const newPhoneVal = phoneInput ? phoneInput.value.trim() : '';
                     const companyVal = companyInput ? companyInput.value.trim() : '';
                     const majorVal = majorInput ? majorInput.value.trim() : '';
-                    const statusSelect = document.getElementById('detail-status-select');
-                    const newStatus = statusSelect ? statusSelect.value : '未获取';
-                    const remarkInput = document.getElementById('detail-remark-input');
-                    const newRemark = remarkInput ? remarkInput.value : '';
                     
                     if (!newPhoneVal) {
                         alert('手机号不能为空！');
@@ -3416,7 +3400,7 @@
                     newSaveProfileBtn.disabled = true;
                     newSaveProfileBtn.innerHTML = '保存中...';
                     
-                    // 1. 串行请求第一步：更新基本资料
+                    // 1. 更新基本资料
                     const formData = new FormData();
                     formData.append('old_name', item.name || '');
                     formData.append('old_phone', item.phone || '');
@@ -3433,33 +3417,25 @@
                     })
                     .then(res => res.json())
                     .then(profileRes => {
+                        newSaveProfileBtn.disabled = false;
                         if (!profileRes.success) {
                             throw new Error(profileRes.error || '保存基本资料失败');
                         }
-                        // 2. 串行请求第二步：更新标注与备注 (使用最新的 newPhoneVal 去更新)
-                        return fetch('/dlsgzs/api/update_status', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json'
-                            },
-                            body: JSON.stringify({
-                                name: item.name,
-                                phone: newPhoneVal,
-                                status: newStatus,
-                                remark: newRemark
-                            })
-                        }).then(res => res.json());
-                    })
-                    .then(statusRes => {
-                        newSaveProfileBtn.disabled = false;
-                        if (!statusRes.success) {
-                            throw new Error(statusRes.error || '保存状态与备注失败');
+                        
+                        // 保存成功，同步本地缓存以供后续使用
+                        item.phone = newPhoneVal;
+                        item.company = companyVal;
+                        item.major = majorVal;
+                        
+                        // 重新渲染 JSON 文本展示
+                        const rawJsonElement = document.getElementById('val-raw-json');
+                        if (rawJsonElement) {
+                            rawJsonElement.innerText = JSON.stringify(item, null, 4);
                         }
                         
-                        // 全部更新成功
                         isDetailEditing = false;
                         setModalEditable(false);
-                        alert('专家档案信息已成功保存！');
+                        alert('专家基本资料已成功保存！');
                         closeDetailModal();
                         
                         // 重新加载列表数据
@@ -3516,19 +3492,90 @@
                 }
             }
             
-            // 反显状态标记与备注信息
+            // 反显状态标记与备注信息 (默认随时可编辑状态)
             const statusSelect = document.getElementById('detail-status-select');
             if (statusSelect) {
                 statusSelect.value = item.status || '未获取';
+                statusSelect.disabled = false;
+                statusSelect.style.background = 'var(--bg-card)';
+                statusSelect.style.cursor = 'pointer';
             }
             const remarkInput = document.getElementById('detail-remark-input');
             if (remarkInput) {
                 remarkInput.value = item.remark || '';
+                remarkInput.readOnly = false;
+                remarkInput.style.background = 'var(--bg-card)';
+                remarkInput.style.cursor = 'text';
             }
             const saveTip = document.getElementById('save-status-tip');
             if (saveTip) {
                 saveTip.style.display = 'none';
+            }
+            
+            // 绑定保存标注与备注按钮事件 (独立随时可保存，不用点编辑按钮)
+            const saveStatusBtn = document.getElementById('btn-save-status');
+            if (saveStatusBtn) {
+                const newSaveStatusBtn = saveStatusBtn.cloneNode(true);
+                saveStatusBtn.parentNode.replaceChild(newSaveStatusBtn, saveStatusBtn);
+                newSaveStatusBtn.addEventListener('click', () => {
+                    const newStatus = statusSelect ? statusSelect.value : '未获取';
+                    const newRemark = remarkInput ? remarkInput.value : '';
+                    
+                    newSaveStatusBtn.disabled = true;
+                    newSaveStatusBtn.innerHTML = '保存中...';
+                    
+                    fetch('/dlsgzs/api/update_status', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            name: item.name,
+                            phone: item.phone, // 使用当前手机号定位专家
+                            status: newStatus,
+                            remark: newRemark
+                        })
+                    })
+                    .then(res => res.json())
+                    .then(res => {
+                        newSaveStatusBtn.disabled = false;
+                        newSaveStatusBtn.innerHTML = '<span>💾</span> 保存标注与备注';
+                        if (res.success) {
+                            // 同步本地数据
+                            item.status = newStatus;
+                            item.remark = newRemark;
+                            
+                            // 重新渲染 JSON 文本展示
+                            if (rawJsonElement) {
+                                rawJsonElement.innerText = JSON.stringify(item, null, 4);
+                            }
+                            
+                            // 显示已保存小提示并淡出
+                            if (saveTip) {
+                                saveTip.style.display = 'inline-flex';
+                                setTimeout(() => {
+                                    saveTip.style.display = 'none';
+                                }, 2000);
+                            }
+                            
+                            // 刷新列表中的卡片
+                            if (typeof renderCards === 'function') {
+                                renderCards();
+                            } else if (typeof renderExpertsGrid === 'function') {
+                                renderExpertsGrid();
+                            }
+                        } else {
+                            alert('⚠️ 保存标注与备注失败：' + res.error);
                         }
+                    })
+                    .catch(err => {
+                        newSaveStatusBtn.disabled = false;
+                        newSaveStatusBtn.innerHTML = '<span>💾</span> 保存标注与备注';
+                        alert('⚠️ 网络连接错误，保存备注失败');
+                        console.error(err);
+                    });
+                });
+            }
             
             // 绑定删除专家按钮事件
             const deleteExpertBtn = document.getElementById('btn-detail-delete');
