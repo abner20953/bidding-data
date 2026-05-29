@@ -321,9 +321,16 @@
                 width: 100%;
                 text-align: center !important;
             }
-            .detail-profile-header-row #btn-save-expert-profile {
+            .detail-profile-header-row > div:last-child {
                 width: 100% !important;
+                display: flex !important;
+                flex-direction: row !important;
+                gap: 8px !important;
+            }
+            #btn-save-expert-profile, #btn-cancel-expert-profile {
+                flex: 1 !important;
                 justify-content: center !important;
+                width: 100% !important;
             }
             .detail-info-item {
                 flex-direction: column !important;
@@ -2363,9 +2370,14 @@
                                 <span id="detail-title-name" style="font-size: 19px; font-weight: 700; color: var(--text-primary);">-</span>
                                 <span class="expert-tag" style="background: rgba(14, 165, 233, 0.1); color: var(--accent-color); font-weight: 600;">基本资料卡</span>
                             </div>
-                            <button id="btn-save-expert-profile" class="btn-search-main" style="border: none; background: var(--accent-color); padding: 0 16px; border-radius: 6px; font-weight: 600; font-size: 13px; cursor: pointer; height: 32px; display: flex; align-items: center; gap: 4px; color: white; box-shadow: 0 2px 6px rgba(14, 165, 233, 0.2); margin: 0;">
-                                <span>✏️</span> 编辑档案
-                            </button>
+                            <div style="display: flex; align-items: center; gap: 8px;">
+                                <button id="btn-cancel-expert-profile" class="action-btn-small" style="display: none; border: 1px solid var(--border-color); background: var(--bg-card); padding: 0 12px; border-radius: 6px; font-weight: 500; font-size: 13px; cursor: pointer; height: 32px; align-items: center; gap: 4px; color: var(--text-primary); margin: 0; box-shadow: var(--shadow-soft);">
+                                    <span>❌</span> 取消
+                                </button>
+                                <button id="btn-save-expert-profile" class="btn-search-main" style="border: none; background: var(--accent-color); padding: 0 16px; border-radius: 6px; font-weight: 600; font-size: 13px; cursor: pointer; height: 32px; display: flex; align-items: center; gap: 4px; color: white; box-shadow: 0 2px 6px rgba(14, 165, 233, 0.2); margin: 0;">
+                                    <span>✏️</span> 编辑资料
+                                </button>
+                            </div>
                         </div>
                         <div class="detail-info-item" style="display: flex; align-items: center; gap: 12px; width: 100%;">
                             <span style="min-width: 80px; font-weight: 600; color: var(--text-secondary); font-size: 13px;">📞 手机号:</span>
@@ -2384,7 +2396,7 @@
                         </div>
                         <div class="detail-info-item" style="display: flex; align-items: center; gap: 12px; width: 100%;">
                             <span style="min-width: 80px; font-weight: 600; color: var(--text-secondary); font-size: 13px;">💼 专家专业:</span>
-                            <input type="text" id="detail-input-major" class="search-input" style="padding: 8px 12px; font-size: 13px; height: 36px; flex-grow: 1; border-radius: 6px; border: 1px solid var(--border-color); background: var(--bg-card); color: var(--text-primary);" placeholder="请输入专家专业">
+                            <textarea id="detail-input-major" class="search-input" style="padding: 8px 12px; font-size: 13px; height: 54px; min-height: 54px; flex-grow: 1; border-radius: 6px; border: 1px solid var(--border-color); background: var(--bg-card); color: var(--text-primary); resize: vertical; box-sizing: border-box; line-height: 1.5; font-family: inherit; margin: 0;" placeholder="请输入专家专业"></textarea>
                         </div>
                         <div class="detail-info-item" id="detail-tags-row" style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 2px;">
                             <span style="min-width: 80px; font-weight: 600; color: var(--text-secondary); font-size: 13px;">🏷️ 专家标签:</span>
@@ -3355,6 +3367,10 @@
                 if (changePhotoBtn) {
                     changePhotoBtn.style.display = editable ? 'flex' : 'none';
                 }
+                const cancelBtn = document.getElementById('btn-cancel-expert-profile');
+                if (cancelBtn) {
+                    cancelBtn.style.display = editable ? 'flex' : 'none';
+                }
                 
                 const editSaveBtn = document.getElementById('btn-save-expert-profile');
                 if (editSaveBtn) {
@@ -3458,6 +3474,30 @@
                         alert('⚠️ 保存失败：' + err.message);
                         console.error(err);
                     });
+                });
+            }
+            
+            // 绑定“取消编辑”按钮事件
+            const cancelBtn = document.getElementById('btn-cancel-expert-profile');
+            if (cancelBtn) {
+                const newCancelBtn = cancelBtn.cloneNode(true);
+                cancelBtn.parentNode.replaceChild(newCancelBtn, cancelBtn);
+                newCancelBtn.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    
+                    // 1. 恢复基本资料的原始数值
+                    if (phoneInput) phoneInput.value = item.phone || '';
+                    if (companyInput) companyInput.value = item.company || '';
+                    if (majorInput) majorInput.value = item.major || '';
+                    
+                    // 2. 清除并恢复照片预览
+                    selectedPhotoFile = null;
+                    const photoFileInput = document.getElementById('detail-photo-file-input');
+                    if (photoFileInput) photoFileInput.value = '';
+                    updateDetailPhotoShow(); // 重新加载和渲染 item 里的原照片
+                    
+                    // 3. 退出编辑状态
+                    setModalEditable(false);
                 });
             }
             
