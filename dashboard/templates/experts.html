@@ -1917,6 +1917,56 @@
             accent-color: var(--accent-color);
             cursor: pointer;
         }
+
+        /* 专家完整档案模态框的移动端专属响应式优化 */
+        @media (max-width: 640px) {
+            #detail-modal .modal-container {
+                max-width: 95% !important;
+                margin: 10px auto !important;
+                border-radius: 12px !important;
+            }
+            #detail-modal .modal-body-scroll {
+                padding: 12px !important;
+            }
+            #detail-modal .detail-header-grid {
+                grid-template-columns: 1fr !important;
+                justify-items: center;
+                padding: 12px !important;
+                gap: 12px !important;
+            }
+            #detail-modal .detail-photo-side-container {
+                margin-bottom: 8px;
+            }
+            #detail-modal .detail-info-item {
+                flex-direction: column !important;
+                align-items: flex-start !important;
+                gap: 4px !important;
+            }
+            #detail-modal .detail-info-item span {
+                min-width: auto !important;
+            }
+            #detail-modal .detail-idcard-val-container {
+                width: 100% !important;
+            }
+            #detail-modal .detail-remark-box {
+                padding: 10px !important;
+            }
+            #detail-modal .detail-remark-header {
+                flex-direction: column !important;
+                align-items: flex-start !important;
+                gap: 8px !important;
+            }
+            #detail-modal .detail-status-wrapper {
+                width: 100% !important;
+                justify-content: space-between !important;
+            }
+            #detail-modal .detail-footer-actions {
+                flex-direction: row !important;
+                justify-content: flex-end !important;
+                gap: 8px !important;
+                padding: 8px !important;
+            }
+        }
     </style>
 </head>
 
@@ -2344,11 +2394,11 @@
                 <button class="modal-close" id="modal-close">&times;</button>
             </div>
             
-            <div class="modal-body-scroll" style="padding: 24px;">
-                <div class="detail-header-grid" style="display: grid; grid-template-columns: 110px 1fr; gap: 24px; margin-bottom: 20px; padding: 24px; background: rgba(14, 165, 233, 0.03); border: 1px solid rgba(14, 165, 233, 0.08); border-radius: 12px; position: relative;">
+            <div class="modal-body-scroll" style="padding: 14px 16px;">
+                <div class="detail-header-grid" style="display: grid; grid-template-columns: 95px 1fr; gap: 16px; margin-bottom: 12px; padding: 14px 16px; background: rgba(14, 165, 233, 0.03); border: 1px solid rgba(14, 165, 233, 0.08); border-radius: 12px; position: relative;">
                     <!-- 照片区域 -->
                     <div class="detail-photo-side-container" style="display: flex; flex-direction: column; align-items: center; justify-content: flex-start; height: 100%;">
-                        <div class="detail-photo-wrapper" style="box-shadow: 0 4px 12px rgba(0,0,0,0.08); border-radius: 8px; width: 110px; height: 145px;">
+                        <div class="detail-photo-wrapper" style="box-shadow: 0 4px 12px rgba(0,0,0,0.08); border-radius: 8px; width: 95px; height: 125px;">
                             <img src="" id="detail-img" alt="身份证照片" style="width: 100%; height: 100%; object-fit: cover; cursor: zoom-in;" onerror="handleDetailImgError()">
                             <div id="detail-img-error">
                                 <span>⚠️</span>
@@ -2358,48 +2408,48 @@
                             <button id="photo-next-btn" class="photo-nav-btn photo-nav-next" style="display: none;">&gt;</button>
                         </div>
                         <div id="detail-photo-indicator" class="photo-indicator" style="display: none; margin-top: 4px;">1 / 1</div>
-                        <button id="btn-change-photo" class="action-btn-small" style="margin-top: 10px; width: 100%; display: flex; align-items: center; justify-content: center; gap: 4px; padding: 6px 12px; font-size: 12px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--bg-card); cursor: pointer; color: var(--text-primary); height: 32px; font-weight: 500;">
+                        <button id="btn-change-photo" class="action-btn-small" style="margin-top: 6px; width: 100%; display: flex; align-items: center; justify-content: center; gap: 4px; padding: 4px 8px; font-size: 12px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--bg-card); cursor: pointer; color: var(--text-primary); height: 28px; font-weight: 500;">
                             <span>📷</span> 更换照片
                         </button>
                         <input type="file" id="detail-photo-file-input" style="display: none;" accept="image/*">
                     </div>
                     <!-- 基础身份 -->
-                    <div class="detail-info-text" style="display: flex; flex-direction: column; gap: 14px; flex-grow: 1; padding-top: 0;">
-                        <div class="detail-profile-header-row" style="display: flex; align-items: center; justify-content: space-between; border-bottom: 1px dashed var(--border-color); padding-bottom: 10px; margin-bottom: 2px;">
+                    <div class="detail-info-text" style="display: flex; flex-direction: column; gap: 8px; flex-grow: 1; padding-top: 0;">
+                        <div class="detail-profile-header-row" style="display: flex; align-items: center; justify-content: space-between; border-bottom: 1px dashed var(--border-color); padding-bottom: 6px; margin-bottom: 0;">
                             <div style="display: flex; align-items: center; gap: 8px;">
-                                <span id="detail-title-name" style="font-size: 19px; font-weight: 700; color: var(--text-primary);">-</span>
-                                <span class="expert-tag" style="background: rgba(14, 165, 233, 0.1); color: var(--accent-color); font-weight: 600;">基本资料卡</span>
+                                <span id="detail-title-name" style="font-size: 18px; font-weight: 700; color: var(--text-primary);">-</span>
+                                <span class="expert-tag" style="background: rgba(14, 165, 233, 0.1); color: var(--accent-color); font-weight: 600; font-size: 11px; padding: 2px 6px; border-radius: 4px;">基本资料卡</span>
                             </div>
                             <div style="display: flex; align-items: center; gap: 8px;">
-                                <button id="btn-cancel-expert-profile" class="action-btn-small" style="display: none; border: 1px solid var(--border-color); background: var(--bg-card); padding: 0 12px; border-radius: 6px; font-weight: 500; font-size: 13px; cursor: pointer; height: 32px; align-items: center; gap: 4px; color: var(--text-primary); margin: 0; box-shadow: var(--shadow-soft);">
+                                <button id="btn-cancel-expert-profile" class="action-btn-small" style="display: none; border: 1px solid var(--border-color); background: var(--bg-card); padding: 0 10px; border-radius: 6px; font-weight: 500; font-size: 12px; cursor: pointer; height: 28px; align-items: center; gap: 4px; color: var(--text-primary); margin: 0; box-shadow: var(--shadow-soft);">
                                     <span>❌</span> 取消
                                 </button>
-                                <button id="btn-save-expert-profile" class="btn-search-main" style="border: none; background: var(--accent-color); padding: 0 16px; border-radius: 6px; font-weight: 600; font-size: 13px; cursor: pointer; height: 32px; display: flex; align-items: center; gap: 4px; color: white; box-shadow: 0 2px 6px rgba(14, 165, 233, 0.2); margin: 0;">
+                                <button id="btn-save-expert-profile" class="btn-search-main" style="border: none; background: var(--accent-color); padding: 0 12px; border-radius: 6px; font-weight: 600; font-size: 12px; cursor: pointer; height: 28px; display: flex; align-items: center; gap: 4px; color: white; box-shadow: 0 2px 6px rgba(14, 165, 233, 0.2); margin: 0;">
                                     <span>✏️</span> 编辑资料
                                 </button>
                             </div>
                         </div>
-                        <div class="detail-info-item" style="display: flex; align-items: center; gap: 12px; width: 100%;">
-                            <span style="min-width: 80px; font-weight: 600; color: var(--text-secondary); font-size: 13px;">📞 手机号:</span>
-                            <input type="text" id="detail-input-phone" class="search-input" style="padding: 8px 12px; font-size: 13px; height: 36px; flex-grow: 1; border-radius: 6px; border: 1px solid var(--border-color); background: var(--bg-card); color: var(--text-primary);" placeholder="请输入手机号">
+                        <div class="detail-info-item" style="display: flex; align-items: center; gap: 8px; width: 100%;">
+                            <span style="min-width: 70px; font-weight: 600; color: var(--text-secondary); font-size: 13px;">📞 手机号:</span>
+                            <input type="text" id="detail-input-phone" class="search-input" style="padding: 6px 10px; font-size: 13px; height: 32px; flex-grow: 1; border-radius: 6px; border: 1px solid var(--border-color); background: var(--bg-card); color: var(--text-primary);" placeholder="请输入手机号">
                         </div>
-                        <div class="detail-info-item" style="display: flex; align-items: center; gap: 12px; width: 100%;">
-                            <span style="min-width: 80px; font-weight: 600; color: var(--text-secondary); font-size: 13px;">🪪 身份证号:</span>
+                        <div class="detail-info-item" style="display: flex; align-items: center; gap: 8px; width: 100%;">
+                            <span style="min-width: 70px; font-weight: 600; color: var(--text-secondary); font-size: 13px;">🪪 身份证号:</span>
                             <div class="detail-idcard-val-container" style="display: flex; align-items: center; gap: 8px; flex-grow: 1; min-width: 0;">
-                                <span id="detail-title-idcard" class="detail-title-val" style="color: var(--text-secondary); background: #f8fafc; padding: 6px 12px; border-radius: 6px; font-family: monospace; font-size: 13px; border: 1px solid #e2e8f0; min-height: 36px; display: inline-flex; align-items: center; flex-grow: 1; box-sizing: border-box;">-</span>
+                                <span id="detail-title-idcard" class="detail-title-val" style="color: var(--text-secondary); background: #f8fafc; padding: 4px 10px; border-radius: 6px; font-family: monospace; font-size: 13px; border: 1px solid #e2e8f0; min-height: 32px; display: inline-flex; align-items: center; flex-grow: 1; box-sizing: border-box;">-</span>
                                 <span style="font-size: 11px; color: #94a3b8; white-space: nowrap;">🔒 (不可修改)</span>
                             </div>
                         </div>
-                        <div class="detail-info-item" style="display: flex; align-items: center; gap: 12px; width: 100%;">
-                            <span style="min-width: 80px; font-weight: 600; color: var(--text-secondary); font-size: 13px;">🏢 工作单位:</span>
-                            <input type="text" id="detail-input-company" class="search-input" style="padding: 8px 12px; font-size: 13px; height: 36px; flex-grow: 1; border-radius: 6px; border: 1px solid var(--border-color); background: var(--bg-card); color: var(--text-primary);" placeholder="请输入工作单位">
+                        <div class="detail-info-item" style="display: flex; align-items: center; gap: 8px; width: 100%;">
+                            <span style="min-width: 70px; font-weight: 600; color: var(--text-secondary); font-size: 13px;">🏢 工作单位:</span>
+                            <input type="text" id="detail-input-company" class="search-input" style="padding: 6px 10px; font-size: 13px; height: 32px; flex-grow: 1; border-radius: 6px; border: 1px solid var(--border-color); background: var(--bg-card); color: var(--text-primary);" placeholder="请输入工作单位">
                         </div>
-                        <div class="detail-info-item" style="display: flex; align-items: center; gap: 12px; width: 100%;">
-                            <span style="min-width: 80px; font-weight: 600; color: var(--text-secondary); font-size: 13px;">💼 专家专业:</span>
-                            <textarea id="detail-input-major" class="search-input" style="padding: 8px 12px; font-size: 13px; height: 54px; min-height: 54px; flex-grow: 1; border-radius: 6px; border: 1px solid var(--border-color); background: var(--bg-card); color: var(--text-primary); resize: vertical; box-sizing: border-box; line-height: 1.5; font-family: inherit; margin: 0;" placeholder="请输入专家专业"></textarea>
+                        <div class="detail-info-item" style="display: flex; align-items: center; gap: 8px; width: 100%;">
+                            <span style="min-width: 70px; font-weight: 600; color: var(--text-secondary); font-size: 13px;">💼 专家专业:</span>
+                            <textarea id="detail-input-major" class="search-input" style="padding: 6px 10px; font-size: 13px; height: 44px; min-height: 44px; flex-grow: 1; border-radius: 6px; border: 1px solid var(--border-color); background: var(--bg-card); color: var(--text-primary); resize: vertical; box-sizing: border-box; line-height: 1.4; font-family: inherit; margin: 0;" placeholder="请输入专家专业"></textarea>
                         </div>
-                        <div class="detail-info-item" id="detail-tags-row" style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 2px;">
-                            <span style="min-width: 80px; font-weight: 600; color: var(--text-secondary); font-size: 13px;">🏷️ 专家标签:</span>
+                        <div class="detail-info-item" id="detail-tags-row" style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 0;">
+                            <span style="min-width: 70px; font-weight: 600; color: var(--text-secondary); font-size: 13px;">🏷️ 专家标签:</span>
                             <div id="detail-title-tags" style="display: flex; gap: 6px; flex-wrap: wrap;">
                                 <!-- 动态标签 -->
                             </div>
@@ -2408,41 +2458,37 @@
                 </div>
 
                 <!-- 专家标注与备注 Card -->
-                <div class="detail-remark-box" style="display: flex; flex-direction: column; gap: 12px; padding: 20px; background: rgba(255, 255, 255, 0.7); border: 1px solid var(--card-border); border-radius: 12px; margin-bottom: 16px;">
-                    <div class="detail-remark-header" style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px dashed var(--border-color); padding-bottom: 8px;">
-                        <div class="detail-remark-title" style="margin-bottom: 0; font-size: 14px; font-weight: 700; color: var(--text-primary);">
+                <div class="detail-remark-box" style="display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; background: rgba(255, 255, 255, 0.7); border: 1px solid var(--card-border); border-radius: 12px; margin-bottom: 10px;">
+                    <div class="detail-remark-header" style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px dashed var(--border-color); padding-bottom: 6px;">
+                        <div class="detail-remark-title" style="margin-bottom: 0; font-size: 13px; font-weight: 700; color: var(--text-primary);">
                             <span>📝 专家标注与备注</span>
                         </div>
                         <div class="detail-status-wrapper" style="margin: 0; display: flex; align-items: center; gap: 6px;">
-                            <span class="detail-status-label" style="font-size: 13px; font-weight: 500;">📌 状态标记:</span>
-                            <select class="filter-select detail-status-select" id="detail-status-select" style="height: 32px; padding: 4px 8px; font-size: 13px; width: 110px; border-radius: 6px; margin: 0; box-shadow: none;">
+                            <span class="detail-status-label" style="font-size: 12px; font-weight: 500;">📌 状态标记:</span>
+                            <select class="filter-select detail-status-select" id="detail-status-select" style="height: 28px; padding: 2px 6px; font-size: 12px; width: 100px; border-radius: 6px; margin: 0; box-shadow: none;">
                                 <option value="未获取">未获取</option>
                                 <option value="已获取">已获取</option>
                                 <option value="无法登录">无法登录</option>
                             </select>
                         </div>
                     </div>
-                    <textarea id="detail-remark-input" style="height: 80px; width: 100%; box-sizing: border-box; resize: none; border-radius: 6px; border: 1px solid var(--border-color); padding: 10px; font-size: 13px; outline: none; margin: 0;" placeholder="输入专家的自定义备注信息（如登录密码、密保答案、临时问题、备用联系方式等）..."></textarea>
+                    <textarea id="detail-remark-input" style="height: 54px; width: 100%; box-sizing: border-box; resize: none; border-radius: 6px; border: 1px solid var(--border-color); padding: 8px 10px; font-size: 13px; outline: none; margin: 0; line-height: 1.4;" placeholder="输入专家的自定义备注信息（如登录密码、密保答案、临时问题、备用联系方式等）..."></textarea>
                     <div class="detail-remark-footer" style="display: flex; justify-content: flex-end; align-items: center; gap: 8px;">
                         <span id="save-status-tip" style="color: #10b981; font-size: 12px; display: none; align-items: center; gap: 4px;">✅ 已成功保存标注与备注</span>
-                        <button id="btn-save-status" style="height: 32px; padding: 0 16px; font-size: 13px; border-radius: 6px; background: var(--accent-color); border: none; color: white; cursor: pointer; font-weight: 600; display: flex; align-items: center; gap: 4px; box-shadow: 0 2px 6px rgba(14, 165, 233, 0.2); margin: 0;">
+                        <button id="btn-save-status" style="height: 28px; padding: 0 12px; font-size: 12px; border-radius: 6px; background: var(--accent-color); border: none; color: white; cursor: pointer; font-weight: 600; display: flex; align-items: center; gap: 4px; box-shadow: 0 2px 6px rgba(14, 165, 233, 0.2); margin: 0;">
                             <span>💾</span> 保存标注与备注
                         </button>
                     </div>
                 </div>
 
                 <!-- 辅助底栏功能操作区 (删除与穿透) -->
-                <div class="detail-footer-actions" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; padding: 12px 16px; background: rgba(0,0,0,0.02); border: 1px solid var(--card-border); border-radius: 12px;">
-                    <div style="display: flex; gap: 8px;">
-                        <button id="btn-detail-project-drill" class="btn-search-main btn-accent-gradient" style="border: none; padding: 0 16px; border-radius: 8px; font-weight: 600; font-size: 13px; cursor: pointer; height: 36px; display: flex; align-items: center; gap: 6px; color: white; margin: 0;">
-                            <span>🔍</span> 参评项目检索 (一键穿透)
-                        </button>
-                    </div>
-                    <div>
-                        <button id="btn-detail-delete" style="height: 36px; padding: 0 16px; font-size: 13px; border-radius: 8px; font-weight: 600; margin: 0;">
-                            <span>🗑️</span> 删除此专家
-                        </button>
-                    </div>
+                <div class="detail-footer-actions" style="display: flex; justify-content: flex-end; align-items: center; gap: 10px; margin-bottom: 12px; padding: 8px 12px; background: rgba(0,0,0,0.02); border: 1px solid var(--card-border); border-radius: 12px;">
+                    <button id="btn-detail-project-drill" class="btn-search-main btn-accent-gradient" style="border: none; padding: 0 12px; border-radius: 6px; font-weight: 600; font-size: 12px; cursor: pointer; height: 32px; display: flex; align-items: center; gap: 6px; color: white; margin: 0;">
+                        <span>🔍</span> 参评项目检索 (一键穿透)
+                    </button>
+                    <button id="btn-detail-delete" style="height: 32px; padding: 0 12px; font-size: 12px; border-radius: 6px; font-weight: 600; border: 1px solid #ef4444; background: transparent; color: #ef4444; cursor: pointer; transition: all 0.2s; margin: 0;">
+                        <span>🗑️</span> 删除此专家
+                    </button>
                 </div>
                 </div>
 
