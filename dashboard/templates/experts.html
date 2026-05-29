@@ -1982,6 +1982,7 @@
                     <input type="date" class="search-input" id="filter-project-time" style="border: none; background: transparent; padding: 8px 4px; width: 145px; box-shadow: none; color: var(--text-primary); font-family: inherit;">
                 </div>
                 <button class="btn-search-main" id="btn-search-projects">搜索项目</button>
+                <button class="btn-search-reset" id="btn-search-projects-reset">🔄 重置条件</button>
             </div>
 
             <!-- 项目展示区 -->
@@ -3873,6 +3874,21 @@
             searchProjBtn.addEventListener('click', executeProjSearch);
             if (filterProjTime) {
                 filterProjTime.addEventListener('change', executeProjSearch);
+            }
+            
+            // 绑定项目重置条件按钮事件
+            const searchProjResetBtn = document.getElementById('btn-search-projects-reset');
+            if (searchProjResetBtn) {
+                searchProjResetBtn.addEventListener('click', () => {
+                    if (searchProjName) searchProjName.value = '';
+                    if (searchProjExpert) searchProjExpert.value = '';
+                    if (searchProjIdcard) searchProjIdcard.value = '';
+                    if (filterProjTime) {
+                        const defaultYear = localStorage.getItem('default_project_min_year') ?? '2025-01-01';
+                        filterProjTime.value = defaultYear;
+                    }
+                    executeProjSearch();
+                });
             }
             
             // 回车键与输入防抖绑定
