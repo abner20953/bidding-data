@@ -332,17 +332,24 @@
                 justify-content: center !important;
                 width: 100% !important;
             }
-            .detail-info-item {
+            .detail-info-item.detail-major-row,
+            .detail-info-item#detail-tags-row {
                 flex-direction: column !important;
                 align-items: stretch !important;
                 gap: 6px !important;
                 width: 100%;
                 word-break: break-all;
             }
-            .detail-info-item > span:first-child {
+            .detail-info-item.detail-major-row > span:first-child,
+            .detail-info-item#detail-tags-row > span:first-child {
                 min-width: 0 !important;
                 text-align: left !important;
                 align-self: flex-start;
+            }
+            .detail-info-item:not(.detail-major-row):not(#detail-tags-row) > span:first-child {
+                white-space: nowrap !important;
+                flex-shrink: 0 !important;
+                min-width: 80px !important;
             }
             .detail-idcard-val-container {
                 width: 100% !important;
@@ -1953,10 +1960,9 @@
                 gap: 6px !important;
             }
             #detail-modal .detail-info-item span {
-                min-width: 70px !important;
-            }
-            #detail-modal .detail-idcard-val-container {
-                width: 100% !important;
+                min-width: 80px !important;
+                white-space: nowrap !important;
+                flex-shrink: 0 !important;
             }
             #detail-modal .detail-remark-box {
                 padding: 10px !important;
