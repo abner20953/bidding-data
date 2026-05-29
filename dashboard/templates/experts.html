@@ -1938,12 +1938,22 @@
                 margin-bottom: 8px;
             }
             #detail-modal .detail-info-item {
+                flex-direction: row !important;
+                align-items: center !important;
+                gap: 8px !important;
+            }
+            #detail-modal .detail-major-row {
                 flex-direction: column !important;
                 align-items: flex-start !important;
                 gap: 4px !important;
             }
+            #detail-modal .detail-info-item#detail-tags-row {
+                flex-direction: column !important;
+                align-items: flex-start !important;
+                gap: 6px !important;
+            }
             #detail-modal .detail-info-item span {
-                min-width: auto !important;
+                min-width: 70px !important;
             }
             #detail-modal .detail-idcard-val-container {
                 width: 100% !important;
@@ -2444,7 +2454,7 @@
                             <span style="min-width: 70px; font-weight: 600; color: var(--text-secondary); font-size: 13px;">🏢 工作单位:</span>
                             <input type="text" id="detail-input-company" class="search-input" style="padding: 6px 10px; font-size: 13px; height: 32px; flex-grow: 1; border-radius: 6px; border: 1px solid var(--border-color); background: var(--bg-card); color: var(--text-primary);" placeholder="请输入工作单位">
                         </div>
-                        <div class="detail-info-item" style="display: flex; align-items: center; gap: 8px; width: 100%;">
+                        <div class="detail-info-item detail-major-row" style="display: flex; align-items: center; gap: 8px; width: 100%;">
                             <span style="min-width: 70px; font-weight: 600; color: var(--text-secondary); font-size: 13px;">💼 专家专业:</span>
                             <textarea id="detail-input-major" class="search-input" style="padding: 6px 10px; font-size: 13px; height: 44px; min-height: 44px; flex-grow: 1; border-radius: 6px; border: 1px solid var(--border-color); background: var(--bg-card); color: var(--text-primary); resize: vertical; box-sizing: border-box; line-height: 1.4; font-family: inherit; margin: 0;" placeholder="请输入专家专业"></textarea>
                         </div>
