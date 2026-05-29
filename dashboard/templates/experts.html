@@ -3215,7 +3215,123 @@
             
             // 填充顶部身份卡片与输入框
             const nameEl = document.getElementById('detail-title-name');
-                        // 声明内部编辑状态和控件只读切换函数
+            const phoneInput = document.getElementById('detail-input-phone');
+            const idcardEl = document.getElementById('detail-title-idcard');
+            const companyInput = document.getElementById('detail-input-company');
+            const majorInput = document.getElementById('detail-input-major');
+            
+            if (nameEl) nameEl.innerText = item.name || '-';
+            if (phoneInput) phoneInput.value = item.phone || '';
+            if (idcardEl) idcardEl.innerText = item.id_card || '未填身份证';
+            if (companyInput) companyInput.value = item.company || '';
+            if (majorInput) majorInput.value = item.major || '';
+            
+            // 重置新照片选择
+            let selectedPhotoFile = null;
+            const photoFileInput = document.getElementById('detail-photo-file-input');
+            if (photoFileInput) photoFileInput.value = '';
+            
+            // 渲染专家标签
+            renderDetailTags(item.tags);
+            
+            // 照片多图匹配与切换控制
+            const detailImg = document.getElementById('detail-img');
+            const errDiv = document.getElementById('detail-img-error');
+            const prevBtn = document.getElementById('photo-prev-btn');
+            const nextBtn = document.getElementById('photo-next-btn');
+            const indicator = document.getElementById('detail-photo-indicator');
+            
+            currentDetailPhotos = item.photo_path ? item.photo_path.split(',') : [];
+            currentDetailPhotoIndex = 0;
+            
+            function updateDetailPhotoShow() {
+                if (detailImg && errDiv) {
+                    if (currentDetailPhotos.length > 0) {
+                        const currentPath = currentDetailPhotos[currentDetailPhotoIndex].trim();
+                        detailImg.src = currentPath;
+                        detailImg.style.display = 'block';
+                        errDiv.style.display = 'none';
+                        detailImg.onclick = () => zoomPhoto(item.photo_path, currentDetailPhotoIndex);
+                        
+                        if (currentDetailPhotos.length > 1) {
+                            if (prevBtn) prevBtn.style.display = 'flex';
+                            if (nextBtn) nextBtn.style.display = 'flex';
+                            if (indicator) {
+                                indicator.style.display = 'block';
+                                indicator.innerText = `${currentDetailPhotoIndex + 1} / ${currentDetailPhotos.length}`;
+                            }
+                        } else {
+                            if (prevBtn) prevBtn.style.display = 'none';
+                            if (nextBtn) nextBtn.style.display = 'none';
+                            if (indicator) indicator.style.display = 'none';
+                        }
+                    } else {
+                        detailImg.src = '';
+                        detailImg.style.display = 'none';
+                        errDiv.style.display = 'flex';
+                        if (prevBtn) prevBtn.style.display = 'none';
+                        if (nextBtn) nextBtn.style.display = 'none';
+                        if (indicator) indicator.style.display = 'none';
+                    }
+                }
+            }
+            
+            if (prevBtn) {
+                prevBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    if (currentDetailPhotos.length > 1) {
+                        currentDetailPhotoIndex = (currentDetailPhotoIndex - 1 + currentDetailPhotos.length) % currentDetailPhotos.length;
+                        updateDetailPhotoShow();
+                    }
+                };
+            }
+            if (nextBtn) {
+                nextBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    if (currentDetailPhotos.length > 1) {
+                        currentDetailPhotoIndex = (currentDetailPhotoIndex + 1) % currentDetailPhotos.length;
+                        updateDetailPhotoShow();
+                    }
+                };
+            }
+            
+            updateDetailPhotoShow();
+            
+            // 绑定“更换照片”按钮事件
+            const changePhotoBtn = document.getElementById('btn-change-photo');
+            if (changePhotoBtn && photoFileInput) {
+                changePhotoBtn.onclick = (e) => {
+                    e.preventDefault();
+                    photoFileInput.click();
+                };
+                
+                photoFileInput.onchange = (e) => {
+                    const file = e.target.files[0];
+                    if (file) {
+                        const ext = file.name.split('.').pop().toLowerCase();
+                        if (!['jpg', 'jpeg', 'png'].includes(ext)) {
+                            alert('上传的照片格式不正确，仅支持 .jpg, .jpeg, .png');
+                            photoFileInput.value = '';
+                            return;
+                        }
+                        selectedPhotoFile = file;
+                        
+                        // 本地实时图片预览
+                        if (detailImg && errDiv) {
+                            detailImg.src = URL.createObjectURL(file);
+                            detailImg.style.display = 'block';
+                            errDiv.style.display = 'none';
+                            
+                            // 本地单图预览，隐藏多图指示器
+                            if (prevBtn) prevBtn.style.display = 'none';
+                            if (nextBtn) nextBtn.style.display = 'none';
+                            if (indicator) indicator.style.display = 'none';
+                        }
+                    }
+                };
+            }
+
+            // 声明内部编辑状态和控件只读切换函数
             let isDetailEditing = false;
             function setModalEditable(editable) {
                 isDetailEditing = editable;
