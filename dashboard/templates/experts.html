@@ -2343,8 +2343,11 @@
                         <button id="btn-save-status">保存修改</button>
                         <span id="save-status-tip">✅ 已保存</span>
                     </div>
-                    <!-- 物理删除区 -->
-                    <div class="detail-delete-wrapper">
+                    <!-- 穿透检索与物理删除区 -->
+                    <div class="detail-delete-wrapper" style="display: flex; gap: 8px;">
+                        <button id="btn-detail-project-drill" class="btn-search-main btn-accent-gradient" style="border: none; padding: 0 16px; border-radius: 8px; font-weight: 500; font-size: 14px; cursor: pointer; height: 38px; display: flex; align-items: center; gap: 6px; color: white;">
+                            <span>🔍</span> 参评项目检索
+                        </button>
                         <button id="btn-detail-delete">
                             <span>🗑️</span> 删除专家
                         </button>
@@ -3489,6 +3492,30 @@
                             .catch(err => {
                                 alert('复制失败，请手动选择复制：' + err);
                             });
+                    });
+                }
+                
+                // 绑定穿透参评项目检索按钮事件
+                const drillProjectBtn = document.getElementById('btn-detail-project-drill');
+                if (drillProjectBtn) {
+                    // 先移除旧事件，避免重复绑定
+                    const newDrillProjectBtn = drillProjectBtn.cloneNode(true);
+                    drillProjectBtn.parentNode.replaceChild(newDrillProjectBtn, drillProjectBtn);
+                    newDrillProjectBtn.addEventListener('click', () => {
+                        // 1. 关闭当前的专家档案模态框
+                        closeDetailModal();
+                        
+                        // 2. 填充项目评审查询输入框
+                        const projExpertNameInput = document.getElementById('search-project-expert-name');
+                        const projExpertIdcardInput = document.getElementById('search-project-expert-idcard');
+                        const projNameInput = document.getElementById('search-project-name');
+                        
+                        if (projExpertNameInput) projExpertNameInput.value = item.name || '';
+                        if (projExpertIdcardInput) projExpertIdcardInput.value = item.id_card || '';
+                        if (projNameInput) projNameInput.value = ''; // 清空可能残留的项目名称过滤
+                        
+                        // 3. 自动切换到“项目评审关系”选项卡并自动检索
+                        switchTab('projects');
                     });
                 }
                 
