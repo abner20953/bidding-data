@@ -11,8 +11,10 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 # 确保日志即时输出
 ENV PYTHONUNBUFFERED=1
 
-# 安装系统依赖 (包括基础编译工具以支持 gevent 等包含 C 扩展的包编译)
-RUN apt-get update && \
+# 安装系统依赖 (先将 APT 源替换为国内阿里云源加速下载，包括基础编译工具以支持 gevent 等包编译)
+RUN (sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list) && \
+    apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates gcc python3-dev && \
     rm -rf /var/lib/apt/lists/*
 
