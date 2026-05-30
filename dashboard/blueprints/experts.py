@@ -84,6 +84,23 @@ def init_face_group():
             print(f"⚠️ 检查人员库状态异常: {e}")
 
 
+def _get_gender_from_idcard(id_card):
+    """根据身份证号计算性别，0: 未知/未填写, 1: 男性, 2: 女性"""
+    if not id_card:
+        return 0
+    id_card = id_card.strip()
+    try:
+        if len(id_card) == 18:
+            gender_num = int(id_card[16])
+            return 1 if gender_num % 2 == 1 else 2
+        elif len(id_card) == 15:
+            gender_num = int(id_card[14])
+            return 1 if gender_num % 2 == 1 else 2
+    except Exception:
+        pass
+    return 0
+
+
 def _register_or_update_face(id_card, name, photo_path):
     """向腾讯云人脸库注册或更新人员"""
     client = _get_iai_client()
@@ -129,6 +146,7 @@ def _register_or_update_face(id_card, name, photo_path):
         create_req.PersonName = name.strip()
         create_req.PersonId = id_card.strip()
         create_req.Image = img_base64
+        create_req.Gender = _get_gender_from_idcard(id_card)
         client.CreatePerson(create_req)
         return True, "成功注册同步至人脸库"
     except TencentCloudSDKException as e:
