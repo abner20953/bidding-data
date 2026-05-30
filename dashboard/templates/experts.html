@@ -2550,6 +2550,8 @@
         let currentDetailPhotoIndex = 0;
         let currentZoomPhotos = [];
         let currentZoomPhotoIndex = 0;
+        let isDetailEditing = false;
+        let selectedPhotoFile = null;
 
         // 页面初始化加载
         document.addEventListener('DOMContentLoaded', () => {
@@ -3279,7 +3281,8 @@
 
         function setupDetailModal(item) {
             if (!item) return;
-            let isDetailEditing = false;
+            isDetailEditing = false;
+            selectedPhotoFile = null;
             const modal = document.getElementById('detail-modal');
             if (!modal) return;
             
@@ -3305,7 +3308,6 @@
             if (majorInput) majorInput.value = item.major || '';
             
             // 重置新照片选择
-            let selectedPhotoFile = null;
             const photoFileInput = document.getElementById('detail-photo-file-input');
             if (photoFileInput) photoFileInput.value = '';
             
