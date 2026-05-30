@@ -1310,7 +1310,7 @@ def api_search():
             
         # 精炼 SQL：不 SELECT raw_json 大文本字段，并通过子查询获取每个专家所对应的标签字符串
         sql = """
-            SELECT id, name, phone, id_card, company, major, photo_path, status, remark, project_count, last_project_time,
+            SELECT id, name, phone, id_card, company, major, photo_path, status, remark, project_count, last_project_time, is_face_synced,
                    (
                        SELECT GROUP_CONCAT(t.tag_name, ',')
                        FROM expert_majors em
@@ -1351,6 +1351,7 @@ def api_search():
             "tags": tags_list,
             "project_count": r['project_count'] if 'project_count' in r.keys() and r['project_count'] is not None else 0,
             "last_project_time": r['last_project_time'] if 'last_project_time' in r.keys() else None,
+            "is_face_synced": r['is_face_synced'] if 'is_face_synced' in r.keys() and r['is_face_synced'] is not None else 0,
             "details": {}  # 列表阶段置空，点击“查看完整档案”时通过 api_detail 懒加载
         })
         
