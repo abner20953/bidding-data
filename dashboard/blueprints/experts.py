@@ -606,11 +606,21 @@ def api_upload():
                 major = str(row.get(col_mapping.get('major', ''), '')).strip()
                 raw_json = str(row.get(col_mapping.get('raw_json', ''), '')).strip()
 
+                # 提前进行数据库查重，以便对于已存在且有照专家跳过压缩包照片的读取与复制流程
+                c.execute("SELECT id, id_card, company, major, photo_path, raw_json FROM experts WHERE name = ? AND phone = ?", (name, phone))
+                exist_record = c.fetchone()
+
                 # 照片关联与去重覆盖逻辑
                 # 照片可能命名为 "{姓名}_{手机号}.jpg"
                 photo_key = f"{name}_{phone}".lower()
                 photo_path_db = None
                 
+                should_process_photo = True
+                if exist_record and exist_record[4]:
+                    # 专家已存在且已有照片，则绝对不再覆盖更新，直接使用原有数据库的照片路径
+                    should_process_photo = False
+                    photo_path_db = exist_record[4]
+
                 # 搜集所有符合条件的图片
                 matched_photos = []
                 
@@ -624,7 +634,7 @@ def api_upload():
                         if path not in matched_photos:
                             matched_photos.append(path)
                 
-                if matched_photos:
+                if matched_photos and should_process_photo:
                     # 排序机制：优先展示文件名（不含扩展名）以 `_1` 或 `-1` 结尾的照片，其他按序号递增
                     def get_photo_sort_key(path_str):
                         fname = os.path.splitext(os.path.basename(path_str))[0].strip()
@@ -740,16 +750,11 @@ def api_upload():
                     
                     photo_path_db = ",".join(copied_paths)
                 else:
-                    # 若本次压缩包内未包含该专家的图片，则保持数据库已存在的旧图片路径，不抹除
-                    c.execute("SELECT photo_path FROM experts WHERE name = ? AND phone = ?", (name, phone))
-                    row_exist = c.fetchone()
-                    if row_exist:
-                        photo_path_db = row_exist[0]
+                    # 若本次压缩包内未包含该专家的图片（或跳过不覆盖），且该专家在数据库已存在，则保持其旧图片路径不抹除
+                    if exist_record:
+                        photo_path_db = exist_record[4]
 
-                # 追加与去重覆盖：使用传统 SELECT 判断在 SQLite 下最兼容安全
-                c.execute("SELECT id, id_card, company, major, photo_path, raw_json FROM experts WHERE name = ? AND phone = ?", (name, phone))
-                exist_record = c.fetchone()
-                
+                # 追加与去重覆盖：由于在循环开始处已执行 SELECT，此处直接使用 exist_record
                 if exist_record:
                     # 已经存在，执行更新操作
                     updated_count += 1
@@ -1093,6 +1098,7 @@ def api_search():
             tag_id_list = [t.strip() for t in tag_ids_str.split(',') if t.strip()]
             digit_ids = [t for t in tag_id_list if t.isdigit()]
             has_unassigned = 'unassigned' in tag_id_list
+            has_multi_photos = 'multi_photos' in tag_id_list
             
             sub_conds = []
             if digit_ids:
@@ -1102,6 +1108,9 @@ def api_search():
                 
             if has_unassigned:
                 sub_conds.append("id NOT IN (SELECT DISTINCT em.expert_id FROM expert_majors em JOIN tag_majors tm ON em.major_name = tm.major_name)")
+                
+            if has_multi_photos:
+                sub_conds.append("photo_path LIKE '%,%'")
                 
             if sub_conds:
                 conditions.append(f"({' OR '.join(sub_conds)})")
@@ -1525,6 +1534,80 @@ def api_update_expert_profile():
         conn.close()
 
 
+@experts_bp.route('/api/delete_photo', methods=['POST'])
+def api_delete_photo():
+    """删除专家的某张身份证照片，并物理删除文件与更新数据库路径"""
+    data = request.get_json() or {}
+    expert_id = data.get('id')
+    photo_to_delete = data.get('photo_path')
+    
+    if not expert_id or not photo_to_delete:
+        return jsonify({"success": False, "error": "参数不足"}), 400
+        
+    conn = get_db_conn()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT photo_path, name, phone FROM experts WHERE id = ?", (expert_id,))
+        row = c.fetchone()
+        if not row:
+            return jsonify({"success": False, "error": "未找到对应的专家记录"}), 404
+            
+        db_photo_path = row[0]
+        name = row[1]
+        phone = row[2]
+        
+        if not db_photo_path:
+            return jsonify({"success": False, "error": "专家原本就没有照片"}), 400
+            
+        # 解析数据库中的照片路径
+        photo_list = [p.strip() for p in db_photo_path.split(',') if p.strip()]
+        
+        # 检验要删除的照片是否确实存在于该专家的路径列表中
+        cleaned_target = photo_to_delete.strip().lower()
+        matched_db_path = None
+        for p in photo_list:
+            if p.lower() == cleaned_target or p.lower().endswith(cleaned_target) or cleaned_target.endswith(p.lower()):
+                matched_db_path = p
+                break
+                
+        if not matched_db_path:
+            return jsonify({"success": False, "error": "该照片路径与数据库中记录不符"}), 400
+            
+        # 至少保留一张照片的约束
+        if len(photo_list) <= 1:
+            return jsonify({"success": False, "error": "专家只剩一张照片，无法执行删除，只能通过更换照片直接覆盖"}), 400
+            
+        # 1. 从列表中移除要删除的照片
+        photo_list.remove(matched_db_path)
+        new_photo_path_db = ",".join(photo_list)
+        
+        # 2. 从服务器磁盘上物理删除该图片文件
+        filename = os.path.basename(matched_db_path)
+        photos_dir = get_photos_dir()
+        physical_path = os.path.join(photos_dir, filename)
+        
+        if os.path.exists(physical_path):
+            try:
+                os.remove(physical_path)
+            except Exception as ex:
+                # 记录文件占用异常，但不阻断数据库的正常更新
+                print(f"物理删除磁盘照片文件失败 {physical_path}: {ex}")
+                
+        # 3. 更新数据库
+        c.execute("UPDATE experts SET photo_path = ?, created_at = ? WHERE id = ?", 
+                  (new_photo_path_db, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), expert_id))
+        
+        conn.commit()
+        
+        _log_action("删除专家部分照片", f"专家: {name}({phone}), 删除照片: {filename}")
+        return jsonify({"success": True, "message": "照片已成功物理删除且路径已更新"})
+        
+    except Exception as e:
+        return jsonify({"success": False, "error": f"系统错误: {str(e)}"}), 500
+    finally:
+        conn.close()
+
+
 @experts_bp.route('/api/tags', methods=['GET', 'POST'])
 def api_tags():
     if request.method == 'GET':
@@ -1548,6 +1631,18 @@ def api_tags():
                     "tag_name": t['tag_name'],
                     "majors": majors,
                     "created_at": t['created_at']
+                })
+            
+            # 3. 动态检查是否存在具有多张照片的专家
+            c.execute("SELECT COUNT(*) FROM experts WHERE photo_path LIKE '%,%'")
+            has_multi_photos = c.fetchone()[0] > 0
+            if has_multi_photos:
+                # 在下拉列表头部塞入虚拟标签“多张照片”
+                tags_list.insert(0, {
+                    "id": "multi_photos",
+                    "tag_name": "多张照片",
+                    "majors": [],
+                    "created_at": ""
                 })
             
             return jsonify({"success": True, "tags": tags_list})
