@@ -208,6 +208,33 @@
         }
 
         @media (max-width: 768px) {
+            /* 移动端标签导航自适应横向滑动 */
+            .glass-tabs {
+                width: 100% !important;
+                max-width: 100% !important;
+                overflow-x: auto !important;
+                white-space: nowrap !important;
+                display: flex !important;
+                flex-wrap: nowrap !important;
+                justify-content: flex-start !important;
+                -webkit-overflow-scrolling: touch;
+                scrollbar-width: none; /* Firefox */
+                box-sizing: border-box;
+                padding: 4px !important;
+                gap: 4px !important;
+                margin: 10px 0 15px 0 !important;
+            }
+            .glass-tabs::-webkit-scrollbar {
+                display: none; /* Safari and Chrome */
+            }
+            .tab-btn {
+                flex-shrink: 0 !important;
+                padding: 8px 12px !important;
+                font-size: 13px !important;
+                white-space: nowrap !important;
+                gap: 4px !important;
+            }
+
             .search-bar-container {
                 flex-direction: column;
                 gap: 12px;
@@ -1982,6 +2009,20 @@
                 gap: 8px !important;
                 padding: 8px !important;
             }
+            #detail-modal .detail-profile-header-row {
+                flex-direction: column !important;
+                align-items: flex-start !important;
+                gap: 10px !important;
+                padding-bottom: 8px !important;
+            }
+            #detail-modal .detail-profile-header-row > div:last-child {
+                width: 100% !important;
+                justify-content: flex-start !important;
+                gap: 6px !important;
+            }
+            #detail-modal .sync-btn-txt-long {
+                display: none !important;
+            }
         }
         @keyframes scanAnimation {
             0% { top: 0%; opacity: 0.8; }
@@ -2545,7 +2586,7 @@
                             </div>
                             <div style="display: flex; align-items: center; gap: 8px;">
                                 <button id="btn-sync-single-face" class="btn-search-main" style="display: none; border: none; background: linear-gradient(135deg, #a855f7, #6366f1); padding: 0 10px; border-radius: 6px; font-weight: 600; font-size: 12px; cursor: pointer; height: 28px; align-items: center; gap: 4px; color: white; margin: 0; box-shadow: 0 2px 6px rgba(168, 85, 247, 0.2);">
-                                    <span>☁️</span> 同步人脸
+                                    <span>☁️</span> <span class="sync-btn-txt-short">同步</span><span class="sync-btn-txt-long">人脸</span>
                                 </button>
                                 <button id="btn-cancel-expert-profile" class="action-btn-small" style="display: none; border: 1px solid var(--border-color); background: var(--bg-card); padding: 0 10px; border-radius: 6px; font-weight: 500; font-size: 12px; cursor: pointer; height: 28px; align-items: center; gap: 4px; color: var(--text-primary); margin: 0; box-shadow: var(--shadow-soft);">
                                     <span>❌</span> 取消
@@ -3690,7 +3731,7 @@
                         .then(r => r.json())
                         .then(res => {
                             newSyncSingleFaceBtn.disabled = false;
-                            newSyncSingleFaceBtn.innerHTML = '<span>☁️</span> 同步人脸';
+                            newSyncSingleFaceBtn.innerHTML = '<span>☁️</span> <span class="sync-btn-txt-short">同步</span><span class="sync-btn-txt-long">人脸</span>';
                             
                             if (res.success) {
                                 alert(res.message);
@@ -3706,7 +3747,7 @@
                         })
                         .catch(err => {
                             newSyncSingleFaceBtn.disabled = false;
-                            newSyncSingleFaceBtn.innerHTML = '<span>☁️</span> 同步人脸';
+                            newSyncSingleFaceBtn.innerHTML = '<span>☁️</span> <span class="sync-btn-txt-short">同步</span><span class="sync-btn-txt-long">人脸</span>';
                             alert('❌ 同步发生请求异常：' + err.message);
                         });
                     }
