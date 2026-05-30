@@ -1146,6 +1146,7 @@ def api_search():
             tags_list = list(set([t.strip() for t in r['tags_str'].split(',') if t.strip()]))
                 
         results.append({
+            "id": r['id'],
             "name": r['name'],
             "phone": r['phone'],
             "id_card": r['id_card'],
