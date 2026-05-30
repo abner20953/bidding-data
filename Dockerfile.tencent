@@ -11,9 +11,9 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 # 确保日志即时输出
 ENV PYTHONUNBUFFERED=1
 
-# 安装系统依赖 (仅需基础工具)
+# 安装系统依赖 (包括基础编译工具以支持 gevent 等包含 C 扩展的包编译)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
+    apt-get install -y --no-install-recommends ca-certificates gcc python3-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # 【核心优化 1】单独安装并缓存极其庞大的 PyTorch CPU 版
