@@ -2050,11 +2050,11 @@
 
         <!-- 功能模块：集成 Tab 导航 -->
         <div class="glass-tabs">
-            <button class="tab-btn active" data-tab="face-search" onclick="switchTab('face-search')">
-                <span>📷</span> 人脸比对检索
-            </button>
-            <button class="tab-btn" data-tab="search" onclick="switchTab('search')">
+            <button class="tab-btn active" data-tab="search" onclick="switchTab('search')">
                 <span>🔍</span> 专家条件检索
+            </button>
+            <button class="tab-btn" data-tab="face-search" onclick="switchTab('face-search')">
+                <span>📷</span> 人脸比对检索
             </button>
             <button class="tab-btn" data-tab="projects" onclick="switchTab('projects')">
                 <span>📊</span> 项目评审查询
@@ -2068,7 +2068,7 @@
         </div>
 
         <!-- 人脸比对检索面板 -->
-        <div id="panel-face-search" class="tab-panel" style="display: block;">
+        <div id="panel-face-search" class="tab-panel" style="display: none;">
             <div style="max-width: 600px; margin: 30px auto; display: flex; flex-direction: column; gap: 20px;">
                 <!-- 拖拽/点击选择照片上传卡片 -->
                 <div class="glass-card" style="padding: 24px 30px; border-radius: 16px; display: flex; flex-direction: column; gap: 20px; background: var(--card-bg); border: 1px solid var(--card-border); box-shadow: var(--shadow-soft);">
@@ -2152,7 +2152,7 @@
         </div>
 
         <!-- 专家信息检索面板 -->
-        <div id="panel-search" class="tab-panel" style="display: none;">
+        <div id="panel-search" class="tab-panel" style="display: block;">
             <!-- 搜索框 -->
             <!-- 新版两行检索布局 -->
             <div class="search-section-wrapper">
@@ -5281,6 +5281,42 @@
                 });
             }
             
+            function compressImage(file, callback) {
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    const img = new Image();
+                    img.onload = () => {
+                        // 设定最大宽高为 1024px，防止超大图片导致腾讯云限制
+                        const maxW = 1024;
+                        const maxH = 1024;
+                        let width = img.width;
+                        let height = img.height;
+                        
+                        if (width > maxW || height > maxH) {
+                            if (width > height) {
+                                height = Math.round((height * maxW) / width);
+                                width = maxW;
+                            } else {
+                                width = Math.round((width * maxH) / height);
+                                height = maxH;
+                            }
+                        }
+                        
+                        const canvas = document.createElement('canvas');
+                        canvas.width = width;
+                        canvas.height = height;
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0, width, height);
+                        
+                        // 采用 jpeg 格式，并以 0.8 质量进行压缩
+                        const base64Image = canvas.toDataURL('image/jpeg', 0.8);
+                        callback(base64Image);
+                    };
+                    img.src = e.target.result;
+                };
+                reader.readAsDataURL(file);
+            }
+
             function processFile(file) {
                 const ext = file.name.split('.').pop().toLowerCase();
                 if (!['jpg', 'jpeg', 'png'].includes(ext)) {
@@ -5288,16 +5324,22 @@
                     return;
                 }
                 
-                const reader = new FileReader();
-                reader.onload = (e) => {
-                    const base64Image = e.target.result;
+                if (statusBanner && statusText) {
+                    statusBanner.style.display = 'flex';
+                    statusBanner.style.borderColor = 'rgba(168, 85, 247, 0.2)';
+                    statusBanner.style.background = 'rgba(168, 85, 247, 0.05)';
+                    statusBanner.style.color = 'var(--text-primary)';
+                    if (statusSpinner) statusSpinner.style.display = 'block';
+                    statusText.innerText = '正在压缩并优化上传图片中...';
+                }
+                
+                compressImage(file, (base64Image) => {
                     if (faceUploadDefault) faceUploadDefault.style.display = 'none';
                     if (faceUploadPreview) faceUploadPreview.style.display = 'block';
                     if (facePreviewImg) facePreviewImg.src = base64Image;
                     
                     performFaceSearch(base64Image);
-                };
-                reader.readAsDataURL(file);
+                });
             }
             
             function performFaceSearch(base64Data) {
@@ -5333,7 +5375,15 @@
                                 const score = item.score;
                                 const exp = item.expert;
                                 const photos = exp.photo_path ? exp.photo_path.split(',') : [];
-                                const photoSrc = photos.length > 0 ? '/dlsgzs/file/' + photos[0] : '';
+                                let photoSrc = '';
+                                if (photos.length > 0) {
+                                    const rawPhoto = photos[0].trim();
+                                    if (rawPhoto.startsWith('/') || rawPhoto.startsWith('http')) {
+                                        photoSrc = rawPhoto;
+                                    } else {
+                                        photoSrc = '/static/uploads/expert_photos/' + rawPhoto;
+                                    }
+                                }
                                 const hasSync = exp.is_face_synced === 1;
                                 
                                 // 根据匹配排名采用不同的卡片边框/得分标签色

@@ -2026,11 +2026,11 @@ def api_face_search():
     if err_msg:
         return jsonify({"success": False, "error": err_msg}), 400
         
-    # 过滤掉得分低于 75.0 的候选人
-    valid_candidates = [c for c in candidates if c['score'] >= 75.0]
+    # 过滤掉得分低于 50.0 的候选人（最大化兼容大年龄跨度身份证比对）
+    valid_candidates = [c for c in candidates if c['score'] >= 50.0]
     
     if not valid_candidates:
-        return jsonify({"success": False, "error": "人脸库中未匹配到相似度足够高的专家档案（最高匹配得分低于阈值 75）"}), 400
+        return jsonify({"success": False, "error": "人脸库中未匹配到相似度足够高的专家档案（最高匹配得分低于阈值 50）"}), 400
         
     conn = get_db_conn()
     results = []

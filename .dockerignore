@@ -18,7 +18,6 @@ __pycache__
 # Application Data (Large files not needed for build)
 file/
 results/
-model_data/
 dashboard/uploads/
 dashboard/visitor_logs.db
 dashboard/scheduler.log
