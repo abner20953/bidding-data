@@ -135,37 +135,41 @@ def _register_or_update_face(id_card, name, photo_path):
 
 
 def _search_face(image_base64):
-    """在腾讯云人员库中搜索匹配的人脸，返回最相似的 PersonId(身份证号) 和相似度得分 Score"""
+    """在腾讯云人员库中搜索匹配的人脸，返回最相似的前3个 PersonId(身份证号) 和相似度得分 Score 的列表"""
     client = _get_iai_client()
     if not client:
-        return None, 0, "腾讯云 SecretId/SecretKey 配置缺失"
+        return [], "腾讯云 SecretId/SecretKey 配置缺失"
         
     try:
         req = models.SearchFacesRequest()
         req.GroupIds = [GROUP_ID]
         req.Image = image_base64
         req.MaxFaceNum = 1 # 仅识别并检索现场图中最大的一张脸
-        req.MaxPersonNum = 1 # 仅返回相似度最高的 Top 1 候选人
-        req.NeedPersonInfo = 0 # 不需要返回额外的人员描述
+        req.MaxPersonNum = 3 # 返回相似度最高的前 3 个候选人
+        req.NeedPersonInfo = 0
         
         resp = client.SearchFaces(req)
         
         # 解析返回结果
+        candidates = []
         if resp.Results and len(resp.Results) > 0:
             result = resp.Results[0]
-            if result.RetCode == 0 and result.Candidates and len(result.Candidates) > 0:
-                top_candidate = result.Candidates[0]
-                return top_candidate.PersonId, top_candidate.Score, None
+            if result.RetCode == 0 and result.Candidates:
+                for candidate in result.Candidates:
+                    candidates.append({
+                        "person_id": candidate.PersonId,
+                        "score": candidate.Score
+                    })
+                return candidates, None
             else:
-                # RetCode 不为 0 说明检索该脸失败（比如照片模糊没匹配到）
-                return None, 0, "人脸库中未匹配到相似度足够高的人脸"
+                return [], "人脸库中未匹配到相似度足够高的人脸"
         else:
-            return None, 0, "图片中未检测到清晰人脸"
+            return [], "图片中未检测到清晰人脸"
             
     except TencentCloudSDKException as e:
-        return None, 0, f"腾讯云人脸搜索失败: {e.message} (代码: {e.code})"
+        return [], f"腾讯云人脸搜索失败: {e.message} (代码: {e.code})"
     except Exception as e:
-        return None, 0, f"人脸搜索发生异常: {str(e)}"
+        return [], f"人脸搜索发生异常: {str(e)}"
 
 
 
@@ -1982,7 +1986,7 @@ def api_face_sync():
 
 @experts_bp.route('/api/face/search', methods=['POST'])
 def api_face_search():
-    """接收前端发送的现场照，检测并调用腾讯云人脸比对，匹配本地专家库并返回匹配专家的完整档案"""
+    """接收前端发送的现场照，检测并调用腾讯云人脸比对，匹配本地专家库并返回排名前3的可能匹配专家"""
     data = request.get_json() or {}
     image_data = data.get('image', '').strip()
     
@@ -1995,73 +1999,85 @@ def api_face_search():
     else:
         image_base64 = image_data
         
-    # 调用腾讯云人脸检索
-    person_id, score, err_msg = _search_face(image_base64)
+    # 调用腾讯云人脸检索，获取前3个候选人
+    candidates, err_msg = _search_face(image_base64)
     if err_msg:
         return jsonify({"success": False, "error": err_msg}), 400
         
-    if not person_id or score < 75.0:
-        return jsonify({"success": False, "error": "人脸库中未匹配到相似度足够高的专家档案（匹配得分低于阈值 75）"}), 400
+    # 过滤掉得分低于 75.0 的候选人
+    valid_candidates = [c for c in candidates if c['score'] >= 75.0]
+    
+    if not valid_candidates:
+        return jsonify({"success": False, "error": "人脸库中未匹配到相似度足够高的专家档案（最高匹配得分低于阈值 75）"}), 400
         
-    # 根据身份证号检索本地专家记录
     conn = get_db_conn()
+    results = []
     try:
         c = conn.cursor()
-        c.execute("""
-            SELECT id, name, phone, id_card, company, major, photo_path, status, remark, raw_json, project_count, is_face_synced
-            FROM experts 
-            WHERE id_card = ?
-        """, (person_id,))
-        row = c.fetchone()
-        
-        if not row:
-            return jsonify({
-                "success": False, 
-                "error": f"腾讯云匹配成功(身份证号: {person_id}, 相似度得分: {score:.1f})，但在本地专家库中未检索到该专家的档案记录。"
-            }), 404
+        for cand in valid_candidates:
+            person_id = cand['person_id']
+            score = cand['score']
             
-        expert_id, name, phone, id_card, company, major, photo_path, status, remark, raw_json, project_count, is_face_synced = row
-        
-        parsed_json = {}
-        if raw_json:
-            try:
-                parsed_json = json.loads(raw_json)
-            except Exception:
-                pass
+            c.execute("""
+                SELECT id, name, phone, id_card, company, major, photo_path, status, remark, raw_json, project_count, is_face_synced
+                FROM experts 
+                WHERE id_card = ?
+            """, (person_id,))
+            row = c.fetchone()
+            if not row:
+                continue
                 
-        # 查询该专家匹配到的所有标签
-        c.execute("""
-            SELECT DISTINCT t.tag_name
-            FROM expert_majors em
-            JOIN tag_majors tm ON em.major_name = tm.major_name
-            JOIN tags t ON tm.tag_id = t.id
-            WHERE em.expert_id = ?
-        """, (expert_id,))
-        tag_rows = c.fetchall()
-        tags = [tr[0] for tr in tag_rows if tr[0]]
+            expert_id, name, phone, id_card, company, major, photo_path, status, remark, raw_json, project_count, is_face_synced = row
+            
+            parsed_json = {}
+            if raw_json:
+                try:
+                    parsed_json = json.loads(raw_json)
+                except Exception:
+                    pass
+                    
+            c.execute("""
+                SELECT DISTINCT t.tag_name
+                FROM expert_majors em
+                JOIN tag_majors tm ON em.major_name = tm.major_name
+                JOIN tags t ON tm.tag_id = t.id
+                WHERE em.expert_id = ?
+            """, (expert_id,))
+            tag_rows = c.fetchall()
+            tags = [tr[0] for tr in tag_rows if tr[0]]
+            
+            expert = {
+                "id": expert_id,
+                "name": name,
+                "phone": phone,
+                "id_card": id_card,
+                "company": company,
+                "major": major,
+                "photo_path": photo_path,
+                "status": status,
+                "remark": remark,
+                "tags": tags,
+                "details": parsed_json,
+                "project_count": project_count if project_count is not None else 0,
+                "is_face_synced": is_face_synced if is_face_synced is not None else 0
+            }
+            results.append({
+                "score": score,
+                "expert": expert
+            })
+            
+        if not results:
+            return jsonify({"success": False, "error": "腾讯云匹配成功，但在本地专家库中未检索到匹配的专家档案记录。"}), 404
+            
+        # 记录第一匹配候选人日志
+        first_match = results[0]['expert']
+        first_score = results[0]['score']
+        _log_action("人脸识别检索专家", f"成功匹配(Top1): {first_match['name']}, 得分: {first_score:.1f}, 候选人数: {len(results)}")
         
-        expert = {
-            "id": expert_id,
-            "name": name,
-            "phone": phone,
-            "id_card": id_card,
-            "company": company,
-            "major": major,
-            "photo_path": photo_path,
-            "status": status,
-            "remark": remark,
-            "tags": tags,
-            "details": parsed_json,
-            "project_count": project_count if project_count is not None else 0,
-            "is_face_synced": is_face_synced if is_face_synced is not None else 0
-        }
-        
-        _log_action("人脸识别检索专家", f"成功匹配: {name}, 身份证: {id_card}, 得分: {score:.1f}")
         return jsonify({
             "success": True,
             "found": True,
-            "score": score,
-            "expert": expert
+            "results": results
         })
     except Exception as e:
         return jsonify({"success": False, "error": f"本地检索专家档案失败: {str(e)}"}), 500

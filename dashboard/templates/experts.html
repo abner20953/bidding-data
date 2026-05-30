@@ -5197,6 +5197,14 @@
         window.openExpertDetailByIdCard = openExpertDetailByIdCard;
         window.fetchProjects = fetchProjects;
 
+        let currentMatchedResults = [];
+        window.openMatchedExpertDetail = function(index) {
+            const item = currentMatchedResults[index];
+            if (item && item.expert) {
+                setupDetailModal(item.expert);
+            }
+        };
+
         // ==================== 人脸识别与刷脸检索逻辑 ====================
         // 全局人脸搜索重置函数 (仅负责清空上传和结果状态)
         function resetFaceSearchPanel() {
@@ -5227,10 +5235,6 @@
             const statusBanner = document.getElementById('face-status-banner');
             const statusText = document.getElementById('face-status-text');
             const statusSpinner = document.getElementById('face-status-spinner');
-            
-            const btnOpenMatchedDetail = document.getElementById('btn-open-matched-detail');
-            
-            let matchedExpert = null; // 用于存储当前匹配成功的专家对象
             
             if (!faceUploadZone) return; // 基础校验
             
@@ -5316,42 +5320,87 @@
                 })
                 .then(r => r.json())
                 .then(res => {
-                    if (res.success && res.found) {
+                    if (res.success && res.results && res.results.length > 0) {
                         if (statusBanner) statusBanner.style.display = 'none';
                         
-                        matchedExpert = res.expert; // 保存起来
+                        currentMatchedResults = res.results; // 缓存起来
                         
                         if (resSuccess) {
                             resSuccess.style.display = 'flex';
+                            resSuccess.innerHTML = ''; // 清空，动态重新构建
                             
-                            // 渲染界面字段
-                            document.getElementById('success-match-score').innerText = res.score.toFixed(1) + '%';
-                            document.getElementById('matched-expert-name').innerText = res.expert.name || '-';
-                            document.getElementById('matched-expert-company').innerText = res.expert.company || '无工作单位';
-                            document.getElementById('matched-expert-idcard').innerText = res.expert.id_card || '-';
-                            document.getElementById('matched-expert-phone').innerText = res.expert.phone || '-';
-                            document.getElementById('matched-expert-major').innerText = res.expert.major || '-';
-                            document.getElementById('matched-expert-project-count').innerText = (res.expert.project_count || 0) + ' 次';
-                            
-                            // 渲染专家头像
-                            const matchedPhoto = document.getElementById('matched-expert-photo');
-                            if (matchedPhoto) {
-                                const photos = res.expert.photo_path ? res.expert.photo_path.split(',') : [];
-                                if (photos.length > 0) {
-                                    matchedPhoto.src = '/dlsgzs/file/' + photos[0];
-                                } else {
-                                    matchedPhoto.src = '';
-                                }
-                            }
-                            
-                            // 渲染同步徽标
-                            const syncBadge = document.getElementById('matched-expert-sync-badge');
-                            if (syncBadge) {
-                                syncBadge.style.display = res.expert.is_face_synced === 1 ? 'flex' : 'none';
-                            }
+                            res.results.forEach((item, index) => {
+                                const score = item.score;
+                                const exp = item.expert;
+                                const photos = exp.photo_path ? exp.photo_path.split(',') : [];
+                                const photoSrc = photos.length > 0 ? '/dlsgzs/file/' + photos[0] : '';
+                                const hasSync = exp.is_face_synced === 1;
+                                
+                                // 根据匹配排名采用不同的卡片边框/得分标签色
+                                const isTop1 = index === 0;
+                                const themeColor = isTop1 ? '#10b981' : (index === 1 ? '#a855f7' : '#6366f1');
+                                const themeBg = isTop1 ? 'rgba(16, 185, 129, 0.08)' : (index === 1 ? 'rgba(168, 85, 247, 0.08)' : 'rgba(99, 102, 241, 0.08)');
+                                const themeBorder = isTop1 ? 'rgba(16, 185, 129, 0.2)' : (index === 1 ? 'rgba(168, 85, 247, 0.2)' : 'rgba(99, 102, 241, 0.2)');
+                                
+                                const expertHtml = `
+                                    <div class="matched-expert-item-card" style="background: rgba(255,255,255,0.25); border: 1px solid var(--border-color); border-radius: 12px; padding: 16px; display: flex; flex-direction: column; gap: 12px; margin-bottom: 12px; box-shadow: var(--shadow-soft); text-align: left;">
+                                        <!-- 顶栏状态 -->
+                                        <div style="background: ${themeBg}; border: 1px solid ${themeBorder}; border-radius: 8px; padding: 8px 12px; display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+                                            <div style="display: flex; align-items: center; gap: 8px;">
+                                                <div style="background: ${themeColor}; color: white; width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: bold; flex-shrink: 0;">${index + 1}</div>
+                                                <span style="font-size: 13px; font-weight: 700; color: ${themeColor};">候选匹配专家 ${index + 1}</span>
+                                            </div>
+                                            <span style="font-size: 12px; color: var(--text-secondary); white-space: nowrap;">匹配相似度：<strong style="color: ${themeColor}; font-size: 13px;">${score.toFixed(1)}%</strong></span>
+                                        </div>
+                                        
+                                        <!-- 专家核心简档 -->
+                                        <div style="display: flex; align-items: center; gap: 16px; border-bottom: 1px dashed var(--border-color); padding-bottom: 12px;">
+                                            <div style="width: 50px; height: 66px; border-radius: 6px; overflow: hidden; background: #e2e8f0; border: 1px solid var(--border-color); flex-shrink: 0; position: relative;">
+                                                <img src="${photoSrc}" style="width: 100%; height: 100%; object-fit: cover;" onerror="this.src=''">
+                                                <div title="人脸已同步至腾讯云" style="position: absolute; bottom: 2px; right: 2px; background: #10b981; color: white; width: 14px; height: 14px; border-radius: 50%; display: ${hasSync ? 'flex' : 'none'}; align-items: center; justify-content: center; font-size: 8px; border: 1px solid white;">☁️</div>
+                                            </div>
+                                            <div style="display: flex; flex-direction: column; gap: 4px; min-width: 0;">
+                                                <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                                                    <span style="font-size: 16px; font-weight: 700; color: var(--text-primary); white-space: nowrap;">${exp.name || '-'}</span>
+                                                    <span class="expert-tag" style="background: rgba(16, 185, 129, 0.1); color: #10b981; font-size: 10px; padding: 2px 6px; border-radius: 4px; font-weight: 600; white-space: nowrap;">已核验</span>
+                                                </div>
+                                                <div style="font-size: 12px; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${exp.company || '无工作单位'}</div>
+                                            </div>
+                                        </div>
+                                        
+                                        <!-- 详情项 -->
+                                        <div style="display: flex; flex-direction: column; gap: 6px; font-size: 13px;">
+                                            <div style="display: flex; align-items: center; gap: 8px;">
+                                                <span style="color: var(--text-secondary); width: 80px; flex-shrink: 0;">🪪 身份证号:</span>
+                                                <span style="font-family: monospace; font-weight: 600; color: var(--text-primary); word-break: break-all;">${exp.id_card || '-'}</span>
+                                            </div>
+                                            <div style="display: flex; align-items: center; gap: 8px;">
+                                                <span style="color: var(--text-secondary); width: 80px; flex-shrink: 0;">📞 手机号码:</span>
+                                                <span style="font-weight: 500; color: var(--text-primary);">${exp.phone || '-'}</span>
+                                            </div>
+                                            <div style="display: flex; align-items: center; gap: 8px;">
+                                                <span style="color: var(--text-secondary); width: 80px; flex-shrink: 0;">💼 专家专业:</span>
+                                                <span style="font-weight: 500; color: var(--text-primary);">${exp.major || '-'}</span>
+                                            </div>
+                                            <div style="display: flex; align-items: center; gap: 8px;">
+                                                <span style="color: var(--text-secondary); width: 80px; flex-shrink: 0;">📊 评审次数:</span>
+                                                <span style="font-weight: 600; color: var(--accent-color);">${exp.project_count || 0} 次</span>
+                                            </div>
+                                        </div>
+                                        
+                                        <!-- 档案穿透按钮 -->
+                                        <button class="btn-search-main btn-accent-gradient" onclick="openMatchedExpertDetail(${index})" style="margin: 4px 0 0 0; font-size: 13px; height: 38px; width: 100%; border: none; display: flex; align-items: center; justify-content: center; gap: 6px; font-weight: 600; border-radius: 8px;">
+                                            📂 打开该专家完整档案
+                                        </button>
+                                    </div>
+                                `;
+                                const div = document.createElement('div');
+                                div.innerHTML = expertHtml.trim();
+                                resSuccess.appendChild(div.firstChild);
+                            });
                         }
                     } else {
-                        throw new Error(res.error || '未匹配到该专家的面部特征');
+                        throw new Error(res.error || '未匹配到任何专家的面部特征');
                     }
                 })
                 .catch(err => {
@@ -5361,17 +5410,6 @@
                         statusBanner.style.color = '#ef4444';
                         if (statusSpinner) statusSpinner.style.display = 'none';
                         statusText.innerText = '❌ 检索失败: ' + err.message;
-                    }
-                });
-            }
-            
-            // 一键穿透打开完整档案
-            if (btnOpenMatchedDetail) {
-                const newBtnOpenMatchedDetail = btnOpenMatchedDetail.cloneNode(true);
-                btnOpenMatchedDetail.parentNode.replaceChild(newBtnOpenMatchedDetail, btnOpenMatchedDetail);
-                newBtnOpenMatchedDetail.addEventListener('click', () => {
-                    if (matchedExpert) {
-                        setupDetailModal(matchedExpert);
                     }
                 });
             }
