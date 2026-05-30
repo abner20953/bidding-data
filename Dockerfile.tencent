@@ -27,9 +27,7 @@ COPY requirements.txt .
 
 # 使用阿里云源加速安装 requirements.txt 里的剩余包，并指定 CPU 版 PyTorch 镜像源以防止依赖覆盖
 RUN pip install --no-cache-dir -r requirements.txt \
-    -i https://mirrors.aliyun.com/pypi/simple/ \
-    --extra-index-url https://mirror.sjtu.edu.cn/pytorch-wheels/cpu/ \
-    --extra-index-url https://download.pytorch.org/whl/cpu/
+    -i https://mirrors.aliyun.com/pypi/simple/
 
 # 【核心优化 3】模型已预下载到宿主机，直接 COPY 避免联网下载和 OOM 报错
 COPY model_data /app/model_data
