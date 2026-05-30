@@ -2458,6 +2458,9 @@
                                 <span class="expert-tag" style="background: rgba(14, 165, 233, 0.1); color: var(--accent-color); font-weight: 600; font-size: 11px; padding: 2px 6px; border-radius: 4px;">基本资料卡</span>
                             </div>
                             <div style="display: flex; align-items: center; gap: 8px;">
+                                <button id="btn-sync-single-face" class="btn-search-main" style="display: none; border: none; background: linear-gradient(135deg, #a855f7, #6366f1); padding: 0 10px; border-radius: 6px; font-weight: 600; font-size: 12px; cursor: pointer; height: 28px; align-items: center; gap: 4px; color: white; margin: 0; box-shadow: 0 2px 6px rgba(168, 85, 247, 0.2);">
+                                    <span>☁️</span> 同步人脸
+                                </button>
                                 <button id="btn-cancel-expert-profile" class="action-btn-small" style="display: none; border: 1px solid var(--border-color); background: var(--bg-card); padding: 0 10px; border-radius: 6px; font-weight: 500; font-size: 12px; cursor: pointer; height: 28px; align-items: center; gap: 4px; color: var(--text-primary); margin: 0; box-shadow: var(--shadow-soft);">
                                     <span>❌</span> 取消
                                 </button>
@@ -3590,6 +3593,11 @@
                     cancelBtn.style.display = editable ? 'flex' : 'none';
                 }
                 
+                const syncSingleFaceBtn = document.getElementById('btn-sync-single-face');
+                if (syncSingleFaceBtn) {
+                    syncSingleFaceBtn.style.display = editable ? 'flex' : 'none';
+                }
+                
                 const editSaveBtn = document.getElementById('btn-save-expert-profile');
                 if (editSaveBtn) {
                     if (editable) {
@@ -3602,8 +3610,66 @@
                         editSaveBtn.style.boxShadow = '0 2px 6px rgba(14, 165, 233, 0.2)';
                     }
                 }
+            // 绑定“单人手动同步人脸”按钮事件
+            const syncSingleFaceBtn = document.getElementById('btn-sync-single-face');
+            if (syncSingleFaceBtn) {
+                const newSyncSingleFaceBtn = syncSingleFaceBtn.cloneNode(true);
+                syncSingleFaceBtn.parentNode.replaceChild(newSyncSingleFaceBtn, syncSingleFaceBtn);
+                
+                newSyncSingleFaceBtn.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    
+                    // 1. 判断是否选择了新照片且还未保存
+                    if (selectedPhotoFile) {
+                        alert('检测到您更换了新照片，请先保存专家资料，然后再执行人脸同步。');
+                        return;
+                    }
+                    
+                    // 2. 检查是否有身份证和照片
+                    if (!item.id_card) {
+                        alert('该专家未填写身份证号，无法同步人脸数据。');
+                        return;
+                    }
+                    if (!item.photo_path) {
+                        alert('该专家没有身份证照片，无法同步人脸数据。');
+                        return;
+                    }
+                    
+                    if (confirm(`确认要将专家【${item.name}】的人脸照同步到腾讯云人员库吗？`)) {
+                        newSyncSingleFaceBtn.disabled = true;
+                        newSyncSingleFaceBtn.innerHTML = '<span>☁️</span> 同步中...';
+                        
+                        fetch('/dlsgzs/api/face/sync_single', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ id: item.id })
+                        })
+                        .then(r => r.json())
+                        .then(res => {
+                            newSyncSingleFaceBtn.disabled = false;
+                            newSyncSingleFaceBtn.innerHTML = '<span>☁️</span> 同步人脸';
+                            
+                            if (res.success) {
+                                alert(res.message);
+                                item.is_face_synced = 1;
+                                
+                                // 刷新主界面列表
+                                if (typeof executeSearch === 'function') {
+                                    executeSearch();
+                                }
+                            } else {
+                                alert('❌ 人脸同步失败：' + (res.error || '未知错误'));
+                            }
+                        })
+                        .catch(err => {
+                            newSyncSingleFaceBtn.disabled = false;
+                            newSyncSingleFaceBtn.innerHTML = '<span>☁️</span> 同步人脸';
+                            alert('❌ 同步发生请求异常：' + err.message);
+                        });
+                    }
+                });
             }
-            
+
             // 默认设置基本资料为只读状态 (标注和备注默认随时可修改)
             setModalEditable(false);
             

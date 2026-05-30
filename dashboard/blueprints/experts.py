@@ -1694,21 +1694,10 @@ def api_update_expert_profile():
         
         conn.commit()
 
-        # 7. 若更新了人脸照片，则同步注册到腾讯云人脸库
+        # 7. 若更新了人脸照片，直接将同步状态重置为未同步 0，不再自动同步
         if photo_file and photo_file.filename != '':
-            c.execute("SELECT id_card, name, photo_path FROM experts WHERE id = ?", (expert_id,))
-            exp_row = c.fetchone()
-            if exp_row and exp_row[0]:
-                id_card_val, name_val, photo_path_val = exp_row
-                photo_list = [p.strip() for p in photo_path_val.split(',') if p.strip()]
-                if photo_list:
-                    ok, sync_err = _register_or_update_face(id_card_val, name_val, photo_list[0])
-                    if ok:
-                        c.execute("UPDATE experts SET is_face_synced = 1 WHERE id = ?", (expert_id,))
-                        conn.commit()
-                    else:
-                        c.execute("UPDATE experts SET is_face_synced = 0 WHERE id = ?", (expert_id,))
-                        conn.commit()
+            c.execute("UPDATE experts SET is_face_synced = 0 WHERE id = ?", (expert_id,))
+            conn.commit()
         
         _log_action("修改专家基本信息", f"专家姓名: {old_name}, 新电话: {new_phone}, 新单位: {company}, 新专业: {major}")
         return jsonify({"success": True, "message": f"专家 {old_name} 的个人资料已成功修改。"})
@@ -1782,22 +1771,13 @@ def api_delete_photo():
         c.execute("UPDATE experts SET photo_path = ?, created_at = ? WHERE id = ?", 
                   (new_photo_path_db, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), expert_id))
         
-        # 4. 删除照片后，若专家仍有照片，自动同步最新的第一张照片至腾讯云
-        c.execute("SELECT id_card, name FROM experts WHERE id = ?", (expert_id,))
-        info_row = c.fetchone()
-        if info_row:
-            id_card_val, name_val = info_row
-            if id_card_val and photo_list:
-                ok, sync_err = _register_or_update_face(id_card_val, name_val, photo_list[0])
-                if ok:
-                    c.execute("UPDATE experts SET is_face_synced = 1 WHERE id = ?", (expert_id,))
-                else:
-                    c.execute("UPDATE experts SET is_face_synced = 0 WHERE id = ?", (expert_id,))
+        # 4. 删除照片后，将同步状态重置为未同步 0，不再自动同步
+        c.execute("UPDATE experts SET is_face_synced = 0 WHERE id = ?", (expert_id,))
         
         conn.commit()
         
         _log_action("删除专家部分照片", f"专家: {name}({phone}), 删除照片: {filename}")
-        return jsonify({"success": True, "message": "照片已成功物理删除且路径已更新并重新同步人脸库"})
+        return jsonify({"success": True, "message": "照片已成功物理删除且路径已更新"})
         
     except Exception as e:
         return jsonify({"success": False, "error": f"系统错误: {str(e)}"}), 500
@@ -1941,6 +1921,193 @@ def api_all_majors():
         return jsonify({"success": True, "majors": majors})
     except Exception as e:
         return jsonify({"success": False, "error": f"获取专业列表失败: {str(e)}"}), 500
+    finally:
+        conn.close()
+
+
+@experts_bp.route('/api/face/sync', methods=['POST'])
+def api_face_sync():
+    """一键将本地所有 is_face_synced = 0 且拥有身份证和照片的专家，增量同步到腾讯云人脸库"""
+    conn = get_db_conn()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT id, name, id_card, photo_path FROM experts WHERE (is_face_synced = 0 OR is_face_synced IS NULL) AND id_card IS NOT NULL AND id_card != '' AND photo_path IS NOT NULL AND photo_path != ''")
+        experts_to_sync = c.fetchall()
+        
+        if not experts_to_sync:
+            return jsonify({"success": True, "synced_count": 0, "failed_count": 0, "message": "所有符合条件的专家人脸已是同步状态，无需同步。"})
+            
+        success_count = 0
+        failed_list = []
+        
+        # 腾讯云公共接口限制默认一般为 5QPS 左右，在循环中适当延迟以防超频
+        for exp in experts_to_sync:
+            exp_id, name, id_card, photo_path_val = exp
+            photo_list = [p.strip() for p in photo_path_val.split(',') if p.strip()]
+            if not photo_list:
+                continue
+            
+            # 使用第一张照片进行同步
+            ok, err_msg = _register_or_update_face(id_card, name, photo_list[0])
+            if ok:
+                c.execute("UPDATE experts SET is_face_synced = 1 WHERE id = ?", (exp_id,))
+                success_count += 1
+            else:
+                failed_list.append({"name": name, "id_card": id_card, "reason": err_msg})
+            
+            # 增量同步加微小延时，保障平稳调用
+            time.sleep(0.2)
+            
+        conn.commit()
+        
+        msg = f"人脸同步完成：成功同步 {success_count} 人"
+        if failed_list:
+            msg += f"，失败 {len(failed_list)} 人。"
+        else:
+            msg += "。"
+            
+        _log_action("一键同步人脸库", f"成功: {success_count}, 失败: {len(failed_list)}")
+        return jsonify({
+            "success": True, 
+            "synced_count": success_count, 
+            "failed_count": len(failed_list), 
+            "failures": failed_list,
+            "message": msg
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": f"同步过程发生系统错误: {str(e)}"}), 500
+    finally:
+        conn.close()
+
+
+@experts_bp.route('/api/face/search', methods=['POST'])
+def api_face_search():
+    """接收前端发送的现场照，检测并调用腾讯云人脸比对，匹配本地专家库并返回匹配专家的完整档案"""
+    data = request.get_json() or {}
+    image_data = data.get('image', '').strip()
+    
+    if not image_data:
+        return jsonify({"success": False, "error": "请提供有效的人脸图像数据"}), 400
+        
+    # 处理 Data URL 前缀（如 data:image/jpeg;base64,）
+    if ',' in image_data:
+        image_base64 = image_data.split(',', 1)[1]
+    else:
+        image_base64 = image_data
+        
+    # 调用腾讯云人脸检索
+    person_id, score, err_msg = _search_face(image_base64)
+    if err_msg:
+        return jsonify({"success": False, "error": err_msg}), 400
+        
+    if not person_id or score < 75.0:
+        return jsonify({"success": False, "error": "人脸库中未匹配到相似度足够高的专家档案（匹配得分低于阈值 75）"}), 400
+        
+    # 根据身份证号检索本地专家记录
+    conn = get_db_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT id, name, phone, id_card, company, major, photo_path, status, remark, raw_json 
+            FROM experts 
+            WHERE id_card = ?
+        """, (person_id,))
+        row = c.fetchone()
+        
+        if not row:
+            return jsonify({
+                "success": False, 
+                "error": f"腾讯云匹配成功(身份证号: {person_id}, 相似度得分: {score:.1f})，但在本地专家库中未检索到该专家的档案记录。"
+            }), 404
+            
+        expert_id, name, phone, id_card, company, major, photo_path, status, remark, raw_json = row
+        
+        parsed_json = {}
+        if raw_json:
+            try:
+                parsed_json = json.loads(raw_json)
+            except Exception:
+                pass
+                
+        # 查询该专家匹配到的所有标签
+        c.execute("""
+            SELECT DISTINCT t.tag_name
+            FROM expert_majors em
+            JOIN tag_majors tm ON em.major_name = tm.major_name
+            JOIN tags t ON tm.tag_id = t.id
+            WHERE em.expert_id = ?
+        """, (expert_id,))
+        tag_rows = c.fetchall()
+        tags = [tr[0] for tr in tag_rows if tr[0]]
+        
+        expert = {
+            "id": expert_id,
+            "name": name,
+            "phone": phone,
+            "id_card": id_card,
+            "company": company,
+            "major": major,
+            "photo_path": photo_path,
+            "status": status,
+            "remark": remark,
+            "tags": tags,
+            "details": parsed_json
+        }
+        
+        _log_action("人脸识别检索专家", f"成功匹配: {name}, 身份证: {id_card}, 得分: {score:.1f}")
+        return jsonify({
+            "success": True,
+            "found": True,
+            "score": score,
+            "expert": expert
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": f"本地检索专家档案失败: {str(e)}"}), 500
+    finally:
+        conn.close()
+
+
+@experts_bp.route('/api/face/sync_single', methods=['POST'])
+def api_face_sync_single():
+    """手动单人同步人脸数据到腾讯云人脸库"""
+    data = request.get_json() or {}
+    expert_id = data.get('id')
+    if not expert_id:
+        return jsonify({"success": False, "error": "缺失专家ID参数"}), 400
+        
+    conn = get_db_conn()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT id_card, name, photo_path FROM experts WHERE id = ?", (expert_id,))
+        row = c.fetchone()
+        if not row:
+            return jsonify({"success": False, "error": "未找到该专家的记录"}), 404
+            
+        id_card, name, photo_path_val = row
+        if not id_card or not id_card.strip():
+            return jsonify({"success": False, "error": "该专家未填写身份证号，无法同步人脸数据"}), 400
+            
+        if not photo_path_val or not photo_path_val.strip():
+            return jsonify({"success": False, "error": "该专家没有身份证照片，无法同步人脸数据"}), 400
+            
+        photo_list = [p.strip() for p in photo_path_val.split(',') if p.strip()]
+        if not photo_list:
+            return jsonify({"success": False, "error": "该专家的照片路径解析为空，无法同步"}), 400
+            
+        # 同步第一张照片
+        ok, err_msg = _register_or_update_face(id_card, name, photo_list[0])
+        if ok:
+            c.execute("UPDATE experts SET is_face_synced = 1 WHERE id = ?", (expert_id,))
+            conn.commit()
+            _log_action("手动同步单人脸", f"专家: {name}, 身份证: {id_card}")
+            return jsonify({"success": True, "message": f"专家【{name}】的人脸数据已成功同步至云端人员库。"})
+        else:
+            c.execute("UPDATE experts SET is_face_synced = 0 WHERE id = ?", (expert_id,))
+            conn.commit()
+            return jsonify({"success": False, "error": err_msg}), 400
+            
+    except Exception as e:
+        return jsonify({"success": False, "error": f"同步单人脸失败: {str(e)}"}), 500
     finally:
         conn.close()
 
