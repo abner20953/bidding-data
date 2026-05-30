@@ -2008,7 +2008,7 @@ def api_face_search():
     try:
         c = conn.cursor()
         c.execute("""
-            SELECT id, name, phone, id_card, company, major, photo_path, status, remark, raw_json 
+            SELECT id, name, phone, id_card, company, major, photo_path, status, remark, raw_json, project_count, is_face_synced
             FROM experts 
             WHERE id_card = ?
         """, (person_id,))
@@ -2020,7 +2020,7 @@ def api_face_search():
                 "error": f"腾讯云匹配成功(身份证号: {person_id}, 相似度得分: {score:.1f})，但在本地专家库中未检索到该专家的档案记录。"
             }), 404
             
-        expert_id, name, phone, id_card, company, major, photo_path, status, remark, raw_json = row
+        expert_id, name, phone, id_card, company, major, photo_path, status, remark, raw_json, project_count, is_face_synced = row
         
         parsed_json = {}
         if raw_json:
@@ -2051,7 +2051,9 @@ def api_face_search():
             "status": status,
             "remark": remark,
             "tags": tags,
-            "details": parsed_json
+            "details": parsed_json,
+            "project_count": project_count if project_count is not None else 0,
+            "is_face_synced": is_face_synced if is_face_synced is not None else 0
         }
         
         _log_action("人脸识别检索专家", f"成功匹配: {name}, 身份证: {id_card}, 得分: {score:.1f}")
