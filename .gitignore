@@ -19,3 +19,4 @@ generate_manual.py
 manual.html
 test_env/
 data/
+.env

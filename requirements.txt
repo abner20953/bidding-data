@@ -14,3 +14,6 @@ jieba
 gevent
 pypinyin
 lxml
+python-dotenv
+tencentcloud-sdk-python-iai
+tencentcloud-sdk-python-common

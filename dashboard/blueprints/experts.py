@@ -10,6 +10,13 @@ import re
 import datetime
 import time
 import json
+import base64
+from dotenv import load_dotenv
+from tencentcloud.common import credential
+from tencentcloud.common.profile.client_profile import ClientProfile
+from tencentcloud.common.profile.http_profile import HttpProfile
+from tencentcloud.common.exceptions.tencent_cloud_sdk_exception import TencentCloudSDKException
+from tencentcloud.iai.v20200303 import iai_client, models
 
 # 定义 Blueprint
 experts_bp = Blueprint('experts', __name__,
@@ -17,6 +24,150 @@ experts_bp = Blueprint('experts', __name__,
                        url_prefix='/dlsgzs')
 
 DB_NAME = 'experts.db'
+
+# --- 腾讯云人脸识别 SDK 配置与加载 ---
+# 1. 尝试从本地加载 .env 配置文件
+base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+env_path = os.path.join(base_dir, '..', '.env')
+if os.path.exists(env_path):
+    load_dotenv(env_path)
+else:
+    load_dotenv() # 降级读取系统环境变量
+
+# 2. 读取腾讯云配置
+SECRET_ID = os.getenv("TENCENTCLOUD_SECRET_ID", "").strip()
+SECRET_KEY = os.getenv("TENCENTCLOUD_SECRET_KEY", "").strip()
+REGION = os.getenv("TENCENTCLOUD_REGION", "ap-beijing").strip()
+GROUP_ID = os.getenv("TENCENTCLOUD_GROUP_ID", "experts_group").strip()
+
+def _get_iai_client():
+    """初始化并获取腾讯云人脸识别客户端"""
+    if not SECRET_ID or not SECRET_KEY:
+        return None
+    cred = credential.Credential(SECRET_ID, SECRET_KEY)
+    httpProfile = HttpProfile()
+    httpProfile.endpoint = "iai.tencentcloudapi.com"
+    clientProfile = ClientProfile()
+    clientProfile.httpProfile = httpProfile
+    client = iai_client.IaiClient(cred, REGION, clientProfile)
+    return client
+
+def init_face_group():
+    """在应用初始化阶段尝试创建人员库，若已存在则忽略"""
+    client = _get_iai_client()
+    if not client:
+        print("⚠️ 腾讯云人脸识别配置不全（SecretId/SecretKey缺失），跳过自动创建人脸库步骤。")
+        return
+        
+    try:
+        # 首先检查人员库是否存在
+        req = models.DescribeGroupRequest()
+        req.GroupId = GROUP_ID
+        client.DescribeGroup(req)
+        print(f"✅ 腾讯云人脸库 GroupId='{GROUP_ID}' 已经存在，无需重复创建。")
+    except TencentCloudSDKException as e:
+        # 错误码为 FailedOperation.GroupNotExist 或错误提示不存在时
+        if "GroupNotExist" in str(e.code) or "GroupNotExist" in str(e):
+            try:
+                create_req = models.CreateGroupRequest()
+                create_req.GroupName = "评标专家人脸库"
+                create_req.GroupId = GROUP_ID
+                create_req.FaceModelVersion = "3.0"
+                client.CreateGroup(create_req)
+                print(f"🎉 成功在腾讯云端创建人员库 GroupId='{GROUP_ID}', 算法版本='3.0'!")
+            except Exception as create_err:
+                print(f"❌ 自动创建腾讯云人脸库失败: {create_err}")
+        else:
+            print(f"⚠️ 检查人员库状态异常: {e}")
+
+
+def _register_or_update_face(id_card, name, photo_path):
+    """向腾讯云人脸库注册或更新人员"""
+    client = _get_iai_client()
+    if not client:
+        return False, "腾讯云 SecretId/SecretKey 配置缺失"
+        
+    if not id_card or not name or not photo_path:
+        return False, "专家必填项(身份证号、姓名或照片路径)缺失"
+        
+    # 定位并读取照片
+    filename = os.path.basename(photo_path)
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    photos_dir = os.path.join(base_dir, 'static', 'uploads', 'expert_photos')
+    physical_path = os.path.join(photos_dir, filename)
+    
+    if not os.path.exists(physical_path):
+        # 兼容相对路径或直接在 file 下的情况
+        alternative_dir = os.path.join(base_dir, '..', 'file')
+        physical_path = os.path.join(alternative_dir, filename)
+        if not os.path.exists(physical_path):
+            return False, f"物理磁盘上未找到该专家的照片文件: {filename}"
+            
+    # 读取照片并转为 Base64
+    try:
+        with open(physical_path, "rb") as f:
+            img_data = f.read()
+            img_base64 = base64.b64encode(img_data).decode("utf-8")
+    except Exception as e:
+        return False, f"读取人脸照片文件失败: {str(e)}"
+        
+    # 为了保证注册/更新 100% 成功，采取“先尝试删除，后创建”的合并策略
+    try:
+        del_req = models.DeletePersonRequest()
+        del_req.PersonId = id_card.strip()
+        client.DeletePerson(del_req)
+    except Exception:
+        # 如果人员原本不存在，删除报错可直接忽略
+        pass
+        
+    try:
+        create_req = models.CreatePersonRequest()
+        create_req.GroupId = GROUP_ID
+        create_req.PersonName = name.strip()
+        create_req.PersonId = id_card.strip()
+        create_req.Image = img_base64
+        client.CreatePerson(create_req)
+        return True, "成功注册同步至人脸库"
+    except TencentCloudSDKException as e:
+        return False, f"注册人脸至腾讯云失败: {e.message} (代码: {e.code})"
+    except Exception as e:
+        return False, f"注册人脸时发生未捕获异常: {str(e)}"
+
+
+def _search_face(image_base64):
+    """在腾讯云人员库中搜索匹配的人脸，返回最相似的 PersonId(身份证号) 和相似度得分 Score"""
+    client = _get_iai_client()
+    if not client:
+        return None, 0, "腾讯云 SecretId/SecretKey 配置缺失"
+        
+    try:
+        req = models.SearchFacesRequest()
+        req.GroupIds = [GROUP_ID]
+        req.Image = image_base64
+        req.MaxFaceNum = 1 # 仅识别并检索现场图中最大的一张脸
+        req.MaxPersonNum = 1 # 仅返回相似度最高的 Top 1 候选人
+        req.NeedPersonInfo = 0 # 不需要返回额外的人员描述
+        
+        resp = client.SearchFaces(req)
+        
+        # 解析返回结果
+        if resp.Results and len(resp.Results) > 0:
+            result = resp.Results[0]
+            if result.RetCode == 0 and result.Candidates and len(result.Candidates) > 0:
+                top_candidate = result.Candidates[0]
+                return top_candidate.PersonId, top_candidate.Score, None
+            else:
+                # RetCode 不为 0 说明检索该脸失败（比如照片模糊没匹配到）
+                return None, 0, "人脸库中未匹配到相似度足够高的人脸"
+        else:
+            return None, 0, "图片中未检测到清晰人脸"
+            
+    except TencentCloudSDKException as e:
+        return None, 0, f"腾讯云人脸搜索失败: {e.message} (代码: {e.code})"
+    except Exception as e:
+        return None, 0, f"人脸搜索发生异常: {str(e)}"
+
+
 
 # --- 操作日志工具 ---
 def _log_action(action, detail=""):
@@ -165,6 +316,7 @@ def init_db():
                 remark TEXT DEFAULT '',
                 project_count INTEGER DEFAULT 0,
                 last_project_time TEXT,
+                is_face_synced INTEGER DEFAULT 0,
                 created_at TEXT
             )
         ''')
@@ -205,6 +357,16 @@ def init_db():
 
         try:
             c.execute('CREATE INDEX IF NOT EXISTS idx_experts_last_project_time ON experts(last_project_time)')
+        except sqlite3.OperationalError:
+            pass
+            
+        try:
+            c.execute("ALTER TABLE experts ADD COLUMN is_face_synced INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            c.execute('CREATE INDEX IF NOT EXISTS idx_experts_is_face_synced ON experts(is_face_synced)')
         except sqlite3.OperationalError:
             pass
             
@@ -307,6 +469,12 @@ def init_db():
             update_all_experts_stats(conn)
         except Exception as e:
             print(f"⚠️ 历史专家参评统计初始化更新失败: {e}")
+
+        # 腾讯云人脸库自动检测建库
+        try:
+            init_face_group()
+        except Exception as e:
+            print(f"⚠️ 自动初始化腾讯云人脸库失败: {e}")
     finally:
         conn.close()
 
@@ -1525,6 +1693,22 @@ def api_update_expert_profile():
             update_expert_stats_by_idcard(conn, row_id_card[0])
         
         conn.commit()
+
+        # 7. 若更新了人脸照片，则同步注册到腾讯云人脸库
+        if photo_file and photo_file.filename != '':
+            c.execute("SELECT id_card, name, photo_path FROM experts WHERE id = ?", (expert_id,))
+            exp_row = c.fetchone()
+            if exp_row and exp_row[0]:
+                id_card_val, name_val, photo_path_val = exp_row
+                photo_list = [p.strip() for p in photo_path_val.split(',') if p.strip()]
+                if photo_list:
+                    ok, sync_err = _register_or_update_face(id_card_val, name_val, photo_list[0])
+                    if ok:
+                        c.execute("UPDATE experts SET is_face_synced = 1 WHERE id = ?", (expert_id,))
+                        conn.commit()
+                    else:
+                        c.execute("UPDATE experts SET is_face_synced = 0 WHERE id = ?", (expert_id,))
+                        conn.commit()
         
         _log_action("修改专家基本信息", f"专家姓名: {old_name}, 新电话: {new_phone}, 新单位: {company}, 新专业: {major}")
         return jsonify({"success": True, "message": f"专家 {old_name} 的个人资料已成功修改。"})
@@ -1598,10 +1782,22 @@ def api_delete_photo():
         c.execute("UPDATE experts SET photo_path = ?, created_at = ? WHERE id = ?", 
                   (new_photo_path_db, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), expert_id))
         
+        # 4. 删除照片后，若专家仍有照片，自动同步最新的第一张照片至腾讯云
+        c.execute("SELECT id_card, name FROM experts WHERE id = ?", (expert_id,))
+        info_row = c.fetchone()
+        if info_row:
+            id_card_val, name_val = info_row
+            if id_card_val and photo_list:
+                ok, sync_err = _register_or_update_face(id_card_val, name_val, photo_list[0])
+                if ok:
+                    c.execute("UPDATE experts SET is_face_synced = 1 WHERE id = ?", (expert_id,))
+                else:
+                    c.execute("UPDATE experts SET is_face_synced = 0 WHERE id = ?", (expert_id,))
+        
         conn.commit()
         
         _log_action("删除专家部分照片", f"专家: {name}({phone}), 删除照片: {filename}")
-        return jsonify({"success": True, "message": "照片已成功物理删除且路径已更新"})
+        return jsonify({"success": True, "message": "照片已成功物理删除且路径已更新并重新同步人脸库"})
         
     except Exception as e:
         return jsonify({"success": False, "error": f"系统错误: {str(e)}"}), 500

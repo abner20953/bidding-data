@@ -1983,6 +1983,11 @@
                 padding: 8px !important;
             }
         }
+        @keyframes scanAnimation {
+            0% { top: 0%; opacity: 0.8; }
+            50% { top: 98%; opacity: 1; }
+            100% { top: 0%; opacity: 0.8; }
+        }
     </style>
 </head>
 
@@ -2064,9 +2069,10 @@
                         <input type="number" min="0" class="search-input" id="search-project-count" placeholder="📊 最少参评次数" style="width: 140px; padding: 10px 12px; height: 48px; box-sizing: border-box;">
                         <input type="date" class="search-input" id="search-last-time" style="width: 200px; padding: 10px 12px; height: 48px; box-sizing: border-box;">
                     </div>
-                    <div class="btn-group">
+                    <div class="btn-group" style="display: flex; gap: 8px;">
                         <button class="btn-search-main btn-accent-gradient" id="btn-search">🔍 搜索专家</button>
                         <button class="btn-search-reset" id="btn-search-reset">🔄 重置条件</button>
+                        <button class="btn-search-main" id="btn-face-search" style="border: none; background: linear-gradient(135deg, #a855f7, #6366f1); color: white; box-shadow: 0 4px 12px rgba(168, 85, 247, 0.25); display: flex; align-items: center; justify-content: center; gap: 6px;">📷 刷脸检索</button>
                     </div>
                 </div>
             </div>
@@ -2263,6 +2269,18 @@
                         <div class="ops-desc">建立与维护专家的分类标签，将若干个具体专业小类归档到大标签下，用于快捷条件筛选检索。</div>
                         <button class="action-btn-large btn-tags btn-accent-gradient" id="btn-manage-tags" style="padding: 10px 20px;">
                             <span>🏷️</span> 管理专家标签
+                        </button>
+                    </div>
+                </div>
+
+                <!-- 腾讯云人脸同步 -->
+                <div class="ops-card">
+                    <div class="ops-icon">📷</div>
+                    <div class="ops-info">
+                        <div class="ops-title">腾讯云人脸库同步</div>
+                        <div class="ops-desc">一键将本地所有未同步的专家（有身份证和照片但未同步到云端的人员）增量同步到腾讯云人脸库中。</div>
+                        <button class="action-btn-large btn-accent-gradient" id="btn-sync-faces" style="padding: 10px 20px;">
+                            <span>🔄</span> 同步人脸库
                         </button>
                     </div>
                 </div>
@@ -2523,6 +2541,70 @@
         </div>
     </div>
 
+    <!-- 刷脸检索人脸识别弹窗 (高科技 Premium 设计) -->
+    <div class="modal" id="face-modal" style="display: none; align-items: center; justify-content: center; z-index: 2000; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(8px);">
+        <div class="modal-container" style="max-width: 750px; width: 90%; background: var(--bg-card); border-radius: 16px; border: 1px solid var(--card-border); box-shadow: 0 20px 40px rgba(0,0,0,0.3); overflow: hidden; display: flex; flex-direction: column;">
+            <div class="modal-header" style="display: flex; justify-content: space-between; align-items: center; padding: 16px 20px; border-bottom: 1px solid var(--card-border); background: linear-gradient(90deg, rgba(168, 85, 247, 0.05), rgba(99, 102, 241, 0.05));">
+                <div style="font-size: 16px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
+                    <span style="font-size: 20px;">📷</span> 刷脸检索专家档案 (人脸比对)
+                </div>
+                <span id="face-modal-close" style="font-size: 24px; cursor: pointer; color: var(--text-secondary); transition: color 0.2s; font-weight: bold;">&times;</span>
+            </div>
+            
+            <div class="modal-body" style="padding: 24px; display: flex; flex-direction: column; gap: 20px;">
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: center;">
+                    <!-- 摄像头捕获区 -->
+                    <div style="position: relative; border-radius: 12px; overflow: hidden; background: #000; aspect-ratio: 4/3; display: flex; align-items: center; justify-content: center; border: 2px solid #a855f7;">
+                        <video id="face-video" autoplay playsinline style="width: 100%; height: 100%; object-fit: cover;"></video>
+                        <canvas id="face-canvas" style="display: none;"></canvas>
+                        
+                        <!-- 高科技扫描框和扫描线效果 -->
+                        <div id="face-scanner-frame" style="position: absolute; top: 15%; left: 15%; right: 15%; bottom: 15%; border: 2px dashed rgba(168, 85, 247, 0.6); border-radius: 8px; pointer-events: none; box-shadow: 0 0 0 9999px rgba(0,0,0,0.4);">
+                            <!-- 四角高亮装饰 -->
+                            <div style="position: absolute; top: -2px; left: -2px; width: 16px; height: 16px; border-top: 3px solid #a855f7; border-left: 3px solid #a855f7;"></div>
+                            <div style="position: absolute; top: -2px; right: -2px; width: 16px; height: 16px; border-top: 3px solid #a855f7; border-right: 3px solid #a855f7;"></div>
+                            <div style="position: absolute; bottom: -2px; left: -2px; width: 16px; height: 16px; border-bottom: 3px solid #a855f7; border-left: 3px solid #a855f7;"></div>
+                            <div style="position: absolute; bottom: -2px; right: -2px; width: 16px; height: 16px; border-bottom: 3px solid #a855f7; border-right: 3px solid #a855f7;"></div>
+                        </div>
+                        <div id="face-scanner-line" style="position: absolute; width: 100%; height: 3px; background: linear-gradient(90deg, transparent, #a855f7, transparent); top: 0; left: 0; animation: scanAnimation 2s linear infinite; pointer-events: none;"></div>
+                        <div id="video-placeholder-tip" style="position: absolute; color: #fff; font-size: 13px; text-align: center; pointer-events: none; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;">
+                            <span style="font-size: 32px;">📷</span>
+                            <span>摄像头未开启</span>
+                        </div>
+                    </div>
+                    
+                    <!-- 拖拽/预览照片上传区 -->
+                    <div id="face-upload-zone" style="border: 2px dashed var(--card-border); border-radius: 12px; height: 100%; aspect-ratio: 4/3; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 20px; text-align: center; cursor: pointer; transition: all 0.2s; background: rgba(0,0,0,0.01); box-sizing: border-box;">
+                        <input type="file" id="face-file-input" accept="image/jpeg, image/png" style="display: none;">
+                        <div id="face-upload-default" style="display: flex; flex-direction: column; align-items: center; gap: 10px;">
+                            <span style="font-size: 32px;">🖼️</span>
+                            <div style="font-size: 14px; font-weight: 600; color: var(--text-primary);">拖拽或点击上传本地照片</div>
+                            <div style="font-size: 12px; color: var(--text-secondary);">支持 JPG/PNG 格式带有面部的现场照</div>
+                        </div>
+                        <div id="face-upload-preview" style="display: none; width: 100%; height: 100%; position: relative;">
+                            <img id="face-preview-img" src="" style="width: 100%; height: 100%; object-fit: contain; border-radius: 8px;">
+                            <span id="face-preview-remove" style="position: absolute; top: 6px; right: 6px; background: rgba(0,0,0,0.6); color: white; width: 24px; height: 24px; border-radius: 50%; font-size: 16px; display: flex; align-items: center; justify-content: center; cursor: pointer; font-weight: bold;">&times;</span>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- 比对中加载或成功提示 -->
+                <div id="face-status-banner" style="display: none; align-items: center; justify-content: center; gap: 10px; padding: 12px; border-radius: 8px; font-size: 13px; font-weight: 500; text-align: center; border: 1px solid transparent;">
+                    <div class="spinner" style="width: 16px; height: 16px; border-width: 2px; margin: 0;" id="face-status-spinner"></div>
+                    <span id="face-status-text">正在上传图片并比对腾讯云端人脸库...</span>
+                </div>
+            </div>
+            
+            <div class="modal-footer" style="display: flex; justify-content: space-between; align-items: center; padding: 16px 20px; border-top: 1px solid var(--card-border); background: rgba(0,0,0,0.01);">
+                <div style="display: flex; gap: 8px;">
+                    <button class="action-btn-large btn-accent-gradient" id="btn-toggle-camera" style="margin: 0; font-size: 12px; height: 36px; padding: 0 14px;">🎥 开启摄像头</button>
+                    <button class="action-btn-large btn-accent-gradient" id="btn-capture-compare" style="margin: 0; font-size: 12px; height: 36px; padding: 0 14px; background: linear-gradient(135deg, #10b981, #059669); box-shadow: 0 2px 6px rgba(16, 185, 129, 0.2);" disabled>📸 拍照并检索</button>
+                </div>
+                <button class="btn-search-reset" id="btn-close-face-modal" style="margin: 0; font-size: 12px; height: 36px; padding: 0 14px;">关闭</button>
+            </div>
+        </div>
+    </div>
+
     <!-- 高清照片放大 Overlay -->
     <div class="zoom-overlay" id="zoom-overlay">
         <button id="zoom-prev-btn" class="zoom-btn-side" style="display: none; position: absolute; left: 30px; top: 50%; transform: translateY(-50%); font-size: 30px; width: 60px; height: 60px; border-radius: 50%; background: rgba(255,255,255,0.15); border: 1px solid rgba(255,255,255,0.2); color: white; cursor: pointer; transition: all 0.2s; z-index: 2010;">&lt;</button>
@@ -2550,7 +2632,7 @@
         let currentDetailPhotoIndex = 0;
         let currentZoomPhotos = [];
         let currentZoomPhotoIndex = 0;
-        let isDetailEditing = false;
+        var isDetailEditing = false;
         let selectedPhotoFile = null;
 
         // 页面初始化加载
@@ -4964,6 +5046,292 @@
         window.showExpertDetailDirectly = showExpertDetailDirectly;
         window.openExpertDetailByIdCard = openExpertDetailByIdCard;
         window.fetchProjects = fetchProjects;
+
+        // ==================== 人脸识别与刷脸检索逻辑 ====================
+        let faceStream = null;
+        let isCameraOn = false;
+
+        function initFaceSearch() {
+            const faceSearchBtn = document.getElementById('btn-face-search');
+            const faceModal = document.getElementById('face-modal');
+            const faceModalClose = document.getElementById('face-modal-close');
+            const btnCloseFaceModal = document.getElementById('btn-close-face-modal');
+            
+            const btnToggleCamera = document.getElementById('btn-toggle-camera');
+            const btnCaptureCompare = document.getElementById('btn-capture-compare');
+            const video = document.getElementById('face-video');
+            const canvas = document.getElementById('face-canvas');
+            const videoTip = document.getElementById('video-placeholder-tip');
+            
+            const faceUploadZone = document.getElementById('face-upload-zone');
+            const faceFileInput = document.getElementById('face-file-input');
+            const faceUploadDefault = document.getElementById('face-upload-default');
+            const faceUploadPreview = document.getElementById('face-upload-preview');
+            const facePreviewImg = document.getElementById('face-preview-img');
+            const facePreviewRemove = document.getElementById('face-preview-remove');
+            
+            const statusBanner = document.getElementById('face-status-banner');
+            const statusText = document.getElementById('face-status-text');
+            const statusSpinner = document.getElementById('face-status-spinner');
+            
+            if (!faceSearchBtn || !faceModal) return;
+
+            // 打开弹窗
+            faceSearchBtn.addEventListener('click', () => {
+                faceModal.style.display = 'flex';
+                resetFaceModal();
+            });
+
+            // 关闭弹窗函数
+            function closeFaceModal() {
+                faceModal.style.display = 'none';
+                stopCamera();
+            }
+
+            if (faceModalClose) faceModalClose.addEventListener('click', closeFaceModal);
+            if (btnCloseFaceModal) btnCloseFaceModal.addEventListener('click', closeFaceModal);
+            
+            // 重置模态框状态
+            function resetFaceModal() {
+                stopCamera();
+                if (videoTip) videoTip.style.display = 'flex';
+                if (btnCaptureCompare) {
+                    btnCaptureCompare.disabled = true;
+                    btnCaptureCompare.innerText = '📸 拍照并检索';
+                }
+                if (statusBanner) statusBanner.style.display = 'none';
+                
+                // 重置上传文件预览
+                if (faceFileInput) faceFileInput.value = '';
+                if (faceUploadDefault) faceUploadDefault.style.display = 'flex';
+                if (faceUploadPreview) faceUploadPreview.style.display = 'none';
+                if (facePreviewImg) facePreviewImg.src = '';
+            }
+
+            // 开启/关闭摄像头
+            if (btnToggleCamera && video) {
+                btnToggleCamera.addEventListener('click', () => {
+                    if (isCameraOn) {
+                        stopCamera();
+                    } else {
+                        startCamera();
+                    }
+                });
+            }
+
+            function startCamera() {
+                if (videoTip) videoTip.style.display = 'none';
+                if (statusBanner) statusBanner.style.display = 'none';
+                
+                navigator.mediaDevices.getUserMedia({ 
+                    video: { width: 640, height: 480, facingMode: 'user' } 
+                })
+                .then(stream => {
+                    faceStream = stream;
+                    video.srcObject = stream;
+                    isCameraOn = true;
+                    if (btnToggleCamera) btnToggleCamera.innerText = '🎥 关闭摄像头';
+                    if (btnCaptureCompare) btnCaptureCompare.disabled = false;
+                })
+                .catch(err => {
+                    console.error("无法访问摄像头: ", err);
+                    alert("无法开启摄像头，请确认设备是否有摄像头并已授予浏览器相关权限。您也可以直接上传本地照片。");
+                    if (videoTip) videoTip.style.display = 'flex';
+                });
+            }
+
+            function stopCamera() {
+                if (faceStream) {
+                    faceStream.getTracks().forEach(track => track.stop());
+                    faceStream = null;
+                }
+                if (video) video.srcObject = null;
+                isCameraOn = false;
+                if (btnToggleCamera) btnToggleCamera.innerText = '🎥 开启摄像头';
+                if (btnCaptureCompare) btnCaptureCompare.disabled = true;
+                if (videoTip) videoTip.style.display = 'flex';
+            }
+
+            // 拍照并检索
+            if (btnCaptureCompare && video && canvas) {
+                btnCaptureCompare.addEventListener('click', () => {
+                    if (!isCameraOn || !faceStream) return;
+                    
+                    const ctx = canvas.getContext('2d');
+                    canvas.width = video.videoWidth || 640;
+                    canvas.height = video.videoHeight || 480;
+                    
+                    // 绘制当前画面帧
+                    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                    const base64Image = canvas.toDataURL('image/jpeg');
+                    
+                    performFaceSearch(base64Image);
+                });
+            }
+
+            // 拖拽与点击选择图片逻辑
+            if (faceUploadZone && faceFileInput) {
+                faceUploadZone.addEventListener('click', (e) => {
+                    // 防止点击移除预览按钮触发 file click
+                    if (e.target !== facePreviewRemove) {
+                        faceFileInput.click();
+                    }
+                });
+
+                faceUploadZone.addEventListener('dragover', (e) => {
+                    e.preventDefault();
+                    faceUploadZone.style.borderColor = '#a855f7';
+                    faceUploadZone.style.background = 'rgba(168, 85, 247, 0.02)';
+                });
+
+                faceUploadZone.addEventListener('dragleave', () => {
+                    faceUploadZone.style.borderColor = 'var(--card-border)';
+                    faceUploadZone.style.background = 'rgba(0,0,0,0.01)';
+                });
+
+                faceUploadZone.addEventListener('drop', (e) => {
+                    e.preventDefault();
+                    faceUploadZone.style.borderColor = 'var(--card-border)';
+                    faceUploadZone.style.background = 'rgba(0,0,0,0.01)';
+                    const files = e.dataTransfer.files;
+                    if (files.length > 0) {
+                        processFile(files[0]);
+                    }
+                });
+
+                faceFileInput.addEventListener('change', () => {
+                    if (faceFileInput.files.length > 0) {
+                        processFile(faceFileInput.files[0]);
+                    }
+                });
+            }
+
+            // 移除预览照片
+            if (facePreviewRemove) {
+                facePreviewRemove.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    if (faceFileInput) faceFileInput.value = '';
+                    if (faceUploadDefault) faceUploadDefault.style.display = 'flex';
+                    if (faceUploadPreview) faceUploadPreview.style.display = 'none';
+                    if (facePreviewImg) facePreviewImg.src = '';
+                    if (statusBanner) statusBanner.style.display = 'none';
+                });
+            }
+
+            function processFile(file) {
+                const ext = file.name.split('.').pop().toLowerCase();
+                if (!['jpg', 'jpeg', 'png'].includes(ext)) {
+                    alert('⚠️ 上传的照片格式不正确，仅支持 .jpg, .jpeg, .png');
+                    return;
+                }
+
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    const base64Image = e.target.result;
+                    
+                    // 显示预览
+                    if (faceUploadDefault) faceUploadDefault.style.display = 'none';
+                    if (faceUploadPreview) faceUploadPreview.style.display = 'block';
+                    if (facePreviewImg) facePreviewImg.src = base64Image;
+                    
+                    performFaceSearch(base64Image);
+                };
+                reader.readAsDataURL(file);
+            }
+
+            // 核心比对与搜索调用
+            function performFaceSearch(base64Data) {
+                if (statusBanner && statusText) {
+                    statusBanner.style.display = 'flex';
+                    statusBanner.style.borderColor = 'rgba(168, 85, 247, 0.2)';
+                    statusBanner.style.background = 'rgba(168, 85, 247, 0.05)';
+                    statusBanner.style.color = 'var(--text-primary)';
+                    if (statusSpinner) statusSpinner.style.display = 'block';
+                    statusText.innerText = '正在提取人脸特征并搜索云端人脸库...';
+                }
+
+                fetch('/dlsgzs/api/face/search', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ image: base64Data })
+                })
+                .then(r => r.json())
+                .then(res => {
+                    if (res.success && res.found) {
+                        if (statusBanner && statusText) {
+                            statusBanner.style.borderColor = 'rgba(16, 185, 129, 0.2)';
+                            statusBanner.style.background = 'rgba(16, 185, 129, 0.05)';
+                            statusBanner.style.color = '#10b981';
+                            if (statusSpinner) statusSpinner.style.display = 'none';
+                            statusText.innerText = `🎉 匹配成功！专家【${res.expert.name}】相似度：${res.score.toFixed(1)}%`;
+                        }
+                        
+                        setTimeout(() => {
+                            closeFaceModal();
+                            // 延时一会儿弹出，给用户一个成功的视觉反馈
+                            if (typeof showExpertDetailDirectly === 'function') {
+                                showExpertDetailDirectly(res.expert);
+                            } else {
+                                setupDetailModal(res.expert);
+                            }
+                        }, 800);
+                        
+                    } else {
+                        throw new Error(res.error || '未匹配到该专家的面部特征');
+                    }
+                })
+                .catch(err => {
+                    if (statusBanner && statusText) {
+                        statusBanner.style.borderColor = 'rgba(239, 68, 68, 0.2)';
+                        statusBanner.style.background = 'rgba(239, 68, 68, 0.05)';
+                        statusBanner.style.color = '#ef4444';
+                        if (statusSpinner) statusSpinner.style.display = 'none';
+                        statusText.innerText = '❌ 检索失败: ' + err.message;
+                    }
+                });
+            }
+        }
+
+        // ==================== 一键同步人脸库逻辑 ====================
+        function initFaceSync() {
+            const syncBtn = document.getElementById('btn-sync-faces');
+            if (!syncBtn) return;
+            
+            syncBtn.addEventListener('click', () => {
+                if (confirm('确认要执行增量人脸库同步吗？\n系统将自动检测本地所有拥有身份证照片但云端未同步的专家，并将其同步至腾讯云人员库中。此过程因请求网络 API 会有微小延迟。')) {
+                    syncBtn.disabled = true;
+                    syncBtn.innerHTML = '<span>🔄</span> 正在同步人脸库...';
+                    
+                    fetch('/dlsgzs/api/face/sync', {
+                        method: 'POST'
+                    })
+                    .then(r => r.json())
+                    .then(res => {
+                        syncBtn.disabled = false;
+                        syncBtn.innerHTML = '<span>🔄</span> 同步人脸库';
+                        
+                        if (res.success) {
+                            alert(res.message);
+                            // 增量同步完成后，重新加载统计数据面板
+                            if (typeof fetchExpertsList === 'function') {
+                                fetchExpertsList();
+                            }
+                        } else {
+                            alert('❌ 人脸库同步失败：' + (res.error || '网络错误'));
+                        }
+                    })
+                    .catch(err => {
+                        syncBtn.disabled = false;
+                        syncBtn.innerHTML = '<span>🔄</span> 同步人脸库';
+                        alert('❌ 同步请求异常，请检查后端服务: ' + err.message);
+                    });
+                }
+            });
+        }
+
+        // 挂载加载初始化
+        initFaceSearch();
+        initFaceSync();
     </script>
 </body>
 
