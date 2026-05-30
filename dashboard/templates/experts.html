@@ -3279,6 +3279,7 @@
 
         function setupDetailModal(item) {
             if (!item) return;
+            let isDetailEditing = false;
             const modal = document.getElementById('detail-modal');
             if (!modal) return;
             
@@ -3481,7 +3482,6 @@
             }
 
             // 声明内部编辑状态和控件只读切换函数 (仅用于基本资料)
-            let isDetailEditing = false;
             function setModalEditable(editable) {
                 isDetailEditing = editable;
                 
