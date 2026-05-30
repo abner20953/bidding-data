@@ -2959,9 +2959,19 @@
                     tagsHtml = item.tags.map(t => `<span class="custom-expert-tag" title="${t}">${t}</span>`).join('');
                 }
                 
+                let syncBadgeHtml = '';
+                if (item.is_face_synced === 1) {
+                    syncBadgeHtml = `
+                        <div class="face-sync-badge" title="人脸数据已同步至腾讯云" style="position: absolute; bottom: -2px; right: -2px; background: #10b981; color: white; width: 16px; height: 16px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 9px; border: 1.5px solid var(--bg-card); z-index: 10; box-shadow: 0 1px 3px rgba(0,0,0,0.2); pointer-events: none;">
+                            ☁️
+                        </div>
+                    `;
+                }
+                
                 card.innerHTML = `
-                    <div class="expert-avatar-container">
+                    <div class="expert-avatar-container" style="position: relative;">
                         ${avatarHtml}
+                        ${syncBadgeHtml}
                     </div>
                     <div class="expert-info">
                         <div>
