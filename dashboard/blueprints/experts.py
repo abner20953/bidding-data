@@ -15,7 +15,10 @@ from dotenv import load_dotenv
 from tencentcloud.common import credential
 from tencentcloud.common.profile.client_profile import ClientProfile
 from tencentcloud.common.profile.http_profile import HttpProfile
-from tencentcloud.common.exceptions.tencent_cloud_sdk_exception import TencentCloudSDKException
+try:
+    from tencentcloud.common.exceptions.tencent_cloud_sdk_exception import TencentCloudSDKException
+except ImportError:
+    from tencentcloud.common.exception.tencent_cloud_sdk_exception import TencentCloudSDKException
 from tencentcloud.iai.v20200303 import iai_client, models
 
 # 定义 Blueprint
