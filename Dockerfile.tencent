@@ -19,15 +19,15 @@ RUN apt-get update && \
 # 【核心优化 1】单独安装并缓存极其庞大的 PyTorch CPU 版
 # 将其放在 COPY requirements.txt 之前，确保以后即使依赖包列表变动，也能永久复用这一层 170MB+ 的下载缓存
 # 强制指定版本 2.2.0+cpu 从国内清华 CPU 镜像源极速下载（约 170MB），失败则降级到官方 CPU 源
-RUN pip install --no-cache-dir torch==2.2.0+cpu --index-url https://mirror.sjtu.edu.cn/pytorch-wheels/cpu/ --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple || \
-    pip install --no-cache-dir torch==2.2.0+cpu --index-url https://download.pytorch.org/whl/cpu/ --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple --default-timeout=1000
+RUN pip install --no-cache-dir torch==2.2.0+cpu --index-url https://mirror.sjtu.edu.cn/pytorch-wheels/cpu/ --extra-index-url https://mirrors.aliyun.com/pypi/simple/ || \
+    pip install --no-cache-dir torch==2.2.0+cpu --index-url https://download.pytorch.org/whl/cpu/ --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --default-timeout=1000
 
 # 【核心优化 2】利用 Docker 缓存机制 handle 业务依赖
 COPY requirements.txt .
 
-# 使用清华源加速安装 requirements.txt 里的剩余包，并指定 CPU 版 PyTorch 镜像源以防止依赖覆盖
+# 使用阿里云源加速安装 requirements.txt 里的剩余包，并指定 CPU 版 PyTorch 镜像源以防止依赖覆盖
 RUN pip install --no-cache-dir -r requirements.txt \
-    -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    -i https://mirrors.aliyun.com/pypi/simple/ \
     --extra-index-url https://mirror.sjtu.edu.cn/pytorch-wheels/cpu/ \
     --extra-index-url https://download.pytorch.org/whl/cpu/
 
