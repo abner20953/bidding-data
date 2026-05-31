@@ -11,6 +11,8 @@ import datetime
 import time
 import json
 import base64
+import io
+from PIL import Image
 from dotenv import load_dotenv
 from tencentcloud.common import credential
 from tencentcloud.common.profile.client_profile import ClientProfile
@@ -101,6 +103,49 @@ def _get_gender_from_idcard(id_card):
     return 0
 
 
+def _resize_and_compress_image(physical_path, max_size=1080):
+    """
+    使用 PIL 对人脸照片进行缩放和压缩，以符合腾讯云人脸注册的分辨率和大小要求。
+    - max_size: 最大边长限制为 1080 像素 (腾讯云要求分辨率在 64*64 至 4096*4096 之间)
+    - 质量 quality: 85 (JPEG 压缩)
+    """
+    try:
+        with Image.open(physical_path) as img:
+            # 兼容 RGBA 等多通道模式，转为 RGB，防止保存为 JPEG 格式报错
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            # 获取原始长宽
+            width, height = img.size
+            
+            # 如果宽或高大于限制值，进行等比例缩放
+            if width > max_size or height > max_size:
+                if width > height:
+                    new_width = max_size
+                    new_height = int(height * (max_size / width))
+                else:
+                    new_height = max_size
+                    new_width = int(width * (max_size / height))
+                
+                # 使用高质量的重采样算法
+                try:
+                    resample_method = Image.Resampling.LANCZOS
+                except AttributeError:
+                    resample_method = Image.ANTIALIAS
+                
+                img = img.resize((new_width, new_height), resample_method)
+            
+            # 压缩保存到内存中
+            output_buffer = io.BytesIO()
+            img.save(output_buffer, format="JPEG", quality=85)
+            img_data = output_buffer.getvalue()
+            
+            # 转为 Base64 并返回
+            return base64.b64encode(img_data).decode("utf-8"), None
+    except Exception as e:
+        return None, f"图像缩放或压缩处理失败: {str(e)}"
+
+
 def _register_or_update_face(id_card, name, photo_path):
     """向腾讯云人脸库注册或更新人员"""
     client = _get_iai_client()
@@ -123,13 +168,10 @@ def _register_or_update_face(id_card, name, photo_path):
         if not os.path.exists(physical_path):
             return False, f"物理磁盘上未找到该专家的照片文件: {filename}"
             
-    # 读取照片并转为 Base64
-    try:
-        with open(physical_path, "rb") as f:
-            img_data = f.read()
-            img_base64 = base64.b64encode(img_data).decode("utf-8")
-    except Exception as e:
-        return False, f"读取人脸照片文件失败: {str(e)}"
+    # 对照片进行处理，缩放其分辨率并压缩其大小（腾讯云要求分辨率在 64*64 至 4096*4096，且限制大小）
+    img_base64, err_msg = _resize_and_compress_image(physical_path)
+    if err_msg:
+        return False, err_msg
         
     # 为了保证注册/更新 100% 成功，采取“先尝试删除，后创建”的合并策略
     try:
