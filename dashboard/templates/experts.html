@@ -5442,32 +5442,35 @@
                                         </div>
                                         
                                         <!-- 专家人脸对比区域 (方案 B) -->
-                                        <div style="display: flex; align-items: center; gap: 12px; border-bottom: 1px dashed var(--border-color); padding-bottom: 12px;">
-                                            <!-- 现场人脸局部 -->
-                                            <div id="crop-container-${index}" style="display: ${item.face_rect ? 'flex' : 'none'}; flex-direction: column; align-items: center; gap: 4px;">
-                                                <span style="font-size: 10px; color: var(--text-secondary); font-weight: 600;">现场照片</span>
-                                                <canvas id="crop-canvas-${index}" width="50" height="66" style="width: 50px; height: 66px; border-radius: 6px; border: 1px solid var(--border-color); object-fit: cover; background: #e2e8f0; flex-shrink: 0;"></canvas>
-                                            </div>
-                                            
-                                            <!-- 中间对比箭头 -->
-                                            <div id="crop-arrow-${index}" style="display: ${item.face_rect ? 'block' : 'none'}; font-size: 14px; color: var(--text-secondary); font-weight: bold; margin-top: 14px;">➡️</div>
-                                            
-                                            <!-- 数据库存档照片 -->
-                                            <div style="display: flex; flex-direction: column; align-items: center; gap: 4px; position: relative;">
-                                                <span style="font-size: 10px; color: var(--text-secondary); font-weight: 600; display: ${item.face_rect ? 'block' : 'none'};">系统存档</span>
-                                                <div style="width: 50px; height: 66px; border-radius: 6px; overflow: hidden; background: #e2e8f0; border: 1px solid var(--border-color); flex-shrink: 0; position: relative;">
-                                                    <img src="${photoSrc}" style="width: 100%; height: 100%; object-fit: cover;" onerror="this.src=''">
-                                                    <div title="人脸已同步至腾讯云" style="position: absolute; bottom: 2px; right: 2px; background: #10b981; color: white; width: 14px; height: 14px; border-radius: 50%; display: ${hasSync ? 'flex' : 'none'}; align-items: center; justify-content: center; font-size: 8px; border: 1px solid white;">☁️</div>
+                                        <div style="border-bottom: 1px dashed var(--border-color); padding-bottom: 12px; display: flex; flex-direction: column; gap: 12px;">
+                                            <!-- 照片对比行 -->
+                                            <div style="display: flex; align-items: center; gap: 12px; justify-content: flex-start;">
+                                                <!-- 现场人脸局部 -->
+                                                <div id="crop-container-${index}" style="display: ${item.face_rect ? 'flex' : 'none'}; flex-direction: column; align-items: center; gap: 4px;">
+                                                    <span style="font-size: 10px; color: var(--text-secondary); font-weight: 600;">现场照片</span>
+                                                    <canvas id="crop-canvas-${index}" width="50" height="66" style="width: 50px; height: 66px; border-radius: 6px; border: 1px solid var(--border-color); object-fit: cover; background: #e2e8f0; flex-shrink: 0;"></canvas>
+                                                </div>
+                                                
+                                                <!-- 中间对比箭头 -->
+                                                <div id="crop-arrow-${index}" style="display: ${item.face_rect ? 'block' : 'none'}; font-size: 14px; color: var(--text-secondary); font-weight: bold; margin-top: 14px;">➡️</div>
+                                                
+                                                <!-- 数据库存档照片 -->
+                                                <div style="display: flex; flex-direction: column; align-items: center; gap: 4px; position: relative;">
+                                                    <span style="font-size: 10px; color: var(--text-secondary); font-weight: 600; display: ${item.face_rect ? 'block' : 'none'};">系统存档</span>
+                                                    <div style="width: 50px; height: 66px; border-radius: 6px; overflow: hidden; background: #e2e8f0; border: 1px solid var(--border-color); flex-shrink: 0; position: relative;">
+                                                        <img src="${photoSrc}" style="width: 100%; height: 100%; object-fit: cover;" onerror="this.src=''">
+                                                        <div title="人脸已同步至腾讯云" style="position: absolute; bottom: 2px; right: 2px; background: #10b981; color: white; width: 14px; height: 14px; border-radius: 50%; display: ${hasSync ? 'flex' : 'none'}; align-items: center; justify-content: center; font-size: 8px; border: 1px solid white;">☁️</div>
+                                                    </div>
                                                 </div>
                                             </div>
                                             
-                                            <!-- 专家核心简档 -->
-                                            <div style="display: flex; flex-direction: column; gap: 6px; min-width: 0; margin-left: 8px; justify-content: center; height: 80px;">
+                                            <!-- 专家姓名与工作单位 (放在照片下方，防移动端遮挡) -->
+                                            <div style="display: flex; flex-direction: column; gap: 6px; min-width: 0;">
                                                 <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
-                                                    <span style="font-size: 16px; font-weight: 700; color: var(--text-primary); white-space: nowrap;">${exp.name || '-'}</span>
+                                                    <span style="font-size: 16px; font-weight: 700; color: var(--text-primary);">${exp.name || '-'}</span>
                                                     <span class="expert-tag" style="background: rgba(16, 185, 129, 0.1); color: #10b981; font-size: 10px; padding: 2px 6px; border-radius: 4px; font-weight: 600; white-space: nowrap;">已核验</span>
                                                 </div>
-                                                <div style="font-size: 12px; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-height: 1.4;">${exp.company || '无工作单位'}</div>
+                                                <div style="font-size: 13px; color: var(--text-secondary); line-height: 1.4; word-break: break-all;">${exp.company || '无工作单位'}</div>
                                             </div>
                                         </div>
                                         
