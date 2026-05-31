@@ -3217,14 +3217,11 @@
                     if (xhr.status === 200) {
                         const res = JSON.parse(xhr.responseText);
                         progressBar.style.width = '100%';
-                        progressText.innerText = '导入成功！正在为您切换视图...';
+                        progressText.innerText = '导入成功！';
                         alert('✅ ' + res.message);
                         
-                        // 导入成功后清空上传控件，自动跳回检索页面并加载最新数据
+                        // 导入成功后清空上传控件，继续停留在当前上传页面
                         fileInput.value = '';
-                        setTimeout(() => {
-                            switchTab('search');
-                        }, 1000);
                     } else {
                         let errorMsg = '上传失败';
                         try {
