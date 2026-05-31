@@ -44,6 +44,10 @@ SECRET_ID = os.getenv("TENCENTCLOUD_SECRET_ID", "").strip()
 SECRET_KEY = os.getenv("TENCENTCLOUD_SECRET_KEY", "").strip()
 REGION = os.getenv("TENCENTCLOUD_REGION", "ap-beijing").strip()
 GROUP_ID = os.getenv("TENCENTCLOUD_GROUP_ID", "experts_group").strip()
+try:
+    MAX_FACE_NUM = int(os.getenv("TENCENTCLOUD_MAX_FACE_NUM", "5").strip())
+except Exception:
+    MAX_FACE_NUM = 5
 
 def _get_iai_client():
     """初始化并获取腾讯云人脸识别客户端"""
@@ -198,7 +202,7 @@ def _register_or_update_face(id_card, name, photo_path):
 
 
 def _search_face(image_base64):
-    """在腾讯云人员库中搜索匹配的人脸，返回最相似的前3个 PersonId(身份证号) 和相似度得分 Score 的列表"""
+    """在腾讯云人员库中搜索匹配的人脸，支持配置的多人脸识别，并返回带有人脸定位框坐标的候选人列表"""
     client = _get_iai_client()
     if not client:
         return [], "腾讯云 SecretId/SecretKey 配置缺失"
@@ -207,8 +211,8 @@ def _search_face(image_base64):
         req = models.SearchFacesRequest()
         req.GroupIds = [GROUP_ID]
         req.Image = image_base64
-        req.MaxFaceNum = 1 # 仅识别并检索现场图中最大的一张脸
-        req.MaxPersonNum = 3 # 返回相似度最高的前 3 个候选人
+        req.MaxFaceNum = MAX_FACE_NUM # 支持配置的最大人脸数
+        req.MaxPersonNum = 3 # 针对每张脸返回前3个最相似的人
         req.NeedPersonInfo = 0
         
         resp = client.SearchFaces(req)
@@ -216,16 +220,26 @@ def _search_face(image_base64):
         # 解析返回结果
         candidates = []
         if resp.Results and len(resp.Results) > 0:
-            result = resp.Results[0]
-            if result.RetCode == 0 and result.Candidates:
-                for candidate in result.Candidates:
-                    candidates.append({
-                        "person_id": candidate.PersonId,
-                        "score": candidate.Score
-                    })
-                return candidates, None
-            else:
+            has_valid_faces = False
+            for result in resp.Results:
+                if result.RetCode == 0 and result.Candidates:
+                    has_valid_faces = True
+                    # 人脸框位置坐标
+                    face_rect = {
+                        "x": result.FaceRect.X,
+                        "y": result.FaceRect.Y,
+                        "width": result.FaceRect.Width,
+                        "height": result.FaceRect.Height
+                    }
+                    for candidate in result.Candidates:
+                        candidates.append({
+                            "person_id": candidate.PersonId,
+                            "score": candidate.Score,
+                            "face_rect": face_rect
+                        })
+            if not has_valid_faces:
                 return [], "人脸库中未匹配到相似度足够高的人脸"
+            return candidates, None
         else:
             return [], "图片中未检测到清晰人脸"
             
@@ -2127,7 +2141,8 @@ def api_face_search():
             }
             results.append({
                 "score": score,
-                "expert": expert
+                "expert": expert,
+                "face_rect": cand.get('face_rect')
             })
             
         if not results:

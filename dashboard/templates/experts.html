@@ -5198,6 +5198,7 @@
         window.fetchProjects = fetchProjects;
 
         let currentMatchedResults = [];
+        let currentSearchImageBase64 = '';
         window.openMatchedExpertDetail = function(index) {
             const item = currentMatchedResults[index];
             if (item && item.expert) {
@@ -5346,6 +5347,13 @@
                 const resSuccess = document.getElementById('face-result-success');
                 if (resSuccess) resSuccess.style.display = 'none';
                 
+                // 缓存当前上传/拍下的现场照片 Base64 字符串
+                if (base64Data.startsWith('data:')) {
+                    currentSearchImageBase64 = base64Data;
+                } else {
+                    currentSearchImageBase64 = 'data:image/jpeg;base64,' + base64Data;
+                }
+                
                 if (statusBanner && statusText) {
                     statusBanner.style.display = 'flex';
                     statusBanner.style.borderColor = 'rgba(168, 85, 247, 0.2)';
@@ -5403,18 +5411,33 @@
                                             <span style="font-size: 12px; color: var(--text-secondary); white-space: nowrap;">匹配相似度：<strong style="color: ${themeColor}; font-size: 13px;">${score.toFixed(1)}%</strong></span>
                                         </div>
                                         
-                                        <!-- 专家核心简档 -->
-                                        <div style="display: flex; align-items: center; gap: 16px; border-bottom: 1px dashed var(--border-color); padding-bottom: 12px;">
-                                            <div style="width: 50px; height: 66px; border-radius: 6px; overflow: hidden; background: #e2e8f0; border: 1px solid var(--border-color); flex-shrink: 0; position: relative;">
-                                                <img src="${photoSrc}" style="width: 100%; height: 100%; object-fit: cover;" onerror="this.src=''">
-                                                <div title="人脸已同步至腾讯云" style="position: absolute; bottom: 2px; right: 2px; background: #10b981; color: white; width: 14px; height: 14px; border-radius: 50%; display: ${hasSync ? 'flex' : 'none'}; align-items: center; justify-content: center; font-size: 8px; border: 1px solid white;">☁️</div>
+                                        <!-- 专家人脸对比区域 (方案 B) -->
+                                        <div style="display: flex; align-items: center; gap: 12px; border-bottom: 1px dashed var(--border-color); padding-bottom: 12px;">
+                                            <!-- 现场人脸局部 -->
+                                            <div id="crop-container-${index}" style="display: ${item.face_rect ? 'flex' : 'none'}; flex-direction: column; align-items: center; gap: 4px;">
+                                                <span style="font-size: 10px; color: var(--text-secondary); font-weight: 600;">现场照片</span>
+                                                <canvas id="crop-canvas-${index}" width="50" height="66" style="width: 50px; height: 66px; border-radius: 6px; border: 1px solid var(--border-color); object-fit: cover; background: #e2e8f0; flex-shrink: 0;"></canvas>
                                             </div>
-                                            <div style="display: flex; flex-direction: column; gap: 4px; min-width: 0;">
+                                            
+                                            <!-- 中间对比箭头 -->
+                                            <div id="crop-arrow-${index}" style="display: ${item.face_rect ? 'block' : 'none'}; font-size: 14px; color: var(--text-secondary); font-weight: bold; margin-top: 14px;">➡️</div>
+                                            
+                                            <!-- 数据库存档照片 -->
+                                            <div style="display: flex; flex-direction: column; align-items: center; gap: 4px; position: relative;">
+                                                <span style="font-size: 10px; color: var(--text-secondary); font-weight: 600; display: ${item.face_rect ? 'block' : 'none'};">系统存档</span>
+                                                <div style="width: 50px; height: 66px; border-radius: 6px; overflow: hidden; background: #e2e8f0; border: 1px solid var(--border-color); flex-shrink: 0; position: relative;">
+                                                    <img src="${photoSrc}" style="width: 100%; height: 100%; object-fit: cover;" onerror="this.src=''">
+                                                    <div title="人脸已同步至腾讯云" style="position: absolute; bottom: 2px; right: 2px; background: #10b981; color: white; width: 14px; height: 14px; border-radius: 50%; display: ${hasSync ? 'flex' : 'none'}; align-items: center; justify-content: center; font-size: 8px; border: 1px solid white;">☁️</div>
+                                                </div>
+                                            </div>
+                                            
+                                            <!-- 专家核心简档 -->
+                                            <div style="display: flex; flex-direction: column; gap: 6px; min-width: 0; margin-left: 8px; justify-content: center; height: 80px;">
                                                 <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
                                                     <span style="font-size: 16px; font-weight: 700; color: var(--text-primary); white-space: nowrap;">${exp.name || '-'}</span>
                                                     <span class="expert-tag" style="background: rgba(16, 185, 129, 0.1); color: #10b981; font-size: 10px; padding: 2px 6px; border-radius: 4px; font-weight: 600; white-space: nowrap;">已核验</span>
                                                 </div>
-                                                <div style="font-size: 12px; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${exp.company || '无工作单位'}</div>
+                                                <div style="font-size: 12px; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-height: 1.4;">${exp.company || '无工作单位'}</div>
                                             </div>
                                         </div>
                                         
@@ -5447,6 +5470,31 @@
                                 const div = document.createElement('div');
                                 div.innerHTML = expertHtml.trim();
                                 resSuccess.appendChild(div.firstChild);
+                            });
+                            
+                            // 遍历绘制各卡片的 Canvas 现场局部人脸裁剪
+                            res.results.forEach((item, index) => {
+                                if (item.face_rect) {
+                                    const canvas = document.getElementById(`crop-canvas-${index}`);
+                                    if (canvas) {
+                                        const ctx = canvas.getContext('2d');
+                                        const img = new Image();
+                                        img.onload = function() {
+                                            const rect = item.face_rect;
+                                            // 对腾讯云检测出的人脸做 15% 边缘扩充，使图像看起来更自然
+                                            const padX = rect.width * 0.15;
+                                            const padY = rect.height * 0.15;
+                                            
+                                            const sx = Math.max(0, rect.x - padX);
+                                            const sy = Math.max(0, rect.y - padY);
+                                            const sw = Math.min(img.width - sx, rect.width + padX * 2);
+                                            const sh = Math.min(img.height - sy, rect.height + padY * 2);
+                                            
+                                            ctx.drawImage(img, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+                                        };
+                                        img.src = currentSearchImageBase64;
+                                    }
+                                }
                             });
                         }
                     } else {
