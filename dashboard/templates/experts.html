@@ -2077,6 +2077,29 @@
                         <span>上传照片检索专家档案</span>
                     </div>
                     
+                    <!-- 检索参数控制项 -->
+                    <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; background: rgba(0,0,0,0.02); border: 1px solid var(--border-color); border-radius: 10px; padding: 10px 16px; margin-bottom: -4px;">
+                        <span style="font-size: 13px; font-weight: 600; color: var(--text-primary); display: flex; align-items: center; gap: 6px;">
+                            <span>🎯</span> 最多检索人脸数量
+                        </span>
+                        <div style="position: relative; display: flex; align-items: center;">
+                            <select id="face-search-limit" style="appearance: none; -webkit-appearance: none; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 6px; padding: 6px 28px 6px 12px; font-size: 13px; font-weight: 600; color: var(--text-primary); cursor: pointer; transition: all 0.2s; outline: none;">
+                                <option value="1">只检索 1 张脸 (单人)</option>
+                                <option value="2">最多检索 2 张脸</option>
+                                <option value="3">最多检索 3 张脸</option>
+                                <option value="4">最多检索 4 张脸</option>
+                                <option value="5" selected>最多检索 5 张脸 (推荐)</option>
+                                <option value="6">最多检索 6 张脸</option>
+                                <option value="7">最多检索 7 张脸</option>
+                                <option value="8">最多检索 8 张脸</option>
+                                <option value="9">最多检索 9 张脸</option>
+                                <option value="10">最多检索 10 张脸 (上限)</option>
+                            </select>
+                            <!-- 自定义下拉框小箭头指示符 -->
+                            <span style="position: absolute; right: 10px; pointer-events: none; font-size: 10px; color: var(--text-secondary);">▼</span>
+                        </div>
+                    </div>
+
                     <!-- 拖拽/预览照片上传区 -->
                     <div id="face-upload-zone" style="border: 2px dashed rgba(99, 102, 241, 0.3); border-radius: 12px; height: 200px; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 16px; text-align: center; cursor: pointer; transition: all 0.2s; background: rgba(255,255,255,0.1); box-sizing: border-box; position: relative;">
                         <input type="file" id="face-file-input" accept="image/jpeg, image/png" style="display: none;">
@@ -5363,10 +5386,17 @@
                     statusText.innerText = '正在提取人脸特征并搜索云端人脸库...';
                 }
                 
+                // 获取用户当前界面选择的最多人脸检索上限
+                const searchLimitSelect = document.getElementById('face-search-limit');
+                const limitVal = searchLimitSelect ? parseInt(searchLimitSelect.value) : 5;
+                
                 fetch('/dlsgzs/api/face/search', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ image: base64Data })
+                    body: JSON.stringify({ 
+                        image: base64Data,
+                        max_face_num: limitVal
+                    })
                 })
                 .then(r => r.json())
                 .then(res => {

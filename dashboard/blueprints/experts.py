@@ -201,17 +201,21 @@ def _register_or_update_face(id_card, name, photo_path):
         return False, f"注册人脸时发生未捕获异常: {str(e)}"
 
 
-def _search_face(image_base64):
+def _search_face(image_base64, max_face_num=None):
     """在腾讯云人员库中搜索匹配的人脸，支持配置的多人脸识别，并返回带有人脸定位框坐标的候选人列表"""
     client = _get_iai_client()
     if not client:
         return [], "腾讯云 SecretId/SecretKey 配置缺失"
         
+    if max_face_num is None:
+        max_face_num = MAX_FACE_NUM
+    max_face_num = max(1, min(10, max_face_num))
+        
     try:
         req = models.SearchFacesRequest()
         req.GroupIds = [GROUP_ID]
         req.Image = image_base64
-        req.MaxFaceNum = MAX_FACE_NUM # 支持配置的最大人脸数
+        req.MaxFaceNum = max_face_num # 支持配置的最大人脸数
         req.MaxPersonNum = 3 # 针对每张脸返回前3个最相似的人
         req.NeedPersonInfo = 0
         
@@ -2071,6 +2075,15 @@ def api_face_search():
     if not image_data:
         return jsonify({"success": False, "error": "请提供有效的人脸图像数据"}), 400
         
+    # 获取并校验最多人脸检索数量
+    max_face_num_param = data.get('max_face_num')
+    try:
+        max_face_num = int(max_face_num_param)
+        if not (1 <= max_face_num <= 10):
+            max_face_num = MAX_FACE_NUM
+    except (TypeError, ValueError):
+        max_face_num = MAX_FACE_NUM
+        
     # 处理 Data URL 前缀（如 data:image/jpeg;base64,）
     if ',' in image_data:
         image_base64 = image_data.split(',', 1)[1]
@@ -2078,7 +2091,7 @@ def api_face_search():
         image_base64 = image_data
         
     # 调用腾讯云人脸检索，获取前3个候选人
-    candidates, err_msg = _search_face(image_base64)
+    candidates, err_msg = _search_face(image_base64, max_face_num=max_face_num)
     if err_msg:
         return jsonify({"success": False, "error": err_msg}), 400
         
