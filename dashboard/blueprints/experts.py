@@ -45,9 +45,9 @@ SECRET_KEY = os.getenv("TENCENTCLOUD_SECRET_KEY", "").strip()
 REGION = os.getenv("TENCENTCLOUD_REGION", "ap-beijing").strip()
 GROUP_ID = os.getenv("TENCENTCLOUD_GROUP_ID", "experts_group").strip()
 try:
-    MAX_FACE_NUM = int(os.getenv("TENCENTCLOUD_MAX_FACE_NUM", "5").strip())
+    MAX_FACE_NUM = int(os.getenv("TENCENTCLOUD_MAX_FACE_NUM", "1").strip())
 except Exception:
-    MAX_FACE_NUM = 5
+    MAX_FACE_NUM = 1
 
 def _get_iai_client():
     """初始化并获取腾讯云人脸识别客户端"""
