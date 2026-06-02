@@ -2098,6 +2098,30 @@ def api_face_search():
     # 过滤掉得分低于 55.0 的候选人（最大化兼容大年龄跨度身份证比对）
     valid_candidates = [c for c in candidates if c['score'] >= 55.0]
     
+    # 针对同一张人脸的分组过滤策略：如果有大于 85% 的匹配，则排除掉该人脸其他低于 75% 的结果
+    from collections import defaultdict
+    grouped = defaultdict(list)
+    for c in valid_candidates:
+        rect = c.get('face_rect')
+        rect_key = (rect['x'], rect['y'], rect['width'], rect['height']) if rect else None
+        grouped[rect_key].append(c)
+        
+    filtered_candidates = []
+    for rect_key, cand_list in grouped.items():
+        if rect_key is None:
+            filtered_candidates.extend(cand_list)
+            continue
+        # 检查这组人脸内是否有得分 >= 85% 的
+        has_high_score = any(c['score'] >= 85.0 for c in cand_list)
+        if has_high_score:
+            # 排除掉低于 75% 的其他匹配项
+            filtered_list = [c for c in cand_list if c['score'] >= 75.0]
+        else:
+            filtered_list = cand_list
+        filtered_candidates.extend(filtered_list)
+        
+    valid_candidates = filtered_candidates
+    
     if not valid_candidates:
         return jsonify({"success": False, "error": "人脸库中未匹配到相似度足够高的专家档案（最高匹配得分低于阈值 55）"}), 400
         
