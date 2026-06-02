@@ -218,6 +218,19 @@ def _process_single_photo_for_upload(physical_path, id_card, name):
                 # 若未检出人脸，安全回退到使用原缩放图
                 final_img = img_resized
                 
+            # 检查最终要上传的图像尺寸，若短边小于128像素，则按比例放大，防止腾讯云报 ImageResolutionTooSmall 错误
+            final_w, final_h = final_img.size
+            min_edge = min(final_w, final_h)
+            if min_edge < 128:
+                scale = 128.0 / min_edge
+                new_w = int(final_w * scale)
+                new_h = int(final_h * scale)
+                try:
+                    resample_method = Image.Resampling.LANCZOS
+                except AttributeError:
+                    resample_method = Image.ANTIALIAS
+                final_img = final_img.resize((new_w, new_h), resample_method)
+                
             # 对最终图像进行压缩（质量85）并转为 Base64
             final_buffer = io.BytesIO()
             final_img.save(final_buffer, format="JPEG", quality=85)
