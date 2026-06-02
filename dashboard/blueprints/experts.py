@@ -151,7 +151,7 @@ def _resize_and_compress_image(physical_path, max_size=1080):
 
 
 def _register_or_update_face(id_card, name, photo_path):
-    """向腾讯云人脸库注册或更新人员"""
+    """向腾讯云人脸库注册或更新人员。针对身份证扫描件和大留白照片，先检测并裁剪人脸。"""
     client = _get_iai_client()
     if not client:
         return False, "腾讯云 SecretId/SecretKey 配置缺失"
@@ -171,11 +171,80 @@ def _register_or_update_face(id_card, name, photo_path):
         physical_path = os.path.join(alternative_dir, filename)
         if not os.path.exists(physical_path):
             return False, f"物理磁盘上未找到该专家的照片文件: {filename}"
+
+    img_base64 = None
+    try:
+        # 打开原始图片
+        with Image.open(physical_path) as img:
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
             
-    # 对照片进行处理，缩放其分辨率并压缩其大小（腾讯云要求分辨率在 64*64 至 4096*4096，且限制大小）
-    img_base64, err_msg = _resize_and_compress_image(physical_path)
-    if err_msg:
-        return False, err_msg
+            # 先进行上限等比例缩放（如限制最大边为1920），以防原图过大（如超清A4扫描件）导致传输和检测超时
+            width, height = img.size
+            max_size = 1920
+            if width > max_size or height > max_size:
+                if width > height:
+                    new_width = max_size
+                    new_height = int(height * (max_size / width))
+                else:
+                    new_height = max_size
+                    new_width = int(width * (max_size / height))
+                
+                try:
+                    resample_method = Image.Resampling.LANCZOS
+                except AttributeError:
+                    resample_method = Image.ANTIALIAS
+                img_resized = img.resize((new_width, new_height), resample_method)
+            else:
+                img_resized = img.copy()
+            
+            # 转为临时 base64，用于人脸检测
+            temp_buffer = io.BytesIO()
+            img_resized.save(temp_buffer, format="JPEG", quality=90)
+            temp_base64 = base64.b64encode(temp_buffer.getvalue()).decode("utf-8")
+            
+            # 调用 DetectFace 检测人脸位置
+            face_infos = []
+            try:
+                detect_req = models.DetectFaceRequest()
+                detect_req.Image = temp_base64
+                detect_req.MaxFaceNum = 1
+                detect_req.MinFaceSize = 34  # 扫描件中人脸占比较小时设为34以提高检出率
+                detect_req.NeedFaceAttributes = 0
+                detect_req.NeedQualityDetection = 0
+                
+                detect_resp = client.DetectFace(detect_req)
+                if detect_resp.FaceInfos and len(detect_resp.FaceInfos) > 0:
+                    face_infos = detect_resp.FaceInfos
+            except Exception as detect_err:
+                print(f"⚠️ [DetectFace 预处理警告] 专家: {name}, 身份证: {id_card}: {str(detect_err)}")
+            
+            # 如果检测到人脸，裁剪出人脸子图并外扩30%
+            if face_infos:
+                face = face_infos[0]
+                fx, fy, fw, fh = face.X, face.Y, face.Width, face.Height
+                
+                pad_w = int(fw * 0.3)
+                pad_h = int(fh * 0.3)
+                
+                img_w, img_h = img_resized.size
+                sx = max(0, fx - pad_w)
+                sy = max(0, fy - pad_h)
+                ex = min(img_w, fx + fw + pad_w)
+                ey = min(img_h, fy + fh + pad_h)
+                
+                final_img = img_resized.crop((sx, sy, ex, ey))
+            else:
+                # 若未检出人脸，安全回退到使用原缩放图
+                final_img = img_resized
+                
+            # 对最终图像进行压缩（质量85）并转为 Base64
+            final_buffer = io.BytesIO()
+            final_img.save(final_buffer, format="JPEG", quality=85)
+            img_base64 = base64.b64encode(final_buffer.getvalue()).decode("utf-8")
+            
+    except Exception as e:
+        return False, f"处理人脸照片文件失败: {str(e)}"
         
     # 为了保证注册/更新 100% 成功，采取“先尝试删除，后创建”的合并策略
     try:
@@ -201,7 +270,7 @@ def _register_or_update_face(id_card, name, photo_path):
         return False, f"注册人脸时发生未捕获异常: {str(e)}"
 
 
-def _search_face(image_base64, max_face_num=None):
+def _search_face(image_base64, max_face_num=None, min_face_size=60):
     """在腾讯云人员库中搜索匹配的人脸，支持配置的多人脸识别，并返回带有人脸定位框坐标的候选人列表"""
     client = _get_iai_client()
     if not client:
@@ -218,6 +287,9 @@ def _search_face(image_base64, max_face_num=None):
         req.MaxFaceNum = max_face_num # 支持配置的最大人脸数
         req.MaxPersonNum = 3 # 针对每张脸返回前3个最相似的人
         req.NeedPersonInfo = 0
+        req.MinFaceSize = min_face_size  # 过滤过小人脸，速度优先60/子图34
+        req.QualityControl = 1  # 服务端过滤非常模糊或五官遮挡严重的人脸
+        req.FaceMatchThreshold = 55.0  # 服务端预过滤低于55分的结果，减少无效传输
         
         resp = client.SearchFaces(req)
         
@@ -267,6 +339,7 @@ def _detect_faces_in_image(image_base64, max_face_num=None):
         req = models.DetectFaceRequest()
         req.Image = image_base64
         req.MaxFaceNum = max_face_num
+        req.MinFaceSize = 40  # 质量优先模式下允许检测较小的人脸
         req.NeedFaceAttributes = 0
         req.NeedQualityDetection = 0
         
@@ -2156,7 +2229,7 @@ def api_face_search():
                 crop_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
                 
                 # 对该人脸子图独立调用人脸搜索 (只返回最相似的 Top 3)
-                face_candidates, search_err = _search_face(crop_base64, max_face_num=1)
+                face_candidates, search_err = _search_face(crop_base64, max_face_num=1, min_face_size=34)
                 if search_err:
                     current_app.logger.warning(f"子图人脸检索失败: {search_err}")
                     continue
