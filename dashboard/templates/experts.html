@@ -2608,13 +2608,16 @@
                             <button id="photo-next-btn" class="photo-nav-btn photo-nav-next" style="display: none;">&gt;</button>
                         </div>
                         <div id="detail-photo-indicator" class="photo-indicator" style="display: none; margin-top: 4px;">1 / 1</div>
-                        <button id="btn-change-photo" class="action-btn-small" style="margin-top: 6px; width: 100%; display: flex; align-items: center; justify-content: center; gap: 4px; padding: 4px 8px; font-size: 12px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--bg-card); cursor: pointer; color: var(--text-primary); height: 28px; font-weight: 500;">
-                            <span>📷</span> 更换照片
+                        <button id="btn-change-photo" class="action-btn-small" style="margin-top: 6px; width: 100%; display: none; align-items: center; justify-content: center; gap: 4px; padding: 4px 8px; font-size: 12px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--bg-card); cursor: pointer; color: var(--text-primary); height: 28px; font-weight: 500;">
+                            <span>🔄</span> 更换此张
+                        </button>
+                        <button id="btn-append-photo" class="action-btn-small" style="margin-top: 6px; width: 100%; display: none; align-items: center; justify-content: center; gap: 4px; padding: 4px 8px; font-size: 12px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--bg-card); cursor: pointer; color: var(--text-primary); height: 28px; font-weight: 500;">
+                            <span>➕</span> 追加照片
                         </button>
                         <button id="btn-delete-photo" class="action-btn-small" style="margin-top: 6px; width: 100%; display: none; align-items: center; justify-content: center; gap: 4px; padding: 4px 8px; font-size: 12px; border: 1px solid #ef4444; border-radius: 6px; background: transparent; cursor: pointer; color: #ef4444; height: 28px; font-weight: 500; transition: all 0.2s;">
                             <span>🗑️</span> 删除此张
                         </button>
-                        <input type="file" id="detail-photo-file-input" style="display: none;" accept="image/*">
+                        <input type="file" id="detail-photo-file-input" style="display: none;" accept="image/*" multiple>
                     </div>
                     <!-- 基础身份 -->
                     <div class="detail-info-text" style="display: flex; flex-direction: column; gap: 8px; flex-grow: 1; padding-top: 0;">
@@ -2740,7 +2743,8 @@
         let currentZoomPhotos = [];
         let currentZoomPhotoIndex = 0;
         var isDetailEditing = false;
-        let selectedPhotoFile = null;
+        let editingPhotoArray = []; // 编辑状态下的照片列表 [{type: 'existing'/'new', path/file/blobUrl}]
+        let fileUploadAction = 'append'; // 'append' 或者是 'replace'
 
         // 页面初始化加载
         document.addEventListener('DOMContentLoaded', () => {
@@ -3524,24 +3528,42 @@
             const nextBtn = document.getElementById('photo-next-btn');
             const indicator = document.getElementById('detail-photo-indicator');
             
+            // 2. 初始化编辑模式下的照片状态列表
             currentDetailPhotos = item.photo_path ? item.photo_path.split(',') : [];
+            editingPhotoArray = currentDetailPhotos.map(path => ({ type: 'existing', path: path.trim() }));
             currentDetailPhotoIndex = 0;
             
             function updateDetailPhotoShow() {
                 if (detailImg && errDiv) {
-                    if (currentDetailPhotos.length > 0) {
-                        const currentPath = currentDetailPhotos[currentDetailPhotoIndex].trim();
-                        detailImg.src = currentPath;
+                    const totalPhotos = isDetailEditing ? editingPhotoArray.length : currentDetailPhotos.length;
+                    
+                    if (totalPhotos > 0) {
+                        let currentSrc = "";
+                        if (isDetailEditing) {
+                            const currentPhoto = editingPhotoArray[currentDetailPhotoIndex];
+                            currentSrc = currentPhoto.type === 'existing' ? currentPhoto.path : currentPhoto.blobUrl;
+                        } else {
+                            currentSrc = currentDetailPhotos[currentDetailPhotoIndex].trim();
+                        }
+                        
+                        detailImg.src = currentSrc;
                         detailImg.style.display = 'block';
                         errDiv.style.display = 'none';
-                        detailImg.onclick = () => zoomPhoto(item.photo_path, currentDetailPhotoIndex);
                         
-                        if (currentDetailPhotos.length > 1) {
+                        // 点击放大切换
+                        detailImg.onclick = () => {
+                            const paths = isDetailEditing 
+                                ? editingPhotoArray.map(p => p.type === 'existing' ? p.path : p.blobUrl)
+                                : currentDetailPhotos;
+                            zoomPhoto(paths.join(','), currentDetailPhotoIndex);
+                        };
+                        
+                        if (totalPhotos > 1) {
                             if (prevBtn) prevBtn.style.display = 'flex';
                             if (nextBtn) nextBtn.style.display = 'flex';
                             if (indicator) {
                                 indicator.style.display = 'block';
-                                indicator.innerText = `${currentDetailPhotoIndex + 1} / ${currentDetailPhotos.length}`;
+                                indicator.innerText = `${currentDetailPhotoIndex + 1} / ${totalPhotos}`;
                             }
                         } else {
                             if (prevBtn) prevBtn.style.display = 'none';
@@ -3562,8 +3584,9 @@
             if (prevBtn) {
                 prevBtn.onclick = (e) => {
                     e.stopPropagation();
-                    if (currentDetailPhotos.length > 1) {
-                        currentDetailPhotoIndex = (currentDetailPhotoIndex - 1 + currentDetailPhotos.length) % currentDetailPhotos.length;
+                    const totalPhotos = isDetailEditing ? editingPhotoArray.length : currentDetailPhotos.length;
+                    if (totalPhotos > 1) {
+                        currentDetailPhotoIndex = (currentDetailPhotoIndex - 1 + totalPhotos) % totalPhotos;
                         updateDetailPhotoShow();
                     }
                 };
@@ -3571,8 +3594,9 @@
             if (nextBtn) {
                 nextBtn.onclick = (e) => {
                     e.stopPropagation();
-                    if (currentDetailPhotos.length > 1) {
-                        currentDetailPhotoIndex = (currentDetailPhotoIndex + 1) % currentDetailPhotos.length;
+                    const totalPhotos = isDetailEditing ? editingPhotoArray.length : currentDetailPhotos.length;
+                    if (totalPhotos > 1) {
+                        currentDetailPhotoIndex = (currentDetailPhotoIndex + 1) % totalPhotos;
                         updateDetailPhotoShow();
                     }
                 };
@@ -3581,111 +3605,118 @@
             updateDetailPhotoShow();
             updatePhotoButtonsVisibility();
             
-            // 绑定“更换照片”按钮事件
+            // 动态控制照片操作按钮的展示（隐藏/显示）
+            function updatePhotoButtonsVisibility() {
+                const changePhotoBtn = document.getElementById('btn-change-photo');
+                const appendPhotoBtn = document.getElementById('btn-append-photo');
+                const deletePhotoBtn = document.getElementById('btn-delete-photo');
+                
+                const totalPhotos = editingPhotoArray.length;
+                
+                if (changePhotoBtn) {
+                    // 编辑状态下，且当前有照片，则显示更换按钮
+                    changePhotoBtn.style.display = (isDetailEditing && totalPhotos > 0) ? 'flex' : 'none';
+                }
+                if (appendPhotoBtn) {
+                    // 编辑状态下，且照片未满5张，则显示追加按钮
+                    appendPhotoBtn.style.display = (isDetailEditing && totalPhotos < 5) ? 'flex' : 'none';
+                }
+                if (deletePhotoBtn) {
+                    // 编辑状态下，且当前有照片，则显示删除按钮
+                    deletePhotoBtn.style.display = (isDetailEditing && totalPhotos > 0) ? 'flex' : 'none';
+                }
+            }
+            
+            // 绑定“更换此张”按钮事件
             const changePhotoBtn = document.getElementById('btn-change-photo');
             if (changePhotoBtn && photoFileInput) {
                 changePhotoBtn.onclick = (e) => {
                     e.preventDefault();
+                    fileUploadAction = 'replace';
                     photoFileInput.click();
                 };
-                
+            }
+            
+            // 绑定“追加照片”按钮事件
+            const appendPhotoBtn = document.getElementById('btn-append-photo');
+            if (appendPhotoBtn && photoFileInput) {
+                appendPhotoBtn.onclick = (e) => {
+                    e.preventDefault();
+                    fileUploadAction = 'append';
+                    photoFileInput.click();
+                };
+            }
+            
+            // 绑定文件输入变更事件
+            if (photoFileInput) {
                 photoFileInput.onchange = (e) => {
-                    const file = e.target.files[0];
-                    if (file) {
+                    const files = e.target.files;
+                    if (!files || files.length === 0) return;
+                    
+                    if (fileUploadAction === 'replace') {
+                        // 更换当前照片逻辑（只用第一个选中的文件）
+                        const file = files[0];
                         const ext = file.name.split('.').pop().toLowerCase();
                         if (!['jpg', 'jpeg', 'png'].includes(ext)) {
                             alert('上传的照片格式不正确，仅支持 .jpg, .jpeg, .png');
                             photoFileInput.value = '';
                             return;
                         }
-                        selectedPhotoFile = file;
                         
-                        // 本地实时图片预览
-                        if (detailImg && errDiv) {
-                            detailImg.src = URL.createObjectURL(file);
-                            detailImg.style.display = 'block';
-                            errDiv.style.display = 'none';
+                        editingPhotoArray[currentDetailPhotoIndex] = {
+                            type: 'new',
+                            file: file,
+                            blobUrl: URL.createObjectURL(file)
+                        };
+                    } else {
+                        // 追加照片逻辑 (支持多选批量追加，直到达到5张)
+                        for (let i = 0; i < files.length; i++) {
+                            const file = files[i];
+                            const ext = file.name.split('.').pop().toLowerCase();
+                            if (!['jpg', 'jpeg', 'png'].includes(ext)) {
+                                alert(`照片【${file.name}】格式不正确，仅支持 .jpg, .jpeg, .png，已跳过。`);
+                                continue;
+                            }
                             
-                            // 本地单图预览，隐藏多图指示器
-                            if (prevBtn) prevBtn.style.display = 'none';
-                            if (nextBtn) nextBtn.style.display = 'none';
-                            if (indicator) indicator.style.display = 'none';
+                            if (editingPhotoArray.length >= 5) {
+                                alert('最多只能上传 5 张照片人脸数据，已达到上限！');
+                                break;
+                            }
+                            
+                            editingPhotoArray.push({
+                                type: 'new',
+                                file: file,
+                                blobUrl: URL.createObjectURL(file)
+                            });
                         }
-                        updatePhotoButtonsVisibility();
+                        // 自动定位到新加入的最后一张照片上
+                        currentDetailPhotoIndex = editingPhotoArray.length - 1;
                     }
+                    
+                    updateDetailPhotoShow();
+                    updatePhotoButtonsVisibility();
+                    photoFileInput.value = ''; // 重置 file 控件
                 };
             }
-
-            // 动态控制照片操作按钮的展示（隐藏/显示）
-            function updatePhotoButtonsVisibility() {
-                const changePhotoBtn = document.getElementById('btn-change-photo');
-                const deletePhotoBtn = document.getElementById('btn-delete-photo');
-                if (changePhotoBtn) {
-                    changePhotoBtn.style.display = isDetailEditing ? 'flex' : 'none';
-                }
-                if (deletePhotoBtn) {
-                    // 必须处于编辑状态，且多图，且没有进行未保存的“新照片上传预览”
-                    deletePhotoBtn.style.display = (isDetailEditing && currentDetailPhotos.length > 1 && !selectedPhotoFile) ? 'flex' : 'none';
-                }
-            }
-
-            // 绑定“删除当前照片”按钮事件
+            
+            // 绑定“删除当前照片”按钮事件 (前端本地暂存删除)
             const deletePhotoBtn = document.getElementById('btn-delete-photo');
             if (deletePhotoBtn) {
                 deletePhotoBtn.onclick = (e) => {
                     e.preventDefault();
-                    if (currentDetailPhotos.length <= 1) return;
+                    if (editingPhotoArray.length === 0) return;
                     
-                    const photoPath = currentDetailPhotos[currentDetailPhotoIndex];
-                    if (!photoPath) return;
-                    
-                    if (confirm('确定要删除当前展示的这张身份证照片吗？\n此操作将立即从服务器磁盘中物理删除该文件并更新数据库路径，无法撤销。')) {
-                        fetch('/dlsgzs/api/delete_photo', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json'
-                            },
-                            body: JSON.stringify({
-                                id: item.id,
-                                photo_path: photoPath
-                            })
-                        })
-                        .then(res => res.json())
-                        .then(data => {
-                            if (data.success) {
-                                alert(data.message || '照片已成功删除！');
-                                
-                                // 1. 从前端的图片路径数组中剔除当前张
-                                currentDetailPhotos.splice(currentDetailPhotoIndex, 1);
-                                
-                                // 2. 调整当前展示照片 of 索引值
-                                if (currentDetailPhotoIndex >= currentDetailPhotos.length) {
-                                    currentDetailPhotoIndex = Math.max(0, currentDetailPhotos.length - 1);
-                                }
-                                
-                                // 3. 重新渲染大图和指示器
-                                updateDetailPhotoShow();
-                                
-                                // 4. 更新更换/删除照片按钮的显示隐藏状态
-                                updatePhotoButtonsVisibility();
-                                
-                                // 5. 局部更新 item 对象的 photo_path，防止关闭弹窗时没有刷新卡片
-                                item.photo_path = currentDetailPhotos.join(',');
-                                
-                                // 6. 一键触发列表重载和标签重载，使左侧卡片同步去重，且多图标签动态隐退
-                                executeSearch();
-                                loadSearchTags();
-                            } else {
-                                alert('删除照片失败：' + data.error);
-                            }
-                        })
-                        .catch(err => {
-                            alert('网络请求失败：' + err.message);
-                        });
+                    if (confirm('确定要在本次保存中删除当前展示的这张照片吗？（保存后生效）')) {
+                        editingPhotoArray.splice(currentDetailPhotoIndex, 1);
+                        if (currentDetailPhotoIndex >= editingPhotoArray.length) {
+                            currentDetailPhotoIndex = Math.max(0, editingPhotoArray.length - 1);
+                        }
+                        updateDetailPhotoShow();
+                        updatePhotoButtonsVisibility();
                     }
                 };
             }
-
+            
             // 声明内部编辑状态和控件只读切换函数 (仅用于基本资料)
             function setModalEditable(editable) {
                 isDetailEditing = editable;
@@ -3827,9 +3858,22 @@
                     formData.append('new_phone', newPhoneVal);
                     formData.append('company', companyVal);
                     formData.append('major', majorVal);
-                    if (selectedPhotoFile) {
-                        formData.append('photo_file', selectedPhotoFile);
-                    }
+                    
+                    // 构建绝对顺序布局并传递至后端
+                    const photoLayout = [];
+                    const photoFiles = [];
+                    editingPhotoArray.forEach(p => {
+                        if (p.type === 'existing') {
+                            photoLayout.push(p.path);
+                        } else if (p.type === 'new') {
+                            photoLayout.push('__NEW_FILE__');
+                            photoFiles.push(p.file);
+                        }
+                    });
+                    formData.append('photo_layout', JSON.stringify(photoLayout));
+                    photoFiles.forEach(file => {
+                        formData.append('photo_files', file);
+                    });
                     
                     fetch('/dlsgzs/api/update_expert_profile', {
                         method: 'POST',
@@ -3895,7 +3939,8 @@
                     if (majorInput) majorInput.value = item.major || '';
                     
                     // 2. 清除并恢复照片预览
-                    selectedPhotoFile = null;
+                    editingPhotoArray = currentDetailPhotos.map(path => ({ type: 'existing', path: path.trim() }));
+                    currentDetailPhotoIndex = 0;
                     const photoFileInput = document.getElementById('detail-photo-file-input');
                     if (photoFileInput) photoFileInput.value = '';
                     updateDetailPhotoShow(); // 重新加载和渲染 item 里的原照片

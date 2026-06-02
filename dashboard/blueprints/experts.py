@@ -150,31 +150,9 @@ def _resize_and_compress_image(physical_path, max_size=1080):
         return None, f"图像缩放或压缩处理失败: {str(e)}"
 
 
-def _register_or_update_face(id_card, name, photo_path):
-    """向腾讯云人脸库注册或更新人员。针对身份证扫描件和大留白照片，先检测并裁剪人脸。"""
-    client = _get_iai_client()
-    if not client:
-        return False, "腾讯云 SecretId/SecretKey 配置缺失"
-        
-    if not id_card or not name or not photo_path:
-        return False, "专家必填项(身份证号、姓名或照片路径)缺失"
-        
-    # 定位并读取照片
-    filename = os.path.basename(photo_path)
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    photos_dir = os.path.join(base_dir, 'static', 'uploads', 'expert_photos')
-    physical_path = os.path.join(photos_dir, filename)
-    
-    if not os.path.exists(physical_path):
-        # 兼容相对路径或直接在 file 下的情况
-        alternative_dir = os.path.join(base_dir, '..', 'file')
-        physical_path = os.path.join(alternative_dir, filename)
-        if not os.path.exists(physical_path):
-            return False, f"物理磁盘上未找到该专家的照片文件: {filename}"
-
-    img_base64 = None
+def _process_single_photo_for_upload(physical_path, id_card, name):
+    """读取单张照片，进行上限为1920等比缩放并调用DetectFace进行裁剪，未检出则回退到原缩放图，返回 base64 和错误消息。"""
     try:
-        # 打开原始图片
         with Image.open(physical_path) as img:
             if img.mode != 'RGB':
                 img = img.convert('RGB')
@@ -205,19 +183,21 @@ def _register_or_update_face(id_card, name, photo_path):
             
             # 调用 DetectFace 检测人脸位置
             face_infos = []
-            try:
-                detect_req = models.DetectFaceRequest()
-                detect_req.Image = temp_base64
-                detect_req.MaxFaceNum = 1
-                detect_req.MinFaceSize = 34  # 扫描件中人脸占比较小时设为34以提高检出率
-                detect_req.NeedFaceAttributes = 0
-                detect_req.NeedQualityDetection = 0
-                
-                detect_resp = client.DetectFace(detect_req)
-                if detect_resp.FaceInfos and len(detect_resp.FaceInfos) > 0:
-                    face_infos = detect_resp.FaceInfos
-            except Exception as detect_err:
-                print(f"⚠️ [DetectFace 预处理警告] 专家: {name}, 身份证: {id_card}: {str(detect_err)}")
+            client = _get_iai_client()
+            if client:
+                try:
+                    detect_req = models.DetectFaceRequest()
+                    detect_req.Image = temp_base64
+                    detect_req.MaxFaceNum = 1
+                    detect_req.MinFaceSize = 34  # 扫描件中人脸较小时设为34以提高检出率
+                    detect_req.NeedFaceAttributes = 0
+                    detect_req.NeedQualityDetection = 0
+                    
+                    detect_resp = client.DetectFace(detect_req)
+                    if detect_resp.FaceInfos and len(detect_resp.FaceInfos) > 0:
+                        face_infos = detect_resp.FaceInfos
+                except Exception as detect_err:
+                    print(f"⚠️ [DetectFace 预处理警告] 专家: {name}, 身份证: {id_card}: {str(detect_err)}")
             
             # 如果检测到人脸，裁剪出人脸子图并外扩30%
             if face_infos:
@@ -241,10 +221,45 @@ def _register_or_update_face(id_card, name, photo_path):
             # 对最终图像进行压缩（质量85）并转为 Base64
             final_buffer = io.BytesIO()
             final_img.save(final_buffer, format="JPEG", quality=85)
-            img_base64 = base64.b64encode(final_buffer.getvalue()).decode("utf-8")
-            
+            return base64.b64encode(final_buffer.getvalue()).decode("utf-8"), None
     except Exception as e:
-        return False, f"处理人脸照片文件失败: {str(e)}"
+        return None, str(e)
+
+
+def _register_or_update_face(id_card, name, photo_path, sub_quality_control=2):
+    """向腾讯云人脸库注册或更新人员。支持多照片同步（1个CreatePerson主照，2-5个AddFace副照，副照严格质量控制）"""
+    client = _get_iai_client()
+    if not client:
+        return False, "腾讯云 SecretId/SecretKey 配置缺失"
+        
+    if not id_card or not name or not photo_path:
+        return False, "专家必填项(身份证号、姓名或照片路径)缺失"
+        
+    # 解析出照片路径列表，最多只取 5 张
+    photo_list = [p.strip() for p in photo_path.split(',') if p.strip()][:5]
+    if not photo_list:
+        return False, "该专家的照片路径解析为空，无法同步"
+
+    # 获取物理图片路径转换辅助函数
+    def get_physical_path(p_path):
+        filename = os.path.basename(p_path)
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        photos_dir = os.path.join(base_dir, 'static', 'uploads', 'expert_photos')
+        phys_path = os.path.join(photos_dir, filename)
+        if not os.path.exists(phys_path):
+            alternative_dir = os.path.join(base_dir, '..', 'file')
+            phys_path = os.path.join(alternative_dir, filename)
+        return phys_path if os.path.exists(phys_path) else None
+
+    # 获取第一张主照片的物理路径
+    main_phys_path = get_physical_path(photo_list[0])
+    if not main_phys_path:
+        return False, f"物理磁盘上未找到该专家的主照片文件: {os.path.basename(photo_list[0])}"
+        
+    # 处理主照片
+    main_base64, err_msg = _process_single_photo_for_upload(main_phys_path, id_card, name)
+    if err_msg:
+        return False, f"处理主照片失败: {err_msg}"
         
     # 为了保证注册/更新 100% 成功，采取“先尝试删除，后创建”的合并策略
     try:
@@ -255,19 +270,49 @@ def _register_or_update_face(id_card, name, photo_path):
         # 如果人员原本不存在，删除报错可直接忽略
         pass
         
+    # 1. 注册第一张主照片 (CreatePerson)
     try:
         create_req = models.CreatePersonRequest()
         create_req.GroupId = GROUP_ID
         create_req.PersonName = name.strip()
         create_req.PersonId = id_card.strip()
-        create_req.Image = img_base64
+        create_req.Image = main_base64
         create_req.Gender = _get_gender_from_idcard(id_card)
+        # 主照片使用腾讯云默认质量标准（不做强校验），避免身份证网纹问题导致失败
         client.CreatePerson(create_req)
-        return True, "成功注册同步至人脸库"
     except TencentCloudSDKException as e:
-        return False, f"注册人脸至腾讯云失败: {e.message} (代码: {e.code})"
+        return False, f"注册主照片至腾讯云失败: {e.message} (代码: {e.code})"
     except Exception as e:
         return False, f"注册人脸时发生未捕获异常: {str(e)}"
+        
+    # 2. 如果存在后续照片，调用 AddFace 追加人脸（最多到第5张），并施加严格质量校验
+    for idx, sub_photo in enumerate(photo_list[1:]):
+        sub_phys_path = get_physical_path(sub_photo)
+        if not sub_phys_path:
+            print(f"⚠️ [AddFace 警告] 专家: {name}, 未找到第 {idx+2} 张物理照片: {sub_photo}")
+            continue
+            
+        sub_base64, sub_err = _process_single_photo_for_upload(sub_phys_path, id_card, name)
+        if sub_err:
+            print(f"⚠️ [AddFace 警告] 专家: {name}, 处理第 {idx+2} 张照片失败: {sub_err}")
+            continue
+            
+        try:
+            add_req = models.AddFaceRequest()
+            add_req.GroupId = GROUP_ID
+            add_req.PersonId = id_card.strip()
+            add_req.Images = [sub_base64]
+            add_req.QualityControl = sub_quality_control  # 传递质量控制限制（默认 2 = 中等质量）
+            
+            client.AddFace(add_req)
+            print(f"✅ [AddFace 成功] 专家: {name}, 成功同步第 {idx+2} 张照片")
+        except TencentCloudSDKException as e:
+            # 捕获单张照片质量或入库报错，仅记录日志，让其它合规的备用照继续尝试
+            print(f"⚠️ [AddFace 质量控制拒绝警告] 专家: {name}, 同步第 {idx+2} 张照片失败: {e.message} (代码: {e.code})")
+        except Exception as e:
+            print(f"⚠️ [AddFace 异常警告] 专家: {name}, 同步第 {idx+2} 张照片发生异常: {str(e)}")
+            
+    return True, "成功注册同步至人脸库"
 
 
 def _search_face(image_base64, max_face_num=None, min_face_size=60):
@@ -1832,38 +1877,54 @@ def api_update_expert_profile():
                 return jsonify({"success": False, "error": f"修改失败：已存在相同姓名（{old_name}）和电话（{new_phone}）的其他专家，请核对后重试。"}), 409
                 
         # 3. 处理照片更换
-        new_photo_path = db_photo_path
-        photo_file = request.files.get('photo_file')
-        if photo_file and photo_file.filename != '':
-            # 校验后缀
-            ext = os.path.splitext(photo_file.filename)[1].lower()
-            if ext not in ['.jpg', '.jpeg', '.png']:
-                return jsonify({"success": False, "error": "上传的照片格式不正确，仅支持 .jpg, .jpeg, .png"}), 400
-                
-            # 保存新照片
-            photos_dir = get_photos_dir()
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"{old_name}_{new_phone}_uploaded_{timestamp}{ext}".lower()
-            dest_path = os.path.join(photos_dir, filename)
+        # 3. 处理多照片更换与删除（基于绝对顺序布局映射机制）
+        photo_layout_raw = request.form.get('photo_layout', '[]').strip()
+        try:
+            photo_layout = json.loads(photo_layout_raw) if photo_layout_raw else []
+        except Exception:
+            photo_layout = []
             
-            photo_file.save(dest_path)
-            new_photo_path = f"/static/uploads/expert_photos/{filename}"
-            
-            # 删除老照片（为了防止爆盘，如果在 uploads 下且不等于新照片就删除）
-            if db_photo_path:
-                old_paths = db_photo_path.split(',')
-                for p_path in old_paths:
-                    p_path = p_path.strip()
-                    if p_path:
-                        old_filename = os.path.basename(p_path)
-                        old_physical_path = os.path.join(photos_dir, old_filename)
-                        if os.path.exists(old_physical_path):
-                            try:
-                                os.remove(old_physical_path)
-                            except Exception:
-                                pass
-                                
-        # 4. 执行更新
+        new_files = request.files.getlist('photo_files')
+        old_paths = [p.strip() for p in db_photo_path.split(',') if p.strip()] if db_photo_path else []
+        photos_dir = get_photos_dir()
+        
+        # 物理删除不再在最终列表中保留的老照片（防爆盘）
+        for p_path in old_paths:
+            if p_path not in photo_layout:
+                old_filename = os.path.basename(p_path)
+                old_physical_path = os.path.join(photos_dir, old_filename)
+                if os.path.exists(old_physical_path):
+                    try:
+                        os.remove(old_physical_path)
+                    except Exception:
+                        pass
+                        
+        # 重构最终的照片列表，保持绝对位置顺序
+        final_paths = []
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        sub_idx = 0
+        
+        for item in photo_layout:
+            if item == "__NEW_FILE__":
+                if new_files and sub_idx < len(new_files):
+                    photo_file = new_files[sub_idx]
+                    sub_idx += 1
+                    if photo_file and photo_file.filename != '':
+                        ext = os.path.splitext(photo_file.filename)[1].lower()
+                        if ext in ['.jpg', '.jpeg', '.png']:
+                            filename = f"{old_name}_{new_phone}_uploaded_{timestamp}_{sub_idx}{ext}".lower()
+                            dest_path = os.path.join(photos_dir, filename)
+                            photo_file.save(dest_path)
+                            final_paths.append(f"/static/uploads/expert_photos/{filename}")
+            else:
+                # 保留原有照片路径
+                if item.strip() and item.strip() in old_paths:
+                    final_paths.append(item.strip())
+                    
+        # 限制最多 5 张照片
+        final_paths = final_paths[:5]
+        new_photo_path = ','.join(final_paths)
+        
         c.execute("""
             UPDATE experts 
             SET phone = ?, company = ?, major = ?, photo_path = ? 
@@ -1882,7 +1943,7 @@ def api_update_expert_profile():
         conn.commit()
 
         # 7. 若更新了人脸照片，直接将同步状态重置为未同步 0，不再自动同步
-        if photo_file and photo_file.filename != '':
+        if new_photo_path != db_photo_path:
             c.execute("UPDATE experts SET is_face_synced = 0 WHERE id = ?", (expert_id,))
             conn.commit()
         
@@ -2134,8 +2195,8 @@ def api_face_sync():
             if not photo_list:
                 continue
             
-            # 使用第一张照片进行同步
-            ok, err_msg = _register_or_update_face(id_card, name, photo_list[0])
+            # 使用多照片同步（传入完整路径列表字符串）
+            ok, err_msg = _register_or_update_face(id_card, name, photo_path_val)
             if ok:
                 c.execute("UPDATE experts SET is_face_synced = 1 WHERE id = ?", (exp_id,))
                 success_count += 1
@@ -2396,7 +2457,8 @@ def api_face_sync_single():
             return jsonify({"success": False, "error": "该专家的照片路径解析为空，无法同步"}), 400
             
         # 同步第一张照片
-        ok, err_msg = _register_or_update_face(id_card, name, photo_list[0])
+        # 同步多照片（传入完整路径列表字符串）
+        ok, err_msg = _register_or_update_face(id_card, name, photo_path_val)
         if ok:
             c.execute("UPDATE experts SET is_face_synced = 1 WHERE id = ?", (expert_id,))
             conn.commit()
