@@ -269,7 +269,7 @@ def _register_or_update_face(id_card, name, photo_path, sub_quality_control=2):
     if not main_phys_path:
         return False, f"物理磁盘上未找到该专家的主照片文件: {os.path.basename(photo_list[0])}"
         
-    # 优先通道：直接使用旧版的 1080px 未裁剪整图进行注册（对普通正常证件照/大头照通过率最高）
+    # 优先通道：尝试使用最新的人脸检测与 30% 外扩裁剪 + 128px 像素等比放大逻辑（最大化提取清晰大头像）
     # 为了保证注册/更新 100% 成功，采取“先尝试删除，后创建”的合并策略
     try:
         del_req = models.DeletePersonRequest()
@@ -279,34 +279,30 @@ def _register_or_update_face(id_card, name, photo_path, sub_quality_control=2):
         # 如果人员原本不存在，删除报错可直接忽略
         pass
         
-    direct_success = False
-    direct_err_msg = ""
+    crop_success = False
+    crop_err_msg = ""
     try:
-        main_base64_1080, err_1080 = _resize_and_compress_image(main_phys_path, max_size=1080)
-        if err_1080:
-            direct_err_msg = f"优先通道压缩失败: {err_1080}"
+        # 处理主照片（执行 1920 缩放 + DetectFace 检测 + 30% 外扩裁剪 + 128px 自适应放大）
+        main_base64_crop, err_msg_crop = _process_single_photo_for_upload(main_phys_path, id_card, name)
+        if err_msg_crop:
+            crop_err_msg = f"本地裁剪图像预处理失败: {err_msg_crop}"
         else:
             create_req = models.CreatePersonRequest()
             create_req.GroupId = GROUP_ID
             create_req.PersonName = name.strip()
             create_req.PersonId = id_card.strip()
-            create_req.Image = main_base64_1080
+            create_req.Image = main_base64_crop
             create_req.Gender = _get_gender_from_idcard(id_card)
             client.CreatePerson(create_req)
-            direct_success = True
+            crop_success = True
     except TencentCloudSDKException as e:
-        direct_err_msg = f"{e.message} (代码: {e.code})"
+        crop_err_msg = f"{e.message} (代码: {e.code})"
     except Exception as e:
-        direct_err_msg = str(e)
+        crop_err_msg = str(e)
         
-    # 2. 如果优先通道失败（例如大留白/A4扫描件，云端无法定位人脸或分辨率不符），则启用裁剪补偿通道
-    if not direct_success:
-        # 处理主照片（执行 1920 缩放 + DetectFace 检测 + 30% 外扩裁剪 + 128px 自适应放大补丁）
-        main_base64_crop, err_msg_crop = _process_single_photo_for_upload(main_phys_path, id_card, name)
-        if err_msg_crop:
-            return False, f"处理主照片失败: {err_msg_crop} (优先通道报错: {direct_err_msg})"
-            
-        # 再次尝试删除（防止优先通道半路创建失败残留）
+    # 2. 如果优先的裁剪通道失败（例如本地 DetectFace 未能检测到人脸），则启用整图 1080px 直接上传保底通道
+    if not crop_success:
+        # 再次尝试删除（防止半路创建失败残留）
         try:
             del_req = models.DeletePersonRequest()
             del_req.PersonId = id_card.strip()
@@ -315,17 +311,21 @@ def _register_or_update_face(id_card, name, photo_path, sub_quality_control=2):
             pass
             
         try:
-            create_req = models.CreatePersonRequest()
-            create_req.GroupId = GROUP_ID
-            create_req.PersonName = name.strip()
-            create_req.PersonId = id_card.strip()
-            create_req.Image = main_base64_crop
-            create_req.Gender = _get_gender_from_idcard(id_card)
-            client.CreatePerson(create_req)
+            main_base64_1080, err_1080 = _resize_and_compress_image(main_phys_path, max_size=1080)
+            if err_1080:
+                return False, f"处理主照片失败，裁剪通道报错: {crop_err_msg}，整图保底通道压缩失败: {err_1080}"
+            else:
+                create_req = models.CreatePersonRequest()
+                create_req.GroupId = GROUP_ID
+                create_req.PersonName = name.strip()
+                create_req.PersonId = id_card.strip()
+                create_req.Image = main_base64_1080
+                create_req.Gender = _get_gender_from_idcard(id_card)
+                client.CreatePerson(create_req)
         except TencentCloudSDKException as e:
-            return False, f"注册主照片至腾讯云失败: {e.message} (代码: {e.code}) [优先通道报错: {direct_err_msg}]"
+            return False, f"注册主照片至腾讯云失败: {e.message} (代码: {e.code}) [裁剪通道报错: {crop_err_msg}]"
         except Exception as e:
-            return False, f"注册人脸时发生未捕获异常: {str(e)} [优先通道报错: {direct_err_msg}]"
+            return False, f"注册人脸时发生未捕获异常: {str(e)} [裁剪通道报错: {crop_err_msg}]"
         
     # 2. 如果存在后续照片，调用 AddFace 追加人脸（最多到第5张），并施加严格质量校验
     for idx, sub_photo in enumerate(photo_list[1:]):
