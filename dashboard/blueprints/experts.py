@@ -269,11 +269,7 @@ def _register_or_update_face(id_card, name, photo_path, sub_quality_control=2):
     if not main_phys_path:
         return False, f"物理磁盘上未找到该专家的主照片文件: {os.path.basename(photo_list[0])}"
         
-    # 处理主照片
-    main_base64, err_msg = _process_single_photo_for_upload(main_phys_path, id_card, name)
-    if err_msg:
-        return False, f"处理主照片失败: {err_msg}"
-        
+    # 优先通道：直接使用旧版的 1080px 未裁剪整图进行注册（对普通正常证件照/大头照通过率最高）
     # 为了保证注册/更新 100% 成功，采取“先尝试删除，后创建”的合并策略
     try:
         del_req = models.DeletePersonRequest()
@@ -283,20 +279,53 @@ def _register_or_update_face(id_card, name, photo_path, sub_quality_control=2):
         # 如果人员原本不存在，删除报错可直接忽略
         pass
         
-    # 1. 注册第一张主照片 (CreatePerson)
+    direct_success = False
+    direct_err_msg = ""
     try:
-        create_req = models.CreatePersonRequest()
-        create_req.GroupId = GROUP_ID
-        create_req.PersonName = name.strip()
-        create_req.PersonId = id_card.strip()
-        create_req.Image = main_base64
-        create_req.Gender = _get_gender_from_idcard(id_card)
-        # 主照片使用腾讯云默认质量标准（不做强校验），避免身份证网纹问题导致失败
-        client.CreatePerson(create_req)
+        main_base64_1080, err_1080 = _resize_and_compress_image(main_phys_path, max_size=1080)
+        if err_1080:
+            direct_err_msg = f"优先通道压缩失败: {err_1080}"
+        else:
+            create_req = models.CreatePersonRequest()
+            create_req.GroupId = GROUP_ID
+            create_req.PersonName = name.strip()
+            create_req.PersonId = id_card.strip()
+            create_req.Image = main_base64_1080
+            create_req.Gender = _get_gender_from_idcard(id_card)
+            client.CreatePerson(create_req)
+            direct_success = True
     except TencentCloudSDKException as e:
-        return False, f"注册主照片至腾讯云失败: {e.message} (代码: {e.code})"
+        direct_err_msg = f"{e.message} (代码: {e.code})"
     except Exception as e:
-        return False, f"注册人脸时发生未捕获异常: {str(e)}"
+        direct_err_msg = str(e)
+        
+    # 2. 如果优先通道失败（例如大留白/A4扫描件，云端无法定位人脸或分辨率不符），则启用裁剪补偿通道
+    if not direct_success:
+        # 处理主照片（执行 1920 缩放 + DetectFace 检测 + 30% 外扩裁剪 + 128px 自适应放大补丁）
+        main_base64_crop, err_msg_crop = _process_single_photo_for_upload(main_phys_path, id_card, name)
+        if err_msg_crop:
+            return False, f"处理主照片失败: {err_msg_crop} (优先通道报错: {direct_err_msg})"
+            
+        # 再次尝试删除（防止优先通道半路创建失败残留）
+        try:
+            del_req = models.DeletePersonRequest()
+            del_req.PersonId = id_card.strip()
+            client.DeletePerson(del_req)
+        except Exception:
+            pass
+            
+        try:
+            create_req = models.CreatePersonRequest()
+            create_req.GroupId = GROUP_ID
+            create_req.PersonName = name.strip()
+            create_req.PersonId = id_card.strip()
+            create_req.Image = main_base64_crop
+            create_req.Gender = _get_gender_from_idcard(id_card)
+            client.CreatePerson(create_req)
+        except TencentCloudSDKException as e:
+            return False, f"注册主照片至腾讯云失败: {e.message} (代码: {e.code}) [优先通道报错: {direct_err_msg}]"
+        except Exception as e:
+            return False, f"注册人脸时发生未捕获异常: {str(e)} [优先通道报错: {direct_err_msg}]"
         
     # 2. 如果存在后续照片，调用 AddFace 追加人脸（最多到第5张），并施加严格质量校验
     for idx, sub_photo in enumerate(photo_list[1:]):
@@ -311,19 +340,18 @@ def _register_or_update_face(id_card, name, photo_path, sub_quality_control=2):
             continue
             
         try:
-            add_req = models.AddFaceRequest()
-            add_req.GroupId = GROUP_ID
+            add_req = models.CreateFaceRequest()
             add_req.PersonId = id_card.strip()
             add_req.Images = [sub_base64]
             add_req.QualityControl = sub_quality_control  # 传递质量控制限制（默认 2 = 中等质量）
             
-            client.AddFace(add_req)
-            print(f"✅ [AddFace 成功] 专家: {name}, 成功同步第 {idx+2} 张照片")
+            client.CreateFace(add_req)
+            print(f"✅ [CreateFace 成功] 专家: {name}, 成功同步第 {idx+2} 张照片")
         except TencentCloudSDKException as e:
             # 捕获单张照片质量或入库报错，仅记录日志，让其它合规的备用照继续尝试
-            print(f"⚠️ [AddFace 质量控制拒绝警告] 专家: {name}, 同步第 {idx+2} 张照片失败: {e.message} (代码: {e.code})")
+            print(f"⚠️ [CreateFace 质量控制拒绝警告] 专家: {name}, 同步第 {idx+2} 张照片失败: {e.message} (代码: {e.code})")
         except Exception as e:
-            print(f"⚠️ [AddFace 异常警告] 专家: {name}, 同步第 {idx+2} 张照片发生异常: {str(e)}")
+            print(f"⚠️ [CreateFace 异常警告] 专家: {name}, 同步第 {idx+2} 张照片发生异常: {str(e)}")
             
     return True, "成功注册同步至人脸库"
 
