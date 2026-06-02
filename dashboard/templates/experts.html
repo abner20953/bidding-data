@@ -5635,7 +5635,14 @@
                         syncBtn.innerHTML = '<span>🔄</span> 同步人脸库';
                         
                         if (res.success) {
-                            alert(res.message);
+                            let alertMsg = res.message;
+                            if (res.failures && res.failures.length > 0) {
+                                alertMsg += '\n\n同步失败名单及主要原因：';
+                                res.failures.forEach((item, idx) => {
+                                    alertMsg += `\n${idx + 1}. 【${item.name}】(${item.id_card})：${item.reason}`;
+                                });
+                            }
+                            alert(alertMsg);
                             // 增量同步完成后，重新加载统计数据面板
                             if (typeof fetchExpertsList === 'function') {
                                 fetchExpertsList();
