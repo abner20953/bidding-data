@@ -356,7 +356,7 @@ def _register_or_update_face(id_card, name, photo_path, sub_quality_control=2):
     return True, "成功注册同步至人脸库"
 
 
-def _search_face(image_base64, max_face_num=None, min_face_size=60):
+def _search_face(image_base64, max_face_num=None, min_face_size=None):
     """在腾讯云人员库中搜索匹配的人脸，支持配置的多人脸识别，并返回带有人脸定位框坐标的候选人列表"""
     client = _get_iai_client()
     if not client:
@@ -373,10 +373,13 @@ def _search_face(image_base64, max_face_num=None, min_face_size=60):
         req.MaxFaceNum = max_face_num # 支持配置的最大人脸数
         req.MaxPersonNum = 3 # 针对每张脸返回前3个最相似的人
         req.NeedPersonInfo = 0
-        req.MinFaceSize = min_face_size  # 过滤过小人脸，速度优先60/子图34
-        req.QualityControl = 1  # 服务端过滤非常模糊或五官遮挡严重的人脸
-        req.FaceMatchThreshold = 55.0  # 服务端预过滤低于55分的结果，减少无效传输
         
+        # 恢复旧版的宽松度，防止腾讯云因拍照角度/光线偏暗/轻微模糊而直接过滤抛弃比对
+        req.QualityControl = 0  # 0: 不进行质量控制，由算法强制提取面部
+        req.FaceMatchThreshold = 0.0  # 0.0: 不在云端预过滤分数，保留所有匹配，在本地统一过滤分值
+        if min_face_size is not None:
+            req.MinFaceSize = min_face_size
+            
         resp = client.SearchFaces(req)
         
         # 解析返回结果
