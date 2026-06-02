@@ -253,6 +253,34 @@ def _search_face(image_base64, max_face_num=None):
         return [], f"人脸搜索发生异常: {str(e)}"
 
 
+def _detect_faces_in_image(image_base64, max_face_num=None):
+    """调用腾讯云 DetectFace 接口检测大图上的人脸，并返回包含位置坐标的 FaceInfo 列表"""
+    client = _get_iai_client()
+    if not client:
+        return [], "腾讯云 SecretId/SecretKey 配置缺失"
+        
+    if max_face_num is None:
+        max_face_num = MAX_FACE_NUM
+    max_face_num = max(1, min(10, max_face_num))
+    
+    try:
+        req = models.DetectFaceRequest()
+        req.Image = image_base64
+        req.MaxFaceNum = max_face_num
+        req.NeedFaceAttributes = 0
+        req.NeedQualityDetection = 0
+        
+        resp = client.DetectFace(req)
+        if resp.FaceInfos and len(resp.FaceInfos) > 0:
+            return resp.FaceInfos, None
+        return [], "图片中未检测到清晰人脸"
+    except TencentCloudSDKException as e:
+        return [], f"腾讯云人脸检测失败: {e.message} (代码: {e.code})"
+    except Exception as e:
+        return [], f"人脸检测发生异常: {str(e)}"
+
+
+
 
 # --- 操作日志工具 ---
 def _log_action(action, detail=""):
@@ -2090,10 +2118,76 @@ def api_face_search():
     else:
         image_base64 = image_data
         
-    # 调用腾讯云人脸检索，获取前3个候选人
-    candidates, err_msg = _search_face(image_base64, max_face_num=max_face_num)
-    if err_msg:
-        return jsonify({"success": False, "error": err_msg}), 400
+    search_mode = data.get('search_mode', 'speed').strip().lower()
+    
+    candidates = []
+    if search_mode == 'quality':
+        # 质量优先模式：先检测人脸定位，然后将每张脸在原图上抠出来独立进行 SearchFaces 检索
+        face_infos, err_msg = _detect_faces_in_image(image_base64, max_face_num=max_face_num)
+        if err_msg:
+            return jsonify({"success": False, "error": err_msg}), 400
+            
+        try:
+            # 使用 PIL 在内存中解码 Base64 原始大图
+            img_data = base64.b64decode(image_base64)
+            orig_img = Image.open(io.BytesIO(img_data))
+            width_orig, height_orig = orig_img.size
+            
+            # 对检测到的每个人脸分别进行裁剪比对
+            for face in face_infos:
+                fx, fy, fw, fh = face.X, face.Y, face.Width, face.Height
+                
+                # 为使人脸识别精度最高，对裁剪框向外做 30% 边缘扩充
+                pad_w = int(fw * 0.3)
+                pad_h = int(fh * 0.3)
+                
+                # 计算裁剪框边界并防溢出
+                sx = max(0, fx - pad_w)
+                sy = max(0, fy - pad_h)
+                ex = min(width_orig, fx + fw + pad_w)
+                ey = min(height_orig, fy + fh + pad_h)
+                
+                # 在大图上裁剪出人脸子图
+                crop_img = orig_img.crop((sx, sy, ex, ey))
+                
+                # 将裁剪出来的子图保存为 JPEG (质量90) Base64 格式
+                buffer = io.BytesIO()
+                crop_img.save(buffer, format="JPEG", quality=90)
+                crop_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+                
+                # 对该人脸子图独立调用人脸搜索 (只返回最相似的 Top 3)
+                face_candidates, search_err = _search_face(crop_base64, max_face_num=1)
+                if search_err:
+                    current_app.logger.warning(f"子图人脸检索失败: {search_err}")
+                    continue
+                    
+                # 腾讯云返回的 FaceRect 坐标是相对于裁剪后子图的坐标，需要将其还原回原图下的绝对坐标
+                # 转换公式：绝对坐标 = 裁剪起点 + 相对坐标
+                for cand in face_candidates:
+                    # 使用 copy 创建候选人副本，防止原地修改带来引用副作用
+                    cand_copy = cand.copy()
+                    rect = cand_copy.get('face_rect')
+                    if rect:
+                        cand_copy['face_rect'] = {
+                            "x": sx + rect['x'],
+                            "y": sy + rect['y'],
+                            "width": rect['width'],
+                            "height": rect['height']
+                        }
+                    candidates.append(cand_copy)
+
+            
+            if not candidates:
+                return jsonify({"success": False, "error": "图片中未匹配到相似度足够高的专家档案"}), 400
+                
+        except Exception as ex_crop:
+            return jsonify({"success": False, "error": f"质量优先模式切图处理失败: {str(ex_crop)}"}), 500
+    else:
+        # 默认速度优先模式：直接整图比对
+        candidates, err_msg = _search_face(image_base64, max_face_num=max_face_num)
+        if err_msg:
+            return jsonify({"success": False, "error": err_msg}), 400
+
         
     # 过滤掉得分低于 55.0 的候选人（最大化兼容大年龄跨度身份证比对）
     valid_candidates = [c for c in candidates if c['score'] >= 55.0]

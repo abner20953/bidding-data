@@ -2100,6 +2100,22 @@
                         </div>
                     </div>
 
+                    <!-- 检索模式控制项 -->
+                    <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; background: rgba(0,0,0,0.02); border: 1px solid var(--border-color); border-radius: 10px; padding: 10px 16px; margin-bottom: -4px;">
+                        <span style="font-size: 13px; font-weight: 600; color: var(--text-primary); display: flex; align-items: center; gap: 6px;">
+                            <span>⚡</span> 检索模式优先
+                        </span>
+                        <div style="position: relative; display: flex; align-items: center;">
+                            <select id="face-search-mode" style="appearance: none; -webkit-appearance: none; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 6px; padding: 6px 28px 6px 12px; font-size: 13px; font-weight: 600; color: var(--text-primary); cursor: pointer; transition: all 0.2s; outline: none;">
+                                <option value="speed" selected>速度优先 (直接整图比对)</option>
+                                <option value="quality">质量优先 (切图高精比对)</option>
+                            </select>
+                            <!-- 自定义下拉框小箭头指示符 -->
+                            <span style="position: absolute; right: 10px; pointer-events: none; font-size: 10px; color: var(--text-secondary);">▼</span>
+                        </div>
+                    </div>
+
+
                     <!-- 拖拽/预览照片上传区 -->
                     <div id="face-upload-zone" style="border: 2px dashed rgba(99, 102, 241, 0.3); border-radius: 12px; height: 200px; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 16px; text-align: center; cursor: pointer; transition: all 0.2s; background: rgba(255,255,255,0.1); box-sizing: border-box; position: relative;">
                         <input type="file" id="face-file-input" accept="image/jpeg, image/png" style="display: none;">
@@ -5302,14 +5318,15 @@
                 });
             }
             
-            function compressImage(file, callback) {
+            function compressImage(file, searchMode, callback) {
                 const reader = new FileReader();
                 reader.onload = (e) => {
                     const img = new Image();
                     img.onload = () => {
-                        // 设定最大宽高为 1024px，防止超大图片导致腾讯云限制
-                        const maxW = 1024;
-                        const maxH = 1024;
+                        // 设定最大宽高：速度优先为 1280px，质量优先为 2560px
+                        const maxLimit = (searchMode === 'quality') ? 2560 : 1280;
+                        const maxW = maxLimit;
+                        const maxH = maxLimit;
                         let width = img.width;
                         let height = img.height;
                         
@@ -5345,6 +5362,9 @@
                     return;
                 }
                 
+                const searchModeSelect = document.getElementById('face-search-mode');
+                const modeVal = searchModeSelect ? searchModeSelect.value : 'speed';
+                
                 if (statusBanner && statusText) {
                     statusBanner.style.display = 'flex';
                     statusBanner.style.borderColor = 'rgba(168, 85, 247, 0.2)';
@@ -5354,7 +5374,7 @@
                     statusText.innerText = '正在压缩并优化上传图片中...';
                 }
                 
-                compressImage(file, (base64Image) => {
+                compressImage(file, modeVal, (base64Image) => {
                     if (faceUploadDefault) faceUploadDefault.style.display = 'none';
                     if (faceUploadPreview) faceUploadPreview.style.display = 'block';
                     if (facePreviewImg) facePreviewImg.src = base64Image;
@@ -5383,18 +5403,23 @@
                     statusText.innerText = '正在提取人脸特征并搜索云端人脸库...';
                 }
                 
-                // 获取用户当前界面选择的最多人脸检索上限
+                // 获取用户当前界面选择的最多人脸检索上限与检索模式
                 const searchLimitSelect = document.getElementById('face-search-limit');
                 const limitVal = searchLimitSelect ? parseInt(searchLimitSelect.value) : 5;
+                
+                const searchModeSelect = document.getElementById('face-search-mode');
+                const modeVal = searchModeSelect ? searchModeSelect.value : 'speed';
                 
                 fetch('/dlsgzs/api/face/search', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ 
                         image: base64Data,
-                        max_face_num: limitVal
+                        max_face_num: limitVal,
+                        search_mode: modeVal
                     })
                 })
+
                 .then(r => r.json())
                 .then(res => {
                     if (res.success && res.results && res.results.length > 0) {
