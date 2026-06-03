@@ -260,34 +260,51 @@ class CollusionDetector:
                 except Exception:
                     continue
 
+        # 统计汉字数以识别是否为扫描件标书
+        len_a = len(re.sub(r'[^\u4e00-\u9fa5]', '', raw_text_a))
+        len_b = len(re.sub(r'[^\u4e00-\u9fa5]', '', raw_text_b))
+        
+        warnings = []
+        if len_a < 100:
+            title_a = meta_a.get('title', '').strip()
+            name_a = f"“{title_a}”" if title_a else "A"
+            warnings.append(f"投标文件 {name_a} 中可读中文字数仅有 {len_a} 字，可能为纯图片扫描件，系统无法对其进行文本查重，请务必人工核防！")
+        if len_b < 100:
+            title_b = meta_b.get('title', '').strip()
+            name_b = f"“{title_b}”" if title_b else "B"
+            warnings.append(f"投标文件 {name_b} 中可读中文字数仅有 {len_b} 字，可能为纯图片扫描件，系统无法对其进行文本查重，请务必人工核防！")
+
         # --- Result Formatting ---
         return {
             "metadata": {
                 "file_a": meta_a,
                 "file_b": meta_b,
-                "tender": {} # TODO: extract tender meta?
+                "tender": {}, # TODO: extract tender meta?
+                "warnings": warnings
             },
             "paragraphs": collisions
         }
 
     def extract_entities(self, text):
         entities = set()
-        # Normalization removes spaces, so regex usually works better on that for strict patterns
-        # But phones might look like 139 3451 8882.
-        # Since we pass in raw_text usually... wait, in find_collisions I passed raw_text to extract_entities?
-        # Yes.
+        if not text:
+            return entities
+            
+        # 统一清理空白字符（空格、换行、制表符等）以及常见的分段横线
+        clean_text_digits = re.sub(r'[\s\-—_]+', '', text)
         
-        # 1. Phone (loose)
-        phones = re.findall(r'1[3-9]\d{9}', text.replace(" ", "").replace("-", ""))
+        # 1. 手机号检测
+        phones = re.findall(r'1[3-9]\d{9}', clean_text_digits)
         entities.update(phones)
         
-        # 2. ID Card
-        ids = re.findall(r'\d{15}|\d{18}|\d{17}[xX]', text)
+        # 2. 身份证号检测
+        ids = re.findall(r'\d{15}|\d{18}|\d{17}[xX]', clean_text_digits)
         for i in ids:
-             if len(i) >= 15: entities.add(i)
-        
-        # 3. Email
-        emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text)
+            entities.add(i.upper()) # 规范身份证大写
+            
+        # 3. 邮箱检测（只过滤空白字符，保留邮箱内部合法的减号 '-'）
+        clean_text_email = re.sub(r'\s+', '', text)
+        emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', clean_text_email)
         entities.update(emails)
         
         return entities

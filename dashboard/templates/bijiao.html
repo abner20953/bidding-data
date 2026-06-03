@@ -559,6 +559,21 @@
                         ${sameWarn}
                     `;
                     document.querySelector('.summary-card').after(div);
+
+                    // 渲染扫描件低字数风险告警
+                    if (metadata.warnings && metadata.warnings.length > 0) {
+                        metadata.warnings.forEach(warn => {
+                            const warnDiv = document.createElement('div');
+                            warnDiv.className = 'common-error-banner';
+                            warnDiv.style.marginBottom = '15px';
+                            warnDiv.innerHTML = `
+                                <div class="common-error-title" style="color: #b91c1c;">
+                                    <span>⚠️ 风险警告：${escapeHtml(warn)}</span>
+                                </div>
+                            `;
+                            document.querySelector('.summary-card').after(warnDiv);
+                        });
+                    }
                 }
 
 
