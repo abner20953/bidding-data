@@ -2392,7 +2392,15 @@ def api_face_search():
             filtered_list = cand_list
         filtered_candidates.extend(filtered_list)
         
-    valid_candidates = filtered_candidates
+    # 对同一个专家（person_id）进行去重，只保留得分最高的那条候选记录（防止因多照片同步，导致同一个人多张人脸均被匹配且得分不同而返回重复记录）
+    unique_candidates = {}
+    for cand in filtered_candidates:
+        pid = cand['person_id']
+        score = cand['score']
+        if pid not in unique_candidates or score > unique_candidates[pid]['score']:
+            unique_candidates[pid] = cand
+            
+    valid_candidates = list(unique_candidates.values())
     
     if not valid_candidates:
         return jsonify({"success": False, "error": "人脸库中未匹配到相似度足够高的专家档案（最高匹配得分低于阈值 55）"}), 400
