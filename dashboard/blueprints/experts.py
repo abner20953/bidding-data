@@ -1991,13 +1991,30 @@ def api_update_expert_profile():
         
         conn.commit()
 
-        # 7. 若更新了人脸照片，直接将同步状态重置为未同步 0，不再自动同步
+        # 7. 若更新了人脸照片，自动将其同步至腾讯云人脸库
+        sync_warning = None
         if new_photo_path != db_photo_path:
-            c.execute("UPDATE experts SET is_face_synced = 0 WHERE id = ?", (expert_id,))
-            conn.commit()
+            id_card_val = row_id_card[0] if (row_id_card and row_id_card[0]) else None
+            if id_card_val and id_card_val.strip() and new_photo_path.strip():
+                # 自动同步最新多照片
+                ok, err_msg = _register_or_update_face(id_card_val, old_name, new_photo_path)
+                if ok:
+                    c.execute("UPDATE experts SET is_face_synced = 1, id_card = ? WHERE id = ?", (id_card_val.strip().upper(), expert_id))
+                    conn.commit()
+                else:
+                    c.execute("UPDATE experts SET is_face_synced = 0, id_card = ? WHERE id = ?", (id_card_val.strip().upper(), expert_id))
+                    conn.commit()
+                    sync_warning = f"人脸照片自动同步至云端失败: {err_msg}。请稍后在列表页手动同步。"
+            else:
+                c.execute("UPDATE experts SET is_face_synced = 0 WHERE id = ?", (expert_id,))
+                conn.commit()
+                
+        message_text = f"专家 {old_name} 的个人资料已成功修改。"
+        if sync_warning:
+            message_text += f" (⚠️ {sync_warning})"
         
         _log_action("修改专家基本信息", f"专家姓名: {old_name}, 新电话: {new_phone}, 新单位: {company}, 新专业: {major}")
-        return jsonify({"success": True, "message": f"专家 {old_name} 的个人资料已成功修改。"})
+        return jsonify({"success": True, "message": message_text})
         
     except Exception as e:
         return jsonify({"success": False, "error": f"更新专家信息失败: {str(e)}"}), 500
@@ -2018,7 +2035,7 @@ def api_delete_photo():
     conn = get_db_conn()
     try:
         c = conn.cursor()
-        c.execute("SELECT photo_path, name, phone FROM experts WHERE id = ?", (expert_id,))
+        c.execute("SELECT photo_path, name, phone, id_card FROM experts WHERE id = ?", (expert_id,))
         row = c.fetchone()
         if not row:
             return jsonify({"success": False, "error": "未找到对应的专家记录"}), 404
@@ -2026,6 +2043,7 @@ def api_delete_photo():
         db_photo_path = row[0]
         name = row[1]
         phone = row[2]
+        id_card_val = row[3]
         
         if not db_photo_path:
             return jsonify({"success": False, "error": "专家原本就没有照片"}), 400
@@ -2068,13 +2086,27 @@ def api_delete_photo():
         c.execute("UPDATE experts SET photo_path = ?, created_at = ? WHERE id = ?", 
                   (new_photo_path_db, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), expert_id))
         
-        # 4. 删除照片后，将同步状态重置为未同步 0，不再自动同步
-        c.execute("UPDATE experts SET is_face_synced = 0 WHERE id = ?", (expert_id,))
-        
-        conn.commit()
+        # 4. 删除照片后，自动重新同步到腾讯云人脸库
+        sync_warning = None
+        if id_card_val and id_card_val.strip() and new_photo_path_db.strip():
+            ok, err_msg = _register_or_update_face(id_card_val, name, new_photo_path_db)
+            if ok:
+                c.execute("UPDATE experts SET is_face_synced = 1, id_card = ? WHERE id = ?", (id_card_val.strip().upper(), expert_id))
+                conn.commit()
+            else:
+                c.execute("UPDATE experts SET is_face_synced = 0, id_card = ? WHERE id = ?", (id_card_val.strip().upper(), expert_id))
+                conn.commit()
+                sync_warning = f"人脸照片删除后同步云端失败: {err_msg}。请稍后手动同步。"
+        else:
+            c.execute("UPDATE experts SET is_face_synced = 0 WHERE id = ?", (expert_id,))
+            conn.commit()
+            
+        message_text = "照片已成功物理删除且路径已更新。"
+        if sync_warning:
+            message_text += f" (⚠️ {sync_warning})"
         
         _log_action("删除专家部分照片", f"专家: {name}({phone}), 删除照片: {filename}")
-        return jsonify({"success": True, "message": "照片已成功物理删除且路径已更新"})
+        return jsonify({"success": True, "message": message_text})
         
     except Exception as e:
         return jsonify({"success": False, "error": f"系统错误: {str(e)}"}), 500
@@ -2376,7 +2408,7 @@ def api_face_search():
     # 过滤掉得分低于 55.0 的候选人（最大化兼容大年龄跨度身份证比对）
     valid_candidates = [c for c in candidates if c['score'] >= 55.0]
     
-    # 针对同一张人脸的分组过滤策略：如果有大于 85% 的匹配，则排除掉该人脸其他低于 75% 的结果
+    # 针对每个独立人脸框（rect_key）进行独立过滤和排序去重，避免跨人脸框误伤
     from collections import defaultdict
     grouped = defaultdict(list)
     for c in valid_candidates:
@@ -2389,24 +2421,28 @@ def api_face_search():
         if rect_key is None:
             filtered_candidates.extend(cand_list)
             continue
-        # 检查这组人脸内是否有得分 >= 85% 的
-        has_high_score = any(c['score'] >= 85.0 for c in cand_list)
-        if has_high_score:
-            # 排除掉低于 75% 的其他匹配项
-            filtered_list = [c for c in cand_list if c['score'] >= 75.0]
-        else:
-            filtered_list = cand_list
-        filtered_candidates.extend(filtered_list)
-        
-    # 对同一个专家（person_id）进行去重，只保留得分最高的那条候选记录（防止因多照片同步，导致同一个人多张人脸均被匹配且得分不同而返回重复记录）
-    unique_candidates = {}
-    for cand in filtered_candidates:
-        pid = cand['person_id']
-        score = cand['score']
-        if pid not in unique_candidates or score > unique_candidates[pid]['score']:
-            unique_candidates[pid] = cand
             
-    valid_candidates = list(unique_candidates.values())
+        # 1. 框内去重：防止同一个专家在该框内有多条结果，仅保留得分最高的那一条
+        box_unique = {}
+        for cand in cand_list:
+            pid = cand['person_id'].strip().upper()
+            score = cand['score']
+            if pid not in box_unique or score > box_unique[pid]['score']:
+                box_unique[pid] = cand
+                
+        box_candidates = list(box_unique.values())
+        
+        # 2. 框内强匹配排他策略：若存在 >= 85.0% 的极高相似度匹配，则排除本框内其他低于 75.0% 的弱匹配
+        has_high_score = any(c['score'] >= 85.0 for c in box_candidates)
+        if has_high_score:
+            box_candidates = [c for c in box_candidates if c['score'] >= 75.0]
+            
+        # 3. 单人脸框归属决策：一个人脸框只可能对应一个人。对该框内候选按得分降序排列，仅保留最相似的第一候选人 (Top 1)
+        if box_candidates:
+            box_candidates.sort(key=lambda x: x['score'], reverse=True)
+            filtered_candidates.append(box_candidates[0])
+            
+    valid_candidates = filtered_candidates
     
     if not valid_candidates:
         return jsonify({"success": False, "error": "人脸库中未匹配到相似度足够高的专家档案（最高匹配得分低于阈值 55）"}), 400
