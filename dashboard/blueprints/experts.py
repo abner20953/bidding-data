@@ -152,6 +152,7 @@ def _resize_and_compress_image(physical_path, max_size=1080):
 
 def _process_single_photo_for_upload(physical_path, id_card, name):
     """读取单张照片，进行上限为1920等比缩放并调用DetectFace进行裁剪，未检出则回退到原缩放图，返回 base64 和错误消息。"""
+    id_card = id_card.strip().upper()
     try:
         with Image.open(physical_path) as img:
             if img.mode != 'RGB':
@@ -247,6 +248,8 @@ def _register_or_update_face(id_card, name, photo_path, sub_quality_control=2):
         
     if not id_card or not name or not photo_path:
         return False, "专家必填项(身份证号、姓名或照片路径)缺失"
+        
+    id_card = id_card.strip().upper()
         
     # 解析出照片路径列表，最多只取 5 张
     photo_list = [p.strip() for p in photo_path.split(',') if p.strip()][:5]
@@ -379,6 +382,8 @@ def _search_face(image_base64, max_face_num=None, min_face_size=None):
         req.FaceMatchThreshold = 0.0  # 0.0: 不在云端预过滤分数，保留所有匹配，在本地统一过滤分值
         if min_face_size is not None:
             req.MinFaceSize = min_face_size
+        else:
+            req.MinFaceSize = 34  # 默认使用 34 像素最小值以支持小人脸或远景人脸识别
             
         resp = client.SearchFaces(req)
         
@@ -428,7 +433,7 @@ def _detect_faces_in_image(image_base64, max_face_num=None):
         req = models.DetectFaceRequest()
         req.Image = image_base64
         req.MaxFaceNum = max_face_num
-        req.MinFaceSize = 40  # 质量优先模式下允许检测较小的人脸
+        req.MinFaceSize = 34  # 质量优先模式下允许检测较小的人脸，设为34以最大化支持小人脸
         req.NeedFaceAttributes = 0
         req.NeedQualityDetection = 0
         
@@ -2242,7 +2247,8 @@ def api_face_sync():
             # 使用多照片同步（传入完整路径列表字符串）
             ok, err_msg = _register_or_update_face(id_card, name, photo_path_val)
             if ok:
-                c.execute("UPDATE experts SET is_face_synced = 1 WHERE id = ?", (exp_id,))
+                # 同步成功后，顺便更新本地身份证号为大写格式
+                c.execute("UPDATE experts SET is_face_synced = 1, id_card = ? WHERE id = ?", (id_card.strip().upper(), exp_id))
                 success_count += 1
             else:
                 failed_list.append({"name": name, "id_card": id_card, "reason": err_msg})
@@ -2410,13 +2416,13 @@ def api_face_search():
     try:
         c = conn.cursor()
         for cand in valid_candidates:
-            person_id = cand['person_id']
+            person_id = cand['person_id'].strip().upper()
             score = cand['score']
             
             c.execute("""
                 SELECT id, name, phone, id_card, company, major, photo_path, status, remark, raw_json, project_count, is_face_synced
                 FROM experts 
-                WHERE id_card = ?
+                WHERE UPPER(id_card) = ?
             """, (person_id,))
             row = c.fetchone()
             if not row:
@@ -2512,12 +2518,13 @@ def api_face_sync_single():
         # 同步多照片（传入完整路径列表字符串）
         ok, err_msg = _register_or_update_face(id_card, name, photo_path_val)
         if ok:
-            c.execute("UPDATE experts SET is_face_synced = 1 WHERE id = ?", (expert_id,))
+            # 同步成功后，顺便将数据库的身份证号也更新为规范的大写
+            c.execute("UPDATE experts SET is_face_synced = 1, id_card = ? WHERE id = ?", (id_card.strip().upper(), expert_id))
             conn.commit()
             _log_action("手动同步单人脸", f"专家: {name}, 身份证: {id_card}")
             return jsonify({"success": True, "message": f"专家【{name}】的人脸数据已成功同步至云端人员库。"})
         else:
-            c.execute("UPDATE experts SET is_face_synced = 0 WHERE id = ?", (expert_id,))
+            c.execute("UPDATE experts SET is_face_synced = 0, id_card = ? WHERE id = ?", (id_card.strip().upper(), expert_id))
             conn.commit()
             return jsonify({"success": False, "error": err_msg}), 400
             
