@@ -1076,9 +1076,18 @@ def api_upload():
 
         try:
             c = conn.cursor()
+            
+            def clean_val(val):
+                if pd.isna(val):
+                    return ""
+                val_str = str(val).strip()
+                if val_str.lower() in ('nan', 'none', '<na>'):
+                    return ""
+                return val_str
+                
             for _, row in df.iterrows():
-                name = str(row.get(col_mapping.get('name', ''), '')).strip()
-                phone = str(row.get(col_mapping.get('phone', ''), '')).strip()
+                name = clean_val(row.get(col_mapping.get('name', '')))
+                phone = clean_val(row.get(col_mapping.get('phone', '')))
                 
                 # 清理电话格式（去除非数字，去掉浮点数表示如 .0）
                 if phone.endswith('.0'):
@@ -1090,14 +1099,14 @@ def api_upload():
                     
                 total_in_file += 1
                     
-                company = str(row.get(col_mapping.get('company', ''), '')).strip()
-                id_card = str(row.get(col_mapping.get('id_card', ''), '')).strip()
+                company = clean_val(row.get(col_mapping.get('company', '')))
+                id_card = clean_val(row.get(col_mapping.get('id_card', '')))
                 if id_card.endswith('.0'):
                     id_card = id_card[:-2]
                 id_card = re.sub(r'\s+', '', id_card).upper()
                     
-                major = str(row.get(col_mapping.get('major', ''), '')).strip()
-                raw_json = str(row.get(col_mapping.get('raw_json', ''), '')).strip()
+                major = clean_val(row.get(col_mapping.get('major', '')))
+                raw_json = clean_val(row.get(col_mapping.get('raw_json', '')))
 
                 # 提前进行数据库查重，以便对于已存在且有照专家跳过压缩包照片的读取与复制流程
                 c.execute("SELECT id, id_card, company, major, photo_path, raw_json FROM experts WHERE name = ? AND phone = ?", (name, phone))
@@ -1285,6 +1294,12 @@ def api_upload():
                 imported_count += 1
 
             conn.commit()
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise e
         finally:
             conn.close()
         
@@ -2082,6 +2097,8 @@ def api_update_expert_profile():
                     conn.commit()
                     sync_warning = f"人脸照片自动同步至云端失败: {err_msg}。请稍后在列表页手动同步。"
             else:
+                if id_card_val and id_card_val.strip():
+                    _delete_face(id_card_val)
                 c.execute("UPDATE experts SET is_face_synced = 0 WHERE id = ?", (expert_id,))
                 conn.commit()
                 
@@ -2223,18 +2240,6 @@ def api_tags():
                     "created_at": t['created_at']
                 })
             
-            # 3. 动态检查是否存在具有多张照片的专家
-            c.execute("SELECT COUNT(*) FROM experts WHERE photo_path LIKE '%,%'")
-            has_multi_photos = c.fetchone()[0] > 0
-            if has_multi_photos:
-                # 在下拉列表头部塞入虚拟标签“多张照片”
-                tags_list.insert(0, {
-                    "id": "multi_photos",
-                    "tag_name": "多张照片",
-                    "majors": [],
-                    "created_at": ""
-                })
-            
             return jsonify({"success": True, "tags": tags_list})
         except Exception as e:
             return jsonify({"success": False, "error": f"获取标签列表失败: {str(e)}"}), 500
@@ -2289,6 +2294,10 @@ def api_tags():
             _log_action(action_desc, f"标签: {tag_name}，包含专业共 {len(majors)} 个")
             return jsonify({"success": True, "message": "保存标签成功！", "tag_id": real_tag_id})
         except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             return jsonify({"success": False, "error": f"保存标签失败: {str(e)}"}), 500
         finally:
             conn.close()
@@ -2360,19 +2369,21 @@ def api_face_sync():
             if not photo_list:
                 continue
             
-            # 使用多照片同步（传入完整路径列表字符串）
+            # 1. 在事务外（即不要挂起未 commit 的排他锁）调用人脸注册云端 API
             ok, err_msg = _register_or_update_face(id_card, name, photo_path_val)
+            
+            # 2. 仅在需要写入更新时开启短暂的 SQL 交互，并立即提交 commit 释放写锁，杜绝高并发锁定报错
             if ok:
-                # 同步成功后，顺便更新本地身份证号为大写格式
                 c.execute("UPDATE experts SET is_face_synced = 1, id_card = ? WHERE id = ?", (id_card.strip().upper(), exp_id))
+                conn.commit()
                 success_count += 1
             else:
+                c.execute("UPDATE experts SET is_face_synced = 0, id_card = ? WHERE id = ?", (id_card.strip().upper(), exp_id))
+                conn.commit()
                 failed_list.append({"name": name, "id_card": id_card, "reason": err_msg})
             
-            # 增量同步加微小延时，保障平稳调用
+            # 3. 延时 0.2 秒是在无事务锁的状态下安全等待
             time.sleep(0.2)
-            
-        conn.commit()
         
         msg = f"人脸同步完成：成功同步 {success_count} 人"
         if failed_list:
