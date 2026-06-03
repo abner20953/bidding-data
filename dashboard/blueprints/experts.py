@@ -760,6 +760,17 @@ def init_db():
         except Exception as e:
             print(f"⚠️ 历史专业同步初始化失败: {e}")
 
+        # 一次性历史 'nan' 字符串脏数据清洗
+        try:
+            c.execute("UPDATE experts SET company = '' WHERE company = 'nan'")
+            c.execute("UPDATE experts SET major = '' WHERE major = 'nan'")
+            c.execute("UPDATE experts SET id_card = '' WHERE id_card = 'nan'")
+            c.execute("UPDATE experts SET raw_json = '' WHERE raw_json = 'nan'")
+            conn.commit()
+            print("✅ 历史 'nan' 脏数据自动清理完成！")
+        except Exception as e:
+            print(f"⚠️ 历史 'nan' 脏数据清理失败: {e}")
+
         # 一次性历史数据清洗重算
         try:
             update_all_experts_stats(conn)
