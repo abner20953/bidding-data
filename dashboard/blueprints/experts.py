@@ -240,6 +240,22 @@ def _process_single_photo_for_upload(physical_path, id_card, name):
         return None, str(e)
 
 
+def _delete_face(id_card):
+    """从腾讯云人脸库中注销/删除人员 (防无用人员残留)"""
+    client = _get_iai_client()
+    if not client or not id_card:
+        return False
+    try:
+        del_req = models.DeletePersonRequest()
+        del_req.PersonId = id_card.strip().upper()
+        client.DeletePerson(del_req)
+        print(f"✅ [DeletePerson 成功] 身份证: {id_card}")
+        return True
+    except Exception as e:
+        print(f"⚠️ [DeletePerson 失败] 身份证: {id_card}, 错误: {e}")
+        return False
+
+
 def _register_or_update_face(id_card, name, photo_path, sub_quality_control=2):
     """向腾讯云人脸库注册或更新人员。支持多照片同步（1个CreatePerson主照，2-5个AddFace副照，副照严格质量控制）"""
     client = _get_iai_client()
@@ -901,6 +917,7 @@ def parse_and_import_md(file_path):
                     
                     exp_name = exp_parts[0]
                     exp_id_card = exp_parts[1] if len(exp_parts) > 1 else ""
+                    exp_id_card = re.sub(r'\s+', '', exp_id_card).upper()
                     exp_code = exp_parts[2] if len(exp_parts) > 2 else ""
                     
                     # 写入项目与专家关系
@@ -950,7 +967,34 @@ def api_upload():
         
         try:
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(temp_dir)
+                for member in zip_ref.infolist():
+                    # 解决中文文件名乱码问题
+                    filename = member.filename
+                    try:
+                        filename = member.filename.encode('cp437').decode('gbk')
+                    except Exception:
+                        try:
+                            filename = member.filename.encode('cp437').decode('utf-8')
+                        except Exception:
+                            pass
+                    
+                    # 物理过滤目录穿越与非法路径，防范 Zip Slip 安全风险
+                    filename = filename.replace('\\', '/').strip('/')
+                    parts = filename.split('/')
+                    if any(p == '..' or p == '.' for p in parts):
+                        continue
+                    
+                    dest_file_path = os.path.join(temp_dir, filename)
+                    
+                    # 确认目标路径确实在临时目录内部
+                    if not os.path.realpath(dest_file_path).startswith(os.path.realpath(temp_dir)):
+                        continue
+                        
+                    os.makedirs(os.path.dirname(dest_file_path), exist_ok=True)
+                    
+                    if not member.is_dir():
+                        with zip_ref.open(member) as source, open(dest_file_path, "wb") as target:
+                            shutil.copyfileobj(source, target)
         except Exception as e:
             return jsonify({"success": False, "error": f"解压压缩包失败: {str(e)}"}), 400
 
@@ -1050,6 +1094,7 @@ def api_upload():
                 id_card = str(row.get(col_mapping.get('id_card', ''), '')).strip()
                 if id_card.endswith('.0'):
                     id_card = id_card[:-2]
+                id_card = re.sub(r'\s+', '', id_card).upper()
                     
                 major = str(row.get(col_mapping.get('major', ''), '')).strip()
                 raw_json = str(row.get(col_mapping.get('raw_json', ''), '')).strip()
@@ -1782,6 +1827,15 @@ def api_clear():
     conn = get_db_conn()
     try:
         c = conn.cursor()
+        # 联动清空腾讯云人脸库人员，防僵尸人脸残留
+        try:
+            c.execute("SELECT id_card FROM experts WHERE id_card IS NOT NULL AND id_card != ''")
+            id_cards = [row[0] for row in c.fetchall() if row[0]]
+            for ic in id_cards:
+                _delete_face(ic)
+        except Exception as fe:
+            print(f"⚠️ [api_clear 警告] 批量注销云端人脸失败: {fe}")
+
         c.execute('DELETE FROM experts')
         c.execute('DELETE FROM expert_majors')
         c.execute('DELETE FROM projects')
@@ -1790,6 +1844,10 @@ def api_clear():
         c.execute('DELETE FROM tag_majors')
         conn.commit()
     except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         return jsonify({"success": False, "error": f"清空数据库失败: {str(e)}"}), 500
     finally:
         conn.close()
@@ -1845,6 +1903,11 @@ def api_delete():
             # 从项目评审专家关联表中删除该专家的评审记录
             if id_card:
                 c.execute("DELETE FROM project_experts WHERE expert_id_card = ?", (id_card,))
+                # 联动注销云端人脸，防止腾讯云人员库产生残留僵尸人脸
+                try:
+                    _delete_face(id_card)
+                except Exception as fe:
+                    print(f"⚠️ [api_delete 警告] 注销云端人脸失败 (身份证: {id_card}): {fe}")
         
         # 从倒排关系表中物理删除
         c.execute("DELETE FROM expert_majors WHERE expert_id IN (SELECT id FROM experts WHERE name = ? AND phone = ?)", (name, phone))
@@ -1855,6 +1918,10 @@ def api_delete():
         _log_action("删除评标专家", f"专家姓名: {name}, 电话: {phone}")
         return jsonify({"success": True, "message": f"专家 {name} 及其相关照片与参评记录已删除。"})
     except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         return jsonify({"success": False, "error": f"删除专家失败: {str(e)}"}), 500
     finally:
         conn.close()
@@ -1897,6 +1964,15 @@ def api_update_expert_profile():
     new_phone = request.form.get('new_phone', '').strip()
     company = request.form.get('company', '').strip()
     major = request.form.get('major', '').strip()
+    
+    # 物理清洗电话格式
+    if old_phone.endswith('.0'):
+        old_phone = old_phone[:-2]
+    old_phone = re.sub(r'\D', '', old_phone)
+    
+    if new_phone.endswith('.0'):
+        new_phone = new_phone[:-2]
+    new_phone = re.sub(r'\D', '', new_phone)
     
     if not old_name or not old_phone:
         return jsonify({"success": False, "error": "定位专家的旧姓名与旧电话号码不能为空"}), 400
@@ -2017,6 +2093,10 @@ def api_update_expert_profile():
         return jsonify({"success": True, "message": message_text})
         
     except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         return jsonify({"success": False, "error": f"更新专家信息失败: {str(e)}"}), 500
     finally:
         conn.close()
@@ -2109,6 +2189,10 @@ def api_delete_photo():
         return jsonify({"success": True, "message": message_text})
         
     except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         return jsonify({"success": False, "error": f"系统错误: {str(e)}"}), 500
     finally:
         conn.close()
