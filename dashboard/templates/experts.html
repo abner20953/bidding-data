@@ -2024,6 +2024,74 @@
                 display: none !important;
             }
         }
+        /* 移动端人脸比对与头部导航适配优化 */
+        .face-ctrl-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            background: rgba(0,0,0,0.02);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: 10px 16px;
+            margin-bottom: -4px;
+            transition: all 0.2s ease;
+        }
+
+        @media (max-width: 640px) {
+            /* 1. 顶部 Header 控件隐藏汉字，防挤压变形 */
+            .glass-header .has-text .btn-text {
+                display: none;
+            }
+            .glass-header .has-text {
+                width: 36px;
+                height: 36px;
+                padding: 0 !important;
+                justify-content: center;
+            }
+            .glass-header {
+                padding: 0 16px !important;
+            }
+
+            /* 2. Tab 滑动横向流畅栏，防硬折行 */
+            .glass-tabs {
+                display: flex !important;
+                overflow-x: auto !important;
+                white-space: nowrap !important;
+                width: 100% !important;
+                max-width: 100% !important;
+                padding: 6px !important;
+                scrollbar-width: none !important; /* Firefox */
+                -ms-overflow-style: none !important;  /* IE and Edge */
+            }
+            .glass-tabs::-webkit-scrollbar {
+                display: none !important; /* Chrome, Safari and Opera */
+            }
+            .glass-tabs .tab-btn {
+                flex-shrink: 0 !important;
+                padding: 8px 14px !important;
+            }
+
+            /* 3. 人脸配置面板单行转垂直堆叠，防标题字拉长成竖排 */
+            .face-ctrl-row {
+                flex-direction: column !important;
+                align-items: flex-start !important;
+                gap: 8px !important;
+                padding: 12px 16px !important;
+            }
+            .face-ctrl-row > span {
+                width: 100% !important;
+                font-size: 13px !important;
+            }
+            .face-ctrl-row > div {
+                width: 100% !important;
+            }
+            .face-ctrl-row select {
+                width: 100% !important;
+                text-align: left !important;
+            }
+        }
+
         @keyframes scanAnimation {
             0% { top: 0%; opacity: 0.8; }
             50% { top: 98%; opacity: 1; }
@@ -2043,7 +2111,7 @@
 
             <div class="controls">
                 <a href="/all" class="glass-btn has-text" style="text-decoration: none;" title="返回系统首页">
-                    <span>🏠</span> 导航首页
+                    <span>🏠</span><span class="btn-text">导航首页</span>
                 </a>
             </div>
         </header>
@@ -2078,7 +2146,7 @@
                     </div>
                     
                     <!-- 检索参数控制项 -->
-                    <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; background: rgba(0,0,0,0.02); border: 1px solid var(--border-color); border-radius: 10px; padding: 10px 16px; margin-bottom: -4px;">
+                    <div class="face-ctrl-row">
                         <span style="font-size: 13px; font-weight: 600; color: var(--text-primary); display: flex; align-items: center; gap: 6px;">
                             <span>🎯</span> 最多检索人脸数量
                         </span>
@@ -2101,7 +2169,7 @@
                     </div>
 
                     <!-- 检索模式控制项 -->
-                    <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; background: rgba(0,0,0,0.02); border: 1px solid var(--border-color); border-radius: 10px; padding: 10px 16px; margin-bottom: -4px;">
+                    <div class="face-ctrl-row">
                         <span style="font-size: 13px; font-weight: 600; color: var(--text-primary); display: flex; align-items: center; gap: 6px;">
                             <span>⚡</span> 检索模式优先
                         </span>
