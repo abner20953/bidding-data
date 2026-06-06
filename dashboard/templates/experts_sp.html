@@ -1,0 +1,955 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>无感人脸识别签到系统</title>
+    <!-- 引入 premium Google 字体 -->
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Noto+Sans+SC:wght@300;400;500;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-dark: #0b0f19;
+            --accent-green: #10b981;
+            --accent-green-glow: rgba(16, 185, 129, 0.25);
+            --accent-red: #f43f5e;
+            --text-primary: #f8fafc;
+            --text-secondary: #94a3b8;
+            --border-glow: rgba(255, 255, 255, 0.08);
+            --glass-bg: rgba(17, 24, 39, 0.7);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        body {
+            font-family: 'Outfit', 'Noto Sans SC', sans-serif;
+            background-color: var(--bg-dark);
+            color: var(--text-primary);
+            overflow-x: hidden;
+            display: flex;
+            flex-direction: column;
+            min-height: 100vh;
+            background-image: 
+                radial-gradient(at 10% 20%, rgba(16, 185, 129, 0.08) 0px, transparent 50%),
+                radial-gradient(at 90% 80%, rgba(14, 165, 233, 0.08) 0px, transparent 50%);
+        }
+
+        /* 顶部导航 Header */
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 16px 20px;
+            background: rgba(15, 23, 42, 0.6);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border-bottom: 1px solid var(--border-glow);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .header-title {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .header-logo {
+            font-size: 24px;
+            background: linear-gradient(135deg, #34d399, #0ea5e9);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-weight: 700;
+        }
+
+        .header-title h1 {
+            font-size: 16px;
+            font-weight: 600;
+            letter-spacing: 0.5px;
+        }
+
+        .btn-back {
+            background: rgba(255, 255, 255, 0.06);
+            color: var(--text-primary);
+            border: 1px solid var(--border-glow);
+            padding: 8px 14px;
+            border-radius: 10px;
+            font-size: 13px;
+            font-weight: 500;
+            text-decoration: none;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .btn-back:hover {
+            background: rgba(255, 255, 255, 0.12);
+            border-color: var(--accent-green);
+        }
+
+        /* 核心工作主区域 */
+        main {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 16px;
+            gap: 16px;
+            max-width: 600px;
+            width: 100%;
+            margin: 0 auto;
+        }
+
+        /* 视频容器区域 */
+        .video-wrapper {
+            width: 100%;
+            position: relative;
+            aspect-ratio: 3 / 4;
+            background: #1e293b;
+            border-radius: 20px;
+            overflow: hidden;
+            border: 1px solid var(--border-glow);
+            box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        #webcam {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transform: scaleX(-1); /* 镜像翻转，使手机拍照时体验更自然 */
+        }
+
+        /* 覆盖在视频上方的 Canvas (绘制人脸追踪框) */
+        #canvas-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 5;
+            transform: scaleX(-1); /* 与视频镜像方向一致 */
+        }
+
+        /* 人脸扫描绿光网格上下移动动效 */
+        .scan-laser {
+            position: absolute;
+            width: 100%;
+            height: 3px;
+            background: linear-gradient(to right, transparent, var(--accent-green), transparent);
+            box-shadow: 0 0 12px var(--accent-green);
+            top: 0;
+            left: 0;
+            z-index: 4;
+            animation: scan 3s infinite linear;
+            pointer-events: none;
+            opacity: 0.7;
+        }
+
+        @keyframes scan {
+            0% { top: 0%; }
+            50% { top: 100%; }
+            100% { top: 0%; }
+        }
+
+        /* 扫描状态横条提示 */
+        .status-tip-bar {
+            position: absolute;
+            bottom: 16px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(15, 23, 42, 0.85);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            padding: 8px 18px;
+            border-radius: 30px;
+            border: 1px solid var(--border-glow);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            z-index: 6;
+            max-width: 90%;
+            pointer-events: none;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: var(--accent-green);
+            box-shadow: 0 0 8px var(--accent-green);
+        }
+
+        .status-dot.loading {
+            background-color: #f59e0b;
+            box-shadow: 0 0 8px #f59e0b;
+            animation: pulse 1s infinite alternate;
+        }
+
+        .status-dot.searching {
+            background-color: #0ea5e9;
+            box-shadow: 0 0 8px #0ea5e9;
+            animation: pulse 0.5s infinite alternate;
+        }
+
+        .status-dot.error {
+            background-color: var(--accent-red);
+            box-shadow: 0 0 8px var(--accent-red);
+        }
+
+        @keyframes pulse {
+            0% { opacity: 0.3; transform: scale(0.8); }
+            100% { opacity: 1; transform: scale(1.2); }
+        }
+
+        .status-text {
+            font-size: 12px;
+            font-weight: 500;
+            letter-spacing: 0.5px;
+            white-space: nowrap;
+        }
+
+        /* 相机与控制操作栏 */
+        .control-bar {
+            display: flex;
+            width: 100%;
+            gap: 12px;
+        }
+
+        .btn-ctrl {
+            flex: 1;
+            background: var(--glass-bg);
+            border: 1px solid var(--border-glow);
+            color: var(--text-primary);
+            padding: 12px;
+            border-radius: 12px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+        }
+
+        .btn-ctrl:active {
+            transform: scale(0.97);
+            background: rgba(255, 255, 255, 0.1);
+        }
+
+        .btn-ctrl:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .btn-ctrl.active-scan {
+            background: var(--accent-green);
+            border-color: var(--accent-green);
+            box-shadow: 0 4px 14px rgba(16, 185, 129, 0.3);
+        }
+
+        /* 识别出的专家信息档案展示区 (毛玻璃拟态卡片) */
+        .expert-result-container {
+            width: 100%;
+            min-height: 120px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .result-card-placeholder {
+            text-align: center;
+            padding: 30px 20px;
+            border: 1px dashed rgba(255, 255, 255, 0.1);
+            border-radius: 16px;
+            color: var(--text-secondary);
+            font-size: 13px;
+            width: 100%;
+            background: rgba(255, 255, 255, 0.02);
+            line-height: 1.6;
+        }
+
+        .result-card-placeholder svg {
+            margin-bottom: 8px;
+            color: rgba(255, 255, 255, 0.2);
+        }
+
+        /* 专家主卡片 */
+        .expert-profile-card {
+            width: 100%;
+            background: var(--glass-bg);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 18px;
+            padding: 18px;
+            display: flex;
+            gap: 16px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            animation: slideIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+            position: relative;
+            overflow: hidden;
+            border-left: 4px solid var(--accent-green);
+        }
+
+        .expert-profile-card::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            right: 0;
+            width: 150px;
+            height: 150px;
+            background: radial-gradient(circle, rgba(16, 185, 129, 0.1) 0%, transparent 70%);
+            pointer-events: none;
+        }
+
+        @keyframes slideIn {
+            0% { transform: translateY(12px); opacity: 0; }
+            100% { transform: translateY(0); opacity: 1; }
+        }
+
+        .profile-avatar-wrapper {
+            width: 75px;
+            height: 100px;
+            border-radius: 10px;
+            overflow: hidden;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            flex-shrink: 0;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+        }
+
+        .profile-avatar {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .profile-info {
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            flex: 1;
+            min-width: 0;
+        }
+
+        .profile-name-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-bottom: 6px;
+        }
+
+        .profile-name {
+            font-size: 17px;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+
+        .verify-badge {
+            background: rgba(16, 185, 129, 0.12);
+            color: var(--accent-green);
+            border: 1px solid rgba(16, 185, 129, 0.2);
+            padding: 2px 6px;
+            border-radius: 6px;
+            font-size: 10px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 3px;
+        }
+
+        .profile-company {
+            font-size: 12.5px;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+            line-height: 1.4;
+            word-break: break-all;
+        }
+
+        .profile-meta-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 5px;
+            font-size: 12px;
+            color: var(--text-secondary);
+            border-top: 1px dashed rgba(255, 255, 255, 0.06);
+            padding-top: 8px;
+        }
+
+        .meta-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .meta-label {
+            width: 60px;
+            flex-shrink: 0;
+        }
+
+        .meta-val {
+            color: var(--text-primary);
+            font-family: monospace;
+            font-weight: 500;
+            word-break: break-all;
+        }
+
+        .meta-val-tag {
+            background: rgba(14, 165, 233, 0.1);
+            color: #38bdf8;
+            padding: 1px 6px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-family: inherit;
+        }
+
+        .meta-val-count {
+            color: var(--accent-green);
+            font-weight: 700;
+        }
+
+        /* 全局加载等待遮罩 */
+        #loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(11, 15, 25, 0.9);
+            z-index: 1000;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 16px;
+            transition: opacity 0.3s;
+        }
+
+        .loader {
+            width: 48px;
+            height: 48px;
+            border: 3px solid rgba(16, 185, 129, 0.1);
+            border-top-color: var(--accent-green);
+            border-radius: 50%;
+            animation: spin 1s infinite linear;
+            box-shadow: 0 0 10px rgba(16, 185, 129, 0.1);
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .loader-text {
+            font-size: 14px;
+            color: var(--text-secondary);
+            letter-spacing: 0.5px;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- 全局加载遮罩 (等待 MediaPipe 庞大 Wasm 加载) -->
+    <div id="loading-overlay">
+        <div class="loader"></div>
+        <div class="loader-text" id="loader-status">正在载入本地人脸初筛引擎 (约 200KB)...</div>
+    </div>
+
+    <!-- 顶部导航 -->
+    <header>
+        <div class="header-title">
+            <span class="header-logo">🤖</span>
+            <h1>实时人脸识别签到</h1>
+        </div>
+        <a href="/dlsgzs" class="btn-back">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+            退出系统
+        </a>
+    </header>
+
+    <!-- 工作区 -->
+    <main>
+        <!-- 视频容器 -->
+        <div class="video-wrapper">
+            <!-- 扫描绿光 -->
+            <div class="scan-laser" id="laser-line"></div>
+            
+            <!-- 视频流 -->
+            <video id="webcam" autoplay playsinline muted></video>
+            
+            <!-- 用于人脸框定位渲染的透明 Canvas 覆盖层 -->
+            <canvas id="canvas-overlay"></canvas>
+            
+            <!-- 扫描提示状态条 -->
+            <div class="status-tip-bar">
+                <div class="status-dot" id="status-indicator"></div>
+                <span class="status-text" id="status-message">扫描雷达已就绪</span>
+            </div>
+        </div>
+
+        <!-- 相机控制按钮栏 -->
+        <div class="control-bar">
+            <button class="btn-ctrl active-scan" id="btn-toggle-scan">
+                <span>⏸️</span> 暂停扫描
+            </button>
+            <button class="btn-ctrl" id="btn-switch-camera">
+                <span>🔄</span> 切换后置镜
+            </button>
+        </div>
+
+        <!-- 专家卡片展示区 -->
+        <div class="expert-result-container">
+            <div class="result-card-placeholder" id="result-placeholder">
+                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
+                <p>雷达已就绪，请专家正对镜头</p>
+                <p style="font-size: 11px; margin-top: 4px; opacity: 0.6;">(本地过滤空帧，仅在人脸进入最佳范围时触发云端比对)</p>
+            </div>
+            
+            <!-- 动态注入的专家档案卡片 -->
+            <div id="expert-card-root" style="display: none; width: 100%;"></div>
+        </div>
+    </main>
+
+    <!-- 用于截取并压缩人脸单帧图片并转成 Base64 的隐藏 Canvas -->
+    <canvas id="hidden-canvas" style="display: none;"></canvas>
+
+    <!-- 异步加载 MediaPipe Tasks-Vision 库 -->
+    <script type="module">
+        import { FaceDetector, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/wasm/vision_bundle.js";
+
+        // DOM 控件引用
+        const video = document.getElementById('webcam');
+        const overlayCanvas = document.getElementById('canvas-overlay');
+        const overlayCtx = overlayCanvas.getContext('2d');
+        const hiddenCanvas = document.getElementById('hidden-canvas');
+        const hiddenCtx = hiddenCanvas.getContext('2d');
+        
+        const loaderOverlay = document.getElementById('loading-overlay');
+        const loaderStatus = document.getElementById('loader-status');
+        
+        const btnToggleScan = document.getElementById('btn-toggle-scan');
+        const btnSwitchCamera = document.getElementById('btn-switch-camera');
+        
+        const statusIndicator = document.getElementById('status-indicator');
+        const statusMessage = document.getElementById('status-message');
+        const laserLine = document.getElementById('laser-line');
+        
+        const resultPlaceholder = document.getElementById('result-placeholder');
+        const expertCardRoot = document.getElementById('expert-card-root');
+
+        // 系统控制变量
+        let faceDetector = null;
+        let scanning = true;
+        let currentFacingMode = "environment"; // 默认优先使用后置摄像头以便对准外部路过人脸
+        let isUploadingFrame = false;
+        let lastUploadTime = 0;
+        let uploadCooldown = 2500; // 对同一人比对间隔 2.5 秒，防止超频与资费泄漏
+        let activeStream = null;
+        
+        // 人脸追踪防抖辅助
+        let faceStableFrames = 0;
+        let lastFaceBox = null;
+        let hasActiveMatch = false;
+
+        // 1. 初始化并拉取本地 BlazeFace 人脸检测模型 (仅约 200KB，极速加载)
+        async function initDetector() {
+            try {
+                loaderStatus.innerText = "正在下载人脸定位引擎 (约 200KB)...";
+                const vision = await FilesetResolver.forVisionTasks(
+                    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/wasm"
+                );
+                
+                loaderStatus.innerText = "引擎载入中，正在启用 GPU 硬件加速...";
+                faceDetector = await FaceDetector.createFromOptions(vision, {
+                    baseOptions: {
+                        modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite`,
+                        delegate: "GPU"
+                    },
+                    runningMode: "VIDEO"
+                });
+                
+                loaderStatus.innerText = "模型就绪，正在开启摄像头...";
+                await startCamera();
+                
+                // 隐藏等待遮罩
+                loaderOverlay.style.opacity = 0;
+                setTimeout(() => {
+                    loaderOverlay.style.display = "none";
+                }, 300);
+                
+                // 启动本地帧检测扫描循环
+                window.requestAnimationFrame(detectFrameLoop);
+                
+            } catch (err) {
+                console.error("Initialization failed:", err);
+                loaderStatus.innerHTML = `<span style="color: #f43f5e;">❌ 初始化失败：${err.message}</span><br>请确保在 HTTPS 加密环境下打开，或检查网络连接。`;
+            }
+        }
+
+        // 2. 调取摄像头媒体流
+        async function startCamera() {
+            if (activeStream) {
+                activeStream.getTracks().forEach(track => track.stop());
+            }
+
+            const constraints = {
+                video: {
+                    facingMode: currentFacingMode,
+                    width: { ideal: 640 }, // 采用最适合移动端的 640*480 尺寸，在带宽占用与识别人脸精度间取得完美平衡
+                    height: { ideal: 480 }
+                },
+                audio: false
+            };
+
+            try {
+                activeStream = await navigator.mediaDevices.getUserMedia(constraints);
+                video.srcObject = activeStream;
+                
+                // 等视频元数据加载完成后自适应画 Canvas 尺寸
+                video.onloadedmetadata = () => {
+                    overlayCanvas.width = video.videoWidth;
+                    overlayCanvas.height = video.videoHeight;
+                    
+                    // 修正切换后置镜头时的镜像效果
+                    if (currentFacingMode === "environment") {
+                        video.style.transform = "scaleX(1)";
+                        overlayCanvas.style.transform = "scaleX(1)";
+                    } else {
+                        video.style.transform = "scaleX(-1)";
+                        overlayCanvas.style.transform = "scaleX(-1)";
+                    }
+                };
+            } catch (err) {
+                throw new Error("无法获取摄像头权限: " + err.message);
+            }
+        }
+
+        // 3. 浏览器端帧扫描主循环（跑本地 CPU/GPU，不耗费任何网络与腾讯云计费）
+        let lastVideoTime = -1;
+        async function detectFrameLoop() {
+            if (!scanning) {
+                window.requestAnimationFrame(detectFrameLoop);
+                return;
+            }
+
+            if (video.readyState === video.HAVE_ENOUGH_DATA && video.currentTime !== lastVideoTime) {
+                lastVideoTime = video.currentTime;
+                
+                // 本地极速人脸框提取 (10-15ms 即可完成)
+                const startTimeMs = performance.now();
+                const detections = faceDetector.detectForVideo(video, startTimeMs).detections;
+                
+                // 绘制定位框并获取最优人脸
+                const targetFace = processDetections(detections);
+                
+                // 4. 初筛决策关卡：当且仅当出现“足够大且位置稳定”的清晰人脸时，才会触发上传！
+                if (targetFace && !isUploadingFrame) {
+                    const now = Date.now();
+                    // 门槛设定：人脸宽度必须大于 85 像素且未处于接口冷却期间，实现无感初筛防频发
+                    if (targetFace.width >= 85 && (now - lastUploadTime > uploadCooldown)) {
+                        triggerCloudMatch(targetFace);
+                    }
+                }
+            }
+
+            window.requestAnimationFrame(detectFrameLoop);
+        }
+
+        // 绘制本地人脸框定位线并执行大小初筛
+        function processDetections(detections) {
+            // 清空上一帧的 Canvas
+            overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+            
+            if (!detections || detections.length === 0) {
+                if (!isUploadingFrame) {
+                    updateStatus("scanning", "🔍 正在巡检路过专家人脸...");
+                }
+                faceStableFrames = 0;
+                lastFaceBox = null;
+                return null;
+            }
+
+            // 我们只对画面中最大、最近的那张人脸进行签到分析
+            let mainFace = null;
+            let maxArea = 0;
+
+            for (const det of detections) {
+                const box = det.boundingBox;
+                const area = box.width * box.height;
+                if (area > maxArea) {
+                    maxArea = area;
+                    mainFace = box;
+                }
+                
+                // 绘制其他人脸的外框为细灰框
+                drawFaceRect(overlayCtx, box.originX, box.originY, box.width, box.height, "rgba(255, 255, 255, 0.25)", 1);
+            }
+
+            if (!mainFace) return null;
+
+            // 检查尺寸大小是否符合“足够识别”的清晰门槛 (宽度大于 85 像素)
+            const isLargeEnough = mainFace.width >= 85;
+            let strokeColor = "rgba(239, 68, 68, 0.7)"; // 太远/太模糊显示为警告红色框
+            let labelText = "⚠️ 请走近一点...";
+
+            if (isLargeEnough) {
+                strokeColor = "rgba(16, 185, 129, 0.9)"; // 符合距离条件显示为亮绿色框
+                labelText = "🎯 聚焦人脸中...";
+                faceStableFrames++;
+            } else {
+                faceStableFrames = 0;
+            }
+
+            if (isUploadingFrame) {
+                strokeColor = "rgba(14, 165, 233, 0.9)"; // 正在云端比对时显示为蓝色框
+                labelText = "⚡ 正在云端核验专家库...";
+            }
+
+            // 绘制主锁定人脸的高亮框和距离提示文字
+            drawFaceRect(overlayCtx, mainFace.originX, mainFace.originY, mainFace.width, mainFace.height, strokeColor, 3);
+            drawTextLabel(overlayCtx, labelText, mainFace.originX, mainFace.originY - 10, strokeColor);
+
+            return mainFace;
+        }
+
+        // 绘制人脸矩形边角效果的助手函数 (体现炫酷科技感)
+        function drawFaceRect(ctx, x, y, w, h, color, lineWidth) {
+            ctx.strokeStyle = color;
+            ctx.lineWidth = lineWidth;
+            ctx.shadowColor = color;
+            ctx.shadowBlur = lineWidth > 1 ? 6 : 0;
+            
+            // 绘制四个拐角线，比普通的四方框显得更具高科技雷达质感
+            const cornerLen = Math.min(w, h) * 0.2;
+            
+            // 左上角
+            ctx.beginPath();
+            ctx.moveTo(x + cornerLen, y);
+            ctx.lineTo(x, y);
+            ctx.lineTo(x, y + cornerLen);
+            ctx.stroke();
+            
+            // 右上角
+            ctx.beginPath();
+            ctx.moveTo(x + w - cornerLen, y);
+            ctx.lineTo(x + w, y);
+            ctx.lineTo(x + w, y + cornerLen);
+            ctx.stroke();
+            
+            // 左下角
+            ctx.beginPath();
+            ctx.moveTo(x, y + h - cornerLen);
+            ctx.lineTo(x, y + h);
+            ctx.lineTo(x + cornerLen, y + h);
+            ctx.stroke();
+            
+            // 右下角
+            ctx.beginPath();
+            ctx.moveTo(x + w - cornerLen, y + h);
+            ctx.lineTo(x + w, y + h);
+            ctx.lineTo(x + w, y + h - cornerLen);
+            ctx.stroke();
+            
+            // 还原 Shadow
+            ctx.shadowBlur = 0;
+        }
+
+        function drawTextLabel(ctx, text, x, y, color) {
+            ctx.fillStyle = color;
+            ctx.font = "bold 11px sans-serif";
+            // 绘制轻量文字背景条
+            const textWidth = ctx.measureText(text).width;
+            ctx.fillStyle = "rgba(11, 15, 25, 0.8)";
+            ctx.fillRect(x - 4, y - 12, textWidth + 8, 16);
+            ctx.fillStyle = color;
+            ctx.fillText(text, x, y);
+        }
+
+        // 5. 触发云端人脸比对 (捕获当前帧并 POST)
+        function triggerCloudMatch(faceBox) {
+            isUploadingFrame = true;
+            lastUploadTime = Date.now();
+            updateStatus("searching", "正在核对云端人脸特征库...");
+            
+            // 利用 canvas 提取当前帧
+            hiddenCanvas.width = video.videoWidth;
+            hiddenCanvas.height = video.videoHeight;
+            hiddenCtx.drawImage(video, 0, 0, video.videoWidth, video.videoHeight);
+            
+            // 将截取图以 0.85 质量压缩为低分辨率 jpeg，节省 90% 室外上行带宽流量
+            const base64Data = hiddenCanvas.toDataURL('image/jpeg', 0.85);
+
+            fetch('/dlsgzs/api/face/search', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ 
+                    image: base64Data,
+                    max_face_num: 1,  // 每次只识别主路过人
+                    search_mode: 'speed' // 速度优先
+                })
+            })
+            .then(r => r.json())
+            .then(res => {
+                isUploadingFrame = false;
+                if (res.success && res.found && res.results && res.results.length > 0) {
+                    const bestMatch = res.results[0];
+                    renderExpertProfile(bestMatch.expert, bestMatch.score);
+                    
+                    // 物理震动反馈 (振动 120ms，提示签到员已经成功匹配到人)
+                    if (navigator.vibrate) {
+                        navigator.vibrate(120);
+                    }
+                    
+                    updateStatus("success", `✅ 签到成功：${bestMatch.expert.name} (${bestMatch.score.toFixed(1)}%)`);
+                } else {
+                    updateStatus("error", "⚠️ 未匹配到登记的专家档案");
+                }
+            })
+            .catch(err => {
+                isUploadingFrame = false;
+                updateStatus("error", "❌ 比对请求异常，请检查网络或服务");
+                console.error("Upload error:", err);
+            });
+        }
+
+        // 6. 脱敏处理敏感数据并动态渲染卡片 (姓名、单位、专业、打码遮盖后的身份证和手机)
+        function renderExpertProfile(expert, score) {
+            // 对身份证中段与手机号进行数据脱敏
+            const maskIdCard = (id) => {
+                if (!id || id.length < 10) return "-";
+                // 遮盖中间 10 位，例如 14010319631218122X -> 140103**********122X
+                return id.slice(0, 6) + "**********" + id.slice(-4);
+            };
+            
+            const maskPhone = (ph) => {
+                if (!ph || ph.length < 7) return "-";
+                // 遮盖手机号中间 4 位，例如 13633443234 -> 136****3234
+                return ph.slice(0, 3) + "****" + ph.slice(-4);
+            };
+
+            const photos = expert.photo_path ? expert.photo_path.split(',') : [];
+            const avatarUrl = (photos.length > 0) ? photos[0].trim() : "/static/uploads/expert_photos/placeholder.jpg";
+            
+            const count = expert.project_count || 0;
+            const statusBadgeText = score >= 70 ? `核验成功 ${score.toFixed(1)}%` : `疑似匹配 ${score.toFixed(1)}%`;
+            
+            const cardHtml = `
+                <div class="expert-profile-card">
+                    <!-- 头像 -->
+                    <div class="profile-avatar-wrapper">
+                        <img src="${avatarUrl}" class="profile-avatar" onerror="this.src=''">
+                    </div>
+                    <!-- 详情信息 -->
+                    <div class="profile-info">
+                        <div class="profile-name-row">
+                            <span class="profile-name">${expert.name || '-'}</span>
+                            <span class="verify-badge">👤 ${statusBadgeText}</span>
+                        </div>
+                        <div class="profile-company">${expert.company || '无工作单位记录'}</div>
+                        
+                        <div class="profile-meta-grid">
+                            <div class="meta-item">
+                                <span class="meta-label">🪪 身份证号</span>
+                                <span class="meta-val">${maskIdCard(expert.id_card)}</span>
+                            </div>
+                            <div class="meta-item">
+                                <span class="meta-label">📞 电话号码</span>
+                                <span class="meta-val">${maskPhone(expert.phone)}</span>
+                            </div>
+                            <div class="meta-item">
+                                <span class="meta-label">💼 专家专业</span>
+                                <span class="meta-val"><span class="meta-val-tag">${expert.major || '未填写'}</span></span>
+                            </div>
+                            <div class="meta-item">
+                                <span class="meta-label">📊 参评记录</span>
+                                <span class="meta-val">已参评 <span class="meta-val-count">${count}</span> 次</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+            
+            // 切换占位符和卡片的可见性
+            resultPlaceholder.style.display = 'none';
+            expertCardRoot.style.display = 'block';
+            expertCardRoot.innerHTML = cardHtml.trim();
+        }
+
+        // 修改扫描状态条的指示与颜色样式
+        function updateStatus(type, msg) {
+            statusMessage.innerText = msg;
+            statusIndicator.className = "status-dot";
+            laserLine.style.display = "block";
+            
+            if (type === "scanning") {
+                statusIndicator.style.backgroundColor = "var(--accent-green)";
+                statusIndicator.style.boxShadow = "0 0 8px var(--accent-green)";
+            } else if (type === "searching") {
+                statusIndicator.classList.add("searching");
+                statusIndicator.style.backgroundColor = "#0ea5e9";
+                statusIndicator.style.boxShadow = "0 0 8px #0ea5e9";
+            } else if (type === "success") {
+                statusIndicator.style.backgroundColor = "var(--accent-green)";
+                statusIndicator.style.boxShadow = "0 0 12px var(--accent-green)";
+                laserLine.style.display = "none"; // 成功时暂停上下扫描的光线
+            } else if (type === "error") {
+                statusIndicator.classList.add("error");
+                statusIndicator.style.backgroundColor = "var(--accent-red)";
+                statusIndicator.style.boxShadow = "0 0 8px var(--accent-red)";
+            }
+        }
+
+        // 7. 相机状态控制按钮交互
+        btnToggleScan.addEventListener('click', () => {
+            scanning = !scanning;
+            if (scanning) {
+                btnToggleScan.innerHTML = "<span>⏸️</span> 暂停扫描";
+                btnToggleScan.classList.add('active-scan');
+                updateStatus("scanning", "🔍 正在巡检路过专家人脸...");
+            } else {
+                btnToggleScan.innerHTML = "<span>▶️</span> 开始扫描";
+                btnToggleScan.classList.remove('active-scan');
+                overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+                updateStatus("error", "⏸️ 扫描雷达已暂停运作");
+            }
+        });
+
+        btnSwitchCamera.addEventListener('click', async () => {
+            currentFacingMode = (currentFacingMode === "user") ? "environment" : "user";
+            btnSwitchCamera.innerHTML = `<span>🔄</span> 切换${currentFacingMode === "user" ? "前置镜" : "后置镜"}`;
+            
+            // 切换摄像头时，开启全页面小加载指示
+            loaderOverlay.style.display = "flex";
+            loaderOverlay.style.opacity = 1;
+            loaderStatus.innerText = "正在切换摄像头流...";
+            
+            try {
+                await startCamera();
+                loaderOverlay.style.opacity = 0;
+                setTimeout(() => {
+                    loaderOverlay.style.display = "none";
+                }, 300);
+            } catch (err) {
+                loaderStatus.innerHTML = `<span style="color: #f43f5e;">❌ 切换摄像头失败：${err.message}</span>`;
+            }
+        });
+
+        // 启动执行入口
+        initDetector();
+    </script>
+</body>
+</html>

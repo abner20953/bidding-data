@@ -958,6 +958,17 @@ def experts_view():
     response.headers['Expires'] = '0'
     return response
 
+@experts_bp.route('/sp')
+def experts_sp_view():
+    """实时视频人脸识别签到页面"""
+    _log_action("访问实时视频签到系统", "访问视频页面")
+    from flask import make_response
+    response = make_response(render_template('experts_sp.html'))
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response
+
 @experts_bp.route('/api/upload', methods=['POST'])
 def api_upload():
     """上传并流式解析专家压缩包"""
