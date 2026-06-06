@@ -467,6 +467,61 @@
         .animate-fade-in {
             animation: fadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
         }
+
+        /* 变焦控制滑块容器，悬浮在视频流右侧 */
+        .zoom-slider-container {
+            position: absolute;
+            right: 15px;
+            top: 50%;
+            transform: translateY(-50%);
+            z-index: 10;
+            background: rgba(15, 23, 42, 0.75);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            padding: 14px 10px;
+            border-radius: 20px;
+            border: 1px solid var(--border-glow);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 12px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        }
+
+        .zoom-slider-container input[type="range"] {
+            writing-mode: vertical-lr; /* 垂直排列 */
+            direction: rtl; /* 向上是放大 */
+            height: 140px;
+            width: 6px;
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 3px;
+            outline: none;
+            -webkit-appearance: none;
+            appearance: none;
+        }
+
+        .zoom-slider-container input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: var(--accent-green);
+            box-shadow: 0 0 8px var(--accent-green);
+            cursor: pointer;
+            border: 2px solid #fff;
+            transition: transform 0.1s;
+        }
+
+        .zoom-slider-container input[type="range"]::-webkit-slider-thumb:active {
+            transform: scale(1.25);
+        }
+
+        .zoom-icon {
+            font-size: 16px;
+            color: var(--text-primary);
+            user-select: none;
+        }
     </style>
 </head>
 <body>
@@ -501,6 +556,13 @@
             
             <!-- 用于人脸框定位渲染的透明 Canvas 覆盖层 -->
             <canvas id="canvas-overlay"></canvas>
+
+            <!-- 变焦控制滑块容器，悬浮在视频流右侧 -->
+            <div class="zoom-slider-container" id="zoom-container" style="display: none;">
+                <span class="zoom-icon">➕</span>
+                <input type="range" id="zoom-slider" min="1" max="1" step="0.1" value="1">
+                <span class="zoom-icon">➖</span>
+            </div>
             
             <!-- 扫描提示状态条 -->
             <div class="status-tip-bar">
@@ -565,9 +627,14 @@
         let currentFacingMode = "environment"; // 默认优先使用后置摄像头以便对准外部路过人脸
         let isUploadingFrame = false;
         let lastUploadTime = 0;
-        let uploadCooldown = 2500; // 对同一人比对间隔 2.5 秒，防止超频与资费泄漏
+        let uploadCooldown = 2500; // 对同一个人比对冷却，防止超频与资费泄漏
         let activeStream = null;
         
+        // 变焦控制全局变量
+        let isPhysicalZoom = false; // 是否为物理硬件变焦
+        let currentZoomValue = 1.0; // 当前变焦倍率 (1.0 ~ 3.0)
+        let videoTrack = null;      // 当前运行的视频轨道轨道对象
+
         // 人脸追踪防抖辅助
         let faceStableFrames = 0;
         let lastFaceBox = null;
@@ -580,7 +647,7 @@
         // 空间追踪器，用于在连续帧中关联已识别的专家 (Map: id_card -> { expert, score, timestamp, lastBox, lostFrames })
         const activeTrackedExperts = new Map();
 
-        // 计算两个矩形框中心点距离 (640x480分辨率下，小脸及中等距离下，小于 90 像素通常判定为同一人)
+        // 计算两个矩形框中心点距离
         function getCenterDistance(boxA, boxB) {
             const cxA = boxA.originX + boxA.width / 2;
             const cyA = boxA.originY + boxA.height / 2;
@@ -594,6 +661,99 @@
             const cyB = by + bh / 2;
             
             return Math.sqrt((cxA - cxB) ** 2 + (cyA - cyB) ** 2);
+        }
+
+        // 统一更新视频与 Canvas 覆盖层的镜像与缩放效果 (支持物理/数字变焦)
+        function updateVideoZoomTransform() {
+            // 物理变焦时，视觉上保持 1.0 倍即可，摄像头会自动调焦；如果是数字变焦，视觉上放大对应倍数
+            const visualZoom = isPhysicalZoom ? 1.0 : currentZoomValue;
+            
+            // 镜像因子 (前置镜像，后置不镜像)
+            const mirror = currentFacingMode === "environment" ? 1 : -1;
+            
+            video.style.transform = `scale(${visualZoom}) scaleX(${mirror})`;
+            overlayCanvas.style.transform = `scale(${visualZoom}) scaleX(${mirror})`;
+        }
+
+        // 初始化变焦控制条 (支持物理/数字变焦)
+        function setupZoomControl() {
+            const zoomContainer = document.getElementById('zoom-container');
+            const zoomSlider = document.getElementById('zoom-slider');
+            if (!zoomContainer || !zoomSlider) return;
+
+            let capabilities = {};
+            try {
+                capabilities = (videoTrack && typeof videoTrack.getCapabilities === 'function') ? videoTrack.getCapabilities() : {};
+            } catch (e) {
+                console.warn("无法获取摄像头属性，启用兼容性数字变焦", e);
+            }
+
+            // 检查物理变焦支持
+            if (capabilities.zoom) {
+                isPhysicalZoom = true;
+                const min = capabilities.zoom.min || 1;
+                const max = capabilities.zoom.max || 3;
+                const step = capabilities.zoom.step || 0.1;
+                
+                zoomSlider.min = min;
+                zoomSlider.max = max;
+                zoomSlider.step = step;
+                
+                // 读取当前值或默认值
+                let currVal = 1;
+                try {
+                    const settings = videoTrack.getSettings();
+                    currVal = settings.zoom || min;
+                } catch(e) {
+                    currVal = min;
+                }
+                currentZoomValue = currVal;
+                zoomSlider.value = currVal;
+                
+                zoomContainer.style.display = "flex";
+                console.log(`物理变焦就绪: 范围 [${min}, ${max}], 步长 ${step}, 当前值 ${currVal}`);
+            } else {
+                // 硬件不支持物理变焦，启用兼容性数字变焦
+                isPhysicalZoom = false;
+                
+                // 设置数字变焦范围：1.0 到 3.0 倍，步长 0.1
+                zoomSlider.min = 1.0;
+                zoomSlider.max = 3.0;
+                zoomSlider.step = 0.1;
+                
+                // 保持或重置为 1.0
+                currentZoomValue = Math.min(Math.max(currentZoomValue, 1.0), 3.0);
+                zoomSlider.value = currentZoomValue;
+                
+                zoomContainer.style.display = "flex";
+                console.log(`启用兼容性数字变焦: 范围 [1.0, 3.0], 当前值 ${currentZoomValue}`);
+            }
+
+            // 应用变焦状态
+            applyZoomValue();
+        }
+
+        // 应用变焦值到 Track 或 视觉层
+        async function applyZoomValue() {
+            if (!videoTrack) return;
+            
+            if (isPhysicalZoom) {
+                // 物理变焦：通过 WebRTC applyConstraints 调节焦距
+                try {
+                    await videoTrack.applyConstraints({
+                        advanced: [{ zoom: currentZoomValue }]
+                    });
+                    console.log("物理变焦设置成功:", currentZoomValue);
+                } catch (e) {
+                    console.error("物理变焦设置失败，切换为数字变焦", e);
+                    isPhysicalZoom = false;
+                    applyZoomValue(); // 降级到数字变焦
+                    return;
+                }
+            }
+            
+            // 更新 CSS transform
+            updateVideoZoomTransform();
         }
 
         // 1. 初始化并拉取本地 BlazeFace 人脸检测模型 (仅约 200KB，极速加载)
@@ -622,6 +782,41 @@
                     loaderOverlay.style.display = "none";
                 }, 300);
                 
+                // 绑定变焦 Slider 拖拽与加减点击事件
+                const zoomSlider = document.getElementById('zoom-slider');
+                const zoomContainer = document.getElementById('zoom-container');
+                if (zoomSlider) {
+                    zoomSlider.addEventListener('input', (e) => {
+                        currentZoomValue = parseFloat(e.target.value);
+                        applyZoomValue();
+                    });
+                }
+                if (zoomContainer && zoomSlider) {
+                    const btnZoomIn = zoomContainer.querySelector('.zoom-icon:first-child');
+                    const btnZoomOut = zoomContainer.querySelector('.zoom-icon:last-child');
+                    
+                    if (btnZoomIn) {
+                        btnZoomIn.style.cursor = "pointer";
+                        btnZoomIn.addEventListener('click', () => {
+                            let step = parseFloat(zoomSlider.step) || 0.1;
+                            let max = parseFloat(zoomSlider.max) || 3.0;
+                            currentZoomValue = Math.min(currentZoomValue + step, max);
+                            zoomSlider.value = currentZoomValue;
+                            applyZoomValue();
+                        });
+                    }
+                    if (btnZoomOut) {
+                        btnZoomOut.style.cursor = "pointer";
+                        btnZoomOut.addEventListener('click', () => {
+                            let step = parseFloat(zoomSlider.step) || 0.1;
+                            let min = parseFloat(zoomSlider.min) || 1.0;
+                            currentZoomValue = Math.max(currentZoomValue - step, min);
+                            zoomSlider.value = currentZoomValue;
+                            applyZoomValue();
+                        });
+                    }
+                }
+                
                 // 启动本地帧检测扫描循环
                 window.requestAnimationFrame(detectFrameLoop);
                 
@@ -640,7 +835,7 @@
             const constraints = {
                 video: {
                     facingMode: currentFacingMode,
-                    width: { ideal: 640 }, // 采用最适合移动端的 640*480 尺寸，在带宽占用与识别人脸精度间取得完美平衡
+                    width: { ideal: 640 }, // 采用最适合移动端的 640*480 尺寸
                     height: { ideal: 480 }
                 },
                 audio: false
@@ -655,13 +850,14 @@
                     overlayCanvas.width = video.videoWidth;
                     overlayCanvas.height = video.videoHeight;
                     
-                    // 修正切换后置镜头时的镜像效果
-                    if (currentFacingMode === "environment") {
-                        video.style.transform = "scaleX(1)";
-                        overlayCanvas.style.transform = "scaleX(1)";
+                    // 获取当前轨道的 Track 并初始化变焦控制
+                    const tracks = activeStream.getVideoTracks();
+                    if (tracks.length > 0) {
+                        videoTrack = tracks[0];
+                        setupZoomControl();
                     } else {
-                        video.style.transform = "scaleX(-1)";
-                        overlayCanvas.style.transform = "scaleX(-1)";
+                        videoTrack = null;
+                        updateVideoZoomTransform();
                     }
                 };
             } catch (err) {
@@ -680,9 +876,26 @@
             if (video.readyState === video.HAVE_ENOUGH_DATA && video.currentTime !== lastVideoTime) {
                 lastVideoTime = video.currentTime;
                 
-                // 本地极速人脸框提取 (10-15ms 即可完成)
                 const startTimeMs = performance.now();
-                const detections = faceDetector.detectForVideo(video, startTimeMs).detections;
+                
+                let detectionInput = video;
+                // 如果是数字变焦状态且倍数大于 1.0，则将截取放大后的 Canvas 送入 MediaPipe
+                if (!isPhysicalZoom && currentZoomValue > 1.0) {
+                    const sWidth = video.videoWidth / currentZoomValue;
+                    const sHeight = video.videoHeight / currentZoomValue;
+                    const sx = (video.videoWidth - sWidth) / 2;
+                    const sy = (video.videoHeight - sHeight) / 2;
+                    
+                    hiddenCanvas.width = video.videoWidth;
+                    hiddenCanvas.height = video.videoHeight;
+                    
+                    hiddenCtx.clearRect(0, 0, hiddenCanvas.width, hiddenCanvas.height);
+                    hiddenCtx.drawImage(video, sx, sy, sWidth, sHeight, 0, 0, video.videoWidth, video.videoHeight);
+                    detectionInput = hiddenCanvas;
+                }
+                
+                // 本地极速人脸框提取 (10-15ms 即可完成)
+                const detections = faceDetector.detectForVideo(detectionInput, startTimeMs).detections;
                 
                 // 绘制定位框并检测是否有符合距离门槛的新人脸
                 const hasNewFace = processDetections(detections);
@@ -862,10 +1075,22 @@
             lastUploadTime = Date.now();
             updateStatus("searching", "正在核对云端人脸特征库...");
             
-            // 利用 canvas 提取当前帧
+            // 利用 canvas 提取当前帧 (适配物理与数字变焦)
             hiddenCanvas.width = video.videoWidth;
             hiddenCanvas.height = video.videoHeight;
-            hiddenCtx.drawImage(video, 0, 0, video.videoWidth, video.videoHeight);
+            hiddenCtx.clearRect(0, 0, hiddenCanvas.width, hiddenCanvas.height);
+            
+            if (isPhysicalZoom || currentZoomValue === 1.0) {
+                // 物理变焦或无变焦时直接截取整幅画面
+                hiddenCtx.drawImage(video, 0, 0, video.videoWidth, video.videoHeight);
+            } else {
+                // 数字变焦时，在 canvas 上提取中心区域进行裁剪拉伸
+                const sWidth = video.videoWidth / currentZoomValue;
+                const sHeight = video.videoHeight / currentZoomValue;
+                const sx = (video.videoWidth - sWidth) / 2;
+                const sy = (video.videoHeight - sHeight) / 2;
+                hiddenCtx.drawImage(video, sx, sy, sWidth, sHeight, 0, 0, video.videoWidth, video.videoHeight);
+            }
             
             // 将截取图以 0.85 质量压缩为低分辨率 jpeg，节省 90% 室外上行带宽流量
             const base64Data = hiddenCanvas.toDataURL('image/jpeg', 0.85);
