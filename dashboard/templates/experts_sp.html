@@ -653,15 +653,15 @@
                 const startTimeMs = performance.now();
                 const detections = faceDetector.detectForVideo(video, startTimeMs).detections;
                 
-                // 绘制定位框并获取最优人脸
-                const targetFace = processDetections(detections);
+                // 绘制定位框并检测是否有符合距离门槛的人脸
+                const hasValidFace = processDetections(detections);
                 
                 // 4. 初筛决策关卡：当且仅当出现“足够大且位置稳定”的清晰人脸时，才会触发上传！
-                if (targetFace && !isUploadingFrame) {
+                if (hasValidFace && !isUploadingFrame) {
                     const now = Date.now();
-                    // 门槛设定：人脸宽度必须大于 85 像素且未处于接口冷却期间，实现无感初筛防频发
-                    if (targetFace.width >= 85 && (now - lastUploadTime > uploadCooldown)) {
-                        triggerCloudMatch(targetFace);
+                    // 门槛设定：当前画面中有符合条件的人脸，且未处于接口冷却期间，实现无感初筛防频发
+                    if (now - lastUploadTime > uploadCooldown) {
+                        triggerCloudMatch();
                     }
                 }
             }
@@ -680,50 +680,42 @@
                 }
                 faceStableFrames = 0;
                 lastFaceBox = null;
-                return null;
+                return false;
             }
 
-            // 我们只对画面中最大、最近的那张人脸进行签到分析
-            let mainFace = null;
-            let maxArea = 0;
+            let hasValidFace = false;
 
             for (const det of detections) {
                 const box = det.boundingBox;
-                const area = box.width * box.height;
-                if (area > maxArea) {
-                    maxArea = area;
-                    mainFace = box;
-                }
                 
-                // 绘制其他人脸的外框为细灰框
-                drawFaceRect(overlayCtx, box.originX, box.originY, box.width, box.height, "rgba(255, 255, 255, 0.25)", 1);
+                // 检查尺寸大小是否符合“足够识别”的清晰门槛 (宽度大于 45 像素，支持较远距离)
+                const isLargeEnough = box.width >= 45;
+                let strokeColor = "rgba(239, 68, 68, 0.7)"; // 太远/太模糊显示为警告红色框
+                let labelText = `⚠️ 请靠近一点 (宽: ${Math.round(box.width)}px)...`;
+
+                if (isLargeEnough) {
+                    strokeColor = "rgba(16, 185, 129, 0.9)"; // 符合距离条件显示为亮绿色框
+                    labelText = `🎯 聚焦人脸中 [宽: ${Math.round(box.width)}px]...`;
+                    hasValidFace = true;
+                }
+
+                if (isUploadingFrame) {
+                    strokeColor = "rgba(14, 165, 233, 0.9)"; // 正在云端比对时显示为蓝色框
+                    labelText = "⚡ 正在云端核验专家库...";
+                }
+
+                // 绘制主锁定人脸的高亮框和距离提示文字
+                drawFaceRect(overlayCtx, box.originX, box.originY, box.width, box.height, strokeColor, 3);
+                drawTextLabel(overlayCtx, labelText, box.originX, box.originY - 10, strokeColor);
             }
 
-            if (!mainFace) return null;
-
-            // 检查尺寸大小是否符合“足够识别”的清晰门槛 (宽度大于 85 像素)
-            const isLargeEnough = mainFace.width >= 85;
-            let strokeColor = "rgba(239, 68, 68, 0.7)"; // 太远/太模糊显示为警告红色框
-            let labelText = "⚠️ 请走近一点...";
-
-            if (isLargeEnough) {
-                strokeColor = "rgba(16, 185, 129, 0.9)"; // 符合距离条件显示为亮绿色框
-                labelText = "🎯 聚焦人脸中...";
+            if (hasValidFace) {
                 faceStableFrames++;
             } else {
                 faceStableFrames = 0;
             }
 
-            if (isUploadingFrame) {
-                strokeColor = "rgba(14, 165, 233, 0.9)"; // 正在云端比对时显示为蓝色框
-                labelText = "⚡ 正在云端核验专家库...";
-            }
-
-            // 绘制主锁定人脸的高亮框和距离提示文字
-            drawFaceRect(overlayCtx, mainFace.originX, mainFace.originY, mainFace.width, mainFace.height, strokeColor, 3);
-            drawTextLabel(overlayCtx, labelText, mainFace.originX, mainFace.originY - 10, strokeColor);
-
-            return mainFace;
+            return hasValidFace;
         }
 
         // 绘制人脸矩形边角效果的助手函数 (体现炫酷科技感)
@@ -779,8 +771,8 @@
             ctx.fillText(text, x, y);
         }
 
-        // 5. 触发云端人脸比对 (捕获当前帧并 POST)
-        function triggerCloudMatch(faceBox) {
+        // 5. 触发云端人脸比对 (捕获当前帧并 POST，支持识别并签到最多 5 人)
+        function triggerCloudMatch() {
             isUploadingFrame = true;
             lastUploadTime = Date.now();
             updateStatus("searching", "正在核对云端人脸特征库...");
@@ -798,23 +790,23 @@
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ 
                     image: base64Data,
-                    max_face_num: 1,  // 每次只识别主路过人
+                    max_face_num: 5,  // 修改为 5，支持同时识别最多 5 个人
                     search_mode: 'speed' // 速度优先
                 })
             })
             .then(r => r.json())
             .then(res => {
                 isUploadingFrame = false;
-                if (res.success && res.found && res.results && res.results.length > 0) {
-                    const bestMatch = res.results[0];
-                    renderExpertProfile(bestMatch.expert, bestMatch.score);
+                if (res.success && res.results && res.results.length > 0) {
+                    renderExpertProfilesList(res.results);
                     
                     // 物理震动反馈 (振动 120ms，提示签到员已经成功匹配到人)
                     if (navigator.vibrate) {
                         navigator.vibrate(120);
                     }
                     
-                    updateStatus("success", `✅ 签到成功：${bestMatch.expert.name} (${bestMatch.score.toFixed(1)}%)`);
+                    const names = res.results.map(r => r.expert.name).join(', ');
+                    updateStatus("success", `✅ 签到成功：${names}`);
                 } else {
                     updateStatus("error", "⚠️ 未匹配到登记的专家档案");
                 }
@@ -826,8 +818,8 @@
             });
         }
 
-        // 6. 脱敏处理敏感数据并动态渲染卡片 (姓名、单位、专业、打码遮盖后的身份证和手机)
-        function renderExpertProfile(expert, score) {
+        // 6. 脱敏处理敏感数据并动态渲染多个专家卡片 (支持多专家同时签到展示)
+        function renderExpertProfilesList(results) {
             // 对身份证中段与手机号进行数据脱敏
             const maskIdCard = (id) => {
                 if (!id || id.length < 10) return "-";
@@ -841,52 +833,57 @@
                 return ph.slice(0, 3) + "****" + ph.slice(-4);
             };
 
-            const photos = expert.photo_path ? expert.photo_path.split(',') : [];
-            const avatarUrl = (photos.length > 0) ? photos[0].trim() : "/static/uploads/expert_photos/placeholder.jpg";
-            
-            const count = expert.project_count || 0;
-            const statusBadgeText = score >= 70 ? `核验成功 ${score.toFixed(1)}%` : `疑似匹配 ${score.toFixed(1)}%`;
-            
-            const cardHtml = `
-                <div class="expert-profile-card">
-                    <!-- 头像 -->
-                    <div class="profile-avatar-wrapper">
-                        <img src="${avatarUrl}" class="profile-avatar" onerror="this.src=''">
-                    </div>
-                    <!-- 详情信息 -->
-                    <div class="profile-info">
-                        <div class="profile-name-row">
-                            <span class="profile-name">${expert.name || '-'}</span>
-                            <span class="verify-badge">👤 ${statusBadgeText}</span>
+            let listHtml = "";
+
+            for (const item of results) {
+                const expert = item.expert;
+                const score = item.score;
+                const photos = expert.photo_path ? expert.photo_path.split(',') : [];
+                const avatarUrl = (photos.length > 0) ? photos[0].trim() : "/static/uploads/expert_photos/placeholder.jpg";
+                const count = expert.project_count || 0;
+                const statusBadgeText = score >= 70 ? `核验成功 ${score.toFixed(1)}%` : `疑似匹配 ${score.toFixed(1)}%`;
+
+                listHtml += `
+                    <div class="expert-profile-card" style="margin-bottom: 15px;">
+                        <!-- 头像 -->
+                        <div class="profile-avatar-wrapper">
+                            <img src="${avatarUrl}" class="profile-avatar" onerror="this.src=''">
                         </div>
-                        <div class="profile-company">${expert.company || '无工作单位记录'}</div>
-                        
-                        <div class="profile-meta-grid">
-                            <div class="meta-item">
-                                <span class="meta-label">🪪 身份证号</span>
-                                <span class="meta-val">${maskIdCard(expert.id_card)}</span>
+                        <!-- 详情信息 -->
+                        <div class="profile-info">
+                            <div class="profile-name-row">
+                                <span class="profile-name">${expert.name || '-'}</span>
+                                <span class="verify-badge">👤 ${statusBadgeText}</span>
                             </div>
-                            <div class="meta-item">
-                                <span class="meta-label">📞 电话号码</span>
-                                <span class="meta-val">${maskPhone(expert.phone)}</span>
-                            </div>
-                            <div class="meta-item">
-                                <span class="meta-label">💼 专家专业</span>
-                                <span class="meta-val"><span class="meta-val-tag">${expert.major || '未填写'}</span></span>
-                            </div>
-                            <div class="meta-item">
-                                <span class="meta-label">📊 参评记录</span>
-                                <span class="meta-val">已参评 <span class="meta-val-count">${count}</span> 次</span>
+                            <div class="profile-company">${expert.company || '无工作单位记录'}</div>
+                            
+                            <div class="profile-meta-grid">
+                                <div class="meta-item">
+                                    <span class="meta-label">🪪 身份证号</span>
+                                    <span class="meta-val">${maskIdCard(expert.id_card)}</span>
+                                </div>
+                                <div class="meta-item">
+                                    <span class="meta-label">📞 电话号码</span>
+                                    <span class="meta-val">${maskPhone(expert.phone)}</span>
+                                </div>
+                                <div class="meta-item">
+                                    <span class="meta-label">💼 专家专业</span>
+                                    <span class="meta-val"><span class="meta-val-tag">${expert.major || '未填写'}</span></span>
+                                </div>
+                                <div class="meta-item">
+                                    <span class="meta-label">📊 参评记录</span>
+                                    <span class="meta-val">已参评 <span class="meta-val-count">${count}</span> 次</span>
+                                </div>
                             </div>
                         </div>
                     </div>
-                </div>
-            `;
+                `;
+            }
             
             // 切换占位符和卡片的可见性
             resultPlaceholder.style.display = 'none';
             expertCardRoot.style.display = 'block';
-            expertCardRoot.innerHTML = cardHtml.trim();
+            expertCardRoot.innerHTML = listHtml.trim();
         }
 
         // 修改扫描状态条的指示与颜色样式
