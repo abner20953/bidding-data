@@ -1124,8 +1124,8 @@
             sWidth = Math.min(videoElement.videoWidth - sx, sWidth);
             sHeight = Math.min(videoElement.videoHeight - sy, sHeight);
             
-            tempCanvas.width = 160;
-            tempCanvas.height = 160;
+            tempCanvas.width = 320;
+            tempCanvas.height = 320;
             
             // 数字变焦模式下的源画面来自经过数字裁剪放大的全局 hiddenCanvas，物理变焦则直接来自 video
             let sourceImage = videoElement;
@@ -1137,7 +1137,7 @@
             tempCtx.drawImage(
                 sourceImage, 
                 sx, sy, sWidth, sHeight, 
-                0, 0, 160, 160
+                0, 0, 320, 320
             );
             
             // 压缩 jpeg 格式
