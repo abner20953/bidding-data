@@ -644,8 +644,9 @@
         const recognizedExperts = new Map();
         const REDUPLICATE_WINDOW = 60 * 1000; // 60秒防重有效期
 
-        // 空间追踪器，用于在连续帧中关联已识别的专家 (Map: id_card -> { expert, score, timestamp, lastBox, lostFrames })
-        const activeTrackedExperts = new Map();
+        // 本地多人脸追踪器 (Local Multi-Face Tracker)
+        let nextTrackId = 1;
+        const activeTracks = new Map(); // Map: local_track_id -> Track对象
 
         // 计算两个矩形框中心点距离
         function getCenterDistance(boxA, boxB) {
@@ -870,148 +871,138 @@
         async function detectFrameLoop() {
             if (!scanning) {
                 window.requestAnimationFrame(detectFrameLoop);
-                return;
-            }
-
-            if (video.readyState === video.HAVE_ENOUGH_DATA && video.currentTime !== lastVideoTime) {
-                lastVideoTime = video.currentTime;
-                
-                const startTimeMs = performance.now();
-                
-                let detectionInput = video;
-                // 如果是数字变焦状态且倍数大于 1.0，则将截取放大后的 Canvas 送入 MediaPipe
-                if (!isPhysicalZoom && currentZoomValue > 1.0) {
-                    const sWidth = video.videoWidth / currentZoomValue;
-                    const sHeight = video.videoHeight / currentZoomValue;
-                    const sx = (video.videoWidth - sWidth) / 2;
-                    const sy = (video.videoHeight - sHeight) / 2;
-                    
-                    hiddenCanvas.width = video.videoWidth;
-                    hiddenCanvas.height = video.videoHeight;
-                    
-                    hiddenCtx.clearRect(0, 0, hiddenCanvas.width, hiddenCanvas.height);
-                    hiddenCtx.drawImage(video, sx, sy, sWidth, sHeight, 0, 0, video.videoWidth, video.videoHeight);
-                    detectionInput = hiddenCanvas;
-                }
-                
-                // 本地极速人脸框提取 (10-15ms 即可完成)
-                const detections = faceDetector.detectForVideo(detectionInput, startTimeMs).detections;
-                
-                // 绘制定位框并检测是否有符合距离门槛的新人脸
-                const hasNewFace = processDetections(detections);
-                
-                // 4. 初筛决策关卡：只有当画面中出现了未识别的新面孔（且满足像素大小）时，才会发起接口请求！
-                if (hasNewFace && !isUploadingFrame) {
-                    const now = Date.now();
-                    // 门槛设定：冷却期过后触发一次整帧的云端多脸匹配，省流量抗频发
-                    if (now - lastUploadTime > uploadCooldown) {
-                        triggerCloudMatch();
-                    }
-                }
-            }
-
-            window.requestAnimationFrame(detectFrameLoop);
-        }
-
-        // 绘制本地人脸框定位线并执行大小初筛与实时位置追踪 (防抖与防重请求)
+                // 绘制本地人脸框定位线并执行大小初筛与实时位置追踪 (防抖与防重请求)
         function processDetections(detections) {
             // 清空上一帧的 Canvas
             overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
             
+            const now = Date.now();
+            
             if (!detections || detections.length === 0) {
-                if (!isUploadingFrame) {
-                    updateStatus("scanning", "🔍 正在巡检路过专家人脸...");
-                }
-                faceStableFrames = 0;
-                lastFaceBox = null;
-                
-                // 所有人脸丢失，增加所有活跃追踪专家的丢失帧数
-                for (const [id_card, tracked] of activeTrackedExperts.entries()) {
-                    tracked.lostFrames++;
-                    if (tracked.lostFrames > 30) { // 丢失超过 30 帧 (约 1 秒) 认为已彻底离开画面
-                        activeTrackedExperts.delete(id_card);
+                // 所有人脸丢失，将所有活跃追踪的 lostFrames 递增
+                for (const [trackId, track] of activeTracks.entries()) {
+                    track.lostFrames++;
+                    if (track.lostFrames > 30) { // 丢失超过 30 帧 (约 1 秒) 认为已彻底离开画面
+                        activeTracks.delete(trackId);
                     }
                 }
+                
+                // 仅在没有正在上传的帧时，更新状态文字
+                let isAnyMatching = Array.from(activeTracks.values()).some(t => t.status === 'matching');
+                if (!isAnyMatching) {
+                    updateStatus("scanning", "🔍 正在巡检路过专家人脸...");
+                }
+                
+                faceStableFrames = 0;
+                lastFaceBox = null;
                 return false;
             }
 
-            let hasNewValidFace = false;
-            const matchedTrackedKeys = new Set(); // 记录本帧中成功关联上的追踪专家 ID
+            const matchedTrackIds = new Set();
 
             for (const det of detections) {
                 const box = det.boundingBox;
                 
-                // 1. 尝试将当前人脸框与活跃追踪中的已识别专家进行空间位置关联
-                let associatedExpert = null;
+                // 1. 尝试在 activeTracks 中寻找本帧人脸最契合的 Track
+                let matchedTrack = null;
                 let minDistance = 9999;
                 
-                for (const [id_card, tracked] of activeTrackedExperts.entries()) {
-                    const dist = getCenterDistance(box, tracked.lastBox);
-                    if (dist < 90 && dist < minDistance) { // 设定 90 像素为空间关联半径
+                for (const [trackId, track] of activeTracks.entries()) {
+                    const dist = getCenterDistance(box, track.lastBox);
+                    // 设定 80 像素为中心距离关联半径，且框宽高变化不能过大 (例如不超过 1.8 倍)
+                    const sizeRatio = Math.max(box.width / track.lastBox.width, track.lastBox.width / box.width);
+                    if (dist < 80 && sizeRatio < 1.8 && dist < minDistance) {
                         minDistance = dist;
-                        associatedExpert = tracked;
+                        matchedTrack = track;
                     }
                 }
 
-                if (associatedExpert) {
-                    // 2.1 成功关联：此人脸为已识别专家，仅更新位置，不重复发起识别请求
-                    const expert = associatedExpert.expert;
-                    associatedExpert.lastBox = {
-                        x: box.originX,
-                        y: box.originY,
+                // 2. 如果匹配上，更新其属性并继承 local_track_id
+                if (matchedTrack) {
+                    matchedTrack.lastBox = {
+                        originX: box.originX,
+                        originY: box.originY,
                         width: box.width,
                         height: box.height
                     };
-                    associatedExpert.lostFrames = 0;
-                    matchedTrackedKeys.add(expert.id_card);
-                    
-                    let strokeColor = "rgba(16, 185, 129, 0.9)"; // 亮绿色
-                    let labelText = `🎯 ${expert.name} (已签到)`;
-                    
-                    if (isUploadingFrame) {
-                        strokeColor = "rgba(14, 165, 233, 0.9)"; // 正在上传其他面孔时显示为蓝色
-                    }
-
-                    // 绘制高亮追踪框
-                    drawFaceRect(overlayCtx, box.originX, box.originY, box.width, box.height, strokeColor, 3);
-                    drawTextLabel(overlayCtx, labelText, box.originX, box.originY - 10, strokeColor);
+                    matchedTrack.lostFrames = 0;
+                    matchedTrack.lastSeen = now;
+                    matchedTrackIds.add(matchedTrack.id);
                 } else {
-                    // 2.2 关联失败：这是一个未识别的新面孔
-                    const isLargeEnough = box.width >= 45;
-                    let strokeColor = "rgba(239, 68, 68, 0.7)"; // 太远/太模糊显示为警告红色框
-                    let labelText = `⚠️ 请靠近一点 (宽: ${Math.round(box.width)}px)...`;
+                    // 3. 匹配失败，分配一个新的 local_track_id 并加入追踪字典
+                    const newTrackId = nextTrackId++;
+                    matchedTrack = {
+                        id: newTrackId,
+                        lastBox: {
+                            originX: box.originX,
+                            originY: box.originY,
+                            width: box.width,
+                            height: box.height
+                        },
+                        lostFrames: 0,
+                        lastSeen: now,
+                        status: 'detected', // 'detected', 'matching', 'success', 'failed'
+                        expert: null,
+                        score: 0,
+                        failCooldown: 0,
+                        successCooldown: 0
+                    };
+                    activeTracks.set(newTrackId, matchedTrack);
+                    matchedTrackIds.add(newTrackId);
+                    console.log(`[Tracker] 发现新目标，分配 local_track_id: ${newTrackId}`);
+                }
 
-                    if (isLargeEnough) {
-                        strokeColor = "rgba(234, 179, 8, 0.9)"; // 新面孔且满足大小，显示黄色聚焦框
-                        labelText = `⚡ 聚焦新面孔 [宽: ${Math.round(box.width)}px]...`;
-                        hasNewValidFace = true; // 标记存在需要识别的新面孔
+                // 4. 根据 Track 当前状态渲染不同颜色和样式的追踪框
+                let strokeColor = "rgba(234, 179, 8, 0.9)"; // 默认黄色 (检测到，待比对)
+                let labelText = `⚡ 聚焦新面孔 [ID: ${matchedTrack.id}]...`;
+
+                if (matchedTrack.status === 'success') {
+                    // 已识别成功，显示绿色，展示专家姓名
+                    strokeColor = "rgba(16, 185, 129, 0.9)";
+                    labelText = `🎯 专家: ${matchedTrack.expert.name} (已核验)`;
+                } else if (matchedTrack.status === 'matching') {
+                    // 正在进行云端比对，显示蓝色虚线框
+                    strokeColor = "rgba(14, 165, 233, 0.9)";
+                    labelText = `⏳ 正在比对 [ID: ${matchedTrack.id}]...`;
+                } else if (matchedTrack.status === 'failed') {
+                    // 识别失败，且在 4 秒冷却内，显示红色或灰色
+                    if (now < matchedTrack.failCooldown) {
+                        strokeColor = "rgba(239, 68, 68, 0.6)";
+                        labelText = `⚠️ 匹配失败 [ID: ${matchedTrack.id}] (冷却中)`;
+                    } else {
+                        // 冷却期过了，恢复检测状态
+                        matchedTrack.status = 'detected';
                     }
+                }
 
-                    if (isUploadingFrame) {
-                        strokeColor = "rgba(14, 165, 233, 0.9)";
-                        labelText = "⚡ 正在云端核验专家库...";
+                // 如果虽然是新面孔，但尺寸太小，显示橙色提示请靠近
+                if (matchedTrack.status === 'detected' && box.width < 45) {
+                    strokeColor = "rgba(249, 115, 22, 0.7)"; // 橙色
+                    labelText = `⚠️ 请靠近一点 (宽: ${Math.round(box.width)}px)...`;
+                }
+
+                // 在覆盖 Canvas 上绘制雷达样式矩形框
+                drawFaceRect(overlayCtx, box.originX, box.originY, box.width, box.height, strokeColor, matchedTrack.status === 'matching' ? 2 : 3);
+                drawTextLabel(overlayCtx, labelText, box.originX, box.originY - 10, strokeColor);
+            }
+
+            // 5. 清理已经丢失超过 30 帧的 Tracks (已离开画面)
+            for (const [trackId, track] of activeTracks.entries()) {
+                if (!matchedTrackIds.has(trackId)) {
+                    track.lostFrames++;
+                    if (track.lostFrames > 30) {
+                        activeTracks.delete(trackId);
+                        console.log(`[Tracker] 目标离开画面，移除 local_track_id: ${trackId}`);
                     }
-
-                    drawFaceRect(overlayCtx, box.originX, box.originY, box.width, box.height, strokeColor, 3);
-                    drawTextLabel(overlayCtx, labelText, box.originX, box.originY - 10, strokeColor);
                 }
             }
 
-            // 3. 处理本帧中未成功匹配的追踪专家 (可能已离场)
-            for (const [id_card, tracked] of activeTrackedExperts.entries()) {
-                if (!matchedTrackedKeys.has(id_card)) {
-                    tracked.lostFrames++;
-                    if (tracked.lostFrames > 30) {
-                        activeTrackedExperts.delete(id_card);
-                    }
-                }
-            }
-
-            if (hasNewValidFace) {
-                faceStableFrames++;
-            } else {
-                faceStableFrames = 0;
-            }
+            // 判断当前帧是否包含至少一个“等待识别且人脸宽度符合要求”的新面孔
+            const hasNewValidFace = Array.from(activeTracks.values()).some(track => {
+                const isCooldown = track.status === 'failed' && now < track.failCooldown;
+                const isSuccess = track.status === 'success' && now < track.successCooldown;
+                return track.status === 'detected' && track.lastBox.width >= 45 && !isCooldown && !isSuccess;
+            });
 
             return hasNewValidFace;
         }
@@ -1069,101 +1060,159 @@
             ctx.fillText(text, x, y);
         }
 
-        // 5. 触发云端人脸比对 (捕获当前帧并 POST，支持识别并签到最多 5 人)
-        function triggerCloudMatch() {
-            isUploadingFrame = true;
-            lastUploadTime = Date.now();
-            updateStatus("searching", "正在核对云端人脸特征库...");
+        // 人脸图像裁剪助手函数 (扩增人脸框 30%，保留额头与下巴， resize 至 160x160 标准大小)
+        function cropFaceImage(videoElement, box) {
+            const tempCanvas = document.createElement('canvas');
+            const tempCtx = tempCanvas.getContext('2d');
             
-            // 利用 canvas 提取当前帧 (适配物理与数字变焦)
-            hiddenCanvas.width = video.videoWidth;
-            hiddenCanvas.height = video.videoHeight;
-            hiddenCtx.clearRect(0, 0, hiddenCanvas.width, hiddenCanvas.height);
+            // 推荐方案：向外扩增 30% 保护人脸边界
+            const zoomFactor = 0.3;
+            const dx = box.width * zoomFactor;
+            const dy = box.height * zoomFactor;
             
-            if (isPhysicalZoom || currentZoomValue === 1.0) {
-                // 物理变焦或无变焦时直接截取整幅画面
-                hiddenCtx.drawImage(video, 0, 0, video.videoWidth, video.videoHeight);
-            } else {
-                // 数字变焦时，在 canvas 上提取中心区域进行裁剪拉伸
-                const sWidth = video.videoWidth / currentZoomValue;
-                const sHeight = video.videoHeight / currentZoomValue;
-                const sx = (video.videoWidth - sWidth) / 2;
-                const sy = (video.videoHeight - sHeight) / 2;
-                hiddenCtx.drawImage(video, sx, sy, sWidth, sHeight, 0, 0, video.videoWidth, video.videoHeight);
+            let sx = box.originX - dx;
+            let sy = box.originY - dy;
+            let sWidth = box.width + 2 * dx;
+            let sHeight = box.height + 2 * dy;
+            
+            // 边缘溢出保护
+            sx = Math.max(0, sx);
+            sy = Math.max(0, sy);
+            sWidth = Math.min(videoElement.videoWidth - sx, sWidth);
+            sHeight = Math.min(videoElement.videoHeight - sy, sHeight);
+            
+            tempCanvas.width = 160;
+            tempCanvas.height = 160;
+            
+            // 数字变焦模式下的源画面来自经过数字裁剪放大的全局 hiddenCanvas，物理变焦则直接来自 video
+            let sourceImage = videoElement;
+            if (!isPhysicalZoom && currentZoomValue > 1.0) {
+                sourceImage = hiddenCanvas;
             }
             
-            // 将截取图以 0.85 质量压缩为低分辨率 jpeg，节省 90% 室外上行带宽流量
-            const base64Data = hiddenCanvas.toDataURL('image/jpeg', 0.85);
+            // 裁剪绘制到 tempCanvas
+            tempCtx.drawImage(
+                sourceImage, 
+                sx, sy, sWidth, sHeight, 
+                0, 0, 160, 160
+            );
+            
+            // 压缩 jpeg 格式
+            return tempCanvas.toDataURL('image/jpeg', 0.85);
+        }
 
-            fetch('/dlsgzs/api/face/search', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ 
-                    image: base64Data,
-                    max_face_num: 5,  // 支持同时识别最多 5 个人
-                    search_mode: 'speed' // 速度优先
-                })
-            })
-            .then(r => r.json())
-            .then(res => {
-                isUploadingFrame = false;
-                if (res.success && res.results && res.results.length > 0) {
-                    const nowTime = Date.now();
-                    const newMatches = [];
+        // 5. 触发云端人脸比对 (由原来的整帧上传优化为：对多目标精准裁剪头像、独立并发 API 请求与防重追踪)
+        function triggerCloudMatch() {
+            const now = Date.now();
+            
+            // 1. 筛选出本帧所有符合检测尺寸且没有处于比对或冷却期中的目标 Track
+            const tracksToIdentify = [];
+            for (const track of activeTracks.values()) {
+                if (track.status === 'detected' && track.lastBox.width >= 45) {
+                    const isFailCooldown = track.status === 'failed' && now < track.failCooldown;
+                    const isSuccessCooldown = track.status === 'success' && now < track.successCooldown;
                     
-                    // 遍历腾讯云比对回来的结果
-                    for (const item of res.results) {
-                        const expert = item.expert;
-                        const score = item.score;
+                    if (!isFailCooldown && !isSuccessCooldown) {
+                        tracksToIdentify.push(track);
+                    }
+                }
+            }
+
+            if (tracksToIdentify.length === 0) {
+                return;
+            }
+
+            isUploadingFrame = true;
+            lastUploadTime = now;
+            updateStatus("searching", `正在核验 ${tracksToIdentify.length} 个新面孔...`);
+
+            // 2. 并发对每个目标进行头像裁剪和 API 请求
+            tracksToIdentify.forEach(track => {
+                track.status = 'matching'; // 标记该目标正在比对中
+                
+                // 精准裁剪人脸小图 (大小仅几 KB，极速上传，省下 95% 带宽)
+                const faceBase64 = cropFaceImage(video, track.lastBox);
+                
+                fetch('/dlsgzs/api/face/search', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ 
+                        image: faceBase64,
+                        max_face_num: 1,      // 已经是单人裁剪图，只需查找 1 个结果
+                        search_mode: 'speed'   // 速度优先
+                    })
+                })
+                .then(r => r.json())
+                .then(res => {
+                    const nowTime = Date.now();
+                    
+                    // 检查活跃的 tracks 中是否还存在该目标 (防止请求返回期间人已离场)
+                    if (!activeTracks.has(track.id)) {
+                        console.log(`[Tracker] 目标 ID ${track.id} 已离场，丢弃识别结果`);
+                        checkUploadFinished();
+                        return;
+                    }
+
+                    if (res.success && res.results && res.results.length > 0 && res.results[0].score >= 80.0) {
+                        const match = res.results[0];
+                        const expert = match.expert;
+                        const score = match.score;
                         const idCard = expert.id_card;
-                        const faceRect = item.face_rect; // 腾讯云在原图上的绝对定位坐标
-                        
-                        // 业务规则：如果匹配率达到 80% 以上，认为高置信度核验通过，享受防重锁定保护
-                        if (score >= 80.0) {
-                            const cached = recognizedExperts.get(idCard);
-                            // 若最近 60 秒内该专家已签到成功，则跳过（不重复震动、不重复新增）
-                            if (!cached || (nowTime - cached.timestamp >= REDUPLICATE_WINDOW)) {
-                                recognizedExperts.set(idCard, {
-                                    expert: expert,
-                                    score: score,
-                                    timestamp: nowTime
-                                });
-                                newMatches.push(expert.name);
-                            }
-                            
-                            // 同时注入到“空间追踪器”中，以便前端依靠坐标轨迹判断他是已识别的，不发 API
-                            activeTrackedExperts.set(idCard, {
+
+                        // 标记该 Track 状态为核验成功
+                        track.status = 'success';
+                        track.expert = expert;
+                        track.score = score;
+                        // 30秒内当前 Track 不再重复比对
+                        track.successCooldown = nowTime + 30 * 1000;
+
+                        // 注册到专家已识别去重列表 (供下方列表渲染，生命周期 60秒)
+                        const cached = recognizedExperts.get(idCard);
+                        if (!cached || (nowTime - cached.timestamp >= REDUPLICATE_WINDOW)) {
+                            recognizedExperts.set(idCard, {
                                 expert: expert,
                                 score: score,
-                                timestamp: nowTime,
-                                lastBox: faceRect || { x: 100, y: 100, width: 100, height: 100 },
-                                lostFrames: 0
+                                timestamp: nowTime
                             });
+                            
+                            // 物理微震动反馈
+                            if (navigator.vibrate) {
+                                navigator.vibrate(120);
+                            }
+                            updateStatus("success", `✅ 签到成功：${expert.name}`);
+                            
+                            // 触发重新渲染卡片列表
+                            renderRecognizedList();
+                        } else {
+                            // 已签到过的专家，安静地置为成功，不重复提示
+                            updateStatus("scanning", "🔍 正在巡检路过专家人脸...");
                         }
-                    }
-                    
-                    // 只有当有“新识别成功”的专家入场时，才触发震动和新名字提示
-                    if (newMatches.length > 0) {
-                        if (navigator.vibrate) {
-                            navigator.vibrate(120);
-                        }
-                        updateStatus("success", `✅ 签到成功：${newMatches.join(', ')}`);
                     } else {
-                        // 若全为已识别的老面孔，提示状态正常扫描中即可，不重复闪动或提示
-                        updateStatus("scanning", "🔍 正在巡检路过专家人脸...");
+                        // 比对失败 (如库外人员/陌生人)
+                        track.status = 'failed';
+                        // 4秒冷却期，期间对该 Track 绝不发送任何 API
+                        track.failCooldown = nowTime + 4000;
+                        console.log(`[Tracker] 目标 ID ${track.id} 匹配失败，进入 4秒 防刷冷却期`);
+                        updateStatus("error", `⚠️ 未匹配到登记的专家档案 (ID: ${track.id})`);
                     }
-                    
-                    // 重新对卡片区域进行列表渲染
-                    renderRecognizedList();
-                } else {
-                    updateStatus("error", "⚠️ 未匹配到登记的专家档案");
-                }
-            })
-            .catch(err => {
-                isUploadingFrame = false;
-                updateStatus("error", "❌ 比对请求异常，请检查网络或服务");
-                console.error("Upload error:", err);
+                    checkUploadFinished();
+                })
+                .catch(err => {
+                    console.error("Upload error:", err);
+                    if (activeTracks.has(track.id)) {
+                        track.status = 'detected'; // 出错重置状态，允许在帧循环中重试
+                    }
+                    checkUploadFinished();
+                });
             });
+        }
+
+        // 辅助判断所有并发请求是否都已结束，重置上传标志
+        function checkUploadFinished() {
+            const anyMatching = Array.from(activeTracks.values()).some(t => t.status === 'matching');
+            if (!anyMatching) {
+                isUploadingFrame = false;
+            }
         }
 
         // 6. 脱敏处理敏感数据并动态渲染多个专家卡片 (支持多专家同时签到展示并带渐显动效)
