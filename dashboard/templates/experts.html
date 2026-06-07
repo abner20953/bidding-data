@@ -5661,7 +5661,25 @@
                                             const sw = Math.min(img.width - sx, rect.width + padX * 2);
                                             const sh = Math.min(img.height - sy, rect.height + padY * 2);
                                             
-                                            ctx.drawImage(img, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+                                            // 目标 canvas 尺寸 (50x66)
+                                            const targetW = canvas.width;
+                                            const targetH = canvas.height;
+                                            
+                                            // 清理画布
+                                            ctx.clearRect(0, 0, targetW, targetH);
+                                            
+                                            if (sw > 0 && sh > 0) {
+                                                // 计算等比例 cover 居中缩放
+                                                const scale = Math.max(targetW / sw, targetH / sh);
+                                                const scaledW = sw * scale;
+                                                const scaledH = sh * scale;
+                                                const dx = (targetW - scaledW) / 2;
+                                                const dy = (targetH - scaledH) / 2;
+                                                
+                                                ctx.drawImage(img, sx, sy, sw, sh, dx, dy, scaledW, scaledH);
+                                            } else {
+                                                ctx.drawImage(img, sx, sy, sw, sh, 0, 0, targetW, targetH);
+                                            }
                                         };
                                         img.src = currentSearchImageBase64;
                                     }
