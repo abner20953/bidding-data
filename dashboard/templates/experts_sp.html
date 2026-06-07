@@ -871,7 +871,50 @@
         async function detectFrameLoop() {
             if (!scanning) {
                 window.requestAnimationFrame(detectFrameLoop);
-                // 绘制本地人脸框定位线并执行大小初筛与实时位置追踪 (防抖与防重请求)
+                return;
+            }
+
+            if (video.readyState === video.HAVE_ENOUGH_DATA && video.currentTime !== lastVideoTime) {
+                lastVideoTime = video.currentTime;
+                
+                const startTimeMs = performance.now();
+                
+                let detectionInput = video;
+                // 如果是数字变焦状态且倍数大于 1.0，则将截取放大后的 Canvas 送入 MediaPipe
+                if (!isPhysicalZoom && currentZoomValue > 1.0) {
+                    const sWidth = video.videoWidth / currentZoomValue;
+                    const sHeight = video.videoHeight / currentZoomValue;
+                    const sx = (video.videoWidth - sWidth) / 2;
+                    const sy = (video.videoHeight - sHeight) / 2;
+                    
+                    hiddenCanvas.width = video.videoWidth;
+                    hiddenCanvas.height = video.videoHeight;
+                    
+                    hiddenCtx.clearRect(0, 0, hiddenCanvas.width, hiddenCanvas.height);
+                    hiddenCtx.drawImage(video, sx, sy, sWidth, sHeight, 0, 0, video.videoWidth, video.videoHeight);
+                    detectionInput = hiddenCanvas;
+                }
+                
+                // 本地极速人脸框提取 (10-15ms 即可完成)
+                const detections = faceDetector.detectForVideo(detectionInput, startTimeMs).detections;
+                
+                // 绘制定位框并检测是否有符合距离门槛的新人脸
+                const hasNewFace = processDetections(detections);
+                
+                // 4. 初筛决策关卡：只有当画面中出现了未识别的新面孔（且满足像素大小）时，才会发起接口请求！
+                if (hasNewFace && !isUploadingFrame) {
+                    const now = Date.now();
+                    // 门槛设定：冷却期过后触发一次整帧的云端多脸匹配，省流量抗频发
+                    if (now - lastUploadTime > uploadCooldown) {
+                        triggerCloudMatch();
+                    }
+                }
+            }
+
+            window.requestAnimationFrame(detectFrameLoop);
+        }
+
+        // 绘制本地人脸框定位线并执行大小初筛与实时位置追踪 (防抖与防重请求)
         function processDetections(detections) {
             // 清空上一帧的 Canvas
             overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
