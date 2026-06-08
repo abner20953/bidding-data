@@ -105,8 +105,13 @@ class CollusionDetector:
         加载招标文件，建立索引（全文句子 + 骨架）。
         """
         print(f"Loading tender: {self.tender_path}")
-        text, _, _ = self.extract_text_with_pages(self.tender_path)
+        text, pages_tender, _ = self.extract_text_with_pages(self.tender_path)
         self.tender_full_text = self.normalize(text)
+        
+        # 按页提取招标文件中的敏感实体，防止跨页拼凑出多余实体
+        self.tender_entities = set()
+        for _, raw_text, _ in pages_tender:
+            self.tender_entities.update(self.extract_entities(raw_text))
         
         # 建立句子索引
         sentences = self.get_sentences(text)
@@ -161,24 +166,34 @@ class CollusionDetector:
         
         # --- 策略 1: 实体雷同 (手机号、身份证、邮箱) ---
         if check_entity:
-            # 优化：直接在 extract_text 阶段或此处对 raw_text 做 entity 提取
-            entities_a = self.extract_entities(raw_text_a)
-            entities_b = self.extract_entities(raw_text_b)
+            # 优化：按页提取敏感实体，防止跨页将无关的页码、序号拼凑为敏感实体，且能更精确地定位页码
+            entities_a = set()
+            entity_pages_a = {}
+            for page_num, raw_text, _ in pages_a:
+                page_ents = self.extract_entities(raw_text)
+                entities_a.update(page_ents)
+                for ent in page_ents:
+                    if ent not in entity_pages_a:
+                        entity_pages_a[ent] = page_num
+                        
+            entities_b = set()
+            entity_pages_b = {}
+            for page_num, raw_text, _ in pages_b:
+                page_ents = self.extract_entities(raw_text)
+                entities_b.update(page_ents)
+                for ent in page_ents:
+                    if ent not in entity_pages_b:
+                        entity_pages_b[ent] = page_num
             
             common_entities = entities_a.intersection(entities_b)
             
             # 排除招标文件中的实体
-            tender_entities = self.extract_entities(self.tender_full_text) # tender_full_text is normalized? No wait.
-            # Correction: tender_full_text was normalized in load_tender. 
-            # extract_entities logic should handle normalized text or raw.
-            # Let's adjust extract_entities to handle loose matching.
-            
-            # Actually, entities usually rely on digits/letters, so normalization (removing spaces) is good.
+            tender_entities = getattr(self, 'tender_entities', set())
             suspect_entities = common_entities - tender_entities
             
             for entity in suspect_entities:
-                page_a = self.find_page_for_text(entity, pages_a)
-                page_b = self.find_page_for_text(entity, pages_b)
+                page_a = entity_pages_a.get(entity, 0)
+                page_b = entity_pages_b.get(entity, 0)
                 collisions.append({
                     "type": "entity",
                     "text_a": entity,
