@@ -5436,34 +5436,86 @@
                 reader.onload = (e) => {
                     const img = new Image();
                     img.onload = () => {
-                        // 设定最大宽高：速度优先为 1280px，质量优先为 2560px
-                        const maxLimit = (searchMode === 'quality') ? 2560 : 1280;
-                        const maxW = maxLimit;
-                        const maxH = maxLimit;
-                        let width = img.width;
-                        let height = img.height;
-                        
-                        if (width > maxW || height > maxH) {
-                            if (width > height) {
-                                height = Math.round((height * maxW) / width);
-                                width = maxW;
-                            } else {
-                                width = Math.round((width * maxH) / height);
-                                height = maxH;
+                        try {
+                            // 速度优先保持轻量上传；质量优先保留更高分辨率，但仍确保不超过腾讯云 base64 限制。
+                            const initialMaxEdge = (searchMode === 'quality') ? 2560 : 1280;
+                            const minMaxEdge = (searchMode === 'quality') ? 1280 : 720;
+                            const targetEncodedSize = (searchMode === 'quality') ? 3.8 * 1024 * 1024 : 1.2 * 1024 * 1024;
+                            const hardEncodedSize = 4.6 * 1024 * 1024;
+                            const qualitySteps = (searchMode === 'quality')
+                                ? [0.9, 0.84, 0.78, 0.72, 0.66, 0.6]
+                                : [0.84, 0.78, 0.72, 0.66, 0.6, 0.54];
+
+                            const canvas = document.createElement('canvas');
+                            const ctx = canvas.getContext('2d');
+
+                            function getPayloadSize(dataUrl) {
+                                const commaIndex = dataUrl.indexOf(',');
+                                return commaIndex >= 0 ? dataUrl.length - commaIndex - 1 : dataUrl.length;
                             }
+
+                            function fitSize(maxEdge) {
+                                let width = img.width;
+                                let height = img.height;
+                                if (width > maxEdge || height > maxEdge) {
+                                    if (width > height) {
+                                        height = Math.round((height * maxEdge) / width);
+                                        width = maxEdge;
+                                    } else {
+                                        width = Math.round((width * maxEdge) / height);
+                                        height = maxEdge;
+                                    }
+                                }
+                                return { width, height };
+                            }
+
+                            let bestDataUrl = '';
+                            let bestSize = Infinity;
+                            let maxEdge = initialMaxEdge;
+
+                            while (maxEdge >= minMaxEdge) {
+                                const size = fitSize(maxEdge);
+                                canvas.width = size.width;
+                                canvas.height = size.height;
+                                ctx.clearRect(0, 0, size.width, size.height);
+                                ctx.drawImage(img, 0, 0, size.width, size.height);
+
+                                for (const quality of qualitySteps) {
+                                    const dataUrl = canvas.toDataURL('image/jpeg', quality);
+                                    const payloadSize = getPayloadSize(dataUrl);
+
+                                    if (payloadSize < bestSize) {
+                                        bestDataUrl = dataUrl;
+                                        bestSize = payloadSize;
+                                    }
+
+                                    if (payloadSize <= targetEncodedSize) {
+                                        callback(dataUrl);
+                                        return;
+                                    }
+                                }
+
+                                if (maxEdge === minMaxEdge) break;
+                                maxEdge = Math.max(minMaxEdge, Math.floor(maxEdge * 0.85));
+                            }
+
+                            if (bestSize > hardEncodedSize) {
+                                console.warn('压缩后图片仍接近腾讯云上传上限，继续使用最小可生成版本', Math.round(bestSize / 1024) + 'KB');
+                            }
+                            callback(bestDataUrl || e.target.result);
+                        } catch (compressErr) {
+                            console.warn('图片自适应压缩失败，回退使用原始上传数据', compressErr);
+                            callback(e.target.result);
                         }
-                        
-                        const canvas = document.createElement('canvas');
-                        canvas.width = width;
-                        canvas.height = height;
-                        const ctx = canvas.getContext('2d');
-                        ctx.drawImage(img, 0, 0, width, height);
-                        
-                        // 采用 jpeg 格式，并以 0.8 质量进行压缩
-                        const base64Image = canvas.toDataURL('image/jpeg', 0.8);
-                        callback(base64Image);
+                    };
+                    img.onerror = () => {
+                        console.warn('图片解码失败，回退使用原始上传数据');
+                        callback(e.target.result);
                     };
                     img.src = e.target.result;
+                };
+                reader.onerror = () => {
+                    alert('读取图片文件失败，请重新选择文件。');
                 };
                 reader.readAsDataURL(file);
             }

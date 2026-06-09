@@ -12,7 +12,7 @@ import time
 import json
 import base64
 import io
-from PIL import Image
+from PIL import Image, ImageOps
 from dotenv import load_dotenv
 from tencentcloud.common import credential
 from tencentcloud.common.profile.client_profile import ClientProfile
@@ -107,6 +107,61 @@ def _get_gender_from_idcard(id_card):
     return 0
 
 
+def _get_resample_method():
+    try:
+        return Image.Resampling.LANCZOS
+    except AttributeError:
+        return Image.ANTIALIAS
+
+
+def _load_rgb_image(physical_path):
+    """读取图片并按 EXIF 方向转正，避免手机照片横竖方向信息丢失后影响人脸检测。"""
+    with Image.open(physical_path) as img:
+        img = ImageOps.exif_transpose(img)
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        return img.copy()
+
+
+def _resize_to_max_edge(img, max_size):
+    width, height = img.size
+    if width <= max_size and height <= max_size:
+        return img.copy()
+
+    if width > height:
+        new_width = max_size
+        new_height = int(height * (max_size / width))
+    else:
+        new_height = max_size
+        new_width = int(width * (max_size / height))
+
+    return img.resize((new_width, new_height), _get_resample_method())
+
+
+def _image_to_base64(img, quality=85):
+    output_buffer = io.BytesIO()
+    img.save(output_buffer, format="JPEG", quality=quality)
+    return base64.b64encode(output_buffer.getvalue()).decode("utf-8")
+
+
+def _detect_face_infos_for_upload(client, img, id_card, name):
+    temp_base64 = _image_to_base64(img, quality=90)
+    try:
+        detect_req = models.DetectFaceRequest()
+        detect_req.Image = temp_base64
+        detect_req.MaxFaceNum = 1
+        detect_req.MinFaceSize = 34  # 扫描件中人脸较小时设为34以提高检出率
+        detect_req.NeedFaceAttributes = 0
+        detect_req.NeedQualityDetection = 0
+
+        detect_resp = client.DetectFace(detect_req)
+        if detect_resp.FaceInfos and len(detect_resp.FaceInfos) > 0:
+            return detect_resp.FaceInfos, None
+        return [], None
+    except Exception as detect_err:
+        return [], f"专家: {name}, 身份证: {id_card}: {str(detect_err)}"
+
+
 def _resize_and_compress_image(physical_path, max_size=1080):
     """
     使用 PIL 对人脸照片进行缩放和压缩，以符合腾讯云人脸注册的分辨率和大小要求。
@@ -114,38 +169,9 @@ def _resize_and_compress_image(physical_path, max_size=1080):
     - 质量 quality: 85 (JPEG 压缩)
     """
     try:
-        with Image.open(physical_path) as img:
-            # 兼容 RGBA 等多通道模式，转为 RGB，防止保存为 JPEG 格式报错
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
-            
-            # 获取原始长宽
-            width, height = img.size
-            
-            # 如果宽或高大于限制值，进行等比例缩放
-            if width > max_size or height > max_size:
-                if width > height:
-                    new_width = max_size
-                    new_height = int(height * (max_size / width))
-                else:
-                    new_height = max_size
-                    new_width = int(width * (max_size / height))
-                
-                # 使用高质量的重采样算法
-                try:
-                    resample_method = Image.Resampling.LANCZOS
-                except AttributeError:
-                    resample_method = Image.ANTIALIAS
-                
-                img = img.resize((new_width, new_height), resample_method)
-            
-            # 压缩保存到内存中
-            output_buffer = io.BytesIO()
-            img.save(output_buffer, format="JPEG", quality=85)
-            img_data = output_buffer.getvalue()
-            
-            # 转为 Base64 并返回
-            return base64.b64encode(img_data).decode("utf-8"), None
+        img = _load_rgb_image(physical_path)
+        img = _resize_to_max_edge(img, max_size)
+        return _image_to_base64(img, quality=85), None
     except Exception as e:
         return None, f"图像缩放或压缩处理失败: {str(e)}"
 
@@ -154,88 +180,57 @@ def _process_single_photo_for_upload(physical_path, id_card, name):
     """读取单张照片，进行上限为1920等比缩放并调用DetectFace进行裁剪，未检出则回退到原缩放图，返回 base64 和错误消息。"""
     id_card = id_card.strip().upper()
     try:
-        with Image.open(physical_path) as img:
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
-            
-            # 先进行上限等比例缩放（如限制最大边为1920），以防原图过大（如超清A4扫描件）导致传输和检测超时
-            width, height = img.size
-            max_size = 1920
-            if width > max_size or height > max_size:
-                if width > height:
-                    new_width = max_size
-                    new_height = int(height * (max_size / width))
-                else:
-                    new_height = max_size
-                    new_width = int(width * (max_size / height))
-                
-                try:
-                    resample_method = Image.Resampling.LANCZOS
-                except AttributeError:
-                    resample_method = Image.ANTIALIAS
-                img_resized = img.resize((new_width, new_height), resample_method)
-            else:
-                img_resized = img.copy()
-            
-            # 转为临时 base64，用于人脸检测
-            temp_buffer = io.BytesIO()
-            img_resized.save(temp_buffer, format="JPEG", quality=90)
-            temp_base64 = base64.b64encode(temp_buffer.getvalue()).decode("utf-8")
-            
-            # 调用 DetectFace 检测人脸位置
-            face_infos = []
-            client = _get_iai_client()
-            if client:
-                try:
-                    detect_req = models.DetectFaceRequest()
-                    detect_req.Image = temp_base64
-                    detect_req.MaxFaceNum = 1
-                    detect_req.MinFaceSize = 34  # 扫描件中人脸较小时设为34以提高检出率
-                    detect_req.NeedFaceAttributes = 0
-                    detect_req.NeedQualityDetection = 0
-                    
-                    detect_resp = client.DetectFace(detect_req)
-                    if detect_resp.FaceInfos and len(detect_resp.FaceInfos) > 0:
-                        face_infos = detect_resp.FaceInfos
-                except Exception as detect_err:
-                    print(f"⚠️ [DetectFace 预处理警告] 专家: {name}, 身份证: {id_card}: {str(detect_err)}")
-            
-            # 如果检测到人脸，裁剪出人脸子图并外扩30%
-            if face_infos:
-                face = face_infos[0]
-                fx, fy, fw, fh = face.X, face.Y, face.Width, face.Height
-                
-                pad_w = int(fw * 0.3)
-                pad_h = int(fh * 0.3)
-                
-                img_w, img_h = img_resized.size
-                sx = max(0, fx - pad_w)
-                sy = max(0, fy - pad_h)
-                ex = min(img_w, fx + fw + pad_w)
-                ey = min(img_h, fy + fh + pad_h)
-                
-                final_img = img_resized.crop((sx, sy, ex, ey))
-            else:
-                # 若未检出人脸，安全回退到使用原缩放图
-                final_img = img_resized
-                
-            # 检查最终要上传的图像尺寸，若短边小于128像素，则按比例放大，防止腾讯云报 ImageResolutionTooSmall 错误
-            final_w, final_h = final_img.size
-            min_edge = min(final_w, final_h)
-            if min_edge < 128:
-                scale = 128.0 / min_edge
-                new_w = int(final_w * scale)
-                new_h = int(final_h * scale)
-                try:
-                    resample_method = Image.Resampling.LANCZOS
-                except AttributeError:
-                    resample_method = Image.ANTIALIAS
-                final_img = final_img.resize((new_w, new_h), resample_method)
-                
-            # 对最终图像进行压缩（质量85）并转为 Base64
-            final_buffer = io.BytesIO()
-            final_img.save(final_buffer, format="JPEG", quality=85)
-            return base64.b64encode(final_buffer.getvalue()).decode("utf-8"), None
+        img = _load_rgb_image(physical_path)
+        img_resized = _resize_to_max_edge(img, 1920)
+
+        face_infos = []
+        chosen_img = img_resized
+        client = _get_iai_client()
+        if client:
+            detect_errors = []
+            for degrees in (0, 90, 180, 270):
+                candidate_img = img_resized if degrees == 0 else img_resized.rotate(degrees, expand=True)
+                face_infos, detect_err = _detect_face_infos_for_upload(client, candidate_img, id_card, name)
+                if detect_err:
+                    detect_errors.append(detect_err)
+                if face_infos:
+                    chosen_img = candidate_img
+                    if degrees != 0:
+                        print(f"✅ [DetectFace 方向纠正] 专家: {name}, 身份证: {id_card}, 自动旋转 {degrees}° 后检出人脸")
+                    break
+            if detect_errors:
+                print(f"⚠️ [DetectFace 预处理警告] {' | '.join(detect_errors[:2])}")
+
+        # 如果检测到人脸，裁剪出人脸子图并外扩30%
+        if face_infos:
+            face = face_infos[0]
+            fx, fy, fw, fh = face.X, face.Y, face.Width, face.Height
+
+            pad_w = int(fw * 0.3)
+            pad_h = int(fh * 0.3)
+
+            img_w, img_h = chosen_img.size
+            sx = max(0, fx - pad_w)
+            sy = max(0, fy - pad_h)
+            ex = min(img_w, fx + fw + pad_w)
+            ey = min(img_h, fy + fh + pad_h)
+
+            final_img = chosen_img.crop((sx, sy, ex, ey))
+        else:
+            # 若未检出人脸，安全回退到使用 EXIF 转正后的原缩放图
+            final_img = img_resized
+
+        # 检查最终要上传的图像尺寸，若短边小于128像素，则按比例放大，防止腾讯云报 ImageResolutionTooSmall 错误
+        final_w, final_h = final_img.size
+        min_edge = min(final_w, final_h)
+        if min_edge < 128:
+            scale = 128.0 / min_edge
+            new_w = int(final_w * scale)
+            new_h = int(final_h * scale)
+            final_img = final_img.resize((new_w, new_h), _get_resample_method())
+
+        # 对最终图像进行压缩（质量85）并转为 Base64
+        return _image_to_base64(final_img, quality=85), None
     except Exception as e:
         return None, str(e)
 
