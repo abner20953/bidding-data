@@ -608,6 +608,7 @@ def init_db():
                 project_count INTEGER DEFAULT 0,
                 last_project_time TEXT,
                 is_face_synced INTEGER DEFAULT 0,
+                assignment_status TEXT DEFAULT '',
                 created_at TEXT
             )
         ''')
@@ -658,6 +659,16 @@ def init_db():
 
         try:
             c.execute('CREATE INDEX IF NOT EXISTS idx_experts_is_face_synced ON experts(is_face_synced)')
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            c.execute("ALTER TABLE experts ADD COLUMN assignment_status TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            c.execute('CREATE INDEX IF NOT EXISTS idx_experts_assignment_status ON experts(assignment_status)')
         except sqlite3.OperationalError:
             pass
             
@@ -1558,6 +1569,7 @@ def api_search():
     company = request.args.get('company', '').strip()
     major = request.args.get('major', '').strip()
     status = request.args.get('status', '').strip()
+    assignment_status = request.args.get('assignment_status', '').strip()
     
     project_count = request.args.get('project_count', '').strip()
     last_project_time = request.args.get('last_project_time', '').strip()
@@ -1610,6 +1622,12 @@ def api_search():
             conditions.append("status = ?")
             params.append(status)
             
+        if assignment_status:
+            if assignment_status == '已分配':
+                conditions.append("assignment_status = '已分配'")
+            elif assignment_status == '空':
+                conditions.append("(assignment_status = '' OR assignment_status IS NULL)")
+            
         if project_count.isdigit():
             conditions.append("project_count >= ?")
             params.append(int(project_count))
@@ -1642,7 +1660,7 @@ def api_search():
             
         # 精炼 SQL：不 SELECT raw_json 大文本字段，并通过子查询获取每个专家所对应的标签字符串
         sql = """
-            SELECT id, name, phone, id_card, company, major, photo_path, status, remark, project_count, last_project_time, is_face_synced,
+            SELECT id, name, phone, id_card, company, major, photo_path, status, remark, assignment_status, project_count, last_project_time, is_face_synced,
                    (
                        SELECT GROUP_CONCAT(t.tag_name, ',')
                        FROM expert_majors em
@@ -1680,6 +1698,7 @@ def api_search():
             "photo_path": r['photo_path'],
             "status": item_status,
             "remark": item_remark,
+            "assignment_status": r['assignment_status'] if 'assignment_status' in r.keys() and r['assignment_status'] else '',
             "tags": tags_list,
             "project_count": r['project_count'] if 'project_count' in r.keys() and r['project_count'] is not None else 0,
             "last_project_time": r['last_project_time'] if 'last_project_time' in r.keys() else None,
@@ -1687,7 +1706,7 @@ def api_search():
             "details": {}  # 列表阶段置空，点击“查看完整档案”时通过 api_detail 懒加载
         })
         
-    _log_action("检索评标专家", f"条件: 姓名={name}, 手机={phone}, 身份证={id_card}, 单位={company}, 专业={major}, 状态={status}，共 {len(results)} 条")
+    _log_action("检索评标专家", f"条件: 姓名={name}, 手机={phone}, 身份证={id_card}, 单位={company}, 专业={major}, 状态={status}, 分配状态={assignment_status}，共 {len(results)} 条")
     return jsonify({"success": True, "data": results})
 
 @experts_bp.route('/api/detail', methods=['GET'])
@@ -1898,6 +1917,25 @@ def api_clear():
     _log_action("清空专家数据库", "清空了全部专家数据和照片")
     return jsonify({"success": True, "message": "评标专家数据库与所有照片已成功清空。"})
 
+@experts_bp.route('/api/clear_assignment', methods=['POST'])
+def api_clear_assignment():
+    """一键清除所有专家的分配状态"""
+    conn = get_db_conn()
+    try:
+        c = conn.cursor()
+        c.execute("UPDATE experts SET assignment_status = ''")
+        conn.commit()
+        _log_action("清除分配状态", "一键清除了所有专家的分配状态")
+        return jsonify({"success": True, "message": "已成功清除所有专家的分配状态。"})
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return jsonify({"success": False, "error": f"清除分配状态失败: {str(e)}"}), 500
+    finally:
+        conn.close()
+
 @experts_bp.route('/api/delete', methods=['POST'])
 def api_delete():
     """删除单个专家并删除物理图片"""
@@ -1967,6 +2005,7 @@ def api_update_status():
     phone = data.get('phone', '').strip()
     status = data.get('status', '').strip()
     remark = data.get('remark', '')
+    assignment_status = data.get('assignment_status', '').strip()
     
     if not name or not phone or not status:
         return jsonify({"success": False, "error": "姓名、手机号和状态不能为空"}), 400
@@ -1977,9 +2016,9 @@ def api_update_status():
     conn = get_db_conn()
     try:
         c = conn.cursor()
-        c.execute("UPDATE experts SET status = ?, remark = ? WHERE name = ? AND phone = ?", (status, remark, name, phone))
+        c.execute("UPDATE experts SET status = ?, remark = ?, assignment_status = ? WHERE name = ? AND phone = ?", (status, remark, assignment_status, name, phone))
         conn.commit()
-        _log_action("更新专家状态", f"专家姓名: {name}, 电话: {phone}, 新状态: {status}, 备注: {remark}")
+        _log_action("更新专家状态", f"专家姓名: {name}, 电话: {phone}, 新状态: {status}, 分配状态: {assignment_status}, 备注: {remark}")
         return jsonify({"success": True, "message": f"专家 {name} 的状态与备注已成功更新。"})
     except Exception as e:
         return jsonify({"success": False, "error": f"更新专家状态/备注失败: {str(e)}"}), 500

@@ -907,6 +907,18 @@
             box-shadow: 0 4px 12px rgba(239, 68, 68, 0.25);
         }
 
+        .btn-clear-assignment {
+            background: rgba(245, 158, 11, 0.1);
+            color: #f59e0b;
+            border-color: rgba(245, 158, 11, 0.2);
+        }
+
+        .btn-clear-assignment:hover {
+            background: #f59e0b;
+            color: white;
+            box-shadow: 0 4px 12px rgba(245, 158, 11, 0.25);
+        }
+
         /* 专家总览名单列表表格 */
         .expert-table-wrapper {
             width: 100%;
@@ -2301,6 +2313,11 @@
                             <option value="无法登录">无法登录</option>
                             <option value="未获取">未获取</option>
                         </select>
+                        <select class="filter-select" id="filter-assignment-status">
+                            <option value="">全部分配状态</option>
+                            <option value="已分配">已分配</option>
+                            <option value="空">空</option>
+                        </select>
                         <input type="number" min="0" class="search-input" id="search-project-count" placeholder="📊 最少参评次数" style="width: 140px; padding: 10px 12px; height: 48px; box-sizing: border-box;">
                         <input type="date" class="search-input" id="search-last-time" style="width: 200px; padding: 10px 12px; height: 48px; box-sizing: border-box;">
                     </div>
@@ -2476,6 +2493,18 @@
                         <div class="ops-desc">一键从数据库物理清空所有评标专家档案，并删除服务器静态资源夹下全部身份证照。</div>
                         <button class="action-btn-large btn-clear" id="btn-clear">
                             <span>🗑️</span> 清空专家库与照片
+                        </button>
+                    </div>
+                </div>
+
+                <!-- 清除所有分配状态 -->
+                <div class="ops-card">
+                    <div class="ops-icon">🔄</div>
+                    <div class="ops-info">
+                        <div class="ops-title">一键清除分配状态</div>
+                        <div class="ops-desc">一键重置并清空数据库中所有专家的分配状态，使他们的分配状态全部恢复为空。</div>
+                        <button class="action-btn-large btn-clear-assignment" id="btn-clear-assignment">
+                            <span>🔄</span> 清除全部分配状态
                         </button>
                     </div>
                 </div>
@@ -2740,13 +2769,22 @@
                         <div class="detail-remark-title" style="margin-bottom: 0; font-size: 13px; font-weight: 700; color: var(--text-primary);">
                             <span>📝 专家标注与备注</span>
                         </div>
-                        <div class="detail-status-wrapper" style="margin: 0; display: flex; align-items: center; gap: 6px;">
-                            <span class="detail-status-label" style="font-size: 12px; font-weight: 500;">📌 状态标记:</span>
-                            <select class="filter-select detail-status-select" id="detail-status-select" style="height: 28px; padding: 2px 6px; font-size: 12px; width: 100px; border-radius: 6px; margin: 0; box-shadow: none;">
-                                <option value="未获取">未获取</option>
-                                <option value="已获取">已获取</option>
-                                <option value="无法登录">无法登录</option>
-                            </select>
+                        <div class="detail-status-wrapper" style="margin: 0; display: flex; align-items: center; gap: 10px;">
+                            <div style="display: flex; align-items: center; gap: 4px;">
+                                <span class="detail-status-label" style="font-size: 12px; font-weight: 500;">📌 状态标记:</span>
+                                <select class="filter-select detail-status-select" id="detail-status-select" style="height: 28px; padding: 2px 6px; font-size: 12px; width: 100px; border-radius: 6px; margin: 0; box-shadow: none;">
+                                    <option value="未获取">未获取</option>
+                                    <option value="已获取">已获取</option>
+                                    <option value="无法登录">无法登录</option>
+                                </select>
+                            </div>
+                            <div style="display: flex; align-items: center; gap: 4px;">
+                                <span class="detail-status-label" style="font-size: 12px; font-weight: 500;">📊 分配状态:</span>
+                                <select class="filter-select detail-status-select" id="detail-assignment-select" style="height: 28px; padding: 2px 6px; font-size: 12px; width: 90px; border-radius: 6px; margin: 0; box-shadow: none;">
+                                    <option value="">空</option>
+                                    <option value="已分配">已分配</option>
+                                </select>
+                            </div>
                         </div>
                     </div>
                     <textarea id="detail-remark-input" style="height: 54px; width: 100%; box-sizing: border-box; resize: none; border-radius: 6px; border: 1px solid var(--border-color); padding: 8px 10px; font-size: 13px; outline: none; margin: 0; line-height: 1.4;" placeholder="输入专家的自定义备注信息（如登录密码、密保答案、临时问题、备用联系方式等）..."></textarea>
@@ -2844,6 +2882,7 @@
                 const searchResetBtn = document.getElementById('btn-search-reset');
                 
                 function executeSearch() {
+                    const filterAssignmentStatus = document.getElementById('filter-assignment-status');
                     fetchExperts(
                         searchName ? searchName.value : '',
                         searchPhone ? searchPhone.value : '',
@@ -2853,7 +2892,8 @@
                         filterStatus ? filterStatus.value : '',
                         selectedTagIds.join(','),
                         searchProjectCount ? searchProjectCount.value : '',
-                        searchLastTime ? searchLastTime.value : ''
+                        searchLastTime ? searchLastTime.value : '',
+                        filterAssignmentStatus ? filterAssignmentStatus.value : ''
                     );
                 }
                 window.executeSearch = executeSearch;
@@ -2870,6 +2910,8 @@
                         if (searchCompany) searchCompany.value = '';
                         if (searchMajor) searchMajor.value = '';
                         if (filterStatus) filterStatus.value = '';
+                        const filterAssignmentStatus = document.getElementById('filter-assignment-status');
+                        if (filterAssignmentStatus) filterAssignmentStatus.value = '';
                         if (searchProjectCount) searchProjectCount.value = '';
                         if (searchLastTime) searchLastTime.value = '';
                         
@@ -2952,6 +2994,13 @@
             } catch (e) {
                 console.error("初始化清空专家库模块失败:", e);
             }
+            
+            // 绑定一键清除分配状态
+            try {
+                setupClearAssignment();
+            } catch (e) {
+                console.error("初始化一键清除分配状态模块失败:", e);
+            }
 
             // 照片放大预览与旋转
             try {
@@ -3023,7 +3072,8 @@
                             document.getElementById('filter-status').value,
                             selectedTagIds.join(','),
                             document.getElementById('search-project-count') ? document.getElementById('search-project-count').value : '',
-                            document.getElementById('search-last-time') ? document.getElementById('search-last-time').value : ''
+                            document.getElementById('search-last-time') ? document.getElementById('search-last-time').value : '',
+                            document.getElementById('filter-assignment-status') ? document.getElementById('filter-assignment-status').value : ''
                         );
                     }
                 } else {
@@ -3033,7 +3083,7 @@
         }
 
         // ==================== 1. 专家检索逻辑 ====================
-        function fetchExperts(name = '', phone = '', idCard = '', company = '', major = '', status = '', tagIds = '', projectCountFilter = '', lastTimeFilter = '') {
+        function fetchExperts(name = '', phone = '', idCard = '', company = '', major = '', status = '', tagIds = '', projectCountFilter = '', lastTimeFilter = '', assignmentStatus = '') {
             const container = document.getElementById('cards-container');
             const paginator = document.getElementById('pagination-container');
             
@@ -3045,7 +3095,7 @@
             `;
             if (paginator) paginator.style.display = 'none';
             
-            const url = `/dlsgzs/api/search?name=${encodeURIComponent(name)}&phone=${encodeURIComponent(phone)}&id_card=${encodeURIComponent(idCard)}&company=${encodeURIComponent(company)}&major=${encodeURIComponent(major)}&status=${encodeURIComponent(status)}&tag_ids=${encodeURIComponent(tagIds)}&project_count=${encodeURIComponent(projectCountFilter)}&last_project_time=${encodeURIComponent(lastTimeFilter)}&_t=${Date.now()}`;
+            const url = `/dlsgzs/api/search?name=${encodeURIComponent(name)}&phone=${encodeURIComponent(phone)}&id_card=${encodeURIComponent(idCard)}&company=${encodeURIComponent(company)}&major=${encodeURIComponent(major)}&status=${encodeURIComponent(status)}&tag_ids=${encodeURIComponent(tagIds)}&project_count=${encodeURIComponent(projectCountFilter)}&last_project_time=${encodeURIComponent(lastTimeFilter)}&assignment_status=${encodeURIComponent(assignmentStatus)}&_t=${Date.now()}`;
             
             fetch(url)
                 .then(res => res.json())
@@ -3980,7 +4030,11 @@
                                 document.getElementById('search-idcard') ? document.getElementById('search-idcard').value : '',
                                 document.getElementById('search-company') ? document.getElementById('search-company').value : '',
                                 document.getElementById('search-major') ? document.getElementById('search-major').value : '',
-                                document.getElementById('filter-status') ? document.getElementById('filter-status').value : ''
+                                document.getElementById('filter-status') ? document.getElementById('filter-status').value : '',
+                                '',
+                                '',
+                                '',
+                                document.getElementById('filter-assignment-status') ? document.getElementById('filter-assignment-status').value : ''
                             );
                         }
                     })
@@ -4064,6 +4118,13 @@
                 remarkInput.style.background = 'var(--bg-card)';
                 remarkInput.style.cursor = 'text';
             }
+            const assignmentSelect = document.getElementById('detail-assignment-select');
+            if (assignmentSelect) {
+                assignmentSelect.value = item.assignment_status || '';
+                assignmentSelect.disabled = false;
+                assignmentSelect.style.background = 'var(--bg-card)';
+                assignmentSelect.style.cursor = 'pointer';
+            }
             const saveTip = document.getElementById('save-status-tip');
             if (saveTip) {
                 saveTip.style.display = 'none';
@@ -4081,6 +4142,7 @@
                     newSaveStatusBtn.disabled = true;
                     newSaveStatusBtn.innerHTML = '保存中...';
                     
+                    const newAssignmentStatus = assignmentSelect ? assignmentSelect.value : '';
                     fetch('/dlsgzs/api/update_status', {
                         method: 'POST',
                         headers: {
@@ -4090,7 +4152,8 @@
                             name: item.name,
                             phone: item.phone, // 使用当前手机号定位专家
                             status: newStatus,
-                            remark: newRemark
+                            remark: newRemark,
+                            assignment_status: newAssignmentStatus
                         })
                     })
                     .then(res => res.json())
@@ -4101,6 +4164,7 @@
                             // 同步本地数据
                             item.status = newStatus;
                             item.remark = newRemark;
+                            item.assignment_status = newAssignmentStatus;
                             
                             // 重新渲染 JSON 文本展示
                             if (rawJsonElement) {
@@ -4179,7 +4243,11 @@
                                     document.getElementById('search-idcard') ? document.getElementById('search-idcard').value : '',
                                     document.getElementById('search-company') ? document.getElementById('search-company').value : '',
                                     document.getElementById('search-major') ? document.getElementById('search-major').value : '',
-                                    document.getElementById('filter-status') ? document.getElementById('filter-status').value : ''
+                                    document.getElementById('filter-status') ? document.getElementById('filter-status').value : '',
+                                    '',
+                                    '',
+                                    '',
+                                    document.getElementById('filter-assignment-status') ? document.getElementById('filter-assignment-status').value : ''
                                 );
                             }
                         } else {
@@ -4257,6 +4325,51 @@
                 alert('查看完整档案失败，错误：' + err.message);
                 console.error(err);
             }
+        }
+
+        function setupClearAssignment() {
+            const clearAssignmentBtn = document.getElementById('btn-clear-assignment');
+            if (!clearAssignmentBtn) {
+                console.warn("未找到 #btn-clear-assignment 元素，跳过清空分配状态模块绑定。");
+                return;
+            }
+            clearAssignmentBtn.addEventListener('click', () => {
+                if (confirm('⚠️ 警告：您确定要一键清除所有专家的分配状态吗？清除后不可恢复！')) {
+                    clearAssignmentBtn.disabled = true;
+                    clearAssignmentBtn.innerHTML = '正在清除...';
+                    
+                    fetch('/dlsgzs/api/clear_assignment', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        }
+                    })
+                    .then(res => res.json())
+                    .then(res => {
+                        clearAssignmentBtn.disabled = false;
+                        clearAssignmentBtn.innerHTML = '<span>🔄</span> 清除全部分配状态';
+                        if (res.success) {
+                            alert('✅ ' + res.message);
+                            // 重置前端搜索条件里的分配状态下拉框
+                            const filterAssignmentStatus = document.getElementById('filter-assignment-status');
+                            if (filterAssignmentStatus) filterAssignmentStatus.value = '';
+                            
+                            // 刷新列表
+                            if (typeof executeSearch === 'function') {
+                                executeSearch();
+                            }
+                        } else {
+                            alert('⚠️ 清除失败: ' + res.error);
+                        }
+                    })
+                    .catch(err => {
+                        clearAssignmentBtn.disabled = false;
+                        clearAssignmentBtn.innerHTML = '<span>🔄</span> 清除全部分配状态';
+                        alert('⚠️ 网络错误，无法清除分配状态');
+                        console.error(err);
+                    });
+                }
+            });
         }
 
         function setupClearDatabase() {
