@@ -1196,6 +1196,14 @@
             transition: transform 0.3s;
         }
 
+        .zoom-status {
+            color: white;
+            font-size: 14px;
+            background: rgba(0, 0, 0, 0.45);
+            padding: 10px 16px;
+            border-radius: 10px;
+        }
+
         .zoom-controls {
             position: absolute;
             bottom: 30px;
@@ -2826,6 +2834,7 @@
         <button id="zoom-prev-btn" class="zoom-btn-side" style="display: none; position: absolute; left: 30px; top: 50%; transform: translateY(-50%); font-size: 30px; width: 60px; height: 60px; border-radius: 50%; background: rgba(255,255,255,0.15); border: 1px solid rgba(255,255,255,0.2); color: white; cursor: pointer; transition: all 0.2s; z-index: 2010;">&lt;</button>
         
         <img src="" class="zoom-img" id="zoom-img" alt="高清身份证大图">
+        <div id="zoom-img-status" class="zoom-status" style="display: none;">照片加载中...</div>
         
         <button id="zoom-next-btn" class="zoom-btn-side" style="display: none; position: absolute; right: 30px; top: 50%; transform: translateY(-50%); font-size: 30px; width: 60px; height: 60px; border-radius: 50%; background: rgba(255,255,255,0.15); border: 1px solid rgba(255,255,255,0.2); color: white; cursor: pointer; transition: all 0.2s; z-index: 2010;">&gt;</button>
 
@@ -3700,6 +3709,7 @@
             const prevBtn = document.getElementById('photo-prev-btn');
             const nextBtn = document.getElementById('photo-next-btn');
             const indicator = document.getElementById('detail-photo-indicator');
+            let detailPhotoLoadToken = 0;
             
             // 2. 初始化编辑模式下的照片状态列表
             currentDetailPhotos = item.photo_path ? item.photo_path.split(',') : [];
@@ -3709,6 +3719,12 @@
             function updateDetailPhotoShow() {
                 if (detailImg && errDiv) {
                     const totalPhotos = isDetailEditing ? editingPhotoArray.length : currentDetailPhotos.length;
+
+                    function setDetailPhotoMessage(icon, text) {
+                        const spans = errDiv.querySelectorAll('span');
+                        if (spans[0]) spans[0].innerText = icon;
+                        if (spans[1]) spans[1].innerText = text;
+                    }
                     
                     if (totalPhotos > 0) {
                         let currentSrc = "";
@@ -3718,10 +3734,30 @@
                         } else {
                             currentSrc = currentDetailPhotos[currentDetailPhotoIndex].trim();
                         }
-                        
-                        detailImg.src = currentSrc;
-                        detailImg.style.display = 'block';
-                        errDiv.style.display = 'none';
+
+                        const loadToken = ++detailPhotoLoadToken;
+                        detailImg.onload = () => {
+                            if (loadToken !== detailPhotoLoadToken) return;
+                            detailImg.style.display = 'block';
+                            errDiv.style.display = 'none';
+                        };
+                        detailImg.onerror = () => {
+                            if (loadToken !== detailPhotoLoadToken) return;
+                            detailImg.removeAttribute('src');
+                            detailImg.style.display = 'none';
+                            setDetailPhotoMessage('⚠️', '照片加载失败');
+                            errDiv.style.display = 'flex';
+                        };
+                        detailImg.style.display = 'none';
+                        detailImg.removeAttribute('src');
+                        setDetailPhotoMessage('⌛', '照片加载中...');
+                        errDiv.style.display = 'flex';
+
+                        if (currentSrc) {
+                            detailImg.src = currentSrc;
+                        } else {
+                            detailImg.onerror();
+                        }
                         
                         // 点击放大切换
                         detailImg.onclick = () => {
@@ -3744,8 +3780,12 @@
                             if (indicator) indicator.style.display = 'none';
                         }
                     } else {
+                        detailPhotoLoadToken++;
+                        detailImg.onload = null;
+                        detailImg.onerror = null;
                         detailImg.src = '';
                         detailImg.style.display = 'none';
+                        setDetailPhotoMessage('⚠️', '无照片');
                         errDiv.style.display = 'flex';
                         if (prevBtn) prevBtn.style.display = 'none';
                         if (nextBtn) nextBtn.style.display = 'none';
@@ -4488,8 +4528,16 @@
         function handleDetailImgError() {
             const img = document.getElementById('detail-img');
             const errDiv = document.getElementById('detail-img-error');
-            if (img) img.style.display = 'none';
-            if (errDiv) errDiv.style.display = 'flex';
+            if (img) {
+                img.removeAttribute('src');
+                img.style.display = 'none';
+            }
+            if (errDiv) {
+                const spans = errDiv.querySelectorAll('span');
+                if (spans[0]) spans[0].innerText = '⚠️';
+                if (spans[1]) spans[1].innerText = '照片加载失败';
+                errDiv.style.display = 'flex';
+            }
         }
 
         function renderDetailTags(tags) {
@@ -4563,6 +4611,8 @@
             const prevBtn = document.getElementById('zoom-prev-btn');
             const nextBtn = document.getElementById('zoom-next-btn');
             const indicator = document.getElementById('zoom-indicator');
+            const statusEl = document.getElementById('zoom-img-status');
+            let zoomPhotoLoadToken = 0;
             
             currentZoomPhotos = path ? path.split(',') : [];
             currentZoomPhotoIndex = parseInt(index) || 0;
@@ -4573,7 +4623,32 @@
             function updateZoomShow() {
                 if (currentZoomPhotos.length > 0) {
                     const currentPath = currentZoomPhotos[currentZoomPhotoIndex].trim();
-                    zoomImg.src = currentPath;
+                    const loadToken = ++zoomPhotoLoadToken;
+                    zoomImg.onload = () => {
+                        if (loadToken !== zoomPhotoLoadToken) return;
+                        zoomImg.style.display = 'block';
+                        if (statusEl) statusEl.style.display = 'none';
+                    };
+                    zoomImg.onerror = () => {
+                        if (loadToken !== zoomPhotoLoadToken) return;
+                        zoomImg.removeAttribute('src');
+                        zoomImg.style.display = 'none';
+                        if (statusEl) {
+                            statusEl.innerText = '照片加载失败';
+                            statusEl.style.display = 'block';
+                        }
+                    };
+                    zoomImg.style.display = 'none';
+                    zoomImg.removeAttribute('src');
+                    if (statusEl) {
+                        statusEl.innerText = currentPath ? '照片加载中...' : '照片加载失败';
+                        statusEl.style.display = 'block';
+                    }
+                    if (currentPath) {
+                        zoomImg.src = currentPath;
+                    } else {
+                        zoomImg.onerror();
+                    }
                     
                     if (currentZoomPhotos.length > 1) {
                         if (prevBtn) prevBtn.style.display = 'block';
@@ -4587,6 +4662,19 @@
                         if (nextBtn) nextBtn.style.display = 'none';
                         if (indicator) indicator.style.display = 'none';
                     }
+                } else {
+                    zoomPhotoLoadToken++;
+                    zoomImg.onload = null;
+                    zoomImg.onerror = null;
+                    zoomImg.removeAttribute('src');
+                    zoomImg.style.display = 'none';
+                    if (statusEl) {
+                        statusEl.innerText = '无照片';
+                        statusEl.style.display = 'block';
+                    }
+                    if (prevBtn) prevBtn.style.display = 'none';
+                    if (nextBtn) nextBtn.style.display = 'none';
+                    if (indicator) indicator.style.display = 'none';
                 }
             }
             
