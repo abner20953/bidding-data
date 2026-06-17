@@ -2838,10 +2838,26 @@
 
     <!-- JS 逻辑控制 -->
     <script>
-        // 全量专家数据缓存
+        // 专家检索当前页数据缓存
         let currentExpertsData = [];
         let currentPage = 1;
-        const pageSize = 32;
+        let currentTotalCount = 0;
+        let currentTotalPages = 0;
+        const pageSize = 33;
+        let latestExpertsSearchRequestId = 0;
+        let activeExpertsSearchController = null;
+        let lastExpertsSearchParams = {
+            name: '',
+            phone: '',
+            idCard: '',
+            company: '',
+            major: '',
+            status: '',
+            tagIds: '',
+            projectCountFilter: '',
+            lastTimeFilter: '',
+            assignmentStatus: ''
+        };
 
         // 多图预览与切换状态缓存
         let currentDetailPhotos = [];
@@ -3083,9 +3099,29 @@
         }
 
         // ==================== 1. 专家检索逻辑 ====================
-        function fetchExperts(name = '', phone = '', idCard = '', company = '', major = '', status = '', tagIds = '', projectCountFilter = '', lastTimeFilter = '', assignmentStatus = '') {
+        function fetchExperts(name = '', phone = '', idCard = '', company = '', major = '', status = '', tagIds = '', projectCountFilter = '', lastTimeFilter = '', assignmentStatus = '', page = 1) {
             const container = document.getElementById('cards-container');
             const paginator = document.getElementById('pagination-container');
+            const requestId = ++latestExpertsSearchRequestId;
+            const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+            const targetPage = Math.max(1, parseInt(page, 10) || 1);
+            lastExpertsSearchParams = {
+                name,
+                phone,
+                idCard,
+                company,
+                major,
+                status,
+                tagIds,
+                projectCountFilter,
+                lastTimeFilter,
+                assignmentStatus
+            };
+
+            if (activeExpertsSearchController && typeof activeExpertsSearchController.abort === 'function') {
+                activeExpertsSearchController.abort();
+            }
+            activeExpertsSearchController = controller;
             
             container.innerHTML = `
                 <div class="no-data">
@@ -3095,23 +3131,50 @@
             `;
             if (paginator) paginator.style.display = 'none';
             
-            const url = `/dlsgzs/api/search?name=${encodeURIComponent(name)}&phone=${encodeURIComponent(phone)}&id_card=${encodeURIComponent(idCard)}&company=${encodeURIComponent(company)}&major=${encodeURIComponent(major)}&status=${encodeURIComponent(status)}&tag_ids=${encodeURIComponent(tagIds)}&project_count=${encodeURIComponent(projectCountFilter)}&last_project_time=${encodeURIComponent(lastTimeFilter)}&assignment_status=${encodeURIComponent(assignmentStatus)}&_t=${Date.now()}`;
+            const url = `/dlsgzs/api/search?name=${encodeURIComponent(name)}&phone=${encodeURIComponent(phone)}&id_card=${encodeURIComponent(idCard)}&company=${encodeURIComponent(company)}&major=${encodeURIComponent(major)}&status=${encodeURIComponent(status)}&tag_ids=${encodeURIComponent(tagIds)}&project_count=${encodeURIComponent(projectCountFilter)}&last_project_time=${encodeURIComponent(lastTimeFilter)}&assignment_status=${encodeURIComponent(assignmentStatus)}&page=${targetPage}&limit=${pageSize}&_t=${Date.now()}`;
             
-            fetch(url)
+            fetch(url, controller ? { signal: controller.signal } : undefined)
                 .then(res => res.json())
                 .then(res => {
+                    if (requestId !== latestExpertsSearchRequestId) return;
                     if (res.success) {
-                        currentExpertsData = res.data;
-                        currentPage = 1; // 检索和切换状态后，页码重置为 1
+                        currentExpertsData = res.data || [];
+                        currentPage = parseInt(res.page, 10) || targetPage;
+                        currentTotalCount = Number.isFinite(Number(res.total)) ? Number(res.total) : currentExpertsData.length;
+                        currentTotalPages = Number.isFinite(Number(res.total_pages)) ? Number(res.total_pages) : Math.ceil(currentTotalCount / pageSize);
                         renderCards();
                     } else {
                         container.innerHTML = `<div class="no-data"><p>⚠️ 获取专家数据失败: ${res.error}</p></div>`;
                     }
                 })
                 .catch(err => {
+                    if (err && err.name === 'AbortError') return;
+                    if (requestId !== latestExpertsSearchRequestId) return;
                     container.innerHTML = `<div class="no-data"><p>⚠️ 网络错误，无法连接到后端</p></div>`;
                     console.error(err);
+                })
+                .finally(() => {
+                    if (activeExpertsSearchController === controller) {
+                        activeExpertsSearchController = null;
+                    }
                 });
+        }
+
+        function fetchExpertsPage(page) {
+            const params = lastExpertsSearchParams || {};
+            fetchExperts(
+                params.name || '',
+                params.phone || '',
+                params.idCard || '',
+                params.company || '',
+                params.major || '',
+                params.status || '',
+                params.tagIds || '',
+                params.projectCountFilter || '',
+                params.lastTimeFilter || '',
+                params.assignmentStatus || '',
+                page
+            );
         }
 
         function renderCards() {
@@ -3120,9 +3183,9 @@
             container.innerHTML = '';
             
             const data = currentExpertsData || [];
-            const total = data.length;
+            const total = currentTotalCount;
             
-            if (total === 0) {
+            if (data.length === 0) {
                 container.innerHTML = `
                     <div class="no-data" style="width: 100%;">
                         <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -3136,22 +3199,18 @@
                 return;
             }
 
-            // 计算总页数
-            const totalPages = Math.ceil(total / pageSize);
+            const totalPages = currentTotalPages || Math.ceil(total / pageSize);
             // 修正页码边界
             if (currentPage > totalPages) currentPage = totalPages;
             if (currentPage < 1) currentPage = 1;
 
-            const startIndex = (currentPage - 1) * pageSize;
-            const endIndex = Math.min(startIndex + pageSize, total);
-            const pageData = data.slice(startIndex, endIndex);
+            const pageData = data;
 
             const cardsGrid = document.createElement('div');
             cardsGrid.className = 'experts-cards-grid';
             cardsGrid.style.width = '100%';
             
             pageData.forEach((item, index) => {
-                const globalIndex = startIndex + index;
                 const card = document.createElement('div');
                 card.className = 'expert-card';
                 
@@ -3231,21 +3290,21 @@
                                 🕒 <span>最后参评: <strong>${item.last_project_time ? item.last_project_time.substring(0, 10) : '无'}</strong></span>
                             </div>
                         </div>
-                        <button class="btn-detail" onclick="showDetails(${globalIndex})">查看完整档案</button>
+                        <button class="btn-detail" onclick="showDetails(${index})">查看完整档案</button>
                     </div>
                 `;
                 cardsGrid.appendChild(card);
             });
             
             container.appendChild(cardsGrid);
-            renderPagination(totalPages);
+            renderPagination();
         }
 
-        function renderPagination(totalPages) {
+        function renderPagination() {
             const paginator = document.getElementById('pagination-container');
             if (!paginator) return;
-            const data = currentExpertsData || [];
-            const total = data.length;
+            const total = currentTotalCount;
+            const totalPages = currentTotalPages || Math.ceil(total / pageSize);
             
             if (total === 0) {
                 paginator.style.display = 'none';
@@ -3269,24 +3328,20 @@
             `;
             
             document.getElementById('btn-first-page').addEventListener('click', () => {
-                currentPage = 1;
-                renderCards();
+                fetchExpertsPage(1);
             });
             document.getElementById('btn-prev-page').addEventListener('click', () => {
                 if (currentPage > 1) {
-                    currentPage--;
-                    renderCards();
+                    fetchExpertsPage(currentPage - 1);
                 }
             });
             document.getElementById('btn-next-page').addEventListener('click', () => {
                 if (currentPage < totalPages) {
-                    currentPage++;
-                    renderCards();
+                    fetchExpertsPage(currentPage + 1);
                 }
             });
             document.getElementById('btn-last-page').addEventListener('click', () => {
-                currentPage = totalPages;
-                renderCards();
+                fetchExpertsPage(totalPages);
             });
         }
 

@@ -1573,6 +1573,18 @@ def api_search():
     
     project_count = request.args.get('project_count', '').strip()
     last_project_time = request.args.get('last_project_time', '').strip()
+    use_pagination = 'page' in request.args or 'limit' in request.args
+    page = 1
+    limit = 33
+    if use_pagination:
+        try:
+            page = max(1, int(request.args.get('page', '1')))
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            limit = max(1, min(100, int(request.args.get('limit', '33'))))
+        except (TypeError, ValueError):
+            limit = 33
     
     conn = get_db_conn()
     conn.row_factory = sqlite3.Row
@@ -1670,11 +1682,27 @@ def api_search():
                    ) as tags_str
             FROM experts
         """
+        where_clause = ""
         if conditions:
-            sql += " WHERE " + " AND ".join(conditions)
+            where_clause = " WHERE " + " AND ".join(conditions)
+            sql += where_clause
         sql += " ORDER BY id DESC"
-        
-        c.execute(sql, params)
+
+        total = None
+        total_pages = None
+        query_params = list(params)
+        if use_pagination:
+            count_sql = "SELECT COUNT(*) FROM experts" + where_clause
+            c.execute(count_sql, params)
+            total = c.fetchone()[0]
+            total_pages = (total + limit - 1) // limit if total else 0
+            if total_pages and page > total_pages:
+                page = total_pages
+            offset = (page - 1) * limit
+            sql += " LIMIT ? OFFSET ?"
+            query_params.extend([limit, offset])
+
+        c.execute(sql, query_params)
         rows = c.fetchall()
     finally:
         conn.close()
@@ -1706,6 +1734,17 @@ def api_search():
             "details": {}  # 列表阶段置空，点击“查看完整档案”时通过 api_detail 懒加载
         })
         
+    if use_pagination:
+        _log_action("检索评标专家", f"条件: 姓名={name}, 手机={phone}, 身份证={id_card}, 单位={company}, 专业={major}, 状态={status}, 分配状态={assignment_status}，共 {total} 条，返回第 {page} 页 {len(results)} 条")
+        return jsonify({
+            "success": True,
+            "data": results,
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "total_pages": total_pages
+        })
+
     _log_action("检索评标专家", f"条件: 姓名={name}, 手机={phone}, 身份证={id_card}, 单位={company}, 专业={major}, 状态={status}, 分配状态={assignment_status}，共 {len(results)} 条")
     return jsonify({"success": True, "data": results})
 
