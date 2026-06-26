@@ -341,16 +341,21 @@ def _register_or_update_face(id_card, name, photo_path, sub_quality_control=2):
         except Exception as e:
             return False, f"注册人脸时发生未捕获异常: {str(e)} [裁剪通道报错: {crop_err_msg}]"
         
+    sub_warnings = []
     # 2. 如果存在后续照片，调用 AddFace 追加人脸（最多到第5张），并施加严格质量校验
     for idx, sub_photo in enumerate(photo_list[1:]):
         sub_phys_path = get_physical_path(sub_photo)
         if not sub_phys_path:
-            print(f"⚠️ [AddFace 警告] 专家: {name}, 未找到第 {idx+2} 张物理照片: {sub_photo}")
+            msg = f"未找到第 {idx+2} 张物理照片"
+            print(f"⚠️ [AddFace 警告] 专家: {name}, {msg}: {sub_photo}")
+            sub_warnings.append(msg)
             continue
             
         sub_base64, sub_err = _process_single_photo_for_upload(sub_phys_path, id_card, name)
         if sub_err:
-            print(f"⚠️ [AddFace 警告] 专家: {name}, 处理第 {idx+2} 张照片失败: {sub_err}")
+            msg = f"处理第 {idx+2} 张照片失败: {sub_err}"
+            print(f"⚠️ [AddFace 警告] 专家: {name}, {msg}")
+            sub_warnings.append(msg)
             continue
             
         try:
@@ -359,14 +364,34 @@ def _register_or_update_face(id_card, name, photo_path, sub_quality_control=2):
             add_req.Images = [sub_base64]
             add_req.QualityControl = sub_quality_control  # 传递质量控制限制（默认 2 = 中等质量）
             
-            client.CreateFace(add_req)
-            print(f"✅ [CreateFace 成功] 专家: {name}, 成功同步第 {idx+2} 张照片")
+            resp = client.CreateFace(add_req)
+            ret_code = resp.RetCode[0] if (resp.RetCode and len(resp.RetCode) > 0) else 0
+            if ret_code == 0:
+                print(f"✅ [CreateFace 成功] 专家: {name}, 成功同步第 {idx+2} 张照片")
+            else:
+                if ret_code == -1601:
+                    err_desc = "图片中未检测到人脸"
+                elif ret_code == -1604:
+                    err_desc = "人脸质量不合规(如图片模糊、脸部阴影、光照不均、侧脸角度过大或尺寸过小)"
+                elif ret_code == -1609:
+                    err_desc = "该人脸与已有人脸相似度过高(重复)"
+                else:
+                    err_desc = f"接口拒绝 (错误码: {ret_code})"
+                
+                msg = f"第 {idx+2} 张照片因 {err_desc} 未能同步到云端"
+                print(f"⚠️ [CreateFace 失败] 专家: {name}, {msg}")
+                sub_warnings.append(msg)
         except TencentCloudSDKException as e:
-            # 捕获单张照片质量或入库报错，仅记录日志，让其它合规的备用照继续尝试
-            print(f"⚠️ [CreateFace 质量控制拒绝警告] 专家: {name}, 同步第 {idx+2} 张照片失败: {e.message} (代码: {e.code})")
+            msg = f"第 {idx+2} 张照片同步失败: {e.message} (代码: {e.code})"
+            print(f"⚠️ [CreateFace 质量控制拒绝警告] 专家: {name}, {msg}")
+            sub_warnings.append(msg)
         except Exception as e:
-            print(f"⚠️ [CreateFace 异常警告] 专家: {name}, 同步第 {idx+2} 张照片发生异常: {str(e)}")
+            msg = f"第 {idx+2} 张照片发生异常: {str(e)}"
+            print(f"⚠️ [CreateFace 异常警告] 专家: {name}, {msg}")
+            sub_warnings.append(msg)
             
+    if sub_warnings:
+        return True, "部分照片未同步成功：" + "；".join(sub_warnings)
     return True, "成功注册同步至人脸库"
 
 
@@ -2187,6 +2212,8 @@ def api_update_expert_profile():
                 if ok:
                     c.execute("UPDATE experts SET is_face_synced = 1, id_card = ? WHERE id = ?", (id_card_val.strip().upper(), expert_id))
                     conn.commit()
+                    if err_msg and err_msg != "成功注册同步至人脸库":
+                        sync_warning = err_msg
                 else:
                     c.execute("UPDATE experts SET is_face_synced = 0, id_card = ? WHERE id = ?", (id_card_val.strip().upper(), expert_id))
                     conn.commit()
@@ -2285,6 +2312,8 @@ def api_delete_photo():
             if ok:
                 c.execute("UPDATE experts SET is_face_synced = 1, id_card = ? WHERE id = ?", (id_card_val.strip().upper(), expert_id))
                 conn.commit()
+                if err_msg and err_msg != "成功注册同步至人脸库":
+                    sync_warning = err_msg
             else:
                 c.execute("UPDATE experts SET is_face_synced = 0, id_card = ? WHERE id = ?", (id_card_val.strip().upper(), expert_id))
                 conn.commit()
@@ -2748,6 +2777,8 @@ def api_face_sync_single():
             c.execute("UPDATE experts SET is_face_synced = 1, id_card = ? WHERE id = ?", (id_card.strip().upper(), expert_id))
             conn.commit()
             _log_action("手动同步单人脸", f"专家: {name}, 身份证: {id_card}")
+            if err_msg and err_msg != "成功注册同步至人脸库":
+                return jsonify({"success": True, "message": f"专家【{name}】的人脸数据已部分同步。{err_msg}"})
             return jsonify({"success": True, "message": f"专家【{name}】的人脸数据已成功同步至云端人员库。"})
         else:
             c.execute("UPDATE experts SET is_face_synced = 0, id_card = ? WHERE id = ?", (id_card.strip().upper(), expert_id))
