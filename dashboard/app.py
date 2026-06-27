@@ -936,6 +936,16 @@ try:
 except Exception as e:
     print(f"⚠️ Experts DB Init Failed: {e}")
 
+# --- Shared Recognition Records Blueprint ---
+from dashboard.blueprints.shared_records import shared_records_bp, init_shared_records_db
+app.register_blueprint(shared_records_bp)
+try:
+    with app.app_context():
+        init_shared_records_db()
+    print("✅ Shared Records DB Initialized")
+except Exception as e:
+    print(f"⚠️ Shared Records DB Init Failed: {e}")
+
 # --- 投标文件对比功能 ---
 
 @app.route('/bijiao')
