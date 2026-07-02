@@ -1161,7 +1161,7 @@ def api_upload():
                 major = clean_val(row.get(col_mapping.get('major', '')))
                 raw_json = clean_val(row.get(col_mapping.get('raw_json', '')))
 
-                # 提前进行数据库查重，以便对于已存在且有照专家跳过压缩包照片的读取与复制流程
+                # 提前进行数据库查重，以便对于已存在专家跳过压缩包照片的读取与复制流程
                 c.execute("SELECT id, id_card, company, major, photo_path, raw_json FROM experts WHERE name = ? AND phone = ?", (name, phone))
                 exist_record = c.fetchone()
 
@@ -1171,8 +1171,8 @@ def api_upload():
                 photo_path_db = None
                 
                 should_process_photo = True
-                if exist_record and exist_record[4]:
-                    # 专家已存在且已有照片，则绝对不再覆盖更新，直接使用原有数据库的照片路径
+                if exist_record:
+                    # 专家已存在时，不使用批量包里的照片覆盖或补写，直接保留数据库中的照片路径。
                     should_process_photo = False
                     photo_path_db = exist_record[4]
 
@@ -1321,12 +1321,13 @@ def api_upload():
                     db_photo_path = exist_record[4]
                     db_raw_json = exist_record[5]
                     
-                    # 只有当新解析的字段非空时，才更新覆盖；若新解析为空（例如 Excel 中该字段为空或根本没有该列），则保留原数据库字段
+                    # 只有当新解析的字段非空时，才更新覆盖；若新解析为空（例如 Excel 中该字段为空或根本没有该列），则保留原数据库字段。
+                    # 已存在专家的专业、照片、原始 JSON 不允许被批量包覆盖，避免导入旧包时冲掉人工维护后的资料。
                     final_id_card = id_card if id_card else db_id_card
                     final_company = company if company else db_company
-                    final_major = major if major else db_major
-                    final_photo_path = photo_path_db if photo_path_db else db_photo_path
-                    final_raw_json = raw_json if raw_json else db_raw_json
+                    final_major = db_major
+                    final_photo_path = db_photo_path
+                    final_raw_json = db_raw_json
                     
                     c.execute('''
                         UPDATE experts 
