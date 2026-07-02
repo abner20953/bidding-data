@@ -70,13 +70,13 @@ def init_face_group():
         
     try:
         # 首先检查人员库是否存在
-        req = models.DescribeGroupRequest()
+        req = models.GetGroupInfoRequest()
         req.GroupId = GROUP_ID
-        client.DescribeGroup(req)
+        client.GetGroupInfo(req)
         print(f"✅ 腾讯云人脸库 GroupId='{GROUP_ID}' 已经存在，无需重复创建。")
     except TencentCloudSDKException as e:
         # 错误码为 FailedOperation.GroupNotExist 或错误提示不存在时
-        if "GroupNotExist" in str(e.code) or "GroupNotExist" in str(e):
+        if "GroupNotExist" in str(e.code) or "GroupNotExist" in str(e) or "GroupIdNotExist" in str(e):
             try:
                 create_req = models.CreateGroupRequest()
                 create_req.GroupName = "评标专家人脸库"
@@ -1942,14 +1942,6 @@ def api_clear():
     conn = get_db_conn()
     try:
         c = conn.cursor()
-        # 联动清空腾讯云人脸库人员，防僵尸人脸残留
-        try:
-            c.execute("SELECT id_card FROM experts WHERE id_card IS NOT NULL AND id_card != ''")
-            id_cards = [row[0] for row in c.fetchall() if row[0]]
-            for ic in id_cards:
-                _delete_face(ic)
-        except Exception as fe:
-            print(f"⚠️ [api_clear 警告] 批量注销云端人脸失败: {fe}")
 
         c.execute('DELETE FROM experts')
         c.execute('DELETE FROM expert_majors')
