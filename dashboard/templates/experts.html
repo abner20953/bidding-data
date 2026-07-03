@@ -3361,6 +3361,22 @@
             const progressContainer = document.getElementById('progress-container');
             const progressBar = document.getElementById('progress-bar');
             const progressText = document.getElementById('progress-text');
+            let uploadProgressHideTimer = null;
+
+            function clearUploadProgressHideTimer() {
+                if (uploadProgressHideTimer) {
+                    clearTimeout(uploadProgressHideTimer);
+                    uploadProgressHideTimer = null;
+                }
+            }
+
+            function scheduleUploadProgressHide() {
+                clearUploadProgressHideTimer();
+                uploadProgressHideTimer = setTimeout(() => {
+                    progressContainer.style.display = 'none';
+                    uploadProgressHideTimer = null;
+                }, 4000);
+            }
 
             dropZone.addEventListener('click', () => fileInput.click());
             
@@ -3394,6 +3410,7 @@
                     return;
                 }
 
+                clearUploadProgressHideTimer();
                 progressContainer.style.display = 'block';
                 progressBar.style.width = '0%';
                 progressText.innerText = '正在上传 0%...';
@@ -3434,18 +3451,14 @@
                         progressText.innerText = '导入失败: ' + errorMsg;
                         alert('⚠️ 导入失败: ' + errorMsg);
                     }
-                    setTimeout(() => {
-                        progressContainer.style.display = 'none';
-                    }, 4000);
+                    scheduleUploadProgressHide();
                 };
 
                 xhr.onerror = () => {
                     progressBar.style.width = '0%';
                     progressText.innerText = '上传时发生网络错误';
                     alert('⚠️ 网络异常，压缩包上传失败');
-                    setTimeout(() => {
-                        progressContainer.style.display = 'none';
-                    }, 4000);
+                    scheduleUploadProgressHide();
                 };
 
                 xhr.send(formData);
