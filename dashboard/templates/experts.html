@@ -733,6 +733,13 @@
             transform: translateY(-2px);
         }
 
+        .upload-zone-large.upload-disabled {
+            cursor: wait;
+            opacity: 0.68;
+            pointer-events: none;
+            transform: none;
+        }
+
         .upload-icon-large {
             font-size: 56px;
             margin-bottom: 16px;
@@ -3058,6 +3065,11 @@
 
         // 标签页切换逻辑
         function switchTab(tabId) {
+            if (window.isBatchUploadInProgress && tabId !== 'upload') {
+                alert('批量上传正在处理中，请等待完成后再切换页面。');
+                return;
+            }
+
             // 切入人脸核验面板时重置其状态
             if (tabId === 'face-search') {
                 if (typeof resetFaceSearchPanel === 'function') {
@@ -3361,27 +3373,33 @@
             const progressContainer = document.getElementById('progress-container');
             const progressBar = document.getElementById('progress-bar');
             const progressText = document.getElementById('progress-text');
-            let uploadProgressHideTimer = null;
+            let activeUploadRequestId = 0;
+            let isBatchUploadInProgress = false;
+            window.isBatchUploadInProgress = false;
 
-            function clearUploadProgressHideTimer() {
-                if (uploadProgressHideTimer) {
-                    clearTimeout(uploadProgressHideTimer);
-                    uploadProgressHideTimer = null;
+            function setBatchUploadBusy(isBusy) {
+                isBatchUploadInProgress = isBusy;
+                window.isBatchUploadInProgress = isBusy;
+                fileInput.disabled = isBusy;
+                dropZone.classList.toggle('upload-disabled', isBusy);
+            }
+
+            function isCurrentUploadRequest(requestId) {
+                return requestId === activeUploadRequestId;
+            }
+
+            dropZone.addEventListener('click', () => {
+                if (isBatchUploadInProgress) {
+                    return;
                 }
-            }
-
-            function scheduleUploadProgressHide() {
-                clearUploadProgressHideTimer();
-                uploadProgressHideTimer = setTimeout(() => {
-                    progressContainer.style.display = 'none';
-                    uploadProgressHideTimer = null;
-                }, 4000);
-            }
-
-            dropZone.addEventListener('click', () => fileInput.click());
+                fileInput.click();
+            });
             
             dropZone.addEventListener('dragover', (e) => {
                 e.preventDefault();
+                if (isBatchUploadInProgress) {
+                    return;
+                }
                 dropZone.classList.add('dragover');
             });
             
@@ -3392,6 +3410,11 @@
             dropZone.addEventListener('drop', (e) => {
                 e.preventDefault();
                 dropZone.classList.remove('dragover');
+                if (isBatchUploadInProgress) {
+                    progressContainer.style.display = 'block';
+                    progressText.innerText = '当前批量上传仍在处理中，请等待完成后再上传新的压缩包。';
+                    return;
+                }
                 const files = e.dataTransfer.files;
                 if (files.length > 0) {
                     handleUpload(files[0]);
@@ -3404,13 +3427,28 @@
                 }
             });
 
+            window.addEventListener('beforeunload', (e) => {
+                if (!isBatchUploadInProgress) {
+                    return;
+                }
+                e.preventDefault();
+                e.returnValue = '';
+            });
+
             function handleUpload(file) {
                 if (!file.name.endsWith('.zip')) {
                     alert('⚠️ 只允许上传 .zip 格式的压缩文件');
                     return;
                 }
 
-                clearUploadProgressHideTimer();
+                if (isBatchUploadInProgress) {
+                    alert('当前批量上传仍在处理中，请等待完成后再上传新的压缩包。');
+                    fileInput.value = '';
+                    return;
+                }
+
+                const uploadRequestId = ++activeUploadRequestId;
+                setBatchUploadBusy(true);
                 progressContainer.style.display = 'block';
                 progressBar.style.width = '0%';
                 progressText.innerText = '正在上传 0%...';
@@ -3422,6 +3460,9 @@
                 xhr.open('POST', '/dlsgzs/api/upload', true);
 
                 xhr.upload.onprogress = (e) => {
+                    if (!isCurrentUploadRequest(uploadRequestId)) {
+                        return;
+                    }
                     if (e.lengthComputable) {
                         const percentComplete = Math.round((e.loaded / e.total) * 100);
                         progressBar.style.width = percentComplete + '%';
@@ -3433,14 +3474,23 @@
                 };
 
                 xhr.onload = () => {
+                    if (!isCurrentUploadRequest(uploadRequestId)) {
+                        return;
+                    }
                     if (xhr.status === 200) {
-                        const res = JSON.parse(xhr.responseText);
+                        let res = {};
+                        try {
+                            res = JSON.parse(xhr.responseText);
+                        } catch (ex) {
+                            res = { message: '导入完成，但服务器返回内容解析异常，请刷新列表确认结果。' };
+                        }
                         progressBar.style.width = '100%';
                         progressText.innerText = '导入成功！';
-                        alert('✅ ' + res.message);
                         
                         // 导入成功后清空上传控件，继续停留在当前上传页面
                         fileInput.value = '';
+                        setBatchUploadBusy(false);
+                        alert('✅ ' + (res.message || '导入成功'));
                     } else {
                         let errorMsg = '上传失败';
                         try {
@@ -3449,19 +3499,45 @@
                         } catch(ex) {}
                         progressBar.style.width = '0%';
                         progressText.innerText = '导入失败: ' + errorMsg;
+                        fileInput.value = '';
+                        setBatchUploadBusy(false);
                         alert('⚠️ 导入失败: ' + errorMsg);
                     }
-                    scheduleUploadProgressHide();
                 };
 
                 xhr.onerror = () => {
+                    if (!isCurrentUploadRequest(uploadRequestId)) {
+                        return;
+                    }
                     progressBar.style.width = '0%';
                     progressText.innerText = '上传时发生网络错误';
+                    fileInput.value = '';
+                    setBatchUploadBusy(false);
                     alert('⚠️ 网络异常，压缩包上传失败');
-                    scheduleUploadProgressHide();
                 };
 
-                xhr.send(formData);
+                xhr.onabort = () => {
+                    if (!isCurrentUploadRequest(uploadRequestId)) {
+                        return;
+                    }
+                    progressBar.style.width = '0%';
+                    progressText.innerText = '上传已取消';
+                    fileInput.value = '';
+                    setBatchUploadBusy(false);
+                };
+
+                try {
+                    xhr.send(formData);
+                } catch (err) {
+                    if (!isCurrentUploadRequest(uploadRequestId)) {
+                        return;
+                    }
+                    progressBar.style.width = '0%';
+                    progressText.innerText = '上传请求发送失败';
+                    fileInput.value = '';
+                    setBatchUploadBusy(false);
+                    alert('⚠️ 上传请求发送失败: ' + err.message);
+                }
             }
         }
 
