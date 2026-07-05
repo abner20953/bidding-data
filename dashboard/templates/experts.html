@@ -820,6 +820,34 @@
             text-align: right;
         }
 
+        .batch-upload-status-toast {
+            position: fixed;
+            right: 24px;
+            bottom: 24px;
+            z-index: 2600;
+            width: min(380px, calc(100vw - 32px));
+            padding: 14px 16px 16px;
+            border-radius: 12px;
+            border: 1px solid rgba(14, 165, 233, 0.18);
+            background: rgba(255, 255, 255, 0.96);
+            box-shadow: 0 16px 40px rgba(15, 23, 42, 0.18);
+            display: none;
+        }
+
+        .batch-upload-status-title {
+            font-size: 13px;
+            font-weight: 700;
+            color: var(--text-primary);
+            margin-bottom: 10px;
+        }
+
+        .batch-upload-status-text {
+            font-size: 12px;
+            line-height: 1.5;
+            color: var(--text-secondary);
+            margin-top: 8px;
+        }
+
         /* 数据维护与删除 */
         .maintenance-grid {
             display: grid;
@@ -2162,6 +2190,14 @@
             </button>
         </div>
 
+        <div class="batch-upload-status-toast" id="batch-upload-status-toast">
+            <div class="batch-upload-status-title">批量上传状态</div>
+            <div class="progress-bar-bg">
+                <div class="progress-bar-fill" id="batch-upload-floating-bar"></div>
+            </div>
+            <div class="batch-upload-status-text" id="batch-upload-floating-text">准备上传...</div>
+        </div>
+
         <!-- 人脸比对检索面板 -->
         <div id="panel-face-search" class="tab-panel" style="display: none;">
             <div style="max-width: 600px; margin: 30px auto; display: flex; flex-direction: column; gap: 20px;">
@@ -3373,8 +3409,12 @@
             const progressContainer = document.getElementById('progress-container');
             const progressBar = document.getElementById('progress-bar');
             const progressText = document.getElementById('progress-text');
+            const floatingStatus = document.getElementById('batch-upload-status-toast');
+            const floatingBar = document.getElementById('batch-upload-floating-bar');
+            const floatingText = document.getElementById('batch-upload-floating-text');
             let activeUploadRequestId = 0;
             let isBatchUploadInProgress = false;
+            let lastUploadPercent = 0;
             window.isBatchUploadInProgress = false;
 
             function setBatchUploadBusy(isBusy) {
@@ -3386,6 +3426,24 @@
 
             function isCurrentUploadRequest(requestId) {
                 return requestId === activeUploadRequestId;
+            }
+
+            function setUploadStatus(percent, text, showFloating = true) {
+                if (Number.isFinite(percent)) {
+                    lastUploadPercent = Math.max(0, Math.min(100, percent));
+                    progressBar.style.width = lastUploadPercent + '%';
+                    if (floatingBar) {
+                        floatingBar.style.width = lastUploadPercent + '%';
+                    }
+                }
+                progressContainer.style.display = 'block';
+                progressText.innerText = text;
+                if (floatingText) {
+                    floatingText.innerText = text;
+                }
+                if (floatingStatus) {
+                    floatingStatus.style.display = showFloating ? 'block' : 'none';
+                }
             }
 
             dropZone.addEventListener('click', () => {
@@ -3411,8 +3469,7 @@
                 e.preventDefault();
                 dropZone.classList.remove('dragover');
                 if (isBatchUploadInProgress) {
-                    progressContainer.style.display = 'block';
-                    progressText.innerText = '当前批量上传仍在处理中，请等待完成后再上传新的压缩包。';
+                    setUploadStatus(lastUploadPercent, '当前批量上传仍在处理中，请等待完成后再上传新的压缩包。');
                     return;
                 }
                 const files = e.dataTransfer.files;
@@ -3449,9 +3506,7 @@
 
                 const uploadRequestId = ++activeUploadRequestId;
                 setBatchUploadBusy(true);
-                progressContainer.style.display = 'block';
-                progressBar.style.width = '0%';
-                progressText.innerText = '正在上传 0%...';
+                setUploadStatus(0, '正在上传 0%...');
 
                 const formData = new FormData();
                 formData.append('file', file);
@@ -3465,10 +3520,9 @@
                     }
                     if (e.lengthComputable) {
                         const percentComplete = Math.round((e.loaded / e.total) * 100);
-                        progressBar.style.width = percentComplete + '%';
-                        progressText.innerText = `正在上传 ${percentComplete}%...`;
+                        setUploadStatus(percentComplete, `正在上传 ${percentComplete}%...`);
                         if (percentComplete >= 100) {
-                            progressText.innerText = '压缩包已上传完毕，后端正在解压并执行去重导入，请勿关闭或刷新本页面...';
+                            setUploadStatus(100, '压缩包已上传完毕，后端正在解压并执行去重导入，请勿关闭或刷新本页面...');
                         }
                     }
                 };
@@ -3484,8 +3538,7 @@
                         } catch (ex) {
                             res = { message: '导入完成，但服务器返回内容解析异常，请刷新列表确认结果。' };
                         }
-                        progressBar.style.width = '100%';
-                        progressText.innerText = '导入成功！';
+                        setUploadStatus(100, '导入成功！');
                         
                         // 导入成功后清空上传控件，继续停留在当前上传页面
                         fileInput.value = '';
@@ -3497,8 +3550,7 @@
                             const res = JSON.parse(xhr.responseText);
                             errorMsg = res.error || errorMsg;
                         } catch(ex) {}
-                        progressBar.style.width = '0%';
-                        progressText.innerText = '导入失败: ' + errorMsg;
+                        setUploadStatus(Math.max(lastUploadPercent, 8), '导入失败: ' + errorMsg);
                         fileInput.value = '';
                         setBatchUploadBusy(false);
                         alert('⚠️ 导入失败: ' + errorMsg);
@@ -3509,19 +3561,17 @@
                     if (!isCurrentUploadRequest(uploadRequestId)) {
                         return;
                     }
-                    progressBar.style.width = '0%';
-                    progressText.innerText = '上传时发生网络错误';
+                    setUploadStatus(Math.max(lastUploadPercent, 8), '上传连接中断，但服务器可能仍在处理，请稍后刷新专家列表确认。');
                     fileInput.value = '';
                     setBatchUploadBusy(false);
-                    alert('⚠️ 网络异常，压缩包上传失败');
+                    alert('⚠️ 上传连接中断，服务器可能仍在处理，请稍后刷新专家列表确认结果。');
                 };
 
                 xhr.onabort = () => {
                     if (!isCurrentUploadRequest(uploadRequestId)) {
                         return;
                     }
-                    progressBar.style.width = '0%';
-                    progressText.innerText = '上传已取消';
+                    setUploadStatus(Math.max(lastUploadPercent, 8), '上传已取消');
                     fileInput.value = '';
                     setBatchUploadBusy(false);
                 };
@@ -3532,8 +3582,7 @@
                     if (!isCurrentUploadRequest(uploadRequestId)) {
                         return;
                     }
-                    progressBar.style.width = '0%';
-                    progressText.innerText = '上传请求发送失败';
+                    setUploadStatus(Math.max(lastUploadPercent, 8), '上传请求发送失败');
                     fileInput.value = '';
                     setBatchUploadBusy(false);
                     alert('⚠️ 上传请求发送失败: ' + err.message);
