@@ -3414,6 +3414,7 @@
             let activeUploadRequestId = 0;
             let isBatchUploadInProgress = false;
             let lastUploadPercent = 0;
+            let uploadStatusHideTimer = null;
             window.isBatchUploadInProgress = false;
 
             function setBatchUploadBusy(isBusy) {
@@ -3425,6 +3426,23 @@
 
             function isCurrentUploadRequest(requestId) {
                 return requestId === activeUploadRequestId;
+            }
+
+            function clearUploadStatusHideTimer() {
+                if (uploadStatusHideTimer) {
+                    clearTimeout(uploadStatusHideTimer);
+                    uploadStatusHideTimer = null;
+                }
+            }
+
+            function scheduleUploadStatusHide() {
+                clearUploadStatusHideTimer();
+                uploadStatusHideTimer = setTimeout(() => {
+                    if (!isBatchUploadInProgress && floatingStatus) {
+                        floatingStatus.style.display = 'none';
+                    }
+                    uploadStatusHideTimer = null;
+                }, 8000);
             }
 
             function setUploadStatus(percent, text, showFloating = true) {
@@ -3505,6 +3523,7 @@
 
                 const uploadRequestId = ++activeUploadRequestId;
                 setBatchUploadBusy(true);
+                clearUploadStatusHideTimer();
                 setUploadStatus(0, '正在上传 0%...');
 
                 const formData = new FormData();
@@ -3542,6 +3561,7 @@
                         // 导入成功后清空上传控件，继续停留在当前上传页面
                         fileInput.value = '';
                         setBatchUploadBusy(false);
+                        scheduleUploadStatusHide();
                         alert('✅ ' + (res.message || '导入成功'));
                     } else {
                         let errorMsg = '上传失败';
@@ -3552,6 +3572,7 @@
                         setUploadStatus(Math.max(lastUploadPercent, 8), '导入失败: ' + errorMsg);
                         fileInput.value = '';
                         setBatchUploadBusy(false);
+                        scheduleUploadStatusHide();
                         alert('⚠️ 导入失败: ' + errorMsg);
                     }
                 };
@@ -3563,6 +3584,7 @@
                     setUploadStatus(Math.max(lastUploadPercent, 8), '上传连接中断，但服务器可能仍在处理，请稍后刷新专家列表确认。');
                     fileInput.value = '';
                     setBatchUploadBusy(false);
+                    scheduleUploadStatusHide();
                     alert('⚠️ 上传连接中断，服务器可能仍在处理，请稍后刷新专家列表确认结果。');
                 };
 
@@ -3573,6 +3595,7 @@
                     setUploadStatus(Math.max(lastUploadPercent, 8), '上传已取消');
                     fileInput.value = '';
                     setBatchUploadBusy(false);
+                    scheduleUploadStatusHide();
                 };
 
                 try {
@@ -3584,6 +3607,7 @@
                     setUploadStatus(Math.max(lastUploadPercent, 8), '上传请求发送失败');
                     fileInput.value = '';
                     setBatchUploadBusy(false);
+                    scheduleUploadStatusHide();
                     alert('⚠️ 上传请求发送失败: ' + err.message);
                 }
             }
