@@ -5018,7 +5018,7 @@
                     <div class="project-card">
                         <div class="project-card-title">
                             <span>${p.project_name || '-'}</span>
-                            <button class="project-view-btn" onclick="toggleProjectExtraDetails(${p.id})" title="查看 Project Name/Code/ID 额外信息">
+                            <button class="project-view-btn" onclick="toggleProjectExtraDetails(${p.id})" title="查看 Project Name/Code/ID/Review ID 额外信息">
                                 👁️ 详情
                             </button>
                         </div>
@@ -5041,6 +5041,10 @@
                             <div class="project-extra-item">
                                 <div class="project-extra-label">Project ID:</div>
                                 <div class="project-extra-val">${p.project_id_str || '<span style="color:#aaa;">(未录入)</span>'}</div>
+                            </div>
+                            <div class="project-extra-item">
+                                <div class="project-extra-label">Review ID:</div>
+                                <div class="project-extra-val">${p.review_id || '<span style="color:#aaa;">(未录入)</span>'}</div>
                             </div>
                         </div>
                         

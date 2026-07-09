@@ -708,6 +708,7 @@ def init_db():
                 project_name_en TEXT,
                 project_code TEXT,
                 project_id_str TEXT,
+                review_id TEXT,
                 created_at TEXT
             )
         ''')
@@ -739,6 +740,11 @@ def init_db():
 
         try:
             c.execute("ALTER TABLE projects ADD COLUMN project_id_str TEXT")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            c.execute("ALTER TABLE projects ADD COLUMN review_id TEXT")
         except sqlite3.OperationalError:
             pass
 
@@ -862,6 +868,8 @@ def parse_and_import_md(file_path):
                             header_indices['project_code'] = i
                         elif 'Project ID' in part or 'Project id' in part:
                             header_indices['project_id_str'] = i
+                        elif 'Review ID' in part or 'Review id' in part:
+                            header_indices['review_id'] = i
                         elif '处理时间' in part:
                             header_indices['process_time'] = i
                         elif '经办人姓名' in part or ('经办人' in part and '部门' not in part):
@@ -910,39 +918,42 @@ def parse_and_import_md(file_path):
                 agent_dept = get_val('agent_dept', "")
                 experts_cell = get_val('experts', "")
                 
-                # 新增的三个字段
+                # 新增的项目额外字段
                 project_name_en = get_val('project_name_en')
                 project_code = get_val('project_code')
                 project_id_str = get_val('project_id_str')
+                review_id = get_val('review_id')
 
                 if not project_name:
                     continue
                 
                 # 插入或更新项目基本信息
-                c.execute("SELECT id, project_name_en, project_code, project_id_str FROM projects WHERE project_name = ?", (project_name,))
+                c.execute("SELECT id, project_name_en, project_code, project_id_str, review_id FROM projects WHERE project_name = ?", (project_name,))
                 row_exist = c.fetchone()
                 if row_exist:
                     project_id = row_exist[0]
-                    # 如果上传的 MD 文件不包含新字段（旧版格式），则保留数据库中已有的这三个字段值，防止被覆盖为 NULL
+                    # 如果上传的 MD 文件不包含新字段（旧版格式），则保留数据库中已有字段值，防止被覆盖为 NULL。
                     final_name_en = project_name_en if 'project_name_en' in header_indices else row_exist[1]
                     final_code = project_code if 'project_code' in header_indices else row_exist[2]
                     final_id_str = project_id_str if 'project_id_str' in header_indices else row_exist[3]
+                    # Review ID 是后续新增字段；旧 MD 缺列或新单元格为空时保留历史值，新 MD 有值时补写/更新。
+                    final_review_id = review_id if review_id else row_exist[4]
                     
                     c.execute('''
                         UPDATE projects 
                         SET process_time = ?, agent_name = ?, agent_dept = ?, 
-                            project_name_en = ?, project_code = ?, project_id_str = ?, created_at = ?
+                            project_name_en = ?, project_code = ?, project_id_str = ?, review_id = ?, created_at = ?
                         WHERE id = ?
-                    ''', (process_time, agent_name, agent_dept, final_name_en, final_code, final_id_str, now_time, project_id))
+                    ''', (process_time, agent_name, agent_dept, final_name_en, final_code, final_id_str, final_review_id, now_time, project_id))
                     # 防重覆盖机制：清空旧参评专家关联
                     c.execute("DELETE FROM project_experts WHERE project_id = ?", (project_id,))
                     project_updated += 1
                 else:
                     c.execute('''
                         INSERT INTO projects (project_name, process_time, agent_name, agent_dept, 
-                                             project_name_en, project_code, project_id_str, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                      ''', (project_name, process_time, agent_name, agent_dept, project_name_en, project_code, project_id_str, now_time))
+                                             project_name_en, project_code, project_id_str, review_id, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      ''', (project_name, process_time, agent_name, agent_dept, project_name_en, project_code, project_id_str, review_id, now_time))
                     project_id = c.lastrowid
                     project_added += 1
                 
@@ -1488,7 +1499,7 @@ def api_search_projects():
         # 2. 精准分页拉取项目详情
         sql = """
             SELECT DISTINCT p.id, p.project_name, p.process_time, p.agent_name, p.agent_dept, p.created_at,
-                            p.project_name_en, p.project_code, p.project_id_str
+                            p.project_name_en, p.project_code, p.project_id_str, p.review_id
             FROM projects p
             LEFT JOIN project_experts pe ON p.id = pe.project_id
         """
@@ -1538,6 +1549,7 @@ def api_search_projects():
                 "project_name_en": p_row['project_name_en'] or "",
                 "project_code": p_row['project_code'] or "",
                 "project_id_str": p_row['project_id_str'] or "",
+                "review_id": p_row['review_id'] or "",
                 "experts": experts_list
             })
             
