@@ -201,6 +201,142 @@
             font-size: 0.95rem;
         }
 
+        .summary-metrics {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 10px;
+            margin-top: 16px;
+        }
+
+        .summary-metric {
+            min-height: 64px;
+            padding: 10px 12px;
+            border: 1px solid #e5e7eb;
+            border-radius: 6px;
+            background: #fff;
+        }
+
+        .summary-metric span {
+            display: block;
+            color: #6b7280;
+            font-size: 0.75rem;
+        }
+
+        .summary-metric strong {
+            display: block;
+            margin-top: 4px;
+            font-size: 1.15rem;
+        }
+
+        .result-toolbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin: -14px 0 18px;
+            flex-wrap: wrap;
+        }
+
+        .result-toolbar select,
+        .result-action-btn {
+            min-height: 36px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            background: #fff;
+            color: #374151;
+            padding: 7px 10px;
+            font-size: 0.85rem;
+        }
+
+        .result-action-btn {
+            cursor: pointer;
+            font-weight: 600;
+        }
+
+        .comparison-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        .comparison-pane {
+            background: #fff;
+            padding: 10px;
+            border: 1px solid #e5e7eb;
+            border-radius: 6px;
+            overflow-wrap: anywhere;
+        }
+
+        .comparison-pane-label {
+            color: #6b7280;
+            font-size: 0.72rem;
+            margin-bottom: 5px;
+        }
+
+        .tender-reference {
+            margin-top: 10px;
+            padding: 10px;
+            border-left: 3px solid #2563eb;
+            background: #eff6ff;
+            color: #374151;
+            font-size: 0.85rem;
+            line-height: 1.55;
+        }
+
+        @media (max-width: 640px) {
+            body {
+                padding: 12px;
+            }
+
+            .container {
+                padding: 20px 14px;
+                border-radius: 12px;
+            }
+
+            .comparison-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .para-meta {
+                align-items: flex-start;
+                flex-direction: column;
+                gap: 8px;
+            }
+        }
+
+        @media print {
+            body {
+                background: #fff;
+                padding: 0;
+            }
+
+            .container {
+                max-width: none;
+                box-shadow: none;
+                border: 0;
+                padding: 0;
+            }
+
+            form,
+            header,
+            .result-toolbar {
+                display: none !important;
+            }
+
+            .results-area {
+                display: block !important;
+                margin-top: 0;
+                border-top: 0;
+                padding-top: 0;
+            }
+
+            .paragraph-card {
+                break-inside: avoid;
+                box-shadow: none;
+            }
+        }
+
         /* Loading Spinner - Kept for fallback although we use bar now */
         .loader {
             display: none;
@@ -298,8 +434,30 @@
         <div class="results-area" id="results-area">
             <div class="summary-card">
                 <h3 style="margin-top: 0; color: #991b1b;">检测报告</h3>
-                <p>共发现 <strong id="count-display" style="font-size: 1.25rem;">0</strong> 处完全一致的段落<span
+                <p>共发现 <strong id="count-display" style="font-size: 1.25rem;">0</strong> 条比对线索<span
                         id="result-msg-suffix">（已排除招标文件原文）</span>。</p>
+                <div class="summary-metrics">
+                    <div class="summary-metric"><span>完全雷同</span><strong id="metric-exact">0</strong></div>
+                    <div class="summary-metric"><span>近似雷同</span><strong id="metric-fuzzy">0</strong></div>
+                    <div class="summary-metric"><span>招标相关共同修改</span><strong id="metric-tender">0</strong></div>
+                    <div class="summary-metric"><span>敏感实体</span><strong id="metric-entity">0</strong></div>
+                    <div class="summary-metric"><span>A / B 涉及正文</span><strong id="metric-ratio">0% / 0%</strong></div>
+                </div>
+            </div>
+
+            <div class="result-toolbar">
+                <select id="result-filter" aria-label="筛选结果类型">
+                    <option value="all">全部线索</option>
+                    <option value="text">完全雷同</option>
+                    <option value="fuzzy">近似雷同</option>
+                    <option value="tender_related">招标相关共同修改</option>
+                    <option value="entity">敏感实体</option>
+                    <option value="rare_word">共同罕见词</option>
+                </select>
+                <div>
+                    <button type="button" class="result-action-btn" id="export-csv-btn">导出 CSV</button>
+                    <button type="button" class="result-action-btn" id="print-report-btn">打印报告</button>
+                </div>
             </div>
 
             <div id="paragraphs-list">
@@ -427,6 +585,8 @@
         setupDragAndDrop('file_b');
         setupDragAndDrop('file_tender');
 
+        let latestParagraphs = [];
+
         // Form Submission
         document.getElementById('compare-form').addEventListener('submit', async function (e) {
             e.preventDefault();
@@ -509,15 +669,20 @@
 
                 let suspicious_paras = [];
                 let metadata = null;
+                let summary = null;
 
                 if (Array.isArray(result.data)) {
                     suspicious_paras = result.data;
                 } else {
                     suspicious_paras = result.data.paragraphs;
                     metadata = result.data.metadata;
+                    summary = result.data.summary;
                 }
 
+                latestParagraphs = suspicious_paras;
+                document.getElementById('result-filter').value = 'all';
                 countDisplay.textContent = suspicious_paras.length;
+                renderSummary(summary, suspicious_paras);
 
                 const tenderInput = document.getElementById('file_tender');
                 const hasTender = tenderInput.files.length > 0;
@@ -534,6 +699,9 @@
                     const metaA = metadata.file_a.author;
                     const metaB = metadata.file_b.author;
                     const metaTender = metadata.tender ? metadata.tender.author : 'N/A';
+                    const textStats = metadata.text_stats || {};
+                    const statsA = textStats.file_a || {};
+                    const statsB = textStats.file_b || {};
 
                     const cleanA = metaA ? metaA.trim() : '';
                     const cleanB = metaB ? metaB.trim() : '';
@@ -555,6 +723,8 @@
                             <div>📄 投标单位 A 作者: <strong>${escapeHtml(metaA)}</strong></div>
                             <div>📄 投标单位 B 作者: <strong>${escapeHtml(metaB)}</strong></div>
                             ${hasTender ? `<div>📘 招标文件 作者: <span style="color:#6b7280">${escapeHtml(metaTender)}</span></div>` : ''}
+                            <div>文件 A: <strong>${statsA.total_pages || 0}</strong> 页，疑似扫描 <strong>${statsA.suspected_scan_pages || 0}</strong> 页</div>
+                            <div>文件 B: <strong>${statsB.total_pages || 0}</strong> 页，疑似扫描 <strong>${statsB.suspected_scan_pages || 0}</strong> 页</div>
                         </div>
                         ${sameWarn}
                     `;
@@ -575,68 +745,7 @@
                         });
                     }
                 }
-
-
-
-                if (suspicious_paras.length === 0) {
-                    list.innerHTML = '<p style="text-align:center; color:#6b7280; padding: 20px;">未发现可疑的雷同段落 🎉</p>';
-                } else {
-                    suspicious_paras.forEach(item => {
-                        const div = document.createElement('div');
-                        div.className = 'paragraph-card';
-
-                        const pageA = item.page_a ? `第 ${item.page_a} 页` : '未知页';
-                        const pageB = item.page_b ? `第 ${item.page_b} 页` : '未知页';
-
-                        // Badges
-                        let badgesHtml = '';
-                        if (item.type === 'fuzzy') {
-                            badgesHtml += `<span class="badge badge-fuzzy">疑似拼写/修改</span>`;
-                        } else if (item.badges && item.badges.includes('共同异常断句')) {
-                            // High priority warning
-                            div.style.borderLeft = '4px solid #ef4444';
-                            badgesHtml += `<span class="badge badge-error">共同异常断句</span>`;
-                        } else {
-                            badgesHtml += `<span class="badge badge-error">完全匹配</span>`;
-                        }
-
-                        if (item.badges) {
-                            item.badges.forEach(b => {
-                                if (b !== '共同异常断句' && b !== '拼写/修改痕迹') {
-                                    badgesHtml += `<span class="badge badge-info">${b}</span>`;
-                                }
-                            });
-                        }
-
-                        div.innerHTML = `
-                            <div class="para-meta">
-                                <div>
-                                    <span style="font-weight:600; margin-right:15px;">📄 投标单位A: <span style="color:#ef4444;">${pageA}</span></span>
-                                    <span style="font-weight:600;">📄 投标单位B: <span style="color:#ef4444;">${pageB}</span></span>
-                                </div>
-                                <div>${badgesHtml}</div>
-                            </div>
-                            <!-- Diff View for Fuzzy -->
-                            ${item.type === 'fuzzy' ?
-                                `<div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-top:10px;">
-                                    <div style="background:#fff; padding:8px; border:1px solid #ddd; border-radius:4px;">
-                                        <div style="font-size:0.7em; color:#999; margin-bottom:4px;">文件 A</div>
-                                        <div style="font-size:0.9em;">${escapeHtml(item.text_a)}</div>
-                                    </div>
-                                    <div style="background:#fff; padding:8px; border:1px solid #ddd; border-radius:4px;">
-                                        <div style="font-size:0.7em; color:#999; margin-bottom:4px;">文件 B</div>
-                                        <div style="font-size:0.9em;">${escapeHtml(item.text_b)}</div>
-                                    </div>
-                                 </div>
-                                 <div style="margin-top:5px; font-size:0.8em; color:#d97706;">* ${item.desc}</div>
-                                `
-                                :
-                                `<div class="para-text">${escapeHtml(item.text_a)}</div>`
-                            }
-                        `;
-                        list.appendChild(div);
-                    });
-                }
+                renderParagraphs(suspicious_paras);
 
                 resultsArea.classList.add('visible');
 
@@ -653,6 +762,119 @@
             }
         });
 
+        function renderSummary(summary, paragraphs) {
+            const fallbackCounts = paragraphs.reduce((counts, item) => {
+                counts[item.type] = (counts[item.type] || 0) + 1;
+                return counts;
+            }, {});
+            const values = summary || {
+                exact: fallbackCounts.text || 0,
+                fuzzy: fallbackCounts.fuzzy || 0,
+                tender_related: fallbackCounts.tender_related || 0,
+                entity: fallbackCounts.entity || 0,
+                matched_ratio_a: 0,
+                matched_ratio_b: 0
+            };
+            document.getElementById('metric-exact').textContent = values.exact || 0;
+            document.getElementById('metric-fuzzy').textContent = values.fuzzy || 0;
+            document.getElementById('metric-tender').textContent = values.tender_related || 0;
+            document.getElementById('metric-entity').textContent = values.entity || 0;
+            document.getElementById('metric-ratio').textContent = `${values.matched_ratio_a || 0}% / ${values.matched_ratio_b || 0}%`;
+        }
+
+        function renderParagraphs(paragraphs) {
+            const list = document.getElementById('paragraphs-list');
+            list.innerHTML = '';
+            if (paragraphs.length === 0) {
+                list.innerHTML = '<p style="text-align:center; color:#6b7280; padding:20px;">当前筛选条件下没有比对线索</p>';
+                return;
+            }
+
+            paragraphs.forEach(item => {
+                const div = document.createElement('div');
+                div.className = 'paragraph-card';
+                const pageA = item.page_a ? `第 ${item.page_a} 页` : '未知页';
+                const pageB = item.page_b ? `第 ${item.page_b} 页` : '未知页';
+                const badgeClass = item.type === 'fuzzy' ? 'badge-fuzzy' : (item.type === 'tender_related' ? 'badge-info' : 'badge-error');
+                const badges = (item.badges && item.badges.length) ? item.badges : [typeLabel(item.type)];
+                const badgesHtml = badges.map(badge => `<span class="badge ${badgeClass}">${escapeHtml(badge)}</span>`).join('');
+                const isSideBySide = item.type === 'fuzzy' || item.type === 'tender_related';
+                const evidenceHtml = isSideBySide ? `
+                    <div class="comparison-grid">
+                        <div class="comparison-pane">
+                            <div class="comparison-pane-label">文件 A</div>
+                            <div>${escapeHtml(item.text_a)}</div>
+                        </div>
+                        <div class="comparison-pane">
+                            <div class="comparison-pane-label">文件 B</div>
+                            <div>${escapeHtml(item.text_b)}</div>
+                        </div>
+                    </div>` : `<div class="para-text">${escapeHtml(item.text_a)}</div>`;
+                const tenderHtml = item.tender_text ? `
+                    <div class="tender-reference">
+                        <strong>对应招标原文：</strong>${escapeHtml(item.tender_text)}
+                    </div>` : '';
+                const similarityHtml = item.similarity ? ` · 相似度 ${Number(item.similarity).toFixed(1)}%` : '';
+
+                div.innerHTML = `
+                    <div class="para-meta">
+                        <div>
+                            <span style="font-weight:600; margin-right:15px;">文件 A: <span style="color:#ef4444;">${pageA}</span></span>
+                            <span style="font-weight:600;">文件 B: <span style="color:#ef4444;">${pageB}</span></span>
+                        </div>
+                        <div>${badgesHtml}</div>
+                    </div>
+                    ${evidenceHtml}
+                    ${tenderHtml}
+                    <div style="margin-top:7px; font-size:0.8rem; color:#6b7280;">${escapeHtml(item.desc || '')}${similarityHtml}</div>
+                `;
+                list.appendChild(div);
+            });
+        }
+
+        function typeLabel(type) {
+            const labels = {
+                text: '完全雷同',
+                fuzzy: '近似雷同',
+                tender_related: '招标相关共同修改',
+                entity: '敏感实体',
+                rare_word: '共同罕见词'
+            };
+            return labels[type] || type;
+        }
+
+        document.getElementById('result-filter').addEventListener('change', function () {
+            const filter = this.value;
+            renderParagraphs(filter === 'all' ? latestParagraphs : latestParagraphs.filter(item => item.type === filter));
+        });
+
+        document.getElementById('print-report-btn').addEventListener('click', () => window.print());
+
+        document.getElementById('export-csv-btn').addEventListener('click', function () {
+            if (!latestParagraphs.length) {
+                alert('当前没有可导出的比对结果');
+                return;
+            }
+            const rows = [
+                ['类型', '文件A', 'A页码', '文件B', 'B页码', '相似度', '说明', '招标原文'],
+                ...latestParagraphs.map(item => [
+                    typeLabel(item.type), item.text_a, item.page_a || '', item.text_b,
+                    item.page_b || '', item.similarity || '', item.desc || '', item.tender_text || ''
+                ])
+            ];
+            const csv = rows.map(row => row.map(csvCell).join(',')).join('\r\n');
+            const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' });
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            link.download = `投标文件比对_${new Date().toISOString().slice(0, 10)}.csv`;
+            link.click();
+            URL.revokeObjectURL(link.href);
+        });
+
+        function csvCell(value) {
+            return `"${String(value ?? '').replace(/"/g, '""')}"`;
+        }
+
         function escapeHtml(text) {
             if (!text) return "";
             const map = {
@@ -662,7 +884,7 @@
                 '"': '&quot;',
                 "'": '&#039;'
             };
-            return text.replace(/[&<>"']/g, function (m) { return map[m]; });
+            return String(text).replace(/[&<>"']/g, function (m) { return map[m]; });
         }
     </script>
 </body>

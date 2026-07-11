@@ -128,7 +128,7 @@ os.makedirs(ARCHIVE_FOLDER, exist_ok=True)
 # 添加上级目录到 path 以导入 scraper 和 utils
 sys.path.append(os.path.join(BASE_DIR, '..'))
 import scraper
-from dashboard.utils.comparator import compare_documents
+from dashboard.utils.comparator import ComparisonLimitError, compare_documents
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
@@ -970,6 +970,17 @@ def api_compare():
     if file_a.filename == '' or file_b.filename == '':
         return jsonify({"error": "未选择文件"}), 400
 
+    submitted_files = [file_a, file_b]
+    if file_tender and file_tender.filename:
+        submitted_files.append(file_tender)
+    invalid_files = [
+        file_obj.filename
+        for file_obj in submitted_files
+        if os.path.splitext(file_obj.filename or "")[1].lower() != ".pdf"
+    ]
+    if invalid_files:
+        return jsonify({"error": f"仅支持 PDF 文件: {', '.join(invalid_files)}"}), 400
+
     # 2. Save temporarily using UUID to avoid Chinese filename issues
     temp_paths = []
     try:
@@ -1008,12 +1019,8 @@ def api_compare():
             if archive_b == archive_tender:
                  return jsonify({"error": "投标文件B与招标文件内容重复 (MD5一致)"}), 400
             
-        # 4. Process (Using Temp Files)
-        # 为了避免潜在的中文文件名编码问题，我们使用 UUID 临时文件进行比对。
-        # 此时归档文件已安全保存。
-        # 注意: content is identical (verified by loopback copy or just assumed since we just saved it).
-        
-        results = compare_documents(temp_a, temp_b, path_tender,
+        # 4. Process archived files so repeated comparisons can reuse extraction cache.
+        results = compare_documents(archive_a, archive_b, archive_tender,
                                      check_entity=request.form.get('check_entity') == '1',
                                      check_text=request.form.get('check_text') == '1',
                                      check_spelling=request.form.get('check_spelling') == '1')
@@ -1026,6 +1033,10 @@ def api_compare():
             
         return jsonify({"status": "success", "data": results})
         
+    except ComparisonLimitError as e:
+        return jsonify({"error": str(e)}), 400
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         print(f"Error during comparison: {e}")
         return jsonify({"error": f"处理出错: {str(e)}"}), 500
