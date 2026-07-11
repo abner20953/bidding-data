@@ -378,17 +378,25 @@ class CollusionDetector:
         if not text:
             return entities
 
-        clean_digits = re.sub(r"[\s\-—_]+", "", unicodedata.normalize("NFKC", text))
-        identities = re.findall(r"(?<!\d)(?:\d{17}[0-9Xx]|\d{15})(?!\d)", clean_digits)
+        normalized_text = unicodedata.normalize("NFKC", text)
+        separator_pattern = r"[\s\-—_]*"
+        identities = re.findall(
+            rf"(?<!\d)(?:(?:\d{separator_pattern}){{17}}[0-9Xx]|"
+            rf"(?:\d{separator_pattern}){{14}}\d)(?!\d)",
+            normalized_text,
+        )
         for identity in identities:
-            identity = identity.upper()
+            identity = re.sub(r"[\s\-—_]+", "", identity).upper()
             if self._is_valid_cn_id(identity):
                 entities.add(identity)
 
-        phones = re.findall(r"(?<!\d)1[3-9]\d{9}(?!\d)", clean_digits)
-        entities.update(phones)
+        phones = re.findall(
+            rf"(?<!\d)1{separator_pattern}[3-9](?:{separator_pattern}\d){{9}}(?!\d)",
+            normalized_text,
+        )
+        entities.update(re.sub(r"[\s\-—_]+", "", phone) for phone in phones)
 
-        clean_email = unicodedata.normalize("NFKC", text)
+        clean_email = normalized_text
         entities.update(
             email.lower()
             for email in re.findall(

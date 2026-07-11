@@ -42,6 +42,13 @@ class ComparatorTests(unittest.TestCase):
         self.assertIn("test@example.com", entities)
         self.assertNotIn("110105194912310", entities)
 
+    def test_adjacent_entities_separated_only_by_space(self):
+        detector = CollusionDetector()
+        entities = detector.extract_entities("11010519491231002X 13800138000")
+
+        self.assertIn("11010519491231002X", entities)
+        self.assertIn("13800138000", entities)
+
     def test_fuzzy_match_detects_small_rewrite(self):
         path_a = self.path("a.pdf")
         path_b = self.path("b.pdf")
