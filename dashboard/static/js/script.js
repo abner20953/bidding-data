@@ -1,4 +1,19 @@
 document.addEventListener('DOMContentLoaded', () => {
+    function escapeHtml(value) {
+        return String(value ?? '').replace(/[&<>"']/g, char => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
+        })[char]);
+    }
+
+    function safeHttpUrl(value) {
+        try {
+            const url = new URL(String(value || ''), window.location.origin);
+            return ['http:', 'https:'].includes(url.protocol) ? url.href : '#';
+        } catch (_) {
+            return '#';
+        }
+    }
+
     // 基础 UI 元素
     const dateSelector = document.getElementById('date-selector');
     const regionSelector = document.getElementById('region-selector');
@@ -93,19 +108,19 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // 填充表格
         modalTableBody.innerHTML = items.map(item => `
-            <tr title="${(item['采购需求'] || '').replace(/"/g, '&quot;')}">
+            <tr title="${escapeHtml(item['采购需求'] || '')}">
                 <td>
-                    <a href="${item['链接']}" target="_blank" class="project-link" title="${item['标题']}">
-                        ${item['标题']}
+                    <a href="${safeHttpUrl(item['链接'])}" target="_blank" rel="noopener noreferrer" class="project-link" title="${escapeHtml(item['标题'])}">
+                        ${escapeHtml(item['标题'])}
                     </a>
                 </td>
-                <td>${formatTime(item['开标具体时间'])}</td>
-                <td>${formatLocation(item['开标地点'])}</td>
-                <td class="cell-budget">${formatBudget(item['预算限价项目'])}</td>
-                <td>${item['代理机构'] || '-'}</td>
-                <td>${item['采购人名称'] || '-'}</td>
+                <td>${escapeHtml(formatTime(item['开标具体时间']))}</td>
+                <td>${escapeHtml(formatLocation(item['开标地点']))}</td>
+                <td class="cell-budget">${escapeHtml(formatBudget(item['预算限价项目']))}</td>
+                <td>${escapeHtml(item['代理机构'] || '-')}</td>
+                <td>${escapeHtml(item['采购人名称'] || '-')}</td>
                 <td>
-                    <span class="tag is-method" style="margin-bottom: 4px;">${item['采购方式'] || '公开招标'}</span>
+                    <span class="tag is-method" style="margin-bottom: 4px;">${escapeHtml(item['采购方式'] || '公开招标')}</span>
                     <br>
                     ${item['是否信息化'] === '是'
                 ? '<span class="tag is-info">信息化</span>'
@@ -298,8 +313,8 @@ document.addEventListener('DOMContentLoaded', () => {
         const infoTitleAttr = isInfo ? ' title="高置信度信息化项目"' : '';
 
         return `
-            <a href="${link}" target="_blank" class="${cardClass}"${infoTitleAttr}>
-                <div class="project-title">${title}</div>
+            <a href="${safeHttpUrl(link)}" target="_blank" rel="noopener noreferrer" class="${cardClass}"${infoTitleAttr}>
+                <div class="project-title">${escapeHtml(title)}</div>
                 
                 <div class="project-details-row">
                     <div class="detail-item" title="开标时间">
@@ -307,21 +322,21 @@ document.addEventListener('DOMContentLoaded', () => {
                             <circle cx="12" cy="12" r="10"></circle>
                             <polyline points="12 6 12 12 16 14"></polyline>
                         </svg>
-                        <span>${bidTime}</span>
+                        <span>${escapeHtml(bidTime)}</span>
                     </div>
-                    <div class="detail-item location" title="${bidLocation}">
+                    <div class="detail-item location" title="${escapeHtml(bidLocation)}">
                         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path>
                             <circle cx="12" cy="10" r="3"></circle>
                         </svg>
-                        <span>${bidLocation}</span>
+                        <span>${escapeHtml(bidLocation)}</span>
                     </div>
                 </div>
 
                 <div class="project-meta">
-                    <span class="project-agency" title="${agency}">${agency}${district}</span>
-                    <span class="tag is-method">${item['采购方式'] || '公开招标'}</span>
-                    <span class="project-budget">${budget}</span>
+                    <span class="project-agency" title="${escapeHtml(agency)}">${escapeHtml(agency)}${escapeHtml(district)}</span>
+                    <span class="tag is-method">${escapeHtml(item['采购方式'] || '公开招标')}</span>
+                    <span class="project-budget">${escapeHtml(budget)}</span>
                 </div>
             </a>
         `;
@@ -369,7 +384,7 @@ document.addEventListener('DOMContentLoaded', () => {
             // 头部：增加点击事件支持
             columnEl.innerHTML = `
                 <div class="region-header">
-                    <h2 class="clickable-title" data-region="${region}">${region}</h2>
+                    <h2 class="clickable-title" data-region="${escapeHtml(region)}">${escapeHtml(region)}</h2>
                     <span class="region-count">${items.length}</span>
                 </div>
                 <div class="region-content">
@@ -515,7 +530,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
             if (data.logs && data.logs.length > 0) {
                 schedulerLogsContainer.innerHTML = data.logs.map(log =>
-                    `<div style="margin-bottom: 4px; border-bottom: 1px solid rgba(0,0,0,0.02); padding-bottom: 2px;">${log}</div>`
+                    `<div style="margin-bottom: 4px; border-bottom: 1px solid rgba(0,0,0,0.02); padding-bottom: 2px;">${escapeHtml(log)}</div>`
                 ).join('');
             } else {
                 schedulerLogsContainer.innerHTML = '<div style="text-align: center; padding-top: 40px;">暂无日志记录</div>';
@@ -563,6 +578,17 @@ document.addEventListener('DOMContentLoaded', () => {
             // 构建 YYYY-MM-DD 字符串
             const currentStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(i).padStart(2, '0')}`;
             dayCell.dataset.date = currentStr;
+
+            const cellDate = new Date(year, month, i);
+            const earliestDate = new Date();
+            earliestDate.setHours(0, 0, 0, 0);
+            earliestDate.setDate(earliestDate.getDate() - 90);
+            if (cellDate < earliestDate) {
+                dayCell.classList.add('disabled');
+                dayCell.title = '超出政府采购网近 90 天查询范围';
+                calendarGrid.appendChild(dayCell);
+                continue;
+            }
 
             // 样式处理
             if (selectedDates.has(currentStr)) {
@@ -652,6 +678,7 @@ document.addEventListener('DOMContentLoaded', () => {
         // 打开进度模态框
         // 重置 UI
         progressBar.style.width = '0%';
+        progressBar.style.backgroundColor = '';
         progressText.textContent = "正在初始化...";
         progressCount.textContent = "0/0";
         logContainer.innerHTML = '';
@@ -787,7 +814,7 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             // 更新日志
-            const logsHtml = status.logs.map(log => `<p>${log}</p>`).join('');
+            const logsHtml = status.logs.map(log => `<p>${escapeHtml(log)}</p>`).join('');
             if (logContainer.innerHTML !== logsHtml) {
                 logContainer.innerHTML = logsHtml;
                 logContainer.scrollTop = logContainer.scrollHeight;
@@ -796,8 +823,17 @@ document.addEventListener('DOMContentLoaded', () => {
             // 检查完成
             if (!status.is_running) {
                 clearInterval(pollInterval);
-                progressText.textContent = "任务已结束";
-                progressBar.style.width = '100%';
+                const statusLabels = {
+                    success: '任务成功完成',
+                    partial: '任务部分完成，请检查警告',
+                    failed: '任务失败，请检查错误日志'
+                };
+                progressText.textContent = statusLabels[status.result_status] || '任务已结束';
+                if (status.result_status === 'failed') {
+                    progressBar.style.backgroundColor = '#ef4444';
+                } else {
+                    progressBar.style.width = '100%';
+                }
                 progressModalFooter.classList.remove('hidden');
 
                 // 任务完成后刷新日期列表
@@ -872,7 +908,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
             if (data.logs && data.logs.length > 0) {
                 schedulerLogsLargeContainer.innerHTML = data.logs.map(log =>
-                    `<div style="margin-bottom: 6px; border-bottom: 1px solid rgba(255,255,255,0.03); padding-bottom: 4px;">${log}</div>`
+                    `<div style="margin-bottom: 6px; border-bottom: 1px solid rgba(255,255,255,0.03); padding-bottom: 4px;">${escapeHtml(log)}</div>`
                 ).join('');
             } else {
                 schedulerLogsLargeContainer.innerHTML = '<div style="text-align: center; padding-top: 100px; color: rgba(255,255,255,0.3);">暂无日志记录</div>';

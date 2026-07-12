@@ -31,6 +31,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     -i https://mirrors.aliyun.com/pypi/simple/
 
+# Build-time compatibility gate: PyTorch 2.2 requires NumPy 1.x ABI.
+RUN python -c "import numpy, torch; assert numpy.__version__.startswith('1.26.'); torch.tensor([1.0]).numpy()"
+
 # 【核心优化 3】模型已预下载到宿主机，直接 COPY 避免联网下载和 OOM 报错
 COPY model_data /app/model_data
 

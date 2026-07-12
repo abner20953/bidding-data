@@ -6,7 +6,15 @@ import re
 import concurrent.futures
 import pandas as pd
 import os
+import gc
+import hashlib
+import json
+import sqlite3
+import threading
+import uuid
+from urllib.parse import urljoin
 from openpyxl.styles import Alignment
+from requests.adapters import HTTPAdapter
 
 
 BASE_URL = "http://search.ccgp.gov.cn/bxsearch"
@@ -14,7 +22,22 @@ REGION_NAME = "山西"
 REGION_ID = "14"
 DAYS_AGO = 90
 MAX_PAGES = 100  # 安全上限（自动分页会提前停止）
-OUTPUT_DIR = "results"
+MAX_RUN_SECONDS = 15 * 60
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR = os.getenv("SCRAPER_OUTPUT_DIR", os.path.join(PROJECT_DIR, "results"))
+DATA_DIR = os.path.join(PROJECT_DIR, "data")
+DETAIL_CACHE_DB = os.getenv("SCRAPER_CACHE_DB", os.path.join(DATA_DIR, "scraper_cache.db"))
+DETAIL_CACHE_TTL_SECONDS = 6 * 60 * 60
+DETAIL_CACHE_MAX_ROWS = 10000
+DETAIL_CACHE_MAX_BYTES = 200 * 1024 * 1024
+REQUIRED_RESULT_COLUMNS = {
+    "标题", "是否信息化", "语义匹配度", "开标具体时间", "开标地点", "链接"
+}
+
+_http_local = threading.local()
+_model_lock = threading.Lock()
+_cache_init_lock = threading.Lock()
+_cache_initialized = False
 
 
 
@@ -42,8 +65,118 @@ STRONG_IT_KEYWORDS = [
 
 
 
-if not os.path.exists(OUTPUT_DIR):
-    os.makedirs(OUTPUT_DIR)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def _get_http_session():
+    session = getattr(_http_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=0)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        _http_local.session = session
+    return session
+
+
+def _decode_response(response):
+    content_type = response.headers.get("Content-Type", "").lower()
+    declared = response.encoding
+    if not declared or declared.lower() in {"iso-8859-1", "ascii"}:
+        declared = response.apparent_encoding
+    if "charset=" in content_type:
+        declared = response.encoding or declared
+    return response.content.decode(declared or "utf-8", errors="replace")
+
+
+def _init_detail_cache():
+    global _cache_initialized
+    if _cache_initialized:
+        return
+    with _cache_init_lock:
+        if _cache_initialized:
+            return
+        os.makedirs(os.path.dirname(DETAIL_CACHE_DB), exist_ok=True)
+        conn = sqlite3.connect(DETAIL_CACHE_DB, timeout=30)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS detail_cache (
+                       url TEXT PRIMARY KEY,
+                       details_json TEXT NOT NULL,
+                       content_hash TEXT,
+                       fetched_at REAL NOT NULL
+                   )"""
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        _cache_initialized = True
+
+
+def _get_cached_details(url):
+    try:
+        _init_detail_cache()
+        conn = sqlite3.connect(DETAIL_CACHE_DB, timeout=30)
+        try:
+            row = conn.execute(
+                "SELECT details_json, fetched_at FROM detail_cache WHERE url = ?", (url,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row or time.time() - row[1] > DETAIL_CACHE_TTL_SECONDS:
+            return None
+        return json.loads(row[0])
+    except Exception:
+        return None
+
+
+def _cache_details(url, details, html):
+    try:
+        _init_detail_cache()
+        conn = sqlite3.connect(DETAIL_CACHE_DB, timeout=30)
+        try:
+            conn.execute(
+                """INSERT INTO detail_cache(url, details_json, content_hash, fetched_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(url) DO UPDATE SET
+                       details_json=excluded.details_json,
+                       content_hash=excluded.content_hash,
+                       fetched_at=excluded.fetched_at""",
+                (
+                    url,
+                    json.dumps(details, ensure_ascii=False),
+                    hashlib.sha256(html.encode("utf-8", errors="ignore")).hexdigest(),
+                    time.time(),
+                ),
+            )
+            count = conn.execute("SELECT COUNT(*) FROM detail_cache").fetchone()[0]
+            if count > DETAIL_CACHE_MAX_ROWS:
+                conn.execute(
+                    "DELETE FROM detail_cache WHERE url IN "
+                    "(SELECT url FROM detail_cache ORDER BY fetched_at ASC LIMIT ?)",
+                    (count - int(DETAIL_CACHE_MAX_ROWS * 0.8),),
+                )
+            conn.commit()
+            cache_size = sum(
+                os.path.getsize(path)
+                for path in (DETAIL_CACHE_DB, DETAIL_CACHE_DB + "-wal", DETAIL_CACHE_DB + "-shm")
+                if os.path.exists(path)
+            )
+            if cache_size > DETAIL_CACHE_MAX_BYTES:
+                conn.execute(
+                    "DELETE FROM detail_cache WHERE url IN "
+                    "(SELECT url FROM detail_cache ORDER BY fetched_at ASC LIMIT ?)",
+                    (max(count // 3, 1),),
+                )
+                conn.commit()
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn.execute("VACUUM")
+        finally:
+            conn.close()
+    except Exception:
+        pass
 
 def get_date_range():
     """获取近三个月的时间范围"""
@@ -96,8 +229,8 @@ def build_search_url(page_index, start_time, end_time, keyword):
     }
     return params
 
-def fetch_page(url, params=None):
-    """发送请求获取页面内容 (带重试机制)"""
+def fetch_page(url, params=None, with_status=False):
+    """Fetch HTML with bounded retries; optionally return a machine-readable status."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -106,19 +239,33 @@ def fetch_page(url, params=None):
     }
     
     max_retries = 3
+    last_status = "network_error"
     for attempt in range(max_retries):
         try:
-            response = requests.get(url, params=params, headers=headers, timeout=30)
+            response = _get_http_session().get(
+                url, params=params, headers=headers, timeout=(10, 30)
+            )
             response.raise_for_status()
-            response.encoding = 'utf-8'
-            return response.text
+            html = _decode_response(response)
+            if "您的访问过于频繁" in html or "访问频繁" in html:
+                last_status = "waf"
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** (attempt + 1))
+                    continue
+                return (None, last_status) if with_status else None
+            return (html, "ok") if with_status else html
+        except requests.HTTPError as e:
+            last_status = f"http_{getattr(e.response, 'status_code', 'error')}"
+            if getattr(e.response, "status_code", 0) in {400, 401, 403, 404}:
+                break
         except Exception as e:
-            if attempt < max_retries - 1:
-                print(f"请求失败，正在重试 ({attempt + 1}/{max_retries})...")
-                time.sleep(5)
-            else:
+            last_status = "network_error"
+            if attempt == max_retries - 1:
                 print(f"请求失败 (已重试{max_retries}次): {url}, 错误: {e}")
-                return None
+        if attempt < max_retries - 1:
+            print(f"请求失败，正在重试 ({attempt + 1}/{max_retries})...")
+            time.sleep(2 ** (attempt + 1))
+    return (None, last_status) if with_status else None
 
 def normalize_budget(text):
     """
@@ -313,12 +460,14 @@ def parse_project_details(html_content):
         "标题": "未找到"
     }
 
+    page_title = soup.title.get_text(" ", strip=True) if soup.title else ""
+
     # 尝试提取标题 (Meta 优先)
     meta_title = soup.find("meta", {"name": "ArticleTitle"})
     if meta_title:
         details["标题"] = meta_title.get("content", "").strip()
-    elif soup.title:
-        details["标题"] = soup.title.string.strip()
+    elif page_title:
+        details["标题"] = page_title
 
     # 策略 1：尝试从结构化的“公告概要”中提取（最准确）
     # CCGP 经常在 div.table 或 table#summaryTable 中放置隐藏的概要数据
@@ -373,7 +522,7 @@ def parse_project_details(html_content):
 
     # 0. 特殊处理：更正公告的时间提取 (High Priority)
     # 如果是更正公告，优先从“更正信息”段落提取时间，并取最后一个（通常是更正后的）
-    if "更正" in soup.title.string or "变更" in soup.title.string or "更正" in details.get("标题", ""):
+    if "更正" in page_title or "变更" in page_title or "更正" in details.get("标题", ""):
         # 修正正则：
         # 1. 移除 '四、' 以防止表格内容中引用 '四、响应文件提交' 时导致截断
         # 2. 增加 \n\s* 前缀，确保匹配的是章节标题而非行内文本
@@ -504,13 +653,13 @@ def parse_project_details(html_content):
     # 7. 采购方式提取 (Regex Fallback)
     # 如果默认为公开招标，尝试从文中提取明确的“采购方式”
     # 优先检查标题 (最强信号)
-    if "竞争性谈判" in details.get("标题", "") or (soup.title and "竞争性谈判" in soup.title.string):
+    if "竞争性谈判" in details.get("标题", "") or "竞争性谈判" in page_title:
          details["采购方式"] = "竞争性谈判"
-    elif "竞争性磋商" in details.get("标题", "") or (soup.title and "竞争性磋商" in soup.title.string):
+    elif "竞争性磋商" in details.get("标题", "") or "竞争性磋商" in page_title:
          details["采购方式"] = "竞争性磋商"
-    elif "询价" in details.get("标题", "") or (soup.title and "询价" in soup.title.string):
+    elif "询价" in details.get("标题", "") or "询价" in page_title:
          details["采购方式"] = "询价"
-    elif "单一来源" in details.get("标题", "") or (soup.title and "单一来源" in soup.title.string):
+    elif "单一来源" in details.get("标题", "") or "单一来源" in page_title:
          details["采购方式"] = "单一来源"
     
     # 如果标题没找到，再找正文
@@ -528,7 +677,12 @@ def parse_project_details(html_content):
 
     # 8. 更正公告特殊处理：回溯原始公告 (Backfill Logic)
     # 如果是更正公告且采购方式未提取成功（或为默认），尝试寻找原公告链接
-    is_correction = "更正" in details.get("标题", "") or "变更" in details.get("标题", "") or (soup.title and ("更正" in soup.title.string or "变更" in soup.title.string))
+    is_correction = (
+        "更正" in details.get("标题", "")
+        or "变更" in details.get("标题", "")
+        or "更正" in page_title
+        or "变更" in page_title
+    )
     
     if is_correction and details["采购方式"] == "公开招标":
         # 寻找原公告链接
@@ -545,15 +699,13 @@ def parse_project_details(html_content):
                 # 处理相对路径 (如果需要) - CCGP 通常是绝对路径或同级相对
                 # 简单起见，假设是绝对路径或完整URL, 实际情况如果出错则忽略
                 if not origin_link.startswith("http"):
-                    # 尝试简单的拼接，或者忽略
-                    pass 
+                    origin_link = urljoin("http://www.ccgp.gov.cn/", origin_link)
                 
                 # Fetch original content
                 # 注意：这里调用 fetch_page 会产生额外的网络请求
                 # 为防止递归死循环，只做一层回溯，且不完全递归 parse_project_details
-                resp = fetch_page(origin_link)
-                if resp and resp.status_code == 200:
-                    orig_html = resp.content.decode("utf-8", errors="ignore")
+                orig_html = fetch_page(origin_link)
+                if orig_html:
                     orig_soup = BeautifulSoup(orig_html, 'html.parser')
                     orig_text = orig_soup.get_text(separator='\n')
                     
@@ -561,7 +713,7 @@ def parse_project_details(html_content):
                     found_pm = None
                     # 1. Title
                     if orig_soup.title:
-                        t = orig_soup.title.string
+                        t = orig_soup.title.get_text(" ", strip=True)
                         if "竞争性谈判" in t: found_pm = "竞争性谈判"
                         elif "竞争性磋商" in t: found_pm = "竞争性磋商"
                         elif "询价" in t: found_pm = "询价"
@@ -575,8 +727,7 @@ def parse_project_details(html_content):
                             if "谈判" in val: found_pm = "竞争性谈判"
                             elif "磋商" in val: found_pm = "竞争性磋商"
                             elif "询价" in val: found_pm = "询价"
-
-                    elif "单一来源" in val: found_pm = "单一来源"
+                            elif "单一来源" in val: found_pm = "单一来源"
                     
                     if found_pm:
                         details["采购方式"] = found_pm
@@ -677,16 +828,34 @@ def find_original_project(project_code, current_url):
     return target_project['url']
 
 
-def fetch_and_parse_details(item):
+def fetch_and_parse_details(item, deadline=None):
     """多线程调用的包装函数"""
     url = item['链接']
-    if not url.startswith("http"):
+    if deadline and time.monotonic() >= deadline:
+        item["_detail_status"] = "deadline_exceeded"
         return item
-    
-    html = fetch_page(url)
+    if not url.startswith("http"):
+        item["_detail_status"] = "invalid_url"
+        return item
+
+    cached_details = _get_cached_details(url)
+    if cached_details:
+        item.update(cached_details)
+        item["_detail_status"] = "cached"
+        return item
+
+    html, fetch_status = fetch_page(url, with_status=True)
     if html:
-        detail_data = parse_project_details(html)
+        try:
+            detail_data = parse_project_details(html)
+        except Exception as exc:
+            item["_detail_status"] = "parse_error"
+            item["_detail_error"] = str(exc)
+            print(f"    详情页解析失败: {item['标题'][:20]}... {exc}")
+            return item
         item.update(detail_data)
+        item["_detail_status"] = "ok"
+        _cache_details(url, detail_data, html)
         
         # --- 更正公告回填逻辑 ---
         # 只要是更正公告，且缺任意一项关键信息（预算、地点、采购需求），都尝试回溯
@@ -723,6 +892,7 @@ def fetch_and_parse_details(item):
         if detail_data.get("预算限价项目") != "未找到":
              print(f"    成功提取详情: {item['标题'][:20]}...")
     else:
+        item["_detail_status"] = fetch_status
         print(f"    详情页请求失败: {item['标题'][:20]}...")
     return item
 
@@ -823,311 +993,402 @@ def scrape():
             time.sleep(5) # 增加延迟以防 WAF 拦截
     print(f"\n采集结束。共采集到 {len(raw_results)} 条包含目标日期的原始记录。")
 
-# 全局模型实例
+# 全局模型实例：同一批多日期任务只加载一次，任务结束后由调用方释放。
 MODEL = None
+ANCHOR_EMBEDDINGS = None
+SEMANTIC_RUNTIME_VALIDATED = False
+
+ANCHOR_SENTENCES = [
+    "软件系统开发与定制", "应用平台建设运营", "业务信息系统升级", "电子政务管理系统", "医务绩效考核软件系统",
+    "大数据平台与数据分析", "云计算服务与云平台", "数据库与数据治理", "算法模型与人工智能应用", "文书档案数字化管理系统",
+    "智能监管执法平台", "指挥调度信息管理平台", "物联网感知与智能控制", "智慧应用与数字化平台",
+    "智慧信息平台", "智慧监管平台", "信息化系统建设", "视频督察与视频会议系统", "医院核心业务信息系统HIS",
+    "机房智能化建设工程", "计算机网络系统集成", "弱电智能化系统工程", "网络信息安全防护系统", "高性能虚拟化平台",
+    "系统集成实施服务", "软件运维技术支持", "信息化项目测评与监理", "网络安全等级保护", "沉浸式数字展厅体验系统", "城市运行数据采集系统",
+    "档案数字化加工系统", "电子政务外网建设", "远程会诊平台软件", "在线教学平台",
+    "文物与古建筑数字化保护", "文化遗产数字资源建设", "实景三维建模数字化项目",
+    "视频监控联网系统", "雪亮工程信息化", "智能安防系统",
+    "网络安全日志审计系统", "数据库运维审计系统", "网络流量分析与监测",
+    "互联网数据采集与分析服务", "行业大数据应用服务", "公共数据治理与服务",
+    "全流程数智化监管平台", "餐饮食品安全智慧监管", "数智化管理系统建设",
+]
+
 
 def get_model():
     global MODEL
-    if MODEL is None:
-        try:
-            from sentence_transformers import SentenceTransformer
-            
-            # 定义模型搜索路径优先级
-            # 1. Docker 容器内固定路径
-            # 2. 当前项目目录下的 model_data (本地开发用)
-            search_paths = [
-                '/app/model_data',
-                os.path.join(os.path.dirname(os.path.abspath(__file__)), 'model_data'),
-                'model_data'
-            ]
-            
-            model_path = None
-            for path in search_paths:
-                if os.path.exists(path):
-                    model_path = path
-                    break
-            
-            if model_path:
-                print(f"正在加载本地语义模型: {model_path}")
-                MODEL = SentenceTransformer(model_path)
-            else:
-                # 严格禁止自动联网下载，抛出错误提示用户手动准备
-                error_msg = (
-                    "错误: 未找到本地模型文件！\n"
-                    "应用程序已配置为严格离线模式，禁止运行时下载。\n"
-                    "请运行 'python download_model.py' 手动下载模型 (BAAI/bge-small-zh-v1.5) 到 'model_data' 目录，"
-                    "或者确保 Docker 镜像构建时已包含 '/app/model_data'。"
-                )
-                print(error_msg)
-                raise RuntimeError(error_msg)
-                 
-        except ImportError:
-            print("错误: 未找到 sentence-transformers 库")
-            return None
-        except Exception as e:
-            print(f"模型加载失败: {e}")
-            return None
+    if MODEL is not None:
+        return MODEL
+    with _model_lock:
+        if MODEL is not None:
+            return MODEL
+        from sentence_transformers import SentenceTransformer
+
+        search_paths = [
+            "/app/model_data",
+            os.path.join(PROJECT_DIR, "model_data"),
+            "model_data",
+        ]
+        model_path = next((path for path in search_paths if os.path.exists(path)), None)
+        if not model_path:
+            raise RuntimeError("未找到本地语义模型 model_data，禁止运行时联网下载")
+        print(f"正在加载本地语义模型: {model_path}")
+        MODEL = SentenceTransformer(model_path)
     return MODEL
 
-def run_scraper_for_date(target_date_str, callback=None):
-    """
-    针对指定日期的自动化采集入口函数
-    :param target_date_str: 目标日期，格式如 "2026年01月27日"
-    :param callback: 进度回调函数，func(message)
-    :return: 结果字典 {"total": int, "file": str}
-    """
-    def log(msg):
-        print(msg)
-        if callback:
-            callback(msg)
 
-    # 1. 生成日期变种
+def validate_semantic_runtime():
+    global SEMANTIC_RUNTIME_VALIDATED
+    if SEMANTIC_RUNTIME_VALIDATED:
+        return get_model()
+
+    import numpy as np
+    import torch
+
+    if int(np.__version__.split(".")[0]) >= 2 and torch.__version__.startswith("2.2."):
+        raise RuntimeError(
+            f"NumPy {np.__version__} 与 PyTorch {torch.__version__} 不兼容"
+        )
+    try:
+        torch.tensor([1.0]).numpy()
+    except Exception as exc:
+        raise RuntimeError(f"PyTorch 无法调用 NumPy: {exc}") from exc
+
+    model = get_model()
+    probe = model.encode(
+        ["语义模型健康检查"], batch_size=1, show_progress_bar=False, convert_to_numpy=True
+    )
+    if getattr(probe, "shape", (0,))[0] != 1:
+        raise RuntimeError("语义模型健康检查未返回有效向量")
+    SEMANTIC_RUNTIME_VALIDATED = True
+    return model
+
+
+def get_anchor_embeddings(model):
+    global ANCHOR_EMBEDDINGS
+    if ANCHOR_EMBEDDINGS is not None:
+        return ANCHOR_EMBEDDINGS
+    with _model_lock:
+        if ANCHOR_EMBEDDINGS is None:
+            ANCHOR_EMBEDDINGS = model.encode(
+                ANCHOR_SENTENCES,
+                batch_size=16,
+                show_progress_bar=False,
+                convert_to_tensor=True,
+            )
+    return ANCHOR_EMBEDDINGS
+
+
+def release_model():
+    global MODEL, ANCHOR_EMBEDDINGS, SEMANTIC_RUNTIME_VALIDATED
+    with _model_lock:
+        MODEL = None
+        ANCHOR_EMBEDDINGS = None
+        SEMANTIC_RUNTIME_VALIDATED = False
+    gc.collect()
+    if os.name == "posix":
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
+
+def validate_result_file(filepath, require_complete=True):
+    if not filepath or not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
+        return False, "文件不存在或为空"
+    try:
+        with pd.ExcelFile(filepath) as excel:
+            frame = pd.read_excel(excel, sheet_name=0)
+            metadata = (
+                pd.read_excel(excel, sheet_name="采集元数据")
+                if "采集元数据" in excel.sheet_names else None
+            )
+    except Exception as exc:
+        return False, f"Excel 无法读取: {exc}"
+    if frame.empty:
+        return False, "Excel 没有数据行"
+    missing = REQUIRED_RESULT_COLUMNS - set(frame.columns)
+    if missing:
+        return False, f"缺少必要字段: {', '.join(sorted(missing))}"
+    classifications = set(frame["是否信息化"].dropna().astype(str).unique())
+    if not classifications or not classifications.issubset({"是", "否"}):
+        return False, "是否信息化字段存在无效值"
+    scores = pd.to_numeric(frame["语义匹配度"], errors="coerce")
+    if scores.isna().any():
+        return False, "语义匹配度存在非数字值"
+    if metadata is not None and not metadata.empty:
+        status = str(metadata.iloc[0].get("status", ""))
+        if require_complete and status != "success":
+            return False, f"上次采集状态为 {status or 'unknown'}"
+    return True, ""
+
+
+def _extract_publish_date(search_item):
+    text = search_item.get_text(" ", strip=True)
+    match = re.search(r"(20\d{2})[.\-/年](\d{1,2})[.\-/月](\d{1,2})日?", text)
+    if not match:
+        return "未找到"
+    year, month, day = match.groups()
+    return f"{year}-{int(month):02d}-{int(day):02d}"
+
+
+def _page_explicitly_has_no_results(html):
+    normalized = re.sub(r"\s+", "", html or "")
+    return any(marker in normalized for marker in ("没有找到相关", "暂无相关", "未检索到", "共0条"))
+
+
+def run_scraper_for_date(target_date_str, callback=None):
+    """Collect, classify and atomically save one opening date."""
+    def log(message):
+        print(message)
+        if callback:
+            callback(message)
+
     date_variants = generate_date_variants(target_date_str)
     if not date_variants:
-        log(f"日期格式错误: {target_date_str}")
-        return {"total": 0, "file": None}
-        
+        message = f"日期格式错误: {target_date_str}"
+        log(message)
+        return {"status": "failed", "total": 0, "file": None, "error": message}
+
     log(f"开始采集日期: {target_date_str} (匹配格式: {date_variants})")
-    
+    deadline = time.monotonic() + MAX_RUN_SECONDS
     start_time, end_time = get_date_range()
-    
-    # 2. 采集阶段
     raw_results = {}
-    
+    source_errors = []
+    successful_keywords = 0
+    search_requests = 0
+    last_search_request = 0.0
+
     for date_str in date_variants:
-        # 新增每种日期的关键词变种支持
-        search_prefixes = ["开标时间：", "开启时间："]
-        
-        for prefix in search_prefixes:
+        for prefix in ("开标时间：", "开启时间："):
             full_keyword = f"{prefix}{date_str}"
             log(f"正在采集关键词: {full_keyword}")
-            
+            keyword_ok = False
             for page in range(1, MAX_PAGES + 1):
-                # 每次请求前强制延迟，防止关键词切换或翻页过快触发 WAF
-                time.sleep(5)
-                
+                if time.monotonic() >= deadline:
+                    message = f"单日期采集超过 {MAX_RUN_SECONDS // 60} 分钟限制"
+                    log(message)
+                    return {
+                        "status": "failed", "total": 0, "file": None, "error": message,
+                        "metrics": {"raw_records": len(raw_results), "search_requests": search_requests},
+                    }
+                elapsed = time.monotonic() - last_search_request
+                if search_requests and elapsed < 1.5:
+                    time.sleep(1.5 - elapsed)
                 params = build_search_url(page, start_time, end_time, full_keyword)
-                # log(f"Requesting page {page}...")
-                
-                html = fetch_page(BASE_URL, params=params)
-                
+                html, fetch_status = fetch_page(BASE_URL, params=params, with_status=True)
+                search_requests += 1
+                last_search_request = time.monotonic()
+
                 if not html:
-                    continue
-                
-                if "您的访问过于频繁" in html:
-                    log("警告: WAF触发，停止当前关键词搜索。")
+                    message = f"关键词 {full_keyword} 第 {page} 页请求失败: {fetch_status}"
+                    source_errors.append(message)
+                    log(message)
                     break
 
-                soup = BeautifulSoup(html, 'html.parser')
-                list_items = soup.select('ul.vT-srch-result-list-bid li')
-                
+                soup = BeautifulSoup(html, "html.parser")
+                list_items = soup.select("ul.vT-srch-result-list-bid li")
                 if not list_items:
-                    list_items = soup.select('.v9-search-result-list li')
-                
+                    list_items = soup.select(".v9-search-result-list li")
+
                 if not list_items:
+                    if page == 1 and not _page_explicitly_has_no_results(html):
+                        message = f"关键词 {full_keyword} 返回页面结构异常，未找到结果列表"
+                        source_errors.append(message)
+                        log(message)
+                    else:
+                        keyword_ok = True
                     break
-                    
-                has_new_data = False
-                for item in list_items:
-                    link_tag = item.find('a')
-                    if not link_tag: continue
-                    
-                    title = link_tag.get_text().strip()
-                    href = link_tag.get('href', '').strip()
-                    
-                    if not href.startswith('http'):
-                        href = "http://www.ccgp.gov.cn" + href if href.startswith('/') else "http://www.ccgp.gov.cn/" + href
-                    
-                    if href not in raw_results:
-                        raw_results[href] = {
-                            "标题": title,
-                            "链接": href,
-                            "发布时间": "N/A", # 简化处理
-                            "匹配日期格式": date_str,
-                            "疑似开标时间": date_str,
-                            "预算限价项目": "待采集",
-                            "开标具体时间": "待采集",
-                            "开标地点": "待采集",
-                            "采购人名称": "待采集",
-                            "代理机构": "待采集",
-                            "采购方式": "待采集"
-                        }
-                        has_new_data = True
-                
-                # 智能停止：如果当前页数据量小于20，说明已到最后一页
+
+                keyword_ok = True
+                for search_item in list_items:
+                    link_tag = search_item.find("a")
+                    if not link_tag:
+                        continue
+                    title = link_tag.get_text(" ", strip=True)
+                    href = urljoin("http://www.ccgp.gov.cn/", link_tag.get("href", "").strip())
+                    if not href or href in raw_results:
+                        continue
+                    raw_results[href] = {
+                        "标题": title,
+                        "链接": href,
+                        "发布时间": _extract_publish_date(search_item),
+                        "匹配日期格式": date_str,
+                        "疑似开标时间": date_str,
+                        "预算限价项目": "待采集",
+                        "开标具体时间": "待采集",
+                        "开标地点": "待采集",
+                        "采购人名称": "待采集",
+                        "代理机构": "待采集",
+                        "采购方式": "待采集",
+                    }
                 if len(list_items) < 20:
-                    print(f"  检测到最后一页（仅 {len(list_items)} 条），停止翻页。")
                     break
+            if keyword_ok:
+                successful_keywords += 1
 
     log(f"共采集到 {len(raw_results)} 条原始记录。")
+    if not raw_results:
+        if source_errors:
+            message = "；".join(source_errors[:3])
+            return {
+                "status": "failed", "total": 0, "file": None,
+                "error": message,
+                "metrics": {"search_requests": search_requests, "source_errors": source_errors},
+            }
+        log("没有找到数据。")
+        return {
+            "status": "no_data", "total": 0, "file": None,
+            "metrics": {"search_requests": search_requests},
+        }
 
-    # 3. 筛选阶段
     log("正在进行语义分析...")
-    model = get_model()
-    
-    anchor_sentences = [
-            # 第一类：软件与应用系统（核心特征）
-            "软件系统开发与定制", "应用平台建设运营", "业务信息系统升级", "电子政务管理系统", "医务绩效考核软件系统",
-            # 第二类：数据与计算（现代IT核心）
-            "大数据平台与数据分析", "云计算服务与云平台", "数据库与数据治理", "算法模型与人工智能应用", "文书档案数字化管理系统",
-            # 第三类：智能化应用（具体场景）
-            "智能监管执法平台", "指挥调度信息管理平台", "物联网感知与智能控制", "智慧应用与数字化平台",
-            "智慧信息平台", "智慧监管平台", "信息化系统建设", "视频督察与视频会议系统", "医院核心业务信息系统HIS",
-            # 第四类：IT基础设施（硬件范畴）
-            "机房智能化建设工程", "计算机网络系统集成", "弱电智能化系统工程", "网络信息安全防护系统", "高性能虚拟化平台",
-            # 第五类：IT专业服务（技术服务）
-            "系统集成实施服务", "软件运维技术支持", "信息化项目测评与监理", "网络安全等级保护", "沉浸式数字展厅体验系统", "城市运行数据采集系统",
-            # 第六类：数字化服务（新增）
-            "档案数字化加工系统","电子政务外网建设","远程会诊平台软件","在线教学平台",
-            "文物与古建筑数字化保护", "文化遗产数字资源建设", "实景三维建模数字化项目",
-            # 第七类：监控与安防（新增）
-            "视频监控联网系统","雪亮工程信息化", "智能安防系统", 
-            "网络安全日志审计系统", "数据库运维审计系统", "网络流量分析与监测",
-            # 第八类：数据服务与数智化（新增）
-            "互联网数据采集与分析服务", "行业大数据应用服务", "公共数据治理与服务",
-            "全流程数智化监管平台", "餐饮食品安全智慧监管", "数智化管理系统建设"
-    ]
-    
-    final_list = []
-    
-    if raw_results and model:
-        titles = [item['标题'] for item in raw_results.values()]
-        try:
-            anchor_embeddings = model.encode(anchor_sentences)
-            title_embeddings = model.encode(titles)
-            
-            from sentence_transformers import util
-            for i, item in enumerate(raw_results.values()):
-                title = item['标题']
-                # 强匹配
-                if any(kw in title for kw in STRONG_IT_KEYWORDS):
-                    item['是否信息化'] = "是"
-                    item['语义匹配度'] = 1.0
-                    final_list.append(item)
-                    continue
-                
-                # 语义匹配
-                scores = util.cos_sim(title_embeddings[i], anchor_embeddings) 
-                max_score = float(scores.max())
-                item['语义匹配度'] = max_score
-                
-                if max_score > 0.61: 
-                    item['是否信息化'] = "是"
-                else:
-                    item['是否信息化'] = "否"
-                final_list.append(item)
+    try:
+        model = validate_semantic_runtime()
+        anchor_embeddings = get_anchor_embeddings(model)
+        titles = [item["标题"] for item in raw_results.values()]
+        title_embeddings = model.encode(
+            titles, batch_size=16, show_progress_bar=False, convert_to_tensor=True
+        )
+        from sentence_transformers import util
 
-        except Exception as e:
-            log(f"语义分析出错: {e}")
-            final_list = list(raw_results.values())
-    else:
-        final_list = list(raw_results.values()) # 无模型或无数据回退
-        
-    # 4. 深度采集
+        final_list = []
+        for index, item in enumerate(raw_results.values()):
+            title = item["标题"]
+            if any(keyword in title for keyword in STRONG_IT_KEYWORDS):
+                item["是否信息化"] = "是"
+                item["语义匹配度"] = 1.0
+            else:
+                score = float(util.cos_sim(title_embeddings[index], anchor_embeddings).max())
+                item["语义匹配度"] = score
+                item["是否信息化"] = "是" if score > 0.61 else "否"
+            final_list.append(item)
+    except Exception as exc:
+        message = f"语义分析失败，任务终止: {exc}"
+        log(message)
+        return {
+            "status": "failed", "total": 0, "file": None, "error": message,
+            "metrics": {"raw_records": len(raw_results), "search_requests": search_requests},
+        }
+
     log(f"正在对 {len(final_list)} 个项目进行深度采集...")
-    items_to_fetch = final_list
-    
-    if items_to_fetch:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            list(executor.map(fetch_and_parse_details, items_to_fetch))
-        
-        for item in items_to_fetch:
-            city, district = extract_region(
-                item.get('开标地点', ''), 
-                item.get('标题', ''), 
-                item.get('采购人名称', ''), 
-                item.get('代理机构', '')
-            )
-            item['地区（市）'] = city
-            item['地区（县）'] = district
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        list(executor.map(lambda item: fetch_and_parse_details(item, deadline), final_list))
 
-    # 4.1 日期一致性过滤 (关联剔除模式)
-    # 策略：如果发现有项目的开标日期与目标日期不符（如更正公告改期），
-    # 则记录该项目的“项目编号”，并剔除列表中所有该编号的项目（包括原公告）。
-    
+    detail_failures = 0
+    cache_hits = 0
+    for item in final_list:
+        status = item.get("_detail_status")
+        if status == "cached":
+            cache_hits += 1
+        elif status != "ok":
+            detail_failures += 1
+        city, district = extract_region(
+            item.get("开标地点", ""), item.get("标题", ""),
+            item.get("采购人名称", ""), item.get("代理机构", "")
+        )
+        item["地区（市）"] = city
+        item["地区（县）"] = district
+
+    warnings = []
+    result_status = "success"
+    if source_errors or detail_failures:
+        result_status = "partial"
+        if source_errors:
+            warnings.append(f"{len(source_errors)} 个搜索请求异常")
+        if detail_failures:
+            warnings.append(f"{detail_failures} 个详情页未完整解析")
+
     target_date_norm = extract_date_str(target_date_str)
-    
+    dropped_count = 0
     if target_date_norm:
-        # 第一步：识别需要剔除的项目编号
         excluded_codes = set()
-        items_to_drop_indices = set() # Store indices of items to drop explicitly (e.g. if no code)
-        
-        for i, item in enumerate(final_list):
+        drop_indices = set()
+        for index, item in enumerate(final_list):
             item_date = item.get("开标日期")
-            # 如果日期明确存在，且不等于目标日期
             if item_date and item_date != "未找到" and item_date != target_date_norm:
-                p_code = item.get("项目编号")
-                if p_code and p_code != "未找到":
-                    excluded_codes.add(p_code)
-                    print(f"    [检测到变更] 编号 {p_code} 日期变更 ({item_date})，将剔除相关记录。")
+                project_code = item.get("项目编号")
+                if project_code and project_code != "未找到":
+                    excluded_codes.add(project_code)
                 else:
-                    # 如果没有编号，只能剔除自己
-                    items_to_drop_indices.add(i)
-        
-        # 第二步：执行剔除
-        filtered_list = []
-        dropped_count = 0
-        
-        for i, item in enumerate(final_list):
-            # 如果索引在待剔除列表，或者编号在黑名单中
-            p_code = item.get("项目编号")
-            if i in items_to_drop_indices or (p_code and p_code in excluded_codes):
-                print(f"    [剔除] 关联剔除: {item['标题'][:20]}... (编号: {p_code})")
+                    drop_indices.add(index)
+        filtered = []
+        for index, item in enumerate(final_list):
+            project_code = item.get("项目编号")
+            if index in drop_indices or (project_code and project_code in excluded_codes):
                 dropped_count += 1
                 continue
-            filtered_list.append(item)
-            
-        if dropped_count > 0:
-            print(f"    共剔除 {dropped_count} 条关联记录。")
-        else:
-            print("    无记录被剔除。")
-            
-        final_list = filtered_list
+            filtered.append(item)
+        final_list = filtered
+        if dropped_count:
+            log(f"日期变更关联剔除 {dropped_count} 条记录。")
 
-    # 5. 排序与保存
-    if final_list:
-        df_temp = pd.DataFrame(final_list)
-        sort_by = ["是否信息化", "地区（市）", "地区（县）", "开标具体时间"]
-        ascending = [False, True, True, True]
-        
-        valid_sort_cols = [c for c in sort_by if c in df_temp.columns]
-        valid_ascending = [ascending[i] for i, c in enumerate(sort_by) if c in df_temp.columns]
-        
-        if valid_sort_cols:
-            df_temp = df_temp.sort_values(by=valid_sort_cols, ascending=valid_ascending)
-            final_list = df_temp.to_dict('records')
+    if not final_list:
+        log("筛选后没有可保存数据。")
+        return {"status": "no_data", "total": 0, "file": None}
 
-        df = pd.DataFrame(final_list)
-        columns_order = [
-            "标题", "是否信息化", "采购方式", "语义匹配度", "地区（市）", "地区（县）", "预算限价项目", 
-            "开标具体时间", "开标地点", "采购需求", "发布时间", "代理机构", 
-            "采购人名称", "链接"
-        ]
-        existing_cols = [col for col in columns_order if col in df.columns]
-        df = df[existing_cols]
-        
-        safe_date = target_date_str.replace(":", "").replace("/", "").replace("\\", "")
-        filename = os.path.join(OUTPUT_DIR, f"shanxi_informatization_{safe_date}.xlsx")
-        
-        try:
-             # 使用 xlsxwriter 或 openpyxl 引擎
-            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
-                df.to_excel(writer, index=False, sheet_name='山西信息化项目')
-                # 简单样式调整
-                worksheet = writer.sheets['山西信息化项目']
-                wrap_alignment = Alignment(wrap_text=True, vertical='top', horizontal='left')
-                for row in worksheet.iter_rows(min_row=1, max_row=len(df) + 1):
-                    for cell in row:
-                        cell.alignment = wrap_alignment
-                        
-            log(f"保存成功: {filename}")
-            return {"total": len(final_list), "file": filename}
-        except Exception as e:
-            log(f"保存失败: {e}")
-            return {"total": len(final_list), "file": None}
-    
-    log("没有找到数据。")
-    return {"total": 0, "file": None}
+    frame = pd.DataFrame(final_list)
+    sort_columns = ["是否信息化", "地区（市）", "地区（县）", "开标具体时间"]
+    frame = frame.sort_values(by=sort_columns, ascending=[False, True, True, True])
+    columns_order = [
+        "标题", "是否信息化", "采购方式", "语义匹配度", "地区（市）", "地区（县）",
+        "预算限价项目", "开标具体时间", "开标地点", "采购需求", "发布时间",
+        "代理机构", "采购人名称", "链接",
+    ]
+    frame = frame[columns_order]
+
+    safe_date = target_date_str.replace(":", "").replace("/", "").replace("\\", "")
+    filename = os.path.join(OUTPUT_DIR, f"shanxi_informatization_{safe_date}.xlsx")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    temp_filename = os.path.join(
+        OUTPUT_DIR, f".{os.path.basename(filename)}.{uuid.uuid4().hex}.tmp.xlsx"
+    )
+    try:
+        with pd.ExcelWriter(temp_filename, engine="openpyxl") as writer:
+            frame.to_excel(writer, index=False, sheet_name="山西信息化项目")
+            pd.DataFrame([{
+                "status": result_status,
+                "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "raw_records": len(raw_results),
+                "saved_records": len(frame),
+                "detail_failures": detail_failures,
+                "source_errors": len(source_errors),
+            }]).to_excel(writer, index=False, sheet_name="采集元数据")
+            worksheet = writer.sheets["山西信息化项目"]
+            writer.sheets["采集元数据"].sheet_state = "hidden"
+            alignment = Alignment(wrap_text=True, vertical="top", horizontal="left")
+            for row in worksheet.iter_rows(min_row=1, max_row=len(frame) + 1):
+                for cell in row:
+                    cell.alignment = alignment
+        valid, reason = validate_result_file(temp_filename, require_complete=False)
+        if not valid:
+            raise ValueError(f"结果文件校验失败: {reason}")
+        os.replace(temp_filename, filename)
+    except Exception as exc:
+        if os.path.exists(temp_filename):
+            try:
+                os.remove(temp_filename)
+            except OSError:
+                pass
+        message = f"保存失败: {exc}"
+        log(message)
+        return {"status": "failed", "total": len(final_list), "file": None, "error": message}
+
+    log(f"保存成功: {filename}")
+    return {
+        "status": result_status,
+        "total": len(final_list),
+        "file": filename,
+        "warnings": warnings,
+        "metrics": {
+            "raw_records": len(raw_results),
+            "search_requests": search_requests,
+            "successful_keywords": successful_keywords,
+            "source_errors": source_errors,
+            "detail_failures": detail_failures,
+            "cache_hits": cache_hits,
+            "dropped_by_date_change": dropped_count,
+        },
+    }
 
 def scrape():
     target_date_input = input("请输入开标日期 (例如 2026年01月27日): ").strip()

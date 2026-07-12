@@ -16,6 +16,8 @@ from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
 import hashlib
 import json
+import copy
+import subprocess
 
 # 配置目录
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -84,7 +86,7 @@ def free_up_space():
                 print(f"Error cleaning uploads: {e}")
 
         # 2. Truncate Log File if > 50MB
-        LOG_FILE = os.path.join(BASE_DIR, 'scheduler.log')
+        LOG_FILE = os.path.join(DATA_DIR, 'scheduler.log')
         if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 50 * 1024 * 1024:
             try:
                 with open(LOG_FILE, 'w') as f:
@@ -106,7 +108,7 @@ except OSError as e:
         print("❌ CRITICAL: Disk full even after cleanup. Attempting to delete more...")
         # Desperate measure: Delete scheduler log entirely
         try:
-             LOG_FILE = os.path.join(BASE_DIR, 'scheduler.log')
+             LOG_FILE = os.path.join(DATA_DIR, 'scheduler.log')
              if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
              # Try makedirs again
              os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -144,7 +146,7 @@ app.config['MAX_CONTENT_LENGTH'] = 300 * 1024 * 1024 # 300MB Limit
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 # --- 定时任务日志存储 (改为文件存储以解决多进程/线程问题) ---
-LOG_FILE = os.path.join(BASE_DIR, 'scheduler.log')
+LOG_FILE = os.path.join(DATA_DIR, 'scheduler.log')
 VISITOR_DB = os.path.join(DATA_DIR, 'visitor_logs.db')
 print(f"DEBUG: BASE_DIR={BASE_DIR}")
 print(f"DEBUG: LOG_FILE={LOG_FILE}")
@@ -236,8 +238,54 @@ SCRAPER_STATUS = {
     "progress": 0,
     "total": 0,
     "logs": [],
-    "completed_files": []
+    "completed_files": [],
+    "result_status": "idle",
+    "errors": [],
+    "warnings": [],
+    "date_results": []
 }
+SCRAPER_STATE_LOCK = threading.Lock()
+SCRAPER_LOCK_FILE = os.path.join(DATA_DIR, "scraper_task.lock")
+SCHEDULER_LOCK_FILE = os.path.join(DATA_DIR, "scheduler_leader.lock")
+SCHEDULER_LOCK_HANDLE = None
+
+
+def acquire_process_lock(lock_path):
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    handle = open(lock_path, "a+b")
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return handle
+    except (OSError, IOError):
+        handle.close()
+        return None
+
+
+def release_process_lock(handle):
+    if not handle:
+        return
+    try:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except (OSError, IOError):
+        pass
+    finally:
+        handle.close()
 
 def get_available_dates():
     """扫描目录获取所有可用的日期文件"""
@@ -253,60 +301,161 @@ def get_available_dates():
     dates.sort(reverse=True)
     return dates
 
-def run_auto_scrape_thread(dates, is_scheduled_task=False):
+def run_auto_scrape_thread(dates, is_scheduled_task=False, process_lock=None):
     """后台运行爬虫的线程函数"""
     global SCRAPER_STATUS
-    SCRAPER_STATUS["is_running"] = True
-    SCRAPER_STATUS["total"] = len(dates)
-    SCRAPER_STATUS["progress"] = 0
-    SCRAPER_STATUS["logs"] = []
-    SCRAPER_STATUS["completed_files"] = []
-    
+
     def status_callback(msg):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        SCRAPER_STATUS["logs"].append(f"[{timestamp}] {msg}")
-        if len(SCRAPER_STATUS["logs"]) > 50:
-            SCRAPER_STATUS["logs"].pop(0)
+        with SCRAPER_STATE_LOCK:
+            SCRAPER_STATUS["logs"].append(f"[{timestamp}] {msg}")
+            if len(SCRAPER_STATUS["logs"]) > 100:
+                SCRAPER_STATUS["logs"].pop(0)
 
-    try:
-        status_callback(f"任务开始，计划采集 {len(dates)} 个日期")
-        
-        for i, day in enumerate(dates):
-            date_str_iso = day.strftime("%Y年%m月%d日")
-            
-            SCRAPER_STATUS["current_date"] = date_str_iso
-            status_callback(f"正在处理: {date_str_iso} ({i+1}/{len(dates)})")
-            
-            # 调用爬虫
-            result = scraper.run_scraper_for_date(date_str_iso, callback=status_callback)
-            
+    def record_result(date_str_iso, result):
+        result_status = result.get("status", "failed")
+        with SCRAPER_STATE_LOCK:
+            SCRAPER_STATUS["date_results"].append({
+                "date": date_str_iso,
+                "status": result_status,
+                "total": result.get("total", 0),
+                "file": result.get("file"),
+                "error": result.get("error"),
+                "warnings": result.get("warnings", []),
+            })
             if result.get("file"):
                 SCRAPER_STATUS["completed_files"].append(result["file"])
+            if result.get("error"):
+                SCRAPER_STATUS["errors"].append(f"{date_str_iso}: {result['error']}")
+            SCRAPER_STATUS["warnings"].extend(result.get("warnings", []))
+            SCRAPER_STATUS["progress"] = len(SCRAPER_STATUS["date_results"])
+
+        if is_scheduled_task:
+            if result_status == "no_data":
+                log_scheduler(f"   [无数据] {date_str_iso} 已确认无招标数据。")
+            elif result_status == "failed":
+                log_scheduler(f"   [失败] {date_str_iso}: {result.get('error', '未知错误')}")
+            elif result_status == "partial":
+                log_scheduler(f"   [部分成功] {date_str_iso}: {'; '.join(result.get('warnings', []))}")
+
+    worker = None
+    try:
+        status_callback(f"任务开始，计划采集 {len(dates)} 个日期")
+        date_args = [day.strftime("%Y-%m-%d") for day in dates]
+        worker_path = os.path.abspath(os.path.join(BASE_DIR, "..", "scrape_worker.py"))
+        worker = subprocess.Popen(
+            [sys.executable, "-u", worker_path, *date_args],
+            cwd=os.path.abspath(os.path.join(BASE_DIR, "..")),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env={**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"},
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        completed_dates = set()
+        for raw_line in worker.stdout:
+            line = raw_line.rstrip()
+            if not line:
+                continue
+            if line.startswith("__SCRAPER_EVENT__"):
+                try:
+                    event = json.loads(line[len("__SCRAPER_EVENT__"):])
+                except json.JSONDecodeError:
+                    status_callback(f"无法解析采集进程事件: {line[:200]}")
+                    continue
+                if event.get("type") == "date_start":
+                    with SCRAPER_STATE_LOCK:
+                        SCRAPER_STATUS["current_date"] = event["date"]
+                    status_callback(
+                        f"正在处理: {event['date']} ({event['index']}/{event['total']})"
+                    )
+                elif event.get("type") == "date_result":
+                    completed_dates.add(event["date"])
+                    record_result(event["date"], event["result"])
+                continue
+            status_callback(line)
+        return_code = worker.wait()
+
+        for day in dates:
+            date_str_iso = day.strftime("%Y年%m月%d日")
+            if date_str_iso not in completed_dates:
+                record_result(date_str_iso, {
+                    "status": "failed", "total": 0, "file": None,
+                    "error": f"采集子进程异常退出，返回码 {return_code}",
+                })
+
+        with SCRAPER_STATE_LOCK:
+            failed_count = sum(1 for item in SCRAPER_STATUS["date_results"] if item["status"] == "failed")
+            partial_count = sum(1 for item in SCRAPER_STATUS["date_results"] if item["status"] == "partial")
+            if failed_count == len(dates):
+                SCRAPER_STATUS["result_status"] = "failed"
+            elif failed_count or partial_count:
+                SCRAPER_STATUS["result_status"] = "partial"
             else:
-                if is_scheduled_task:
-                    log_scheduler(f"   [提示] {date_str_iso} 无招标数据。")
-                
-            SCRAPER_STATUS["progress"] = i + 1
-            
-        status_callback("所有任务已完成！")
-        
-        # --- 定时任务日志回写 ---
+                SCRAPER_STATUS["result_status"] = "success"
+        status_callback(f"任务结束，状态: {SCRAPER_STATUS['result_status']}")
+
         if is_scheduled_task:
             files_count = len(SCRAPER_STATUS["completed_files"])
-            log_msg = f"   [报告] 后台采集任务完成。新增 {files_count} 个文件。"
+            log_msg = f"   [报告] 后台采集任务结束，状态 {SCRAPER_STATUS['result_status']}，生成 {files_count} 个文件。"
             log_scheduler(log_msg)
-            # 强制再打印一遍，确保不为空
-            print(f"DEBUG_THREAD: {log_msg}")
-        
     except Exception as e:
+        if worker and worker.poll() is None:
+            worker.terminate()
+            try:
+                worker.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                worker.kill()
         status_callback(f"任务异常终止: {str(e)}")
+        with SCRAPER_STATE_LOCK:
+            SCRAPER_STATUS["result_status"] = "failed"
+            SCRAPER_STATUS["errors"].append(str(e))
         print(f"Scrape thread error: {e}")
         if is_scheduled_task:
             log_scheduler(f"   [错误] 后台采集线程发生异常: {str(e)}")
-            
     finally:
-        SCRAPER_STATUS["is_running"] = False
-        SCRAPER_STATUS["current_date"] = None
+        with SCRAPER_STATE_LOCK:
+            SCRAPER_STATUS["is_running"] = False
+            SCRAPER_STATUS["current_date"] = None
+        release_process_lock(process_lock)
+
+
+def start_scrape_task(dates, is_scheduled_task=False):
+    process_lock = acquire_process_lock(SCRAPER_LOCK_FILE)
+    if process_lock is None:
+        return False, "已有采集任务正在运行中"
+    with SCRAPER_STATE_LOCK:
+        if SCRAPER_STATUS["is_running"]:
+            release_process_lock(process_lock)
+            return False, "已有采集任务正在运行中"
+        SCRAPER_STATUS.update({
+            "is_running": True,
+            "current_date": None,
+            "progress": 0,
+            "total": len(dates),
+            "logs": [],
+            "completed_files": [],
+            "result_status": "running",
+            "errors": [],
+            "warnings": [],
+            "date_results": [],
+        })
+    try:
+        thread = threading.Thread(
+            target=run_auto_scrape_thread,
+            args=(dates, is_scheduled_task, process_lock),
+            daemon=True,
+        )
+        thread.start()
+    except Exception:
+        with SCRAPER_STATE_LOCK:
+            SCRAPER_STATUS["is_running"] = False
+            SCRAPER_STATUS["result_status"] = "failed"
+        release_process_lock(process_lock)
+        raise
+    return True, "采集任务已启动"
 
 # --- 用户操作日志工具函数 ---
 
@@ -1170,9 +1319,6 @@ def api_data():
 
 @app.route('/api/scrape/auto_start', methods=['POST'])
 def api_scrape_start():
-    if SCRAPER_STATUS["is_running"]:
-        return jsonify({"status": "error", "message": "已有任务正在运行中"}), 409
-    
     data = request.get_json()
     if not data or 'dates' not in data:
          return jsonify({"status": "error", "message": "请选择至少一个日期"}), 400
@@ -1188,13 +1334,18 @@ def api_scrape_start():
     try:
         for d_str in date_strs:
             dt = datetime.datetime.strptime(d_str, "%Y-%m-%d").date()
+            if dt < date.today() - timedelta(days=scraper.DAYS_AGO):
+                return jsonify({
+                    "status": "error",
+                    "message": f"{d_str} 超出政府采购网近 {scraper.DAYS_AGO} 天查询范围"
+                }), 400
             target_dates.append(dt)
     except ValueError:
         return jsonify({"status": "error", "message": "日期格式错误，应为 YYYY-MM-DD"}), 400
 
-    thread = threading.Thread(target=run_auto_scrape_thread, args=(target_dates,))
-    thread.daemon = True
-    thread.start()
+    started, message = start_scrape_task(target_dates)
+    if not started:
+        return jsonify({"status": "error", "message": message}), 409
     
     log_user_action("启动数据采集", f"目标日期: {', '.join(date_strs)}")
     
@@ -1206,7 +1357,8 @@ def api_scrape_start():
 
 @app.route('/api/scrape/status')
 def api_scrape_status():
-    return jsonify(SCRAPER_STATUS)
+    with SCRAPER_STATE_LOCK:
+        return jsonify(copy.deepcopy(SCRAPER_STATUS))
 
 # --- 定时任务配置 ---
 class Config:
@@ -1220,7 +1372,7 @@ scheduler.init_app(app)
 
 def scheduled_job():
     """
-    每天凌晨 02:00 执行的任务:
+    每天 07:00 执行的任务:
     1. 自动采集 [今天, 明天, 后天] 的数据 (如果文件不存在)。
     2. 清理 [前一天之前] 的数据 (保留前一天及以后)。
     """
@@ -1240,20 +1392,22 @@ def scheduled_job():
         filepath = os.path.join(RESULTS_DIR, filename)
         
         if os.path.exists(filepath):
-            log_scheduler(f"   [跳过] {date_str_iso} 数据已存在。")
+            valid, reason = scraper.validate_result_file(filepath)
+            if valid:
+                log_scheduler(f"   [跳过] {date_str_iso} 有效数据已存在。")
+                continue
+            log_scheduler(f"   [重采] {date_str_iso} 现有文件无效: {reason}")
+            scrape_targets.append(target_date)
         else:
             log_scheduler(f"   [计划] {date_str_iso} 加入采集队列。")
             scrape_targets.append(target_date)
             
     if scrape_targets:
-        if SCRAPER_STATUS["is_running"]:
-            log_scheduler("   [跳过] 爬虫正在运行中，本次定时任务取消采集。")
-        else:
-            # 启动采集线程，传递 is_scheduled_task=True
-            thread = threading.Thread(target=run_auto_scrape_thread, args=(scrape_targets, True))
-            thread.daemon = True
-            thread.start()
+        started, message = start_scrape_task(scrape_targets, is_scheduled_task=True)
+        if started:
             log_scheduler(f"   [启动] 已启动后台采集线程，目标: {len(scrape_targets)} 天")
+        else:
+            log_scheduler(f"   [跳过] {message}，本次定时任务取消采集。")
     else:
         log_scheduler("   [完成] 所有目标日期数据均已就绪，无需采集。")
 
@@ -1303,9 +1457,16 @@ def scheduled_job():
 
 # 添加定时任务并启动调度器
 try:
-    scheduler.add_job(id='daily_task', func=scheduled_job, trigger='cron', hour=7, minute=0)
-    scheduler.start()
-    print("✅ 定时任务调度器已启动 (每天 07:00 执行)")
+    SCHEDULER_LOCK_HANDLE = acquire_process_lock(SCHEDULER_LOCK_FILE)
+    if SCHEDULER_LOCK_HANDLE:
+        scheduler.add_job(
+            id='daily_task', func=scheduled_job, trigger='cron', hour=7, minute=0,
+            max_instances=1, coalesce=True, misfire_grace_time=1800
+        )
+        scheduler.start()
+        print("✅ 定时任务调度器已启动 (每天 07:00 执行)")
+    else:
+        print("ℹ️ 当前进程不是调度器主实例，跳过重复调度器启动")
 except Exception as e:
     print(f"⚠️ 调度器启动失败: {e}")
 

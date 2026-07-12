@@ -634,6 +634,17 @@ body {
     cursor: default;
 }
 
+.calendar-day.disabled {
+    cursor: not-allowed;
+    color: var(--text-secondary);
+    opacity: 0.35;
+}
+
+.calendar-day.disabled:hover {
+    background: transparent;
+    transform: none;
+}
+
 .calendar-day.selected {
     background: var(--accent-color);
     color: white;
