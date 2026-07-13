@@ -284,6 +284,20 @@
             line-height: 1.55;
         }
 
+        .shared-edit-evidence {
+            margin-top: 10px;
+            padding: 10px;
+            border-left: 3px solid #0f766e;
+            background: #f0fdfa;
+            color: #134e4a;
+            font-size: 0.85rem;
+            line-height: 1.55;
+        }
+
+        .shared-edit-row + .shared-edit-row {
+            margin-top: 6px;
+        }
+
         @media (max-width: 640px) {
             body {
                 padding: 12px;
@@ -418,9 +432,8 @@
                     </label>
                     <label
                         style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 0.9rem; color: #4b5563;">
-                        <input type="checkbox" name="check_spelling" value="1" style="width: 16px; height: 16px;">
-                        共同拼写错误
-                        <span style="font-size: 0.75rem; color: #9ca3af;">(首次较慢)</span>
+                        <input type="checkbox" name="check_spelling" value="1" checked style="width: 16px; height: 16px;">
+                        共同文字/标点/编号/计算错误
                     </label>
                 </div>
             </div>
@@ -439,7 +452,8 @@
                 <div class="summary-metrics">
                     <div class="summary-metric"><span>完全雷同</span><strong id="metric-exact">0</strong></div>
                     <div class="summary-metric"><span>近似雷同</span><strong id="metric-fuzzy">0</strong></div>
-                    <div class="summary-metric"><span>招标相关共同修改</span><strong id="metric-tender">0</strong></div>
+                    <div class="summary-metric"><span>已验证招标共同修改</span><strong id="metric-tender">0</strong></div>
+                    <div class="summary-metric"><span>共同错误</span><strong id="metric-error">0</strong></div>
                     <div class="summary-metric"><span>敏感实体</span><strong id="metric-entity">0</strong></div>
                     <div class="summary-metric"><span>A / B 涉及正文</span><strong id="metric-ratio">0% / 0%</strong></div>
                 </div>
@@ -450,9 +464,9 @@
                     <option value="all">全部线索</option>
                     <option value="text">完全雷同</option>
                     <option value="fuzzy">近似雷同</option>
-                    <option value="tender_related">招标相关共同修改</option>
+                    <option value="tender_related">已验证招标共同修改</option>
+                    <option value="shared_error">共同错误</option>
                     <option value="entity">敏感实体</option>
-                    <option value="rare_word">共同罕见词</option>
                 </select>
                 <div>
                     <button type="button" class="result-action-btn" id="export-csv-btn">导出 CSV</button>
@@ -771,6 +785,7 @@
                 exact: fallbackCounts.text || 0,
                 fuzzy: fallbackCounts.fuzzy || 0,
                 tender_related: fallbackCounts.tender_related || 0,
+                shared_error: fallbackCounts.shared_error || 0,
                 entity: fallbackCounts.entity || 0,
                 matched_ratio_a: 0,
                 matched_ratio_b: 0
@@ -778,6 +793,7 @@
             document.getElementById('metric-exact').textContent = values.exact || 0;
             document.getElementById('metric-fuzzy').textContent = values.fuzzy || 0;
             document.getElementById('metric-tender').textContent = values.tender_related || 0;
+            document.getElementById('metric-error').textContent = values.shared_error || 0;
             document.getElementById('metric-entity').textContent = values.entity || 0;
             document.getElementById('metric-ratio').textContent = `${values.matched_ratio_a || 0}% / ${values.matched_ratio_b || 0}%`;
         }
@@ -793,12 +809,13 @@
             paragraphs.forEach(item => {
                 const div = document.createElement('div');
                 div.className = 'paragraph-card';
-                const pageA = item.page_a ? `第 ${item.page_a} 页` : '未知页';
-                const pageB = item.page_b ? `第 ${item.page_b} 页` : '未知页';
+                const pageA = formatPageRange(item.page_a, item.page_a_end);
+                const pageB = formatPageRange(item.page_b, item.page_b_end);
                 const badgeClass = item.type === 'fuzzy' ? 'badge-fuzzy' : (item.type === 'tender_related' ? 'badge-info' : 'badge-error');
                 const badges = (item.badges && item.badges.length) ? item.badges : [typeLabel(item.type)];
                 const badgesHtml = badges.map(badge => `<span class="badge ${badgeClass}">${escapeHtml(badge)}</span>`).join('');
-                const isSideBySide = item.type === 'fuzzy' || item.type === 'tender_related';
+                const isSideBySide = item.type === 'fuzzy' || item.type === 'tender_related'
+                    || (item.type === 'shared_error' && item.text_a !== item.text_b);
                 const evidenceHtml = isSideBySide ? `
                     <div class="comparison-grid">
                         <div class="comparison-pane">
@@ -814,6 +831,14 @@
                     <div class="tender-reference">
                         <strong>对应招标原文：</strong>${escapeHtml(item.tender_text)}
                     </div>` : '';
+                const sharedEditsHtml = item.shared_edits && item.shared_edits.length ? `
+                    <div class="shared-edit-evidence">
+                        <strong>共同改动证据</strong>
+                        ${item.shared_edits.map(change => `
+                            <div class="shared-edit-row">
+                                招标原文“${escapeHtml(change.original)}” → 两份文件均为“${escapeHtml(change.modified)}”
+                            </div>`).join('')}
+                    </div>` : '';
                 const similarityHtml = item.similarity ? ` · 相似度 ${Number(item.similarity).toFixed(1)}%` : '';
 
                 div.innerHTML = `
@@ -826,6 +851,7 @@
                     </div>
                     ${evidenceHtml}
                     ${tenderHtml}
+                    ${sharedEditsHtml}
                     <div style="margin-top:7px; font-size:0.8rem; color:#6b7280;">${escapeHtml(item.desc || '')}${similarityHtml}</div>
                 `;
                 list.appendChild(div);
@@ -836,7 +862,8 @@
             const labels = {
                 text: '完全雷同',
                 fuzzy: '近似雷同',
-                tender_related: '招标相关共同修改',
+                tender_related: '已验证招标共同修改',
+                shared_error: '共同错误',
                 entity: '敏感实体',
                 rare_word: '共同罕见词'
             };
@@ -856,10 +883,11 @@
                 return;
             }
             const rows = [
-                ['类型', '文件A', 'A页码', '文件B', 'B页码', '相似度', '说明', '招标原文'],
+                ['类型', '文件A', 'A页码', '文件B', 'B页码', '相似度', '说明', '招标原文', '共同改动证据'],
                 ...latestParagraphs.map(item => [
-                    typeLabel(item.type), item.text_a, item.page_a || '', item.text_b,
-                    item.page_b || '', item.similarity || '', item.desc || '', item.tender_text || ''
+                    typeLabel(item.type), item.text_a, csvPageRange(item.page_a, item.page_a_end), item.text_b,
+                    csvPageRange(item.page_b, item.page_b_end), item.similarity || '', item.desc || '', item.tender_text || '',
+                    (item.shared_edits || []).map(change => `${change.original} -> ${change.modified}`).join('；')
                 ])
             ];
             const csv = rows.map(row => row.map(csvCell).join(',')).join('\r\n');
@@ -873,6 +901,17 @@
 
         function csvCell(value) {
             return `"${String(value ?? '').replace(/"/g, '""')}"`;
+        }
+
+        function formatPageRange(start, end) {
+            if (!start) return '未知页';
+            if (end && end !== start) return `第 ${start}-${end} 页`;
+            return `第 ${start} 页`;
+        }
+
+        function csvPageRange(start, end) {
+            if (!start) return '';
+            return end && end !== start ? `${start}-${end}` : start;
         }
 
         function escapeHtml(text) {
