@@ -79,6 +79,126 @@ class ComparatorTests(unittest.TestCase):
         self.assertTrue(fuzzy)
         self.assertGreaterEqual(fuzzy[0]["similarity"], 78)
 
+    def test_bid_form_boilerplate_is_suppressed(self):
+        detector = CollusionDetector()
+        exact_units = [
+            {"text": detector.normalize("邮政编码:030041"), "page": 1, "order": 0},
+            {
+                "text": detector.normalize("项目生产采用专用的五级质量复检程序"),
+                "page": 2,
+                "order": 1,
+            },
+        ]
+
+        exact, _ = detector._find_exact_collisions(exact_units, exact_units)
+
+        self.assertEqual(len(exact), 1)
+        self.assertIn("五级质量复检程序", exact[0]["text_a"])
+
+        fuzzy = detector._find_fuzzy_collisions(
+            [
+                {
+                    "text": detector.normalize(
+                        "投标人:甲公司(电子签章)法定代表人或其委托代理人:"
+                        "(电子签章)2026年7月12日"
+                    ),
+                    "page": 1,
+                }
+            ],
+            [
+                {
+                    "text": detector.normalize(
+                        "投标人:乙公司(电子签章)法定代表人或其委托代理人:"
+                        "(电子签章)2026年7月12日"
+                    ),
+                    "page": 1,
+                }
+            ],
+            set(),
+        )
+        self.assertFalse(fuzzy)
+
+    def test_page_counter_lines_are_removed_from_fuzzy_units(self):
+        detector = CollusionDetector()
+        content = (
+            "项目实施方案包含质量复检现场验收进度控制和售后响应程序\n"
+            "72\n56/193"
+        )
+        pages = [(56, content, detector.normalize(content))]
+
+        units = detector.get_comparison_units(pages)
+
+        self.assertTrue(units)
+        self.assertTrue(all("56/193" not in unit["text"] for unit in units))
+        self.assertTrue(all(not unit["text"].endswith("72") for unit in units))
+
+    def test_business_materials_outline_is_suppressed(self):
+        detector = CollusionDetector()
+
+        self.assertTrue(
+            detector._is_low_value_boilerplate(
+                "八、商务部分资料1、附2025年度审计报告、获奖情况及"
+                "能证明企业实力的资料"
+            )
+        )
+
+    def test_tender_derived_parameter_table_is_suppressed(self):
+        detector = CollusionDetector()
+        text_a = detector.normalize(
+            "序号1办公桌2200*2050*760mm厚度66mm密度26kg/m3承重102kg"
+            "耐磨80000次采用水性环保油漆和三节导轨"
+        )
+        text_b = detector.normalize(
+            "序号1主管桌2200*2050*760mm厚度66mm密度26kg/m3承重102kg"
+            "耐磨80000次采用水性环保油漆和三节导轨"
+        )
+
+        with mock.patch.object(
+            detector, "_tender_shingle_coverage", return_value=0.8
+        ):
+            fuzzy = detector._find_fuzzy_collisions(
+                [{"text": text_a, "page": 10}],
+                [{"text": text_b, "page": 20}],
+                set(),
+            )
+
+        self.assertFalse(fuzzy)
+
+    def test_fuzzy_match_covered_by_exact_substring_is_suppressed(self):
+        detector = CollusionDetector()
+        first_exact = detector.normalize("施工队伍进场后参加安全教育培训")
+        second_exact = detector.normalize("参加考试不合格的施工人员清退出场")
+        combined = first_exact + second_exact
+
+        fuzzy = detector._find_fuzzy_collisions(
+            [{"text": combined, "page": 10}],
+            [{"text": detector.normalize("安全施工注意事项") + combined, "page": 20}],
+            {first_exact, second_exact},
+        )
+
+        self.assertFalse(fuzzy)
+
+    def test_nearby_exact_segments_merge_when_three_or_more_align(self):
+        detector = CollusionDetector()
+        texts = [
+            detector.normalize("第一项共同生产质量检验控制程序"),
+            detector.normalize("第二项共同生产复检控制程序"),
+            detector.normalize("第三项共同生产问题上报程序"),
+        ]
+        units_a = [
+            {"text": text, "page": 1, "order": order}
+            for text, order in zip(texts, (0, 2, 4))
+        ]
+        units_b = [
+            {"text": text, "page": 3, "order": order}
+            for text, order in zip(texts, (0, 2, 4))
+        ]
+
+        exact, _ = detector._find_exact_collisions(units_a, units_b)
+
+        self.assertEqual(len(exact), 1)
+        self.assertEqual(exact[0]["segment_count"], 3)
+
     def test_shared_tender_edit_has_separate_classification(self):
         path_a = self.path("a.pdf")
         path_b = self.path("b.pdf")

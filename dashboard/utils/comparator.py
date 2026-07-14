@@ -11,7 +11,7 @@ from difflib import SequenceMatcher
 import fitz  # PyMuPDF
 
 
-ALGORITHM_VERSION = 5
+ALGORITHM_VERSION = 6
 MIN_EXACT_LENGTH = 9
 MAX_EXACT_BLOCK_LENGTH = 1200
 MIN_FUZZY_LENGTH = 20
@@ -282,9 +282,16 @@ class CollusionDetector:
         order = 0
 
         for page_number, raw_text, _ in pages:
-            for line in raw_text.splitlines():
+            lines = raw_text.splitlines()
+            for line_index, line in enumerate(lines):
                 normalized_line = self.normalize(line)
-                if not normalized_line or normalized_line in repeated_lines:
+                if (
+                    not normalized_line
+                    or normalized_line in repeated_lines
+                    or self._is_page_number_line(
+                        normalized_line, line_index >= len(lines) - 3
+                    )
+                ):
                     continue
                 for part in re.split(r"[。.!！?？;；,，]", line):
                     normalized = self.normalize(part.strip())
@@ -305,6 +312,73 @@ class CollusionDetector:
         if not self.tender_full_text:
             return False
         return text in self.tender_exact_texts or text in self.tender_full_text
+
+    @staticmethod
+    def _is_page_number_line(text, is_trailing=False):
+        """Recognize standalone PDF page counters without touching content numbers."""
+        normalized = CollusionDetector.normalize(text)
+        if re.fullmatch(r"\d{1,4}[/／]\d{1,4}", normalized):
+            return True
+        if re.fullmatch(r"第?\d{1,4}页(?:共\d{1,4}页)?", normalized):
+            return True
+        return is_trailing and bool(re.fullmatch(r"\d{1,4}", normalized))
+
+    @staticmethod
+    def _is_low_value_boilerplate(text):
+        """Suppress only high-confidence bid form boilerplate and generic fields."""
+        normalized = CollusionDetector.normalize(text)
+        if not normalized:
+            return True
+
+        if normalized.count("所有条款无偏差") >= 2:
+            return True
+        if "商务和技术偏差表" in normalized and (
+            "偏差说明" in normalized or "所有条款无偏差" in normalized
+        ):
+            return True
+        if (
+            re.match(r"^[一二三四五六七八九十]+[、.]商务部分资料", normalized)
+            and "年度审计报告" in normalized
+            and "获奖情况" in normalized
+            and len(normalized) <= 140
+        ):
+            return True
+
+        if "投标人:" in normalized and "电子签章" in normalized and any(
+            marker in normalized
+            for marker in ("法定代表人", "委托代理人", "身份证复印件")
+        ):
+            return True
+
+        identity_form_fields = (
+            "单位名称:",
+            "单位性质:",
+            "地址:",
+            "成立时间:",
+            "经营期限:",
+            "姓名:",
+            "性别:",
+            "年龄:",
+            "职务:",
+        )
+        if "法定代表人身份证明" in normalized and sum(
+            field in normalized for field in identity_form_fields
+        ) >= 4:
+            return True
+
+        if len(normalized) <= 100:
+            if re.match(r"^\d+[.]?无\(?其他补充说明\)?", normalized):
+                return True
+            if normalized.startswith(("邮政编码:", "单位性质:")):
+                return True
+            if "代理人:" in normalized and "性别:" in normalized and "年龄:" in normalized:
+                return True
+            if normalized.startswith("增值税税率为"):
+                return True
+            if normalized.startswith("质量标准为满足国家及行业"):
+                return True
+
+        return False
 
     def _tender_shingle_coverage(self, text):
         if not self.tender_unit_index:
@@ -675,17 +749,41 @@ class CollusionDetector:
         current = []
         current_length = 0
 
+        def append_candidate(candidate):
+            if len(candidate) >= 3:
+                groups.append(candidate)
+                return
+            strict_group = []
+            for pair in candidate:
+                if strict_group and not (
+                    pair[0]["order"] == strict_group[-1][0]["order"] + 1
+                    and pair[1]["order"] == strict_group[-1][1]["order"] + 1
+                ):
+                    groups.append(strict_group)
+                    strict_group = []
+                strict_group.append(pair)
+            if strict_group:
+                groups.append(strict_group)
+
         for unit_a, unit_b in pairs:
-            is_contiguous = not current or (
-                unit_a["order"] == current[-1][0]["order"] + 1
-                and unit_b["order"] == current[-1][1]["order"] + 1
-            )
+            if current:
+                gap_a = unit_a["order"] - current[-1][0]["order"]
+                gap_b = unit_b["order"] - current[-1][1]["order"]
+                is_nearby = (
+                    1 <= gap_a <= 4
+                    and 1 <= gap_b <= 4
+                    and abs(gap_a - gap_b) <= 1
+                    and unit_a["page"] - current[-1][0]["page"] <= 1
+                    and unit_b["page"] - current[-1][1]["page"] <= 1
+                )
+            else:
+                is_nearby = True
             added_length = len(unit_a["text"]) + (1 if current else 0)
             if current and (
-                not is_contiguous
+                not is_nearby
                 or current_length + added_length > MAX_EXACT_BLOCK_LENGTH
             ):
-                groups.append(current)
+                append_candidate(current)
                 current = []
                 current_length = 0
                 added_length = len(unit_a["text"])
@@ -693,12 +791,22 @@ class CollusionDetector:
             current_length += added_length
 
         if current:
-            groups.append(current)
+            append_candidate(current)
         return groups
 
     def _find_exact_collisions(self, units_a, units_b):
-        filtered_a = [unit for unit in units_a if not self._is_tender_copy(unit["text"])]
-        filtered_b = [unit for unit in units_b if not self._is_tender_copy(unit["text"])]
+        filtered_a = [
+            unit
+            for unit in units_a
+            if not self._is_tender_copy(unit["text"])
+            and not self._is_low_value_boilerplate(unit["text"])
+        ]
+        filtered_b = [
+            unit
+            for unit in units_b
+            if not self._is_tender_copy(unit["text"])
+            and not self._is_low_value_boilerplate(unit["text"])
+        ]
         sequence_a = [unit["text"] for unit in filtered_a]
         sequence_b = [unit["text"] for unit in filtered_b]
         matcher = SequenceMatcher(None, sequence_a, sequence_b)
@@ -840,9 +948,17 @@ class CollusionDetector:
 
         for page_number, raw_text, _ in pages:
             kept_lines = []
-            for line in raw_text.splitlines():
+            lines = raw_text.splitlines()
+            for line_index, line in enumerate(lines):
                 normalized_line = self.normalize(line)
-                if normalized_line and normalized_line not in repeated_lines:
+                if (
+                    normalized_line
+                    and normalized_line not in repeated_lines
+                    and not re.fullmatch(r"\d{1,4}", normalized_line)
+                    and not self._is_page_number_line(
+                        normalized_line, line_index >= len(lines) - 3
+                    )
+                ):
                     kept_lines.append(line.strip())
             page_text = "".join(kept_lines)
             for part in re.split(r"[。.!！?？;；]+", page_text):
@@ -1024,16 +1140,57 @@ class CollusionDetector:
         return None
 
     def _find_fuzzy_collisions(self, units_a, units_b, exact_sentences):
-        index_b = self._build_unit_index(units_b)
+        exact_prefixes = {}
+        for exact_text in exact_sentences:
+            if len(exact_text) < MIN_EXACT_LENGTH:
+                continue
+            prefix = exact_text[:MIN_EXACT_LENGTH]
+            matches = exact_prefixes.setdefault(prefix, [])
+            if matches is not None:
+                if len(matches) < MAX_POSTINGS_PER_SHINGLE:
+                    matches.append(exact_text)
+                else:
+                    exact_prefixes[prefix] = None
+
+        filtered_b = [
+            unit for unit in units_b if not self._is_low_value_boilerplate(unit["text"])
+        ]
+        index_b = self._build_unit_index(filtered_b)
         proposals = []
         seen_pairs = set()
 
         for index_a, unit_a in enumerate(units_a):
             text_a = unit_a["text"]
+            if self._is_low_value_boilerplate(text_a):
+                continue
             for candidate in self._best_candidates(text_a, index_b, minimum_ratio=0.78):
                 unit_b = candidate["unit"]
                 text_b = unit_b["text"]
                 if text_a == text_b or (text_a in exact_sentences and text_b in exact_sentences):
+                    continue
+                if (text_a in exact_sentences and text_a in text_b) or (
+                    text_b in exact_sentences and text_b in text_a
+                ):
+                    continue
+                shared_exact_parts = set()
+                for start in range(len(text_a) - MIN_EXACT_LENGTH + 1):
+                    prefix_matches = exact_prefixes.get(
+                        text_a[start : start + MIN_EXACT_LENGTH]
+                    )
+                    if not prefix_matches:
+                        continue
+                    shared_exact_parts.update(
+                        exact_text
+                        for exact_text in prefix_matches
+                        if exact_text in text_b
+                    )
+                if any(
+                    len(exact_text) >= MIN_FUZZY_DISPLAY_LENGTH
+                    for exact_text in shared_exact_parts
+                ) or (
+                    len(shared_exact_parts) >= 2
+                    and sum(map(len, shared_exact_parts)) >= 18
+                ):
                     continue
                 if min(len(text_a), len(text_b)) < MIN_FUZZY_DISPLAY_LENGTH:
                     continue
@@ -1075,6 +1232,14 @@ class CollusionDetector:
             error_kind = ""
             verified_tender_edit = False
 
+            table_a = self._looks_like_table_extraction(text_a)
+            table_b = self._looks_like_table_extraction(text_b)
+            if table_a and table_b and min(
+                self._tender_shingle_coverage(text_a),
+                self._tender_shingle_coverage(text_b),
+            ) >= 0.75:
+                continue
+
             if tender_a and tender_b and tender_a["index"] == tender_b["index"]:
                 candidate_tender_text = tender_a["unit"]["text"]
                 edit_evidence = self._shared_tender_edit_evidence(
@@ -1102,8 +1267,6 @@ class CollusionDetector:
                 derived_b = tender_b or self._best_tender_match(
                     text_b, minimum_ratio=0.55, minimum_jaccard=0.12
                 )
-                table_a = self._looks_like_table_extraction(text_a)
-                table_b = self._looks_like_table_extraction(text_b)
                 is_tender_derived = False
 
                 if derived_a and derived_b:
