@@ -11,7 +11,7 @@ from difflib import SequenceMatcher
 import fitz  # PyMuPDF
 
 
-ALGORITHM_VERSION = 6
+ALGORITHM_VERSION = 7
 MIN_EXACT_LENGTH = 9
 MAX_EXACT_BLOCK_LENGTH = 1200
 MIN_FUZZY_LENGTH = 20
@@ -33,6 +33,8 @@ MIN_SHARED_EDIT_COVERAGE = 0.6
 TENDER_DERIVED_RATIO = 0.78
 TENDER_EXACT_SHINGLE_COVERAGE = 0.65
 TENDER_FRAGMENT_SHINGLE_COVERAGE = 0.40
+MIN_SHARED_NONTENDER_SHINGLES = 24
+MIN_SHARED_NONTENDER_RATIO = 0.20
 CACHE_MAX_BYTES = 256 * 1024 * 1024
 CACHE_DIR = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "data", "bijiao_cache")
@@ -388,6 +390,17 @@ class CollusionDetector:
             return 0.0
         tender_postings = self.tender_unit_index["postings"]
         return sum(shingle in tender_postings for shingle in signature) / len(signature)
+
+    def _shared_nontender_shingle_stats(self, text_a, text_b):
+        """Measure shared wording that cannot be explained by the tender text."""
+        shared = self._shingles(text_a) & self._shingles(text_b)
+        if not shared:
+            return 0, 0.0
+        if not self.tender_unit_index:
+            return len(shared), 1.0
+        tender_postings = self.tender_unit_index["postings"]
+        novel_count = sum(shingle not in tender_postings for shingle in shared)
+        return novel_count, novel_count / len(shared)
 
     @staticmethod
     def _edit_operations(source, target):
@@ -1234,11 +1247,20 @@ class CollusionDetector:
 
             table_a = self._looks_like_table_extraction(text_a)
             table_b = self._looks_like_table_extraction(text_b)
+            has_substantial_nontender_table_content = False
             if table_a and table_b and min(
                 self._tender_shingle_coverage(text_a),
                 self._tender_shingle_coverage(text_b),
             ) >= 0.75:
-                continue
+                novel_count, novel_ratio = self._shared_nontender_shingle_stats(
+                    text_a, text_b
+                )
+                has_substantial_nontender_table_content = (
+                    novel_count >= MIN_SHARED_NONTENDER_SHINGLES
+                    and novel_ratio >= MIN_SHARED_NONTENDER_RATIO
+                )
+                if not has_substantial_nontender_table_content:
+                    continue
 
             if tender_a and tender_b and tender_a["index"] == tender_b["index"]:
                 candidate_tender_text = tender_a["unit"]["text"]
@@ -1302,7 +1324,7 @@ class CollusionDetector:
                         )
                     )
 
-                if is_tender_derived:
+                if is_tender_derived and not has_substantial_nontender_table_content:
                     continue
 
             proposal.pop("index_a")

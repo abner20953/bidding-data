@@ -155,6 +155,8 @@ class ComparatorTests(unittest.TestCase):
 
         with mock.patch.object(
             detector, "_tender_shingle_coverage", return_value=0.8
+        ), mock.patch.object(
+            detector, "_shared_nontender_shingle_stats", return_value=(8, 0.1)
         ):
             fuzzy = detector._find_fuzzy_collisions(
                 [{"text": text_a, "page": 10}],
@@ -163,6 +165,33 @@ class ComparatorTests(unittest.TestCase):
             )
 
         self.assertFalse(fuzzy)
+
+    def test_parameter_table_keeps_substantial_shared_nontender_content(self):
+        detector = CollusionDetector()
+        shared_custom_text = (
+            "双方共同新增现场复核流程并要求每批产品记录责任人和复核时间"
+        )
+        text_a = detector.normalize(
+            "序号1办公桌2200*2050*760mm厚度66mm密度26kg/m3承重102kg"
+            "耐磨80000次" + shared_custom_text
+        )
+        text_b = detector.normalize(
+            "序号1主管桌2200*2050*760mm厚度66mm密度26kg/m3承重102kg"
+            "耐磨80000次" + shared_custom_text
+        )
+
+        with mock.patch.object(
+            detector, "_tender_shingle_coverage", return_value=0.8
+        ), mock.patch.object(
+            detector, "_shared_nontender_shingle_stats", return_value=(36, 0.3)
+        ):
+            fuzzy = detector._find_fuzzy_collisions(
+                [{"text": text_a, "page": 10}],
+                [{"text": text_b, "page": 20}],
+                set(),
+            )
+
+        self.assertTrue(fuzzy)
 
     def test_fuzzy_match_covered_by_exact_substring_is_suppressed(self):
         detector = CollusionDetector()
