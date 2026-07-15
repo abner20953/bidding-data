@@ -1,0 +1,842 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>专家人脸检索</title>
+    <link rel="stylesheet" href="/static/css/style.css?v=20260715">
+    <style>
+        :root {
+            --face-bg: #f3f6f8;
+            --face-surface: #ffffff;
+            --face-border: #dce5ec;
+            --face-text: #1d2939;
+            --face-muted: #667085;
+            --face-blue: #0b78c7;
+            --face-blue-soft: #eaf5fd;
+            --face-green: #07875a;
+            --face-green-soft: #ecfdf3;
+            --face-amber: #b54708;
+            --face-amber-soft: #fffaeb;
+            --face-red: #b42318;
+            --face-red-soft: #fef3f2;
+        }
+
+        body.face-page {
+            background: var(--face-bg);
+            color: var(--face-text);
+            min-height: 100vh;
+        }
+
+        .face-header {
+            height: 64px;
+            display: flex;
+            align-items: center;
+            border-bottom: 1px solid var(--face-border);
+            background: var(--face-surface);
+        }
+
+        .face-header-inner {
+            width: min(1120px, calc(100% - 40px));
+            margin: 0 auto;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+        }
+
+        .face-title {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            min-width: 0;
+        }
+
+        .face-title-mark {
+            width: 30px;
+            height: 30px;
+            display: grid;
+            place-items: center;
+            color: #ffffff;
+            background: var(--face-blue);
+            border-radius: 7px;
+            font-size: 16px;
+        }
+
+        .face-title h1 {
+            margin: 0;
+            font-size: 18px;
+            font-weight: 700;
+            letter-spacing: 0;
+        }
+
+        .face-title span {
+            color: var(--face-muted);
+            font-size: 13px;
+        }
+
+        .face-main {
+            width: min(1120px, calc(100% - 40px));
+            margin: 0 auto;
+            padding: 32px 0 48px;
+        }
+
+        .face-layout {
+            display: grid;
+            grid-template-columns: minmax(300px, 360px) minmax(0, 1fr);
+            gap: 24px;
+            align-items: start;
+        }
+
+        .face-tool,
+        .face-results {
+            background: var(--face-surface);
+            border: 1px solid var(--face-border);
+            border-radius: 8px;
+        }
+
+        .face-tool {
+            padding: 20px;
+        }
+
+        .panel-heading {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+
+        .panel-heading h2 {
+            margin: 0;
+            font-size: 16px;
+            font-weight: 700;
+        }
+
+        .panel-heading p {
+            margin: 4px 0 0;
+            color: var(--face-muted);
+            font-size: 13px;
+            line-height: 1.5;
+        }
+
+        .icon-button {
+            width: 32px;
+            height: 32px;
+            border: 1px solid var(--face-border);
+            border-radius: 6px;
+            background: #ffffff;
+            color: var(--face-muted);
+            cursor: pointer;
+            font-size: 19px;
+            line-height: 1;
+        }
+
+        .icon-button:hover {
+            color: var(--face-text);
+            border-color: #aebdca;
+        }
+
+        .face-control {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 7px;
+            margin-bottom: 14px;
+        }
+
+        .face-control label {
+            color: var(--face-text);
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        .face-control select {
+            width: 100%;
+            height: 38px;
+            padding: 0 10px;
+            border: 1px solid var(--face-border);
+            border-radius: 6px;
+            background: #ffffff;
+            color: var(--face-text);
+            font: inherit;
+            font-size: 13px;
+        }
+
+        .upload-zone {
+            min-height: 234px;
+            margin-top: 20px;
+            padding: 16px;
+            border: 1px dashed #9db9ce;
+            border-radius: 8px;
+            background: #f9fcfe;
+            cursor: pointer;
+            display: grid;
+            place-items: center;
+            transition: border-color .16s ease, background .16s ease;
+            position: relative;
+        }
+
+        .upload-zone.is-dragover {
+            border-color: var(--face-blue);
+            background: var(--face-blue-soft);
+        }
+
+        .upload-empty {
+            text-align: center;
+            color: var(--face-muted);
+        }
+
+        .upload-empty .upload-symbol {
+            display: block;
+            font-size: 32px;
+            margin-bottom: 10px;
+        }
+
+        .upload-empty strong {
+            display: block;
+            color: var(--face-text);
+            font-size: 14px;
+            margin-bottom: 5px;
+        }
+
+        .upload-empty small {
+            font-size: 12px;
+        }
+
+        .upload-preview {
+            display: none;
+            width: 100%;
+            height: 200px;
+            position: relative;
+        }
+
+        .upload-preview img {
+            display: block;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            border-radius: 6px;
+        }
+
+        .upload-preview button {
+            position: absolute;
+            top: 0;
+            right: 0;
+        }
+
+        .search-state {
+            display: none;
+            margin-top: 16px;
+            padding: 12px;
+            border: 1px solid #bee2f9;
+            border-radius: 7px;
+            background: var(--face-blue-soft);
+            color: #075985;
+            font-size: 13px;
+            line-height: 1.45;
+        }
+
+        .search-state.is-error {
+            border-color: #fecdca;
+            background: var(--face-red-soft);
+            color: var(--face-red);
+        }
+
+        .search-state.is-loading::before {
+            content: '';
+            display: inline-block;
+            width: 13px;
+            height: 13px;
+            margin-right: 8px;
+            vertical-align: -2px;
+            border: 2px solid rgba(7, 89, 133, .25);
+            border-top-color: #075985;
+            border-radius: 50%;
+            animation: face-spin .8s linear infinite;
+        }
+
+        @keyframes face-spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .face-results {
+            min-height: 500px;
+            padding: 24px;
+        }
+
+        .results-empty {
+            min-height: 450px;
+            display: grid;
+            place-items: center;
+            text-align: center;
+            color: var(--face-muted);
+            padding: 24px;
+        }
+
+        .results-empty .empty-symbol {
+            display: block;
+            margin-bottom: 12px;
+            color: #98a2b3;
+            font-size: 34px;
+        }
+
+        .results-empty strong {
+            display: block;
+            color: var(--face-text);
+            font-size: 15px;
+            margin-bottom: 6px;
+        }
+
+        .results-empty p {
+            margin: 0;
+            font-size: 13px;
+            line-height: 1.5;
+        }
+
+        .results-content {
+            display: none;
+        }
+
+        .results-summary {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid var(--face-border);
+            margin-bottom: 16px;
+        }
+
+        .results-summary strong {
+            display: block;
+            font-size: 15px;
+        }
+
+        .results-summary span {
+            color: var(--face-muted);
+            font-size: 13px;
+        }
+
+        .match-list {
+            display: grid;
+            gap: 12px;
+        }
+
+        .match-card {
+            border: 1px solid var(--face-border);
+            border-left: 4px solid var(--face-amber);
+            border-radius: 7px;
+            padding: 16px;
+            background: #ffffff;
+        }
+
+        .match-card.is-verified {
+            border-left-color: var(--face-green);
+        }
+
+        .match-card-header {
+            display: flex;
+            justify-content: space-between;
+            gap: 16px;
+            align-items: flex-start;
+        }
+
+        .match-person {
+            display: flex;
+            align-items: center;
+            min-width: 0;
+            gap: 12px;
+        }
+
+        .live-face {
+            display: none;
+            width: 48px;
+            height: 64px;
+            flex: 0 0 auto;
+            overflow: hidden;
+            border: 1px solid var(--face-border);
+            border-radius: 6px;
+            background: #eef2f6;
+        }
+
+        .live-face canvas {
+            display: block;
+            width: 48px;
+            height: 64px;
+        }
+
+        .match-person h3 {
+            margin: 0;
+            font-size: 17px;
+            font-weight: 700;
+        }
+
+        .match-person p {
+            margin: 4px 0 0;
+            color: var(--face-muted);
+            font-size: 13px;
+            overflow-wrap: anywhere;
+        }
+
+        .match-score {
+            flex: 0 0 auto;
+            text-align: right;
+        }
+
+        .match-score strong {
+            display: block;
+            color: var(--face-amber);
+            font-size: 18px;
+        }
+
+        .is-verified .match-score strong {
+            color: var(--face-green);
+        }
+
+        .match-score span {
+            color: var(--face-muted);
+            font-size: 11px;
+        }
+
+        .match-badge {
+            display: inline-flex;
+            margin-top: 6px;
+            padding: 3px 6px;
+            border-radius: 4px;
+            background: var(--face-amber-soft);
+            color: var(--face-amber);
+            font-size: 11px;
+            font-weight: 600;
+        }
+
+        .is-verified .match-badge {
+            background: var(--face-green-soft);
+            color: var(--face-green);
+        }
+
+        .match-fields {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px 20px;
+            margin: 16px 0 0;
+            padding-top: 14px;
+            border-top: 1px solid #edf1f5;
+        }
+
+        .match-field {
+            min-width: 0;
+        }
+
+        .match-field dt {
+            color: var(--face-muted);
+            font-size: 11px;
+            margin-bottom: 3px;
+        }
+
+        .match-field dd {
+            margin: 0;
+            color: var(--face-text);
+            font-size: 13px;
+            font-weight: 500;
+            overflow-wrap: anywhere;
+        }
+
+        .tag-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 5px;
+        }
+
+        .expert-tag {
+            display: inline-flex;
+            padding: 2px 6px;
+            border: 1px solid #cbe5f5;
+            border-radius: 4px;
+            background: #f0f9ff;
+            color: #0369a1;
+            font-size: 11px;
+            font-weight: 600;
+        }
+
+        @media (max-width: 760px) {
+            .face-header-inner,
+            .face-main {
+                width: min(100% - 24px, 1120px);
+            }
+
+            .face-header-inner {
+                gap: 8px;
+            }
+
+            .face-title span {
+                display: none;
+            }
+
+            .face-main {
+                padding-top: 16px;
+            }
+
+            .face-layout {
+                grid-template-columns: 1fr;
+                gap: 16px;
+            }
+
+            .face-results {
+                min-height: 320px;
+                padding: 16px;
+            }
+
+            .results-empty {
+                min-height: 288px;
+            }
+
+            .match-card-header {
+                gap: 10px;
+            }
+
+            .match-fields {
+                grid-template-columns: 1fr;
+                gap: 9px;
+            }
+        }
+    </style>
+</head>
+<body class="face-page">
+    <header class="face-header">
+        <div class="face-header-inner">
+            <div class="face-title">
+                <div class="face-title-mark" aria-hidden="true">人</div>
+                <div>
+                    <h1>专家人脸检索</h1>
+                    <span>上传现场照片，检索专家库匹配结果</span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <main class="face-main">
+        <div class="face-layout">
+            <section class="face-tool" aria-label="上传并检索照片">
+                <div class="panel-heading">
+                    <div>
+                        <h2>上传现场照片</h2>
+                        <p>照片将用于云端人脸检索，不会保存到专家库。</p>
+                    </div>
+                    <button id="reset-search" class="icon-button" type="button" title="清空本次检索" aria-label="清空本次检索">×</button>
+                </div>
+
+                <div class="face-control">
+                    <label for="face-search-limit">最多检索人脸数量</label>
+                    <select id="face-search-limit">
+                        <option value="1" selected>1 张脸（单人，最快）</option>
+                        <option value="2">最多 2 张脸</option>
+                        <option value="3">最多 3 张脸</option>
+                        <option value="4">最多 4 张脸</option>
+                        <option value="5">最多 5 张脸</option>
+                        <option value="6">最多 6 张脸</option>
+                        <option value="7">最多 7 张脸</option>
+                        <option value="8">最多 8 张脸</option>
+                        <option value="9">最多 9 张脸</option>
+                        <option value="10">最多 10 张脸</option>
+                    </select>
+                </div>
+
+                <div class="face-control">
+                    <label for="face-search-mode">检索模式</label>
+                    <select id="face-search-mode">
+                        <option value="speed" selected>速度优先（直接整图比对）</option>
+                        <option value="quality">质量优先（切图高精比对）</option>
+                    </select>
+                </div>
+
+                <div id="face-upload-zone" class="upload-zone" role="button" tabindex="0" aria-label="上传现场照片">
+                    <input id="face-file-input" type="file" accept="image/jpeg,image/png" hidden>
+                    <div id="face-upload-empty" class="upload-empty">
+                        <span class="upload-symbol" aria-hidden="true">▣</span>
+                        <strong>拖拽或点击上传照片</strong>
+                        <small>支持 JPG、JPEG、PNG，系统会自动压缩后检索</small>
+                    </div>
+                    <div id="face-upload-preview" class="upload-preview">
+                        <img id="face-preview-image" alt="待检索现场照片预览">
+                        <button id="remove-image" class="icon-button" type="button" title="移除照片" aria-label="移除照片">×</button>
+                    </div>
+                </div>
+
+                <div id="face-status" class="search-state" role="status"></div>
+            </section>
+
+            <section class="face-results" aria-live="polite">
+                <div id="results-empty" class="results-empty">
+                    <div>
+                        <span class="empty-symbol" aria-hidden="true">◎</span>
+                        <strong>等待上传照片</strong>
+                        <p>完成检索后，这里会显示匹配专家的基本信息。</p>
+                    </div>
+                </div>
+                <div id="results-content" class="results-content">
+                    <div class="results-summary">
+                        <div>
+                            <strong id="results-title">检索结果</strong>
+                            <span id="results-description"></span>
+                        </div>
+                    </div>
+                    <div id="match-list" class="match-list"></div>
+                </div>
+            </section>
+        </div>
+    </main>
+
+    <script>
+        (() => {
+            const uploadZone = document.getElementById('face-upload-zone');
+            const fileInput = document.getElementById('face-file-input');
+            const uploadEmpty = document.getElementById('face-upload-empty');
+            const uploadPreview = document.getElementById('face-upload-preview');
+            const previewImage = document.getElementById('face-preview-image');
+            const removeImage = document.getElementById('remove-image');
+            const resetButton = document.getElementById('reset-search');
+            const status = document.getElementById('face-status');
+            const resultsEmpty = document.getElementById('results-empty');
+            const resultsContent = document.getElementById('results-content');
+            const resultsTitle = document.getElementById('results-title');
+            const resultsDescription = document.getElementById('results-description');
+            const matchList = document.getElementById('match-list');
+            const searchLimit = document.getElementById('face-search-limit');
+            const searchMode = document.getElementById('face-search-mode');
+            let currentImageData = '';
+
+            function escapeHtml(value) {
+                return String(value ?? '').replace(/[&<>'"]/g, char => ({
+                    '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
+                }[char]));
+            }
+
+            function setStatus(message, type = '') {
+                status.textContent = message;
+                status.className = `search-state ${type}`.trim();
+                status.style.display = message ? 'block' : 'none';
+            }
+
+            function resetSearch() {
+                currentImageData = '';
+                fileInput.value = '';
+                previewImage.removeAttribute('src');
+                uploadPreview.style.display = 'none';
+                uploadEmpty.style.display = 'block';
+                matchList.replaceChildren();
+                resultsContent.style.display = 'none';
+                resultsEmpty.style.display = 'grid';
+                setStatus('');
+            }
+
+            function resizeForSearch(file, mode) {
+                return new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onerror = () => reject(new Error('读取图片文件失败，请重新选择。'));
+                    reader.onload = event => {
+                        const image = new Image();
+                        image.onerror = () => reject(new Error('无法解析该图片，请重新选择。'));
+                        image.onload = () => {
+                            try {
+                                const initialMaxEdge = mode === 'quality' ? 2560 : 1280;
+                                const minMaxEdge = mode === 'quality' ? 1280 : 720;
+                                const targetEncodedSize = mode === 'quality' ? 3.8 * 1024 * 1024 : 1.2 * 1024 * 1024;
+                                const qualitySteps = mode === 'quality'
+                                    ? [0.90, 0.84, 0.78, 0.72, 0.66, 0.60]
+                                    : [0.84, 0.78, 0.72, 0.66, 0.60, 0.54];
+                                const canvas = document.createElement('canvas');
+                                const context = canvas.getContext('2d');
+                                let best = event.target.result;
+                                let bestSize = Infinity;
+                                let maxEdge = initialMaxEdge;
+
+                                const getSize = value => value.length - value.indexOf(',') - 1;
+                                while (maxEdge >= minMaxEdge) {
+                                    let width = image.width;
+                                    let height = image.height;
+                                    if (width > maxEdge || height > maxEdge) {
+                                        if (width >= height) {
+                                            height = Math.round(height * maxEdge / width);
+                                            width = maxEdge;
+                                        } else {
+                                            width = Math.round(width * maxEdge / height);
+                                            height = maxEdge;
+                                        }
+                                    }
+                                    canvas.width = width;
+                                    canvas.height = height;
+                                    context.drawImage(image, 0, 0, width, height);
+                                    for (const quality of qualitySteps) {
+                                        const dataUrl = canvas.toDataURL('image/jpeg', quality);
+                                        const payloadSize = getSize(dataUrl);
+                                        if (payloadSize < bestSize) {
+                                            best = dataUrl;
+                                            bestSize = payloadSize;
+                                        }
+                                        if (payloadSize <= targetEncodedSize) {
+                                            resolve(dataUrl);
+                                            return;
+                                        }
+                                    }
+                                    if (maxEdge === minMaxEdge) break;
+                                    maxEdge = Math.max(minMaxEdge, Math.floor(maxEdge * 0.85));
+                                }
+                                resolve(best);
+                            } catch (error) {
+                                reject(new Error('图片压缩失败，请重新选择。'));
+                            }
+                        };
+                        image.src = event.target.result;
+                    };
+                    reader.readAsDataURL(file);
+                });
+            }
+
+            function drawFaceCrop(canvas, rect) {
+                const image = new Image();
+                image.onload = () => {
+                    const context = canvas.getContext('2d');
+                    const padX = rect.width * 0.15;
+                    const padY = rect.height * 0.15;
+                    const sx = Math.max(0, rect.x - padX);
+                    const sy = Math.max(0, rect.y - padY);
+                    const sw = Math.min(image.width - sx, rect.width + padX * 2);
+                    const sh = Math.min(image.height - sy, rect.height + padY * 2);
+                    if (sw <= 0 || sh <= 0) return;
+                    const scale = Math.max(canvas.width / sw, canvas.height / sh);
+                    const width = sw * scale;
+                    const height = sh * scale;
+                    context.clearRect(0, 0, canvas.width, canvas.height);
+                    context.drawImage(image, sx, sy, sw, sh, (canvas.width - width) / 2, (canvas.height - height) / 2, width, height);
+                };
+                image.src = currentImageData;
+            }
+
+            function renderResults(results) {
+                matchList.replaceChildren();
+                results.forEach((item, index) => {
+                    const expert = item.expert || {};
+                    const verified = Number(item.score) >= 70;
+                    const tags = Array.isArray(expert.tags) ? expert.tags : [];
+                    const faceId = `live-face-${index}`;
+                    const faceCanvasId = `live-face-canvas-${index}`;
+                    const tagsHtml = tags.length
+                        ? `<div class="tag-list">${tags.map(tag => `<span class="expert-tag">${escapeHtml(tag)}</span>`).join('')}</div>`
+                        : '-';
+                    const card = document.createElement('article');
+                    card.className = `match-card ${verified ? 'is-verified' : ''}`;
+                    card.innerHTML = `
+                        <div class="match-card-header">
+                            <div class="match-person">
+                                <div id="${faceId}" class="live-face"><canvas id="${faceCanvasId}" width="48" height="64"></canvas></div>
+                                <div>
+                                    <h3>${escapeHtml(expert.name || '-')}</h3>
+                                    <p>${escapeHtml(expert.company || '无工作单位')}</p>
+                                </div>
+                            </div>
+                            <div class="match-score">
+                                <strong>${Number(item.score).toFixed(1)}%</strong>
+                                <span>匹配相似度</span>
+                                <div class="match-badge">${verified ? '核验通过' : '疑似匹配'}</div>
+                            </div>
+                        </div>
+                        <dl class="match-fields">
+                            <div class="match-field"><dt>身份证号</dt><dd>${escapeHtml(expert.id_card || '-')}</dd></div>
+                            <div class="match-field"><dt>手机号码</dt><dd>${escapeHtml(expert.phone || '-')}</dd></div>
+                            <div class="match-field"><dt>专家专业</dt><dd>${escapeHtml(expert.major || '-')}</dd></div>
+                            <div class="match-field"><dt>专家标签</dt><dd>${tagsHtml}</dd></div>
+                        </dl>
+                    `;
+                    matchList.appendChild(card);
+                    if (item.face_rect) {
+                        const faceContainer = document.getElementById(faceId);
+                        const canvas = document.getElementById(faceCanvasId);
+                        faceContainer.style.display = 'block';
+                        drawFaceCrop(canvas, item.face_rect);
+                    }
+                });
+            }
+
+            async function performSearch(imageData) {
+                setStatus('正在提取人脸特征并搜索云端人脸库...', 'is-loading');
+                resultsContent.style.display = 'none';
+                resultsEmpty.style.display = 'grid';
+                try {
+                    const response = await fetch('/dlsgzs/api/face/search', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            image: imageData,
+                            max_face_num: Number(searchLimit.value),
+                            search_mode: searchMode.value
+                        })
+                    });
+                    const payload = await response.json();
+                    if (!response.ok || !payload.success || !Array.isArray(payload.results) || !payload.results.length) {
+                        throw new Error(payload.error || '未匹配到专家档案。');
+                    }
+                    renderResults(payload.results);
+                    resultsTitle.textContent = '匹配结果';
+                    resultsDescription.textContent = `共找到 ${payload.results.length} 位候选专家`;
+                    resultsEmpty.style.display = 'none';
+                    resultsContent.style.display = 'block';
+                    setStatus('');
+                } catch (error) {
+                    resultsContent.style.display = 'none';
+                    resultsEmpty.style.display = 'grid';
+                    setStatus(`检索失败：${error.message}`, 'is-error');
+                }
+            }
+
+            async function processFile(file) {
+                const extension = file.name.split('.').pop().toLowerCase();
+                if (!['jpg', 'jpeg', 'png'].includes(extension)) {
+                    setStatus('仅支持 JPG、JPEG、PNG 格式照片。', 'is-error');
+                    return;
+                }
+                setStatus('正在压缩并优化上传图片...', 'is-loading');
+                try {
+                    const imageData = await resizeForSearch(file, searchMode.value);
+                    currentImageData = imageData;
+                    previewImage.src = imageData;
+                    uploadEmpty.style.display = 'none';
+                    uploadPreview.style.display = 'block';
+                    await performSearch(imageData);
+                } catch (error) {
+                    setStatus(error.message, 'is-error');
+                }
+            }
+
+            uploadZone.addEventListener('click', event => {
+                if (!event.target.closest('button')) fileInput.click();
+            });
+            uploadZone.addEventListener('keydown', event => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    fileInput.click();
+                }
+            });
+            uploadZone.addEventListener('dragover', event => {
+                event.preventDefault();
+                uploadZone.classList.add('is-dragover');
+            });
+            uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('is-dragover'));
+            uploadZone.addEventListener('drop', event => {
+                event.preventDefault();
+                uploadZone.classList.remove('is-dragover');
+                const [file] = event.dataTransfer.files;
+                if (file) processFile(file);
+            });
+            fileInput.addEventListener('change', () => {
+                const [file] = fileInput.files;
+                if (file) processFile(file);
+            });
+            removeImage.addEventListener('click', event => {
+                event.stopPropagation();
+                resetSearch();
+            });
+            resetButton.addEventListener('click', resetSearch);
+        })();
+    </script>
+</body>
+</html>

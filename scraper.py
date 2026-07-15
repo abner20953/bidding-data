@@ -41,27 +41,45 @@ _cache_initialized = False
 
 
 
-# 高置信度特征词（命中即判定为信息化，解决长标题语义稀释问题）
-# 只要项目标题包含这些核心技术词汇，直接判定为“是”
-STRONG_IT_KEYWORDS = [
-    '信息化', '软件', '大数据', '云计算', '物联网', '人工智能',
-    '智慧监管', '智慧平台', '智能平台', '智慧信息', '网络安全',
-    '数据中心', '调度中心', '监控系统',
-    # 组合词替代单字，防止误判（如“开发区”、“空调系统”）
-    '软件开发', '系统开发', '平台开发', '网站建设', 'APP开发', '小程序', '公众号',
-    '信息系统', '管理系统', '办公系统', '操作系统', '运维服务',
-    # 补漏关键词 (Step 664 + Step 705)
-    '智慧黑板', '互联智慧', '系统录入', '数字乡村', '平台建设', '云服务', '政务云',
-    '培训平台', '管理平台', '在线平台',
-    # 新增数字化相关 (Step 1045)
-    '电子化', '数字化', '档案数字化', '档案电子化',
-    # 新增补漏 (Step 1069)
-    '视频会议', '会议系统', '考核平台', '信息采集',
-    # 新增补漏 (Step 1088)
-    '虚拟化', '智慧医院',
-    # 新增补漏 (User Request)
-    '日志审计', '数据服务', '数智化', '监管平台'
-]
+# 标题中命中这些明确技术词时，可直接判定为信息化项目。宽泛的“平台建设”
+# “调度中心”等不在此列，避免仅凭一个多义词直接判“是”。
+STRONG_IT_KEYWORDS = (
+    "信息化", "软件", "大数据", "云计算", "物联网", "人工智能",
+    "网络安全", "数据中心", "数据库", "服务器", "等级保护", "系统集成",
+    "电子政务", "智慧政务", "智慧校园", "deepseek", "数字孪生",
+    "互联网专线", "网络运维", "网络运行维护",
+    "软件开发", "系统开发", "平台开发", "网站建设", "app开发", "小程序", "公众号",
+    "信息系统", "管理系统", "办公系统", "操作系统", "运维服务",
+    "管理平台", "数据平台", "在线平台", "监管平台", "考核平台", "培训平台",
+    "智慧平台", "智能平台", "智慧监管", "智慧信息", "智慧黑板", "数字乡村",
+    "云服务", "政务云",
+    "电子化", "数字化", "档案数字化", "档案电子化", "视频会议",
+    "虚拟化", "智慧医院", "日志审计", "数智化",
+)
+
+STRONG_IT_TITLE_PATTERNS = (
+    re.compile(r"信息.{0,8}(?:系统|平台|网络|服务|管理|建设)"),
+    re.compile(r"(?:系统|网络|平台).{0,8}(?:运维|运行维护|维护升级|升级改造)"),
+)
+
+# 这些词本身不足以定性，只用于识别需要结合采购需求复核的边界项目。
+WEAK_IT_TITLE_KEYWORDS = (
+    "系统", "平台", "网络", "智能", "智慧", "数字", "数据", "监控", "摄像",
+    "指挥", "调度", "信息", "电子", "云", "网站", "机房", "通信", "通讯",
+)
+
+# 采购需求必须包含较明确的技术对象，才允许把边界标题提升为信息化项目。
+DETAIL_IT_SIGNALS = (
+    "信息化", "软件", "数据库", "服务器", "网络设备", "互联网", "专线",
+    "云平台", "云服务", "信息系统", "管理平台", "业务平台", "数据平台",
+    "应用系统", "业务系统", "系统对接", "数据治理", "网络安全", "等级保护",
+    "人脸识别", "视频联网", "网络摄像", "数字孪生", "大数据", "人工智能",
+    "物联网", "数字化", "数智化", "虚拟化", "存储系统", "机房", "数据采集",
+)
+
+SEMANTIC_THRESHOLD = 0.68
+DETAIL_REVIEW_MIN_SCORE = 0.50
+DETAIL_REVIEW_THRESHOLD = 0.62
 
 
 
@@ -1092,6 +1110,105 @@ def release_model():
         except Exception:
             pass
 
+
+def _normalize_classification_text(value):
+    if value is None:
+        return ""
+    text = str(value).strip().lower()
+    if text in {"", "未找到", "待采集", "nan", "none"}:
+        return ""
+    return re.sub(r"[\s\u3000]+", "", text)
+
+
+def _classification_title(item):
+    detail_title = _normalize_classification_text(item.get("标题"))
+    search_title = _normalize_classification_text(item.get("_search_title"))
+    return detail_title or search_title
+
+
+def _has_strong_it_title_evidence(title):
+    normalized = _normalize_classification_text(title)
+    if not normalized:
+        return False
+    if any(keyword in normalized for keyword in STRONG_IT_KEYWORDS):
+        return True
+    return any(pattern.search(normalized) for pattern in STRONG_IT_TITLE_PATTERNS)
+
+
+def _weak_it_title_signal_count(title):
+    normalized = _normalize_classification_text(title)
+    return len({
+        keyword for keyword in WEAK_IT_TITLE_KEYWORDS if keyword in normalized
+    })
+
+
+def _detail_it_signal_count(requirement):
+    normalized = _normalize_classification_text(requirement)
+    return len({signal for signal in DETAIL_IT_SIGNALS if signal in normalized})
+
+
+def _should_review_with_details(title, title_score, requirement):
+    if title_score < DETAIL_REVIEW_MIN_SCORE:
+        return False
+    if _weak_it_title_signal_count(title) == 0:
+        return False
+    return _detail_it_signal_count(requirement) >= 1
+
+
+def _encode_semantic_scores(model, texts, anchor_embeddings):
+    if not texts:
+        return []
+    from sentence_transformers import util
+
+    embeddings = model.encode(
+        texts, batch_size=16, show_progress_bar=False, convert_to_tensor=True
+    )
+    similarities = util.cos_sim(embeddings, anchor_embeddings)
+    return similarities.max(dim=1).values.detach().cpu().tolist()
+
+
+def classify_information_projects(items, model, anchor_embeddings):
+    """Classify with title first, then recheck only evidence-backed borderline items."""
+    titles = [_classification_title(item) for item in items]
+    title_scores = _encode_semantic_scores(model, titles, anchor_embeddings)
+    detail_review = []
+
+    for index, (item, title, score) in enumerate(zip(items, titles, title_scores)):
+        score = float(score)
+        if _has_strong_it_title_evidence(title):
+            item["是否信息化"] = "是"
+            item["语义匹配度"] = 1.0
+            continue
+
+        item["语义匹配度"] = score
+        item["是否信息化"] = (
+            "是"
+            if score > SEMANTIC_THRESHOLD and _weak_it_title_signal_count(title) >= 2
+            else "否"
+        )
+        requirement = item.get("采购需求")
+        if item["是否信息化"] == "否" and _should_review_with_details(
+            title, score, requirement
+        ):
+            review_text = f"{title}。采购需求：{str(requirement)[:500]}"
+            detail_review.append((index, review_text))
+
+    if detail_review:
+        review_scores = _encode_semantic_scores(
+            model, [text for _, text in detail_review], anchor_embeddings
+        )
+        for (index, _), review_score in zip(detail_review, review_scores):
+            review_score = float(review_score)
+            item = items[index]
+            item["语义匹配度"] = max(float(item["语义匹配度"]), review_score)
+            if (
+                review_score > DETAIL_REVIEW_THRESHOLD
+                or _detail_it_signal_count(item.get("采购需求")) >= 2
+            ):
+                item["是否信息化"] = "是"
+
+    return items
+
 def validate_result_file(filepath, require_complete=True):
     if not filepath or not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
         return False, "文件不存在或为空"
@@ -1210,6 +1327,7 @@ def run_scraper_for_date(target_date_str, callback=None):
                         continue
                     raw_results[href] = {
                         "标题": title,
+                        "_search_title": title,
                         "链接": href,
                         "发布时间": _extract_publish_date(search_item),
                         "匹配日期格式": date_str,
@@ -1241,27 +1359,10 @@ def run_scraper_for_date(target_date_str, callback=None):
             "metrics": {"search_requests": search_requests},
         }
 
-    log("正在进行语义分析...")
+    log("正在准备语义分析...")
     try:
         model = validate_semantic_runtime()
         anchor_embeddings = get_anchor_embeddings(model)
-        titles = [item["标题"] for item in raw_results.values()]
-        title_embeddings = model.encode(
-            titles, batch_size=16, show_progress_bar=False, convert_to_tensor=True
-        )
-        from sentence_transformers import util
-
-        final_list = []
-        for index, item in enumerate(raw_results.values()):
-            title = item["标题"]
-            if any(keyword in title for keyword in STRONG_IT_KEYWORDS):
-                item["是否信息化"] = "是"
-                item["语义匹配度"] = 1.0
-            else:
-                score = float(util.cos_sim(title_embeddings[index], anchor_embeddings).max())
-                item["语义匹配度"] = score
-                item["是否信息化"] = "是" if score > 0.61 else "否"
-            final_list.append(item)
     except Exception as exc:
         message = f"语义分析失败，任务终止: {exc}"
         log(message)
@@ -1270,9 +1371,21 @@ def run_scraper_for_date(target_date_str, callback=None):
             "metrics": {"raw_records": len(raw_results), "search_requests": search_requests},
         }
 
+    final_list = list(raw_results.values())
     log(f"正在对 {len(final_list)} 个项目进行深度采集...")
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         list(executor.map(lambda item: fetch_and_parse_details(item, deadline), final_list))
+
+    log("正在进行语义分析...")
+    try:
+        classify_information_projects(final_list, model, anchor_embeddings)
+    except Exception as exc:
+        message = f"语义分析失败，任务终止: {exc}"
+        log(message)
+        return {
+            "status": "failed", "total": 0, "file": None, "error": message,
+            "metrics": {"raw_records": len(raw_results), "search_requests": search_requests},
+        }
 
     detail_failures = 0
     cache_hits = 0

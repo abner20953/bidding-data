@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, render_template, request, redirect, url_for, send_from_directory, session
+from flask import Flask, jsonify, render_template, request, redirect, url_for, send_from_directory, session, make_response
 from flask_apscheduler import APScheduler
 import pandas as pd
 import threading
@@ -629,6 +629,15 @@ def collection_view():
 @app.route('/mobile')
 def mobile_view():
     return render_template('mobile.html')
+
+@app.route('/face')
+def face_search_view():
+    """独立专家人脸检索页，复用专家库现有的人脸搜索接口。"""
+    response = make_response(render_template('face.html'))
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response
 
 @app.route('/all')
 def navigation_index():
