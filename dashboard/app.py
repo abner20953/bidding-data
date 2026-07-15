@@ -343,6 +343,22 @@ def run_auto_scrape_thread(dates, is_scheduled_task=False, process_lock=None):
         status_callback(f"任务开始，计划采集 {len(dates)} 个日期")
         date_args = [day.strftime("%Y-%m-%d") for day in dates]
         worker_path = os.path.abspath(os.path.join(BASE_DIR, "..", "scrape_worker.py"))
+        if not os.path.isfile(worker_path):
+            error_message = f"采集子进程脚本不存在: {worker_path}"
+            status_callback(error_message)
+            for day in dates:
+                date_str_iso = day.strftime("%Y年%m月%d日")
+                record_result(date_str_iso, {
+                    "status": "failed",
+                    "total": 0,
+                    "file": None,
+                    "error": error_message,
+                })
+            with SCRAPER_STATE_LOCK:
+                SCRAPER_STATUS["result_status"] = "failed"
+            if is_scheduled_task:
+                log_scheduler(f"   [错误] {error_message}")
+            return
         worker = subprocess.Popen(
             [sys.executable, "-u", worker_path, *date_args],
             cwd=os.path.abspath(os.path.join(BASE_DIR, "..")),
