@@ -13,6 +13,7 @@ import fitz  # PyMuPDF
 
 ALGORITHM_VERSION = 7
 MIN_EXACT_LENGTH = 9
+MIN_EXACT_DISPLAY_LENGTH = 30
 MAX_EXACT_BLOCK_LENGTH = 1200
 MIN_FUZZY_LENGTH = 20
 MIN_FUZZY_DISPLAY_LENGTH = 30
@@ -334,9 +335,46 @@ class CollusionDetector:
 
         if normalized.count("所有条款无偏差") >= 2:
             return True
+        if "无偏离" in normalized:
+            return True
+        if "招标文件要求" in normalized and "投标文件对应内容" in normalized:
+            return True
         if "商务和技术偏差表" in normalized and (
             "偏差说明" in normalized or "所有条款无偏差" in normalized
         ):
+            return True
+        if (
+            "投标文件" in normalized
+            and "投标单位名称" in normalized
+            and "法定代表人" in normalized
+        ):
+            return True
+        if (
+            "参加贵方组织" in normalized
+            and "项目名称" in normalized
+            and "项目编号" in normalized
+            and "公开招标采购" in normalized
+        ):
+            return True
+        if (
+            "政府采购" in normalized
+            and "自愿参加本次政府采购活动" in normalized
+            and "依法诚信经营" in normalized
+        ):
+            return True
+        if (
+            "开标一览表" in normalized
+            and "投标报价" in normalized
+            and "投标单位名称" in normalized
+        ):
+            return True
+        if (
+            "投标人提供的" in normalized
+            and "售后服务承诺" in normalized
+            and "故障处理措施" in normalized
+        ):
+            return True
+        if "指导意见" in normalized and len(normalized) <= 100:
             return True
         if (
             re.match(r"^[一二三四五六七八九十]+[、.]商务部分资料", normalized)
@@ -433,6 +471,63 @@ class CollusionDetector:
         )
         return len(numeric_groups) >= 5 and len(measurement_markers) >= 2
 
+    @staticmethod
+    def _is_low_value_tender_edit(edit):
+        """Reject table artifacts and trivial structural changes in tender text."""
+        original = edit["original"]
+        modified = edit["modified"]
+
+        # Row numbers can be interleaved into a cell during PDF extraction, for
+        # example "32菜单管理".  They are not evidence of a bidder's edit.
+        if re.search(r"\d[\u4e00-\u9fff]", original) and not re.search(
+            r"\d+(?:\.\d+)?(?:年|月|日|小时|分钟|天|周|次|个|项|台|套|件|页|%|万元|元)",
+            original,
+        ):
+            return True
+
+        # A short removed cell heading or suffix is normally caused by a
+        # heading being rendered separately in the bidder's document.  It has
+        # no independent review value.  Keep replacements (including numeric
+        # changes) so substantive requirements remain detectable.
+        if not modified and len(original) <= 6:
+            return True
+        if not modified and re.fullmatch(r"提供.{1,8}服务[,]?", original):
+            return True
+        if not original and len(modified) < 3:
+            return True
+        return False
+
+    @staticmethod
+    def _is_leading_table_title_insertion(edit, tender_text):
+        """Recognize a table row title moved before the tender's cell text."""
+        inserted = edit["modified"]
+        return (
+            not edit["original"]
+            and edit["source_start"] == 0
+            and edit["target_start"] == 0
+            and 2 <= len(inserted) <= 12
+            and not re.search(r"[,;:，；：]", inserted)
+            and tender_text.startswith(("提供", "支持", "在", "可", "应"))
+        )
+
+    @staticmethod
+    def _has_substantive_tender_change(changes):
+        """Keep numeric changes, but not isolated one-character table shifts."""
+        for change in changes:
+            original = change["original"]
+            modified = change["modified"]
+            if original == "（此处新增）":
+                original = ""
+            if modified == "（删除）":
+                modified = ""
+            if original.isdigit() and modified.isdigit():
+                return True
+            if original and modified:
+                return True
+            if max(len(original), len(modified)) >= 3:
+                return True
+        return False
+
     def _shared_tender_edit_evidence(self, tender_text, text_a, text_b):
         """Prove that A and B made substantially the same edits to tender text."""
         if not tender_text or tender_text == text_a or tender_text == text_b:
@@ -442,10 +537,27 @@ class CollusionDetector:
             for text in (tender_text, text_a, text_b)
         ):
             return None
+        if "中小企业声明函" in tender_text:
+            return None
 
         edits_a = self._edit_operations(tender_text, text_a)
         edits_b = self._edit_operations(tender_text, text_b)
-        shared_signatures = set(edits_a) & set(edits_b)
+        edits_a = {
+            signature: edit
+            for signature, edit in edits_a.items()
+            if not self._is_low_value_tender_edit(edit)
+            and not self._is_leading_table_title_insertion(edit, tender_text)
+        }
+        edits_b = {
+            signature: edit
+            for signature, edit in edits_b.items()
+            if not self._is_low_value_tender_edit(edit)
+            and not self._is_leading_table_title_insertion(edit, tender_text)
+        }
+        shared_signatures = {
+            signature
+            for signature in set(edits_a) & set(edits_b)
+        }
         if not shared_signatures:
             return None
 
@@ -854,6 +966,8 @@ class CollusionDetector:
         )
         for group in self._split_exact_pairs(ordered_pairs):
             text = "；".join(unit_a["text"] for unit_a, _ in group)
+            if self._is_low_value_boilerplate(text):
+                continue
             matched_texts.update(unit_a["text"] for unit_a, _ in group)
             tender_references = []
             shared_edits = []
@@ -882,6 +996,10 @@ class CollusionDetector:
                 edit_evidence = self._shared_tender_edit_evidence(
                     tender_text, unit_a["text"], unit_a["text"]
                 )
+                if edit_evidence and not self._has_substantive_tender_change(
+                    edit_evidence["changes"]
+                ):
+                    edit_evidence = None
                 if not edit_evidence:
                     if tender_match["ratio"] >= TENDER_DERIVED_RATIO:
                         tender_derived_segments += 1
@@ -1425,6 +1543,12 @@ class CollusionDetector:
                 self.get_exact_units(pages_a),
                 self.get_exact_units(pages_b),
             )
+            exact_collisions = [
+                item
+                for item in exact_collisions
+                if item["type"] == "tender_related"
+                or len(item["text_a"]) >= MIN_EXACT_DISPLAY_LENGTH
+            ]
 
             units_a = self.get_comparison_units(pages_a)
             units_b = self.get_comparison_units(pages_b)

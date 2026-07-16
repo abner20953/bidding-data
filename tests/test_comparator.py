@@ -79,6 +79,29 @@ class ComparatorTests(unittest.TestCase):
         self.assertTrue(fuzzy)
         self.assertGreaterEqual(fuzzy[0]["similarity"], 78)
 
+    def test_standalone_short_exact_fragment_is_not_reported(self):
+        path_a = self.path("a.pdf")
+        path_b = self.path("b.pdf")
+        create_pdf(path_a, ["支持接口调用"])
+        create_pdf(path_b, ["支持接口调用"])
+
+        result = compare_documents(path_a, path_b, check_entity=False)
+
+        self.assertFalse(
+            [item for item in result["paragraphs"] if item["type"] == "text"]
+        )
+
+    def test_tender_table_title_moved_to_paragraph_start_is_not_an_edit(self):
+        detector = CollusionDetector()
+        tender_text = detector.normalize("提供测试数据源连接情况的能力")
+        bid_text = detector.normalize("数据源连接测试提供测试数据源连接情况的能力")
+
+        evidence = detector._shared_tender_edit_evidence(
+            tender_text, bid_text, bid_text
+        )
+
+        self.assertIsNone(evidence)
+
     def test_bid_form_boilerplate_is_suppressed(self):
         detector = CollusionDetector()
         exact_units = [
