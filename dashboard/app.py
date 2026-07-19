@@ -134,6 +134,7 @@ from dashboard.utils.comparator import ComparisonLimitError, compare_documents
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
+app.config['BASE_DIR'] = BASE_DIR
 # Apply ProxyFix to handle X-Forwarded-For headers from Nginx/LoadBalancer
 # x_for=1 means trust the first X-Forwarded-For value
 # x_proto=1 means trust X-Forwarded-Proto
@@ -1113,6 +1114,10 @@ except Exception as e:
 # --- Shared Recognition Records Blueprint ---
 from dashboard.blueprints.shared_records import shared_records_bp, init_shared_records_db
 app.register_blueprint(shared_records_bp)
+
+# 评标工作台为独立模块；只注册路由，不在应用启动时创建任务进程或加载模型。
+from dashboard.blueprints.evaluation_workbench import evaluation_workbench_bp
+app.register_blueprint(evaluation_workbench_bp)
 try:
     with app.app_context():
         init_shared_records_db()
@@ -1612,6 +1617,6 @@ def rename_chat():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    debug = os.environ.get('DEBUG', 'True').lower() == 'true'
+    debug = os.environ.get('DEBUG', 'False').lower() == 'true'
     app.run(host='0.0.0.0', port=port, debug=debug)
 

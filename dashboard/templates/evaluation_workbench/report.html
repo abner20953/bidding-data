@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ project.name }} - 评标辅助汇总报告</title>
+    <style>
+        body { font-family: "Microsoft YaHei", sans-serif; color: #1f2937; max-width: 1100px; margin: 32px auto; line-height: 1.55; }
+        h1 { margin-bottom: 4px; } .muted { color: #6b7280; } table { width: 100%; border-collapse: collapse; margin: 14px 0 28px; font-size: 13px; } th, td { border: 1px solid #cbd5e1; padding: 7px; text-align: left; vertical-align: top; } th { background: #f1f5f9; } .notice { padding: 10px 12px; background: #fff7ed; border-left: 4px solid #f97316; } @media print { body { margin: 12mm; max-width: none; } .no-print { display: none; } }
+    </style>
+</head>
+<body>
+    <button class="no-print" onclick="window.print()">打印</button>
+    <h1>评标辅助汇总报告</h1>
+    <p class="muted">项目：{{ project.name }}{% if project.project_number %} · 编号：{{ project.project_number }}{% endif %}{% if project.section_name %} · 标段：{{ project.section_name }}{% endif %}</p>
+    <p class="muted">生成时间：{{ generated_at }}</p>
+    <p class="notice">本报告为电子文件辅助审查和评分留痕，不替代评标委员会的人工判断、最终打分或废标认定。</p>
+    <h2>文件清单</h2>
+    <table><tr><th>角色</th><th>文件</th><th>投标人</th><th>解析状态</th></tr>{% for item in documents %}<tr><td>{{ item.role }}</td><td>{{ item.original_name }}</td><td>{{ item.bidder_name or '-' }}</td><td>{{ item.parse_status }}</td></tr>{% endfor %}</table>
+    <h2>投标文件查重</h2>
+    {% set cross_analysis = compare_task.result.cross_bid_analysis if compare_task and compare_task.result and compare_task.result.cross_bid_analysis else none %}
+    {% if cross_analysis %}
+    <p class="notice">{{ cross_analysis.decision_boundary }}</p>
+    <p class="muted">{{ cross_analysis.methodology.template_filter_note }}；未执行维度不会被推测或补齐。</p>
+    <table><tr><th>文件对</th><th>独立线索维度</th><th>复核优先级</th><th>核验状态</th></tr>{% for item in cross_analysis.pair_summaries %}<tr><td>{{ item.bidder_a }} ↔ {{ item.bidder_b }}</td><td>{{ item.independent_dimension_count }}（{{ item.dimension_labels | join('、') }}）</td><td>{{ item.review_priority }}</td><td>{{ item.assessment_result }}</td></tr>{% endfor %}</table>
+    {% if cross_analysis.signals %}<table><tr><th>文件对</th><th>维度</th><th>等级/可信度</th><th>线索依据</th><th>人工处置</th></tr>{% for item in cross_analysis.signals %}<tr><td>{{ item.bidder_a }} ↔ {{ item.bidder_b }}</td><td>{{ item.dimension_label }}</td><td>{{ item.severity }} / {{ item.confidence }}</td><td>{{ item.basis }}{% if item.counter_evidence %}<br><span class="muted">反证提示：{{ item.counter_evidence | join('；') }}</span>{% endif %}</td><td>{{ item.human_disposition }}{% if item.human_note %}<br>{{ item.human_note }}{% endif %}</td></tr>{% endfor %}</table>{% endif %}
+    {% endif %}
+    {% if compare_pairs %}<table><tr><th>文件对</th><th>结果摘要</th></tr>{% for item in compare_pairs %}<tr><td>{{ item.bidder_a or item.filename_a }} ↔ {{ item.bidder_b or item.filename_b }}</td><td>{{ item.result.summary | tojson }}</td></tr>{% endfor %}</table>{% else %}<p class="muted">尚无已完成的查重结果。</p>{% endif %}
+    <h2>规则集</h2>
+    <p class="muted">{% if rule_set %}版本 {{ rule_set.version }} · {{ rule_set.status }}{% else %}尚未建立规则集{% endif %}</p>
+    <table><tr><th>分类</th><th>规则</th><th>招标依据</th></tr>{% for item in rules %}<tr><td>{{ item.category }}</td><td>{{ item.title }}</td><td>{{ item.source_text }}</td></tr>{% endfor %}</table>
+    <h2>实质性审查结果</h2>
+    <table><tr><th>投标人</th><th>规则</th><th>模型结论</th><th>人工结论</th><th>风险</th><th>证据与理由</th></tr>{% for item in reviews %}<tr><td>{{ item.bidder_name or item.original_name }}</td><td>{{ item.title }}</td><td>{{ item.status }}</td><td>{{ item.final_status or '未确认' }}</td><td>{{ item.risk_level }}</td><td>{{ item.evidence }}<br>{{ item.reason }}</td></tr>{% endfor %}</table>
+    <h2>客观分</h2>
+    <table><tr><th>投标人</th><th>评分项</th><th>建议/最终分</th><th>满分</th><th>证据与理由</th></tr>{% for item in objective_scores %}<tr><td>{{ item.bidder_name or item.original_name }}</td><td>{{ item.title }}</td><td>{{ item.suggested_score if item.suggested_score is not none else '-' }} / {{ item.final_score if item.final_score is not none else '-' }}</td><td>{{ item.max_score or '-' }}</td><td>{{ item.evidence }}<br>{{ item.reason }}</td></tr>{% endfor %}</table>
+    <h2>主观分</h2>
+    <table><tr><th>投标人</th><th>评分项</th><th>建议/最终分</th><th>满分</th><th>证据与理由</th></tr>{% for item in subjective_scores %}<tr><td>{{ item.bidder_name or item.original_name }}</td><td>{{ item.title }}</td><td>{{ item.suggested_score if item.suggested_score is not none else '-' }} / {{ item.final_score if item.final_score is not none else '-' }}</td><td>{{ item.max_score or '-' }}</td><td>{{ item.evidence }}<br>{{ item.reason }}</td></tr>{% endfor %}</table>
+</body>
+</html>

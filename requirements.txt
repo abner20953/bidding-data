@@ -18,6 +18,7 @@ gevent
 pypinyin
 lxml
 python-dotenv
+cryptography
 tencentcloud-sdk-python-iai
 tencentcloud-sdk-python-common
 Pillow

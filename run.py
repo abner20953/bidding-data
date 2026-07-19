@@ -9,7 +9,8 @@ sys.path.append(current_dir)
 try:
     from dashboard.app import app
     print("Dashboard app loaded successfully.")
-    app.run(debug=True, port=5000)
+    debug = os.environ.get("DEBUG", "False").lower() == "true"
+    app.run(host="0.0.0.0", port=5000, debug=debug, use_reloader=debug)
 except ImportError as e:
     print(f"Error importing dashboard: {e}")
     # 尝试直接运行
