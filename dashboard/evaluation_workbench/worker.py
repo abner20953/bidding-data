@@ -25,6 +25,8 @@ MAX_PARSE_PAGES = 2000
 MAX_PARSED_CHARS = 2_000_000
 MAX_DOCX_XML_BYTES = 50 * 1024 * 1024
 PROMPT_VERSION = "token-optimized-v1"
+COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v1"
+COMPARE_AI_BATCH_SIZE = 24
 
 
 def _prompt_char_limit(profile: dict, default: int, ceiling: int) -> int:
@@ -179,7 +181,75 @@ def _compare_documents(app, task: dict) -> dict:
         })
     analysis = build_cross_bid_analysis(task["task_id"], analyzed_pairs, tender_loaded=bool(tender))
     storage.initialize_compare_signal_reviews(app, task["task_id"], analysis["signals"])
+    _assess_compare_signals_with_ai(app, task, analysis)
     return {"pair_count": len(pairs), "pairs": summaries, "cross_bid_analysis": analysis}
+
+
+def _compare_evidence_packet(signal: dict) -> dict:
+    """只向模型传递固定规则已命中的短证据，不传完整投标文件。"""
+    evidence = []
+    for item in signal.get("evidence", [])[:3]:
+        evidence.append({key: str(value)[:280] for key, value in item.items()
+                         if key in {"page_a", "page_b", "text_a", "text_b", "similarity", "shared_edits", "error_kind", "field", "value", "strength"}})
+    return {
+        "signal_id": signal["signal_id"], "bidders": [signal.get("bidder_a"), signal.get("bidder_b")],
+        "fixed_rule": signal.get("dimension_label"), "basis": str(signal.get("basis", ""))[:420],
+        "evidence": evidence, "counter_evidence": [str(item)[:220] for item in signal.get("counter_evidence", [])[:2]],
+    }
+
+
+def _assess_compare_signals_with_ai(app, task: dict, analysis: dict) -> None:
+    signals = analysis.get("signals") or []
+    if not signals:
+        analysis["ai_assessment"] = {"status": "skipped", "reason": "未发现固定规则线索，未调用模型。", "prompt_version": COMPARE_AI_PROMPT_VERSION}
+        return
+    try:
+        profile = storage.get_model_profile(app, task.get("payload", {}).get("profile_id"), "deepseek-v4-flash")
+    except ValueError as exc:
+        analysis["ai_assessment"] = {"status": "unavailable", "reason": f"AI 判定未执行：{exc}", "prompt_version": COMPARE_AI_PROMPT_VERSION}
+        return
+    by_id = {item["signal_id"]: item for item in signals}
+    completed, failures = 0, []
+    system_prompt = (
+        "你是招投标文件横向异常线索复核助手。只能评估固定规则提取的证据可靠性，不得认定串通投标、"
+        "废标或作出法律结论。证据不足时必须保守输出 unassessable。"
+    )
+    for start in range(0, len(signals), COMPARE_AI_BATCH_SIZE):
+        batch = signals[start:start + COMPARE_AI_BATCH_SIZE]
+        packets = [_compare_evidence_packet(item) for item in batch]
+        user_prompt = f"""请按固定规则复核以下压缩证据包，只返回 JSON：
+{{"assessments":[{{"signal_id":"ID","decision":"confirmed_clue|suspected_clue|excluded|unassessable","risk_level":"low|medium|high","confidence":"high|medium|low","reason":"简洁理由","suggested_check":"建议核验事项"}}]}}
+
+判定含义：confirmed_clue 仅表示该异常线索有较充分证据；suspected_clue 表示仍有合理替代解释；excluded 表示现有证据更可能为模板/公共来源；unassessable 表示证据不足。不得输出串标成立、废标或扣分结论。
+证据包：{json.dumps(packets, ensure_ascii=False, separators=(',', ':'))}"""
+        try:
+            parsed = _request_task_json(app, task, profile, "compare_ai_assessment", system_prompt, user_prompt,
+                                        context_mode="evidence_batch")
+            values = parsed.get("assessments") if isinstance(parsed, dict) else []
+            for value in values if isinstance(values, list) else []:
+                if not isinstance(value, dict) or value.get("signal_id") not in by_id:
+                    continue
+                decision = value.get("decision")
+                if decision not in {"confirmed_clue", "suspected_clue", "excluded", "unassessable"}:
+                    decision = "unassessable"
+                signal = by_id[value["signal_id"]]
+                signal["ai_assessment"] = {
+                    "decision": decision,
+                    "risk_level": value.get("risk_level") if value.get("risk_level") in {"low", "medium", "high"} else "medium",
+                    "confidence": value.get("confidence") if value.get("confidence") in {"high", "medium", "low"} else "medium",
+                    "reason": str(value.get("reason", ""))[:1000],
+                    "suggested_check": str(value.get("suggested_check", ""))[:700],
+                }
+                completed += 1
+        except Exception as exc:  # 保留确定性查重结果，不能因 AI 暂不可用而丢失证据。
+            failures.append(str(exc)[:180])
+    for signal in signals:
+        signal.setdefault("ai_assessment", {"decision": "unassessable", "risk_level": "medium", "confidence": "low", "reason": "AI 未返回该线索的可用判定。", "suggested_check": "请结合原始文件人工核验。"})
+    analysis["ai_assessment"] = {
+        "status": "partial" if failures else "success", "assessed_count": completed, "signal_count": len(signals),
+        "failure_count": len(failures), "reason": "；".join(failures), "profile": profile["display_name"],
+        "prompt_version": COMPARE_AI_PROMPT_VERSION, "input_mode": "fixed_rule_evidence_packets_only",
+    }
 
 
 def _extract_rules(app, task: dict) -> dict:
@@ -254,7 +324,7 @@ def _review_documents(app, task: dict) -> dict:
         text = Path(document["parsed_path"]).read_text(encoding="utf-8", errors="ignore")
         system_prompt = "你是严谨的招投标电子文件审查助手。只能基于给出的规则和投标文件原文判断，不能推断图片、签字、盖章或线下材料。"
         user_prompt = f"""请逐条审查投标文件。返回 JSON：
-{{"results":[{{"rule_id":"规则ID","status":"satisfied|not_satisfied|partial|not_found|manual","evidence":"投标文件原文摘录","page_hint":null,"reason":"简洁判断理由","risk_level":"low|medium|high"}}]}}
+{{"results":[{{"rule_id":"规则ID","status":"satisfied|not_satisfied|partial|not_found|manual","evidence":"投标文件原文摘录","page_hint":null,"reason":"简洁判断理由","risk_level":"low|medium|high","confidence":"high|medium|low","evidence_quality":"sufficient|limited|missing"}}]}}
 
 规则：
 {rule_prompt}
@@ -276,9 +346,9 @@ def _review_documents(app, task: dict) -> dict:
             status = item.get("status")
             if status not in {"satisfied", "not_satisfied", "partial", "not_found", "manual"}:
                 status = "manual"
-            normalized.append({"rule_id": rule_id, "status": status, "evidence": str(item.get("evidence", ""))[:2000], "page_hint": str(item.get("page_hint", ""))[:80] or None, "reason": str(item.get("reason", ""))[:2000], "risk_level": item.get("risk_level") if item.get("risk_level") in {"low", "medium", "high"} else "medium"})
+            normalized.append(_review_result_from_model(item, rule_id, status))
         returned_ids = {item["rule_id"] for item in normalized}
-        normalized.extend({"rule_id": rule["rule_id"], "status": "manual", "reason": "模型未返回该规则的可验证结论，请人工复核。", "risk_level": "medium"} for rule in rules if rule["rule_id"] not in returned_ids)
+        normalized.extend(_review_result_from_model({"reason": "模型未返回该规则的可验证结论，请人工复核。"}, rule["rule_id"], "manual") for rule in rules if rule["rule_id"] not in returned_ids)
         storage.save_review_results(app, review_run["review_run_id"], document["document_id"], normalized)
     return {"review_run_id": review_run["review_run_id"], "document_count": len(documents), "rule_count": len(rules), "profile": profile["display_name"]}
 
@@ -334,7 +404,7 @@ def _score_documents(app, task: dict, score_type: str) -> dict:
             else:
                 value = raw.get("suggested_score")
                 suggested = min(max_score, max(0.0, float(value))) if isinstance(value, (int, float)) and not isinstance(value, bool) and max_score > 0 else None
-            results.append({"rule_id": item["rule_id"], "suggested_score": suggested, "final_score": None, "max_score": max_score or None, "evidence": str(raw.get("evidence", ""))[:2000], "reason": str(raw.get("reason", "模型未返回可确认结论，请人工评分。"))[:2000], "confidence": raw.get("confidence") if raw.get("confidence") in {"high", "medium", "low"} else "medium"})
+            results.append(_score_result_from_model(item["rule_id"], suggested, max_score, raw))
         storage.save_score_results(app, score_run["score_run_id"], document["document_id"], results)
     return {"score_run_id": score_run["score_run_id"], "score_type": score_type, "document_count": len(documents), "rule_count": len(rules), "profile": profile["display_name"]}
 
@@ -349,14 +419,25 @@ def _normalise_review_results(output: object, rules: list[dict]) -> list[dict]:
         status = item.get("status")
         if status not in {"satisfied", "not_satisfied", "partial", "not_found", "manual"}:
             status = "manual"
-        normalized.append({"rule_id": rule_id, "status": status, "evidence": str(item.get("evidence", ""))[:2000],
-                           "page_hint": str(item.get("page_hint", ""))[:80] or None,
-                           "reason": str(item.get("reason", ""))[:2000],
-                           "risk_level": item.get("risk_level") if item.get("risk_level") in {"low", "medium", "high"} else "medium"})
+        normalized.append(_review_result_from_model(item, rule_id, status))
     returned_ids = {item["rule_id"] for item in normalized}
-    normalized.extend({"rule_id": rule["rule_id"], "status": "manual", "reason": "模型未返回该规则的可验证结论，请人工复核。", "risk_level": "medium"}
+    normalized.extend(_review_result_from_model({"reason": "模型未返回该规则的可验证结论，请人工复核。"}, rule["rule_id"], "manual")
                       for rule in rules if rule["rule_id"] not in returned_ids)
     return normalized
+
+
+def _review_result_from_model(item: dict, rule_id: str, status: str) -> dict:
+    confidence = item.get("confidence") if item.get("confidence") in {"high", "medium", "low"} else "medium"
+    evidence_quality = item.get("evidence_quality") if item.get("evidence_quality") in {"sufficient", "limited", "missing"} else ("sufficient" if str(item.get("evidence", "")).strip() else "missing")
+    risk = item.get("risk_level") if item.get("risk_level") in {"low", "medium", "high"} else "medium"
+    # 仅对正向、低风险、证据充分的结论自动进入批量确认；否定/废标类风险不自动放行。
+    auto_ready = status == "satisfied" and risk == "low" and confidence == "high" and evidence_quality == "sufficient"
+    return {"rule_id": rule_id, "status": status, "evidence": str(item.get("evidence", ""))[:2000],
+            "page_hint": str(item.get("page_hint", ""))[:80] or None, "reason": str(item.get("reason", ""))[:2000],
+            "risk_level": risk, "confidence": confidence, "evidence_quality": evidence_quality,
+            "automation_status": "ready_for_batch_confirmation" if auto_ready else "needs_review",
+            "requires_review": not auto_ready,
+            "review_reason": "" if auto_ready else "非正向结论、证据不足、置信度不足或存在风险，需人工复核。"}
 
 
 def _score_payload(rules: list[dict]) -> list[dict]:
@@ -388,11 +469,21 @@ def _normalise_score_results(output: object, rule_payload: list[dict], score_typ
         else:
             value = raw.get("suggested_score")
             suggested = min(max_score, max(0.0, float(value))) if isinstance(value, (int, float)) and not isinstance(value, bool) and max_score > 0 else None
-        results.append({"rule_id": item["rule_id"], "suggested_score": suggested, "final_score": None,
-                        "max_score": max_score or None, "evidence": str(raw.get("evidence", ""))[:2000],
-                        "reason": str(raw.get("reason", "模型未返回可确认结论，请人工评分。"))[:2000],
-                        "confidence": raw.get("confidence") if raw.get("confidence") in {"high", "medium", "low"} else "medium"})
+        results.append(_score_result_from_model(item["rule_id"], suggested, max_score, raw))
     return results
+
+
+def _score_result_from_model(rule_id: str, suggested: float | None, max_score: float, raw: dict) -> dict:
+    confidence = raw.get("confidence") if raw.get("confidence") in {"high", "medium", "low"} else "medium"
+    has_evidence = bool(str(raw.get("evidence", "")).strip())
+    auto_ready = suggested is not None and confidence == "high" and has_evidence
+    return {"rule_id": rule_id, "suggested_score": suggested, "final_score": None,
+            "effective_score": suggested if auto_ready else None, "max_score": max_score or None,
+            "evidence": str(raw.get("evidence", ""))[:2000],
+            "reason": str(raw.get("reason", "模型未返回可确认结论，请人工评分。"))[:2000],
+            "confidence": confidence, "automation_status": "ready_for_batch_confirmation" if auto_ready else "needs_review",
+            "requires_review": not auto_ready,
+            "review_reason": "" if auto_ready else "未得到高置信、可引用的建议分，需人工复核。"}
 
 
 def _evaluate_all(app, task: dict) -> dict:
@@ -421,7 +512,7 @@ def _evaluate_all(app, task: dict) -> dict:
         storage.update_task(app, task["task_id"], progress=int((index - 1) * 100 / len(documents)), message=f"正在综合评审 {index}/{len(documents)}：{document['bidder_name'] or document['original_name']}")
         text = Path(document["parsed_path"]).read_text(encoding="utf-8", errors="ignore")[:char_limit]
         user_prompt = f"""对同一份投标文件完成下列三类工作，并只返回 JSON 对象：
-{{"review_results":[{{"rule_id":"规则ID","status":"satisfied|not_satisfied|partial|not_found|manual","evidence":"原文摘录","page_hint":null,"reason":"简洁理由","risk_level":"low|medium|high"}}],"objective_scores":[{{"rule_id":"规则ID","met":true|false|null,"evidence":"原文摘录","reason":"判断理由","confidence":"high|medium|low"}}],"subjective_scores":[{{"rule_id":"规则ID","suggested_score":数字,"evidence":"原文摘录","reason":"得扣分理由","confidence":"high|medium|low"}}]}}
+{{"review_results":[{{"rule_id":"规则ID","status":"satisfied|not_satisfied|partial|not_found|manual","evidence":"原文摘录","page_hint":null,"reason":"简洁理由","risk_level":"low|medium|high","confidence":"high|medium|low","evidence_quality":"sufficient|limited|missing"}}],"objective_scores":[{{"rule_id":"规则ID","met":true|false|null,"evidence":"原文摘录","reason":"判断理由","confidence":"high|medium|low"}}],"subjective_scores":[{{"rule_id":"规则ID","suggested_score":数字,"evidence":"原文摘录","reason":"得扣分理由","confidence":"high|medium|low"}}]}}
 
 审查规则：{json.dumps(review_payload, ensure_ascii=False, separators=(',', ':'))}
 客观评分规则：{json.dumps(objective_payload, ensure_ascii=False, separators=(',', ':'))}

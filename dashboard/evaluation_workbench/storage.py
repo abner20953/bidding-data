@@ -141,6 +141,11 @@ def init_database(app) -> None:
                 updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_ew_signal_reviews_task ON ew_compare_signal_reviews(task_id);
+            CREATE TABLE IF NOT EXISTS ew_settings (
+                setting_key TEXT PRIMARY KEY,
+                setting_value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS ew_model_profiles (
                 profile_id TEXT PRIMARY KEY,
                 display_name TEXT NOT NULL,
@@ -235,10 +240,20 @@ def init_database(app) -> None:
         _ensure_column(conn, "ew_review_results", "final_status", "TEXT")
         _ensure_column(conn, "ew_review_results", "confirmed_at", "TEXT")
         _ensure_column(conn, "ew_model_profiles", "api_key_encrypted", "TEXT")
+        _ensure_column(conn, "ew_review_results", "confidence", "TEXT")
+        _ensure_column(conn, "ew_review_results", "evidence_quality", "TEXT")
+        _ensure_column(conn, "ew_review_results", "automation_status", "TEXT NOT NULL DEFAULT 'needs_review'")
+        _ensure_column(conn, "ew_review_results", "requires_review", "INTEGER NOT NULL DEFAULT 1")
+        _ensure_column(conn, "ew_review_results", "review_reason", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "ew_score_results", "effective_score", "REAL")
+        _ensure_column(conn, "ew_score_results", "automation_status", "TEXT NOT NULL DEFAULT 'needs_review'")
+        _ensure_column(conn, "ew_score_results", "requires_review", "INTEGER NOT NULL DEFAULT 1")
+        _ensure_column(conn, "ew_score_results", "review_reason", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "ew_rules", "source_type", "TEXT")
         _ensure_column(conn, "ew_rules", "source_task_id", "TEXT")
         conn.execute("UPDATE ew_rules SET source_type = CASE WHEN rule_set_id IN (SELECT rule_set_id FROM ew_rule_sets WHERE source_task_id IS NOT NULL) THEN 'ai' ELSE 'manual' END WHERE source_type IS NULL OR source_type = ''")
         _seed_default_profiles(conn)
+        _seed_default_model_setting(conn)
     app.extensions["evaluation_workbench_database"] = marker
 
 
@@ -264,6 +279,22 @@ def _seed_default_profiles(conn: sqlite3.Connection) -> None:
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         rows,
     )
+
+
+def _seed_default_model_setting(conn: sqlite3.Connection) -> None:
+    """将旧版的 Flash 优先策略迁移为可持久化的全局默认模型。"""
+    if conn.execute("SELECT 1 FROM ew_settings WHERE setting_key = 'default_model_profile_id'").fetchone():
+        return
+    row = conn.execute(
+        "SELECT profile_id FROM ew_model_profiles WHERE enabled = 1 AND model_name = 'deepseek-v4-flash' ORDER BY created_at LIMIT 1"
+    ).fetchone()
+    if not row:
+        row = conn.execute("SELECT profile_id FROM ew_model_profiles WHERE enabled = 1 ORDER BY created_at LIMIT 1").fetchone()
+    if row:
+        conn.execute(
+            "INSERT INTO ew_settings(setting_key, setting_value, updated_at) VALUES ('default_model_profile_id', ?, ?)",
+            (row["profile_id"], now_iso()),
+        )
 
 
 def project_dir(app, project_id: str) -> Path:
@@ -733,13 +764,48 @@ def _public_model_profile(profile: dict) -> dict:
 def list_model_profiles(app) -> list[dict]:
     with connection(app) as conn:
         rows = conn.execute("SELECT * FROM ew_model_profiles ORDER BY created_at").fetchall()
-    return [_public_model_profile(dict(row)) for row in rows]
+        default_row = conn.execute("SELECT setting_value FROM ew_settings WHERE setting_key = 'default_model_profile_id'").fetchone()
+    default_id = default_row["setting_value"] if default_row else None
+    profiles = []
+    for row in rows:
+        profile = _public_model_profile(dict(row))
+        profile["is_default"] = profile["profile_id"] == default_id
+        profiles.append(profile)
+    return profiles
+
+
+def default_model_profile_id(app) -> str | None:
+    with connection(app) as conn:
+        row = conn.execute("SELECT setting_value FROM ew_settings WHERE setting_key = 'default_model_profile_id'").fetchone()
+    return row["setting_value"] if row else None
+
+
+def set_default_model_profile(app, profile_id: str) -> dict:
+    with connection(app) as conn:
+        row = conn.execute("SELECT * FROM ew_model_profiles WHERE profile_id = ? AND enabled = 1", (profile_id,)).fetchone()
+        if not row:
+            raise ValueError("只能将已启用的模型设为默认模型")
+        profile = dict(row)
+        has_key = bool(profile.get("api_key_encrypted")) or bool(profile.get("api_key_env") and os.environ.get(profile["api_key_env"], "").strip())
+        if not has_key:
+            raise ValueError("默认模型必须已配置 API Key")
+        conn.execute(
+            "INSERT INTO ew_settings(setting_key, setting_value, updated_at) VALUES ('default_model_profile_id', ?, ?) "
+            "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value, updated_at=excluded.updated_at",
+            (profile_id, now_iso()),
+        )
+    return _public_model_profile(profile)
 
 
 def get_model_profile(app, profile_id: str | None, preferred_model: str = "") -> dict:
     with connection(app) as conn:
         if profile_id:
             row = conn.execute("SELECT * FROM ew_model_profiles WHERE profile_id = ? AND enabled = 1", (profile_id,)).fetchone()
+        elif (row := conn.execute(
+            """SELECT p.* FROM ew_model_profiles p JOIN ew_settings s ON s.setting_value=p.profile_id
+               WHERE s.setting_key='default_model_profile_id' AND p.enabled=1"""
+        ).fetchone()):
+            pass
         elif preferred_model:
             row = conn.execute("SELECT * FROM ew_model_profiles WHERE model_name = ? AND enabled = 1 LIMIT 1", (preferred_model,)).fetchone()
         else:
@@ -832,6 +898,9 @@ def delete_model_profile(app, profile_id: str) -> None:
         row = conn.execute("SELECT 1 FROM ew_model_profiles WHERE profile_id = ?", (profile_id,)).fetchone()
         if not row:
             raise ValueError("模型档案不存在")
+        default_row = conn.execute("SELECT setting_value FROM ew_settings WHERE setting_key = 'default_model_profile_id'").fetchone()
+        if default_row and default_row["setting_value"] == profile_id:
+            raise ValueError("该模型是全局默认模型，请先指定其他默认模型后再删除")
         active_rows = conn.execute(
             "SELECT payload_json FROM ew_tasks WHERE status IN ('queued', 'running')"
         ).fetchall()
@@ -1061,13 +1130,18 @@ def save_review_results(app, review_run_id: str, document_id: str, results: list
     with connection(app) as conn:
         for item in results:
             conn.execute(
-                """INSERT INTO ew_review_results(review_result_id, review_run_id, document_id, rule_id, status, evidence, page_hint, reason, risk_level, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """INSERT INTO ew_review_results(review_result_id, review_run_id, document_id, rule_id, status, evidence, page_hint, reason, risk_level,
+                   confidence, evidence_quality, automation_status, requires_review, review_reason, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(review_run_id, document_id, rule_id) DO UPDATE SET
                 status=excluded.status, evidence=excluded.evidence, page_hint=excluded.page_hint, reason=excluded.reason,
-                risk_level=excluded.risk_level, final_status=NULL, confirmed_at=NULL, created_at=excluded.created_at""",
+                risk_level=excluded.risk_level, confidence=excluded.confidence, evidence_quality=excluded.evidence_quality,
+                automation_status=excluded.automation_status, requires_review=excluded.requires_review,
+                review_reason=excluded.review_reason, final_status=NULL, confirmed_at=NULL, created_at=excluded.created_at""",
                 (str(uuid.uuid4()), review_run_id, document_id, item["rule_id"], item["status"], item.get("evidence", ""),
-                 item.get("page_hint"), item.get("reason", ""), item.get("risk_level", "medium"), timestamp),
+                 item.get("page_hint"), item.get("reason", ""), item.get("risk_level", "medium"), item.get("confidence", "medium"),
+                 item.get("evidence_quality", "limited"), item.get("automation_status", "needs_review"),
+                 1 if item.get("requires_review", True) else 0, item.get("review_reason", ""), timestamp),
             )
 
 
@@ -1109,6 +1183,23 @@ def update_review_final_status(app, review_result_id: str, final_status: str) ->
     return dict(row)
 
 
+def confirm_auto_review_results(app, project_id: str) -> int:
+    """一次确认所有证据充分的 AI 结论；异常项仍必须逐条复核。"""
+    with connection(app) as conn:
+        updated = conn.execute(
+            """UPDATE ew_review_results SET final_status=status, confirmed_at=?, automation_status='confirmed'
+               WHERE review_result_id IN (
+                   SELECT r.review_result_id FROM ew_review_results r JOIN ew_review_runs run ON run.review_run_id=r.review_run_id
+                   JOIN ew_tasks task ON task.task_id=run.task_id
+                   WHERE run.project_id=? AND task.status='success' AND r.requires_review=0
+                     AND r.final_status IS NULL
+                     AND run.rule_set_id=(SELECT rule_set_id FROM ew_rule_sets WHERE project_id=? ORDER BY version DESC LIMIT 1)
+               )""",
+            (now_iso(), project_id, project_id),
+        ).rowcount
+    return updated
+
+
 def create_score_run(app, project_id: str, task_id: str, score_type: str, profile_id: str | None) -> dict:
     rule_set = current_rule_set(app, project_id)
     if not rule_set or rule_set["status"] != "confirmed":
@@ -1124,12 +1215,18 @@ def save_score_results(app, score_run_id: str, document_id: str, results: list[d
     with connection(app) as conn:
         for item in results:
             conn.execute(
-                """INSERT INTO ew_score_results(score_result_id, score_run_id, document_id, rule_id, suggested_score, final_score, max_score, evidence, reason, confidence, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """INSERT INTO ew_score_results(score_result_id, score_run_id, document_id, rule_id, suggested_score, final_score, effective_score, max_score,
+                   evidence, reason, confidence, automation_status, requires_review, review_reason, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(score_run_id, document_id, rule_id) DO UPDATE SET
-                suggested_score=excluded.suggested_score, final_score=excluded.final_score, max_score=excluded.max_score,
-                evidence=excluded.evidence, reason=excluded.reason, confidence=excluded.confidence, updated_at=excluded.updated_at""",
-                (str(uuid.uuid4()), score_run_id, document_id, item["rule_id"], item.get("suggested_score"), item.get("final_score"), item.get("max_score"), item.get("evidence", ""), item.get("reason", ""), item.get("confidence"), timestamp, timestamp),
+                suggested_score=excluded.suggested_score, final_score=excluded.final_score, effective_score=excluded.effective_score,
+                max_score=excluded.max_score, evidence=excluded.evidence, reason=excluded.reason, confidence=excluded.confidence,
+                automation_status=excluded.automation_status, requires_review=excluded.requires_review,
+                review_reason=excluded.review_reason, updated_at=excluded.updated_at""",
+                (str(uuid.uuid4()), score_run_id, document_id, item["rule_id"], item.get("suggested_score"), item.get("final_score"),
+                 item.get("effective_score"), item.get("max_score"), item.get("evidence", ""), item.get("reason", ""), item.get("confidence"),
+                 item.get("automation_status", "needs_review"), 1 if item.get("requires_review", True) else 0,
+                 item.get("review_reason", ""), timestamp, timestamp),
             )
 
 
@@ -1163,6 +1260,26 @@ def update_final_score(app, score_result_id: str, final_score: float) -> dict:
         max_score = row["max_score"]
         if final_score < 0 or (max_score is not None and final_score > max_score):
             raise ValueError("最终分数必须在 0 与该项满分之间")
-        conn.execute("UPDATE ew_score_results SET final_score = ?, updated_at = ? WHERE score_result_id = ?", (final_score, now_iso(), score_result_id))
+        conn.execute("UPDATE ew_score_results SET final_score = ?, effective_score = ?, automation_status='confirmed', updated_at = ? WHERE score_result_id = ?", (final_score, final_score, now_iso(), score_result_id))
         updated = conn.execute("SELECT * FROM ew_score_results WHERE score_result_id = ?", (score_result_id,)).fetchone()
     return dict(updated)
+
+
+def confirm_auto_score_results(app, project_id: str, score_type: str | None = None) -> int:
+    params: list[object] = [now_iso(), project_id, project_id]
+    type_sql = ""
+    if score_type:
+        type_sql = " AND run.score_type=?"
+        params.append(score_type)
+    with connection(app) as conn:
+        updated = conn.execute(
+            """UPDATE ew_score_results SET final_score=effective_score, automation_status='confirmed', updated_at=?
+               WHERE score_result_id IN (
+                   SELECT s.score_result_id FROM ew_score_results s JOIN ew_score_runs run ON run.score_run_id=s.score_run_id
+                   JOIN ew_tasks task ON task.task_id=run.task_id
+                   WHERE run.project_id=? AND task.status='success' AND s.requires_review=0
+                     AND s.final_score IS NULL
+                     AND run.rule_set_id=(SELECT rule_set_id FROM ew_rule_sets WHERE project_id=? ORDER BY version DESC LIMIT 1)""" + type_sql + ")",
+            params,
+        ).rowcount
+    return updated

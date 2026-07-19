@@ -225,12 +225,13 @@ def tasks_api(project_id):
         if not rule_set or rule_set["status"] != "confirmed" or not has_review or not needed.issubset(categories):
             return jsonify({"error": "请先确认包含审查、客观评分和主观评分项的规则集"}), 400
     try:
-        payload = {"profile_id": data.get("profile_id")}
-        if task_type in {"extract_rules", "review_documents", "score_objective", "score_subjective", "evaluate_all"}:
+        requested_profile_id = data.get("profile_id") or storage.default_model_profile_id(current_app)
+        payload = {"profile_id": requested_profile_id}
+        if task_type in {"compare_documents", "extract_rules", "review_documents", "score_objective", "score_subjective", "evaluate_all"}:
             payload["input_fingerprint"] = storage.task_input_fingerprint(
-                current_app, project_id, task_type, data.get("profile_id"), TASK_PROMPT_VERSION,
+                current_app, project_id, task_type, requested_profile_id, TASK_PROMPT_VERSION,
             )
-            if data.get("reuse_completed") is True:
+            if data.get("reuse_completed") is True or (task_type == "compare_documents" and data.get("reuse_completed") is not False):
                 reusable = storage.find_reusable_task(current_app, project_id, task_type, payload["input_fingerprint"])
                 if reusable:
                     return jsonify({"task": reusable, "reused": True})
@@ -318,6 +319,15 @@ def test_model_profile_api(profile_id):
         return jsonify({"error": str(exc)}), 400
 
 
+@evaluation_workbench_bp.route("/api/evaluation-workbench/model-profiles/<profile_id>/default", methods=["POST"])
+def set_default_model_profile_api(profile_id):
+    _init()
+    try:
+        return jsonify({"profile": storage.set_default_model_profile(current_app, profile_id)})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
 @evaluation_workbench_bp.route("/api/evaluation-workbench/projects/<project_id>/rules", methods=["GET", "POST"])
 def rules_api(project_id):
     _init()
@@ -380,6 +390,15 @@ def update_review_result_api(review_result_id):
     return jsonify({"review_result": result})
 
 
+@evaluation_workbench_bp.route("/api/evaluation-workbench/projects/<project_id>/review-results/confirm-auto", methods=["POST"])
+def confirm_auto_review_results_api(project_id):
+    _init()
+    _, error = _project_or_404(project_id)
+    if error:
+        return error
+    return jsonify({"confirmed_count": storage.confirm_auto_review_results(current_app, project_id)})
+
+
 @evaluation_workbench_bp.route("/api/evaluation-workbench/projects/<project_id>/score-results/<score_type>")
 def score_results_api(project_id, score_type):
     _init()
@@ -401,6 +420,18 @@ def update_score_result_api(score_result_id):
         return jsonify({"score_result": storage.update_final_score(current_app, score_result_id, final_score)})
     except (TypeError, ValueError) as exc:
         return jsonify({"error": str(exc) if str(exc) else "请填写有效的最终分数"}), 400
+
+
+@evaluation_workbench_bp.route("/api/evaluation-workbench/projects/<project_id>/score-results/confirm-auto", methods=["POST"])
+def confirm_auto_score_results_api(project_id):
+    _init()
+    _, error = _project_or_404(project_id)
+    if error:
+        return error
+    score_type = str(_json_body().get("score_type", "")).strip() or None
+    if score_type not in {None, "objective", "subjective"}:
+        return jsonify({"error": "不支持的评分类型"}), 400
+    return jsonify({"confirmed_count": storage.confirm_auto_score_results(current_app, project_id, score_type)})
 
 
 @evaluation_workbench_bp.route("/pingbiao/projects/<project_id>/report")

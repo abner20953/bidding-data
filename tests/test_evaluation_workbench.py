@@ -150,6 +150,18 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         metadata = next(item for item in analysis["signals"] if item["dimension"] == "metadata")
         self.assertEqual(len(metadata["evidence"]), 1)
 
+    def test_compare_ai_packet_is_limited_to_fixed_rule_evidence(self):
+        packet = worker._compare_evidence_packet({
+            "signal_id": "signal-1", "bidder_a": "甲公司", "bidder_b": "乙公司", "dimension_label": "正文雷同",
+            "basis": "发现 1 处完全雷同", "counter_evidence": ["公共模板可能造成相似"],
+            "evidence": [{"page_a": 1, "page_b": 2, "text_a": "A" * 1000, "text_b": "B" * 1000, "ignored": "不得发送"}],
+        })
+
+        self.assertEqual(packet["signal_id"], "signal-1")
+        self.assertNotIn("ignored", packet["evidence"][0])
+        self.assertLessEqual(len(packet["evidence"][0]["text_a"]), 280)
+        self.assertNotIn("投标文件全文", str(packet))
+
     def test_compare_signal_disposition_is_persisted_separately(self):
         task = storage.create_task(self.app, self.project["project_id"], "compare_documents")
         storage.initialize_compare_signal_reviews(self.app, task["task_id"], [{"signal_id": "signal-1"}])
@@ -239,6 +251,46 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertNotIn(profile["profile_id"], {item["profile_id"] for item in storage.list_model_profiles(self.app)})
+
+    def test_global_default_model_is_persisted_and_cannot_be_deleted(self):
+        profile = storage.create_model_profile(self.app, {
+            "display_name": "默认测试模型", "base_url": "https://example.test/v1", "model_name": "default-test", "api_key": "test-key",
+        })
+
+        response = self.app.test_client().post(f"/api/evaluation-workbench/model-profiles/{profile['profile_id']}/default")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(storage.get_model_profile(self.app, None)["profile_id"], profile["profile_id"])
+        profiles = storage.list_model_profiles(self.app)
+        self.assertTrue(next(item for item in profiles if item["profile_id"] == profile["profile_id"])["is_default"])
+        blocked = self.app.test_client().delete(f"/api/evaluation-workbench/model-profiles/{profile['profile_id']}")
+        self.assertEqual(blocked.status_code, 400)
+
+    def test_auto_results_can_be_confirmed_in_batch_while_exceptions_remain(self):
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案。")
+        review_rule = storage.add_rule(self.app, self.project["project_id"], {"category": "qualification", "title": "资质"})
+        score_rule = storage.add_rule(self.app, self.project["project_id"], {"category": "objective", "title": "资质评分", "scoring": {"kind": "boolean", "max_score": 5}})
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        storage.update_task(self.app, task["task_id"], status="success")
+        review_run = storage.create_review_run(self.app, self.project["project_id"], task["task_id"], None)
+        score_run = storage.create_score_run(self.app, self.project["project_id"], task["task_id"], "objective", None)
+        storage.save_review_results(self.app, review_run["review_run_id"], document["document_id"], [
+            {"rule_id": review_rule["rule_id"], "status": "satisfied", "confidence": "high", "evidence_quality": "sufficient", "risk_level": "low", "requires_review": False, "automation_status": "ready_for_batch_confirmation"},
+        ])
+        storage.save_score_results(self.app, score_run["score_run_id"], document["document_id"], [
+            {"rule_id": score_rule["rule_id"], "suggested_score": 5, "effective_score": 5, "max_score": 5, "confidence": "high", "evidence": "资质证书", "requires_review": False, "automation_status": "ready_for_batch_confirmation"},
+        ])
+
+        reviews = self.app.test_client().post(f"/api/evaluation-workbench/projects/{self.project['project_id']}/review-results/confirm-auto")
+        scores = self.app.test_client().post(f"/api/evaluation-workbench/projects/{self.project['project_id']}/score-results/confirm-auto", json={"score_type": "objective"})
+        _, review_rows = storage.latest_review_results(self.app, self.project["project_id"])
+        _, score_rows = storage.latest_score_results(self.app, self.project["project_id"], "objective")
+
+        self.assertEqual(reviews.get_json()["confirmed_count"], 1)
+        self.assertEqual(scores.get_json()["confirmed_count"], 1)
+        self.assertEqual(review_rows[0]["final_status"], "satisfied")
+        self.assertEqual(score_rows[0]["final_score"], 5.0)
 
     def test_deleting_project_removes_files_and_related_records(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案：稳定运行。")
