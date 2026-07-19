@@ -11,7 +11,7 @@ from difflib import SequenceMatcher
 import fitz  # PyMuPDF
 
 
-ALGORITHM_VERSION = 7
+ALGORITHM_VERSION = 8
 MIN_EXACT_LENGTH = 9
 MIN_EXACT_DISPLAY_LENGTH = 30
 MAX_EXACT_BLOCK_LENGTH = 1200
@@ -30,6 +30,7 @@ MAX_EXTRACTED_CHARS = 8_000_000
 MAX_COMPARISON_CHARS = 12_000_000
 MAX_EXACT_UNITS_PER_FILE = 200_000
 MAX_FUZZY_UNITS_PER_FILE = 50_000
+MAX_TENDER_SOURCE_HASHES = 450_000
 MIN_SHARED_EDIT_COVERAGE = 0.6
 TENDER_DERIVED_RATIO = 0.78
 TENDER_EXACT_SHINGLE_COVERAGE = 0.65
@@ -87,6 +88,9 @@ class CollusionDetector:
         self.tender_path = tender_path
         self.build_text_index = build_text_index
         self.tender_exact_texts = set()
+        self.tender_source_hashes = set()
+        self.tender_field_templates = set()
+        self.tender_field_values = {}
         self.tender_skeletons = set()
         self.tender_full_text = ""
         self.tender_entities = set()
@@ -119,6 +123,136 @@ class CollusionDetector:
             }
         )
         return re.sub(r"\s+", "", text.translate(translations)).lower()
+
+    @classmethod
+    def tender_source_canonical(cls, text):
+        """Normalize presentation-only punctuation while retaining numeric meaning."""
+        normalized = cls.normalize(text)
+        if not normalized:
+            return ""
+
+        # Decimal separators and numeric ratios can change a requirement, so keep
+        # punctuation between digits.  Operators such as <, >, !, =, ≥ and ≤
+        # always remain significant.
+        normalized = re.sub(r"(?<!\d)[.,:]|[.,:](?!\d)", "", normalized)
+        return re.sub(r"[;?\"'`()（）\[\]【】{}《》·、]", "", normalized)
+
+    @staticmethod
+    def _tender_source_digest(canonical):
+        return hashlib.blake2b(
+            canonical.encode("utf-8", errors="ignore"), digest_size=16
+        ).digest()
+
+    @staticmethod
+    def _split_text_parts(text, split_commas=True):
+        # ASCII ! may be a logical-not operator in technical requirements.
+        # Only the full-width Chinese exclamation mark is treated as sentence
+        # punctuation; != and ！= remain intact as well.
+        pattern = r"[。.]|！(?![=＝])|[?？;；]"
+        if split_commas:
+            pattern += r"|[,，]"
+        return re.split(pattern, text or "")
+
+    @classmethod
+    def _tender_field_signature(cls, text, require_placeholder=False):
+        """Identify only strict document-control values, never free-form text."""
+        normalized = cls.normalize(text)
+        if not normalized or len(normalized) > 80:
+            return ""
+        match = re.match(
+            r"^(?:第?[一二三四五六七八九十\d]+[、.)）]?)?"
+            r"(项目编号|招标编号|采购编号|标段编号|包号|日期):(.+)$",
+            normalized,
+        )
+        if not match:
+            return ""
+
+        label, value = match.groups()
+        if label == "日期":
+            placeholder_date = value.strip("()（）[]【】_-. ")
+            if re.fullmatch(r"[年月日]{2,3}", placeholder_date):
+                return label
+            if require_placeholder:
+                return ""
+            if re.fullmatch(
+                r"(?:\d{4}[-/.年])?\d{1,2}[-/.月]\d{1,2}日?",
+                value,
+            ):
+                return label
+            return ""
+
+        placeholder = value.strip("()（）[]【】_-. ")
+        is_placeholder = bool(re.fullmatch(
+            r"(?:请)?(?:在此)?(?:填写|填入)?"
+            r"(?:项目编号|招标编号|采购编号|标段编号|包号)",
+            placeholder,
+        ))
+        if is_placeholder:
+            return label
+        if require_placeholder:
+            return ""
+        if re.fullmatch(r"[a-z0-9_./\\()（）-]+", value) and re.search(r"\d", value):
+            return label
+        return ""
+
+    @classmethod
+    def _tender_field_value(cls, text):
+        normalized = cls.normalize(text)
+        match = re.match(
+            r"^(?:第?[一二三四五六七八九十\d]+[、.)）]?)?"
+            r"(?:项目编号|招标编号|采购编号|标段编号|包号|日期):(.+)$",
+            normalized,
+        )
+        return match.group(1).strip("()（）[]【】{}_:./\\ ") if match else ""
+
+    @classmethod
+    def _build_tender_source_hashes(cls, tender_exact_units, tender_pages=None):
+        """Build a bounded index resilient to presentation punctuation boundaries."""
+        hashes = set()
+
+        def add_canonical(canonical):
+            if len(canonical) < MIN_EXACT_LENGTH:
+                return
+            if len(hashes) >= MAX_TENDER_SOURCE_HASHES:
+                return
+            hashes.add(cls._tender_source_digest(canonical))
+
+        def add_fragments(text):
+            fragments = re.split(
+                r"(?<!\d):|:(?!\d)|[;?\"'`()（）\[\]【】{}《》·、]+",
+                cls.normalize(text),
+            )
+            for fragment in fragments:
+                add_canonical(cls.tender_source_canonical(fragment))
+
+        for unit in tender_exact_units:
+            canonical = cls.tender_source_canonical(unit["text"])
+            add_canonical(canonical)
+
+            # get_exact_units already splits sentence punctuation. Split the
+            # remaining ignorable punctuation so the reverse boundary change
+            # (tender colon, bid comma) can still match safely.
+            add_fragments(unit["text"])
+
+        # Preserve short pieces that get dropped by get_exact_units. They may
+        # become part of one longer unit when a bidder changes punctuation.
+        for _, raw_text, _ in tender_pages or ():
+            for line in raw_text.splitlines():
+                raw_parts = [
+                    part
+                    for part in cls._split_text_parts(line)
+                    if part.strip()
+                ]
+                parts = [cls.tender_source_canonical(part) for part in raw_parts]
+                for raw_part, part in zip(raw_parts, parts):
+                    add_canonical(part)
+                    add_fragments(raw_part)
+                for index in range(len(parts) - 1):
+                    combined = parts[index] + parts[index + 1]
+                    if len(combined) <= MAX_EXACT_BLOCK_LENGTH:
+                        add_canonical(combined)
+
+        return hashes
 
     @staticmethod
     def get_skeleton(text):
@@ -260,6 +394,27 @@ class CollusionDetector:
         if self.build_text_index:
             tender_exact_units = self.get_exact_units(pages)
             self.tender_exact_texts = {unit["text"] for unit in tender_exact_units}
+            self.tender_source_hashes = self._build_tender_source_hashes(
+                tender_exact_units, pages
+            )
+            self.tender_field_templates = {
+                signature
+                for unit in tender_exact_units
+                if (
+                    signature := self._tender_field_signature(
+                        unit["text"], require_placeholder=True
+                    )
+                )
+            }
+            for unit in tender_exact_units:
+                label = self._tender_field_signature(unit["text"])
+                if not label or self._tender_field_signature(
+                    unit["text"], require_placeholder=True
+                ):
+                    continue
+                value = self._tender_field_value(unit["text"])
+                if value:
+                    self.tender_field_values.setdefault(label, set()).add(value)
             self.tender_skeletons = {
                 skeleton
                 for text in self.tender_exact_texts
@@ -272,7 +427,7 @@ class CollusionDetector:
         """Preserve the existing exact-match segmentation for API compatibility."""
         sentences = []
         for line in (text or "").split("\n"):
-            for part in re.split(r"[。.!！?？;；,，]", line):
+            for part in self._split_text_parts(line):
                 part = part.strip()
                 if len(part) >= MIN_EXACT_LENGTH:
                     sentences.append(self.normalize(part))
@@ -296,7 +451,7 @@ class CollusionDetector:
                     )
                 ):
                     continue
-                for part in re.split(r"[。.!！?？;；,，]", line):
+                for part in self._split_text_parts(line):
                     normalized = self.normalize(part.strip())
                     if len(normalized) < MIN_EXACT_LENGTH:
                         continue
@@ -314,7 +469,31 @@ class CollusionDetector:
     def _is_tender_copy(self, text):
         if not self.tender_full_text:
             return False
-        return text in self.tender_exact_texts or text in self.tender_full_text
+        if text in self.tender_exact_texts:
+            return True
+
+        field_signature = self._tender_field_signature(text)
+        if field_signature:
+            if field_signature not in self.tender_field_templates:
+                return False
+            field_value = self._tender_field_value(text)
+            return bool(
+                len(re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", field_value)) >= 4
+                and field_value
+                in self.tender_field_values.get(field_signature, set())
+            )
+
+        if text in self.tender_full_text:
+            return True
+
+        canonical = self.tender_source_canonical(text)
+        if (
+            len(canonical) >= MIN_EXACT_LENGTH
+            and self._tender_source_digest(canonical) in self.tender_source_hashes
+        ):
+            return True
+
+        return False
 
     @staticmethod
     def _is_page_number_line(text, is_trailing=False):
@@ -1092,7 +1271,7 @@ class CollusionDetector:
                 ):
                     kept_lines.append(line.strip())
             page_text = "".join(kept_lines)
-            for part in re.split(r"[。.!！?？;；]+", page_text):
+            for part in self._split_text_parts(page_text, split_commas=False):
                 normalized = self.normalize(part)
                 if len(normalized) < MIN_FUZZY_LENGTH:
                     continue
@@ -1494,6 +1673,83 @@ class CollusionDetector:
             "matched_ratio_b": round(min(matched_chars_b / chinese_b * 100, 100), 1),
         }
 
+    @staticmethod
+    def _clean_metadata_value(value):
+        if value is None:
+            return ""
+        return re.sub(r"\s+", " ", str(value)).strip()[:300]
+
+    @classmethod
+    def _is_meaningful_metadata_value(cls, value):
+        normalized = cls._clean_metadata_value(value).casefold().strip(".-_/ ")
+        return normalized not in {
+            "",
+            "unknown",
+            "n/a",
+            "na",
+            "none",
+            "null",
+            "anonymous",
+            "未知",
+            "不详",
+            "未设置",
+        }
+
+    @classmethod
+    def _build_metadata_auxiliary(cls, metadata_a, metadata_b, metadata_tender=None):
+        """Build explainable metadata clues without affecting collision scoring."""
+        field_definitions = (
+            ("title", "文档标题"),
+            ("author", "作者/创建者"),
+            ("creator", "创建软件"),
+            ("producer", "PDF 生成工具"),
+            ("creationDate", "创建时间"),
+            ("modDate", "修改时间"),
+        )
+
+        def select_fields(metadata):
+            source = metadata or {}
+            return {
+                key: cls._clean_metadata_value(source.get(key))
+                for key, _ in field_definitions
+            }
+
+        files = {
+            "file_a": select_fields(metadata_a),
+            "file_b": select_fields(metadata_b),
+            "tender": select_fields(metadata_tender),
+        }
+        matches = []
+        weak_fields = {"title", "creator", "producer"}
+        for key, label in field_definitions:
+            value_a = files["file_a"][key]
+            value_b = files["file_b"][key]
+            if not cls._is_meaningful_metadata_value(
+                value_a
+            ) or not cls._is_meaningful_metadata_value(value_b):
+                continue
+            if value_a.casefold() != value_b.casefold():
+                continue
+            tender_value = files["tender"].get(key, "")
+            also_in_tender = bool(
+                tender_value and tender_value.casefold() == value_a.casefold()
+            )
+            matches.append(
+                {
+                    "field": key,
+                    "label": label,
+                    "value": value_a,
+                    "strength": "weak" if key in weak_fields or also_in_tender else "reference",
+                    "also_in_tender": also_in_tender,
+                }
+            )
+
+        return {
+            "notice": "文档属性可能被复制、清除或由同一软件批量生成，仅作辅助排查，不参与相似度分数和雷同结论。",
+            "files": files,
+            "matches": matches,
+        }
+
     def find_collisions(
         self, path_a, path_b, check_entity=True, check_text=True, check_spelling=False
     ):
@@ -1597,6 +1853,9 @@ class CollusionDetector:
                 "file_a": metadata_a,
                 "file_b": metadata_b,
                 "tender": self.tender_metadata,
+                "auxiliary": self._build_metadata_auxiliary(
+                    metadata_a, metadata_b, self.tender_metadata
+                ),
                 "warnings": warnings,
                 "text_stats": {"file_a": stats_a, "file_b": stats_b, "tender": self.tender_stats},
                 "algorithm_version": ALGORITHM_VERSION,

@@ -9,11 +9,13 @@ from dashboard.utils import comparator
 from dashboard.utils.comparator import CollusionDetector, compare_documents
 
 
-def create_pdf(path, pages):
+def create_pdf(path, pages, metadata=None):
     document = fitz.open()
     for content in pages:
         page = document.new_page()
         page.insert_text((72, 72), content, fontsize=10)
+    if metadata:
+        document.set_metadata(metadata)
     document.save(path)
     document.close()
 
@@ -60,6 +62,318 @@ class ComparatorTests(unittest.TestCase):
 
         self.assertIn("11010519491231002X", entities)
         self.assertIn("13800138000", entities)
+
+    def test_tender_copy_with_presentation_punctuation_difference_is_suppressed(self):
+        detector = CollusionDetector()
+        detector.tender_path = "mock-tender.pdf"
+        raw_tender_text = (
+            "供应商应建立（质量复核）制度，并保存全过程记录。"
+        )
+        pages = [(1, raw_tender_text, detector.normalize(raw_tender_text))]
+        with mock.patch.object(
+            detector,
+            "extract_text_with_pages",
+            return_value=(
+                raw_tender_text,
+                pages,
+                {},
+                {"extracted_chars": len(raw_tender_text)},
+            ),
+        ):
+            detector.load_tender()
+
+        bid_text = detector.normalize(
+            "供应商应建立质量复核制度:并保存全过程记录"
+        )
+
+        self.assertTrue(detector._is_tender_copy(bid_text))
+
+    def test_tender_source_canonical_keeps_decimal_requirement_significant(self):
+        detector = CollusionDetector()
+        tender_text = detector.normalize("桌面厚度为1.5mm并满足承重要求")
+        detector.tender_full_text = tender_text
+        canonical = detector.tender_source_canonical(tender_text)
+        detector.tender_source_hashes = {
+            detector._tender_source_digest(canonical)
+        }
+
+        bid_text = detector.normalize("桌面厚度为15mm并满足承重要求")
+
+        self.assertFalse(detector._is_tender_copy(bid_text))
+
+    def test_tender_placeholder_requires_value_verified_in_tender(self):
+        detector = CollusionDetector()
+        detector.tender_full_text = detector.normalize(
+            "项目编号：（在此填写项目编号）"
+        )
+        detector.tender_field_templates = {
+            detector._tender_field_signature("项目编号：（在此填写项目编号）")
+        }
+        detector.tender_field_values = {"项目编号": {"f19-2026-001"}}
+
+        self.assertTrue(
+            detector._is_tender_copy(detector.normalize("项目编号：F19-2026-001"))
+        )
+        self.assertFalse(
+            detector._is_tender_copy(detector.normalize("项目编号：F19-2026-002"))
+        )
+        for truncated in ("F19-2026", "2026-001", "2026"):
+            self.assertFalse(
+                detector._is_tender_copy(
+                    detector.normalize(f"项目编号：{truncated}")
+                )
+            )
+        self.assertFalse(
+            detector._is_tender_copy(detector.normalize("质保期：3年"))
+        )
+
+    def test_tender_source_canonical_keeps_comparison_operators_significant(self):
+        detector = CollusionDetector()
+        tender_text = detector.normalize("设备运行噪声<50db并满足验收要求")
+        detector.tender_full_text = tender_text
+        canonical = detector.tender_source_canonical(tender_text)
+        detector.tender_source_hashes = {
+            detector._tender_source_digest(canonical)
+        }
+
+        changed_text = detector.normalize("设备运行噪声>50db并满足验收要求")
+
+        self.assertFalse(detector._is_tender_copy(changed_text))
+        self.assertIn("<", detector.tender_source_canonical(tender_text))
+        self.assertIn(">", detector.tender_source_canonical(changed_text))
+        self.assertNotEqual(
+            detector.tender_source_canonical("接口状态!=0时应立即告警"),
+            detector.tender_source_canonical("接口状态=0时应立即告警"),
+        )
+
+    def test_real_tender_loading_keeps_not_equal_operator_significant(self):
+        detector = CollusionDetector()
+        detector.tender_path = "mock-tender.pdf"
+        raw_text = "接口状态!=0时应立即告警并记录全部异常状态信息"
+        pages = [(1, raw_text, detector.normalize(raw_text))]
+
+        with mock.patch.object(
+            detector,
+            "extract_text_with_pages",
+            return_value=(raw_text, pages, {}, {"extracted_chars": len(raw_text)}),
+        ):
+            detector.load_tender()
+
+        changed_text = detector.normalize(
+            "接口状态=0时应立即告警并记录全部异常状态信息"
+        )
+        self.assertFalse(detector._is_tender_copy(changed_text))
+
+    def test_real_tender_loading_keeps_standalone_logical_not_significant(self):
+        detector = CollusionDetector()
+        detector.tender_path = "mock-tender.pdf"
+        raw_text = "system must verify !ready status before continuing operation"
+        pages = [(1, raw_text, detector.normalize(raw_text))]
+
+        with mock.patch.object(
+            detector,
+            "extract_text_with_pages",
+            return_value=(raw_text, pages, {}, {"extracted_chars": len(raw_text)}),
+        ):
+            detector.load_tender()
+
+        changed_text = detector.normalize(
+            "system must verify ready status before continuing operation"
+        )
+        self.assertFalse(detector._is_tender_copy(changed_text))
+
+    def test_tender_source_canonical_keeps_numeric_ratio_colon(self):
+        detector = CollusionDetector()
+
+        self.assertNotEqual(
+            detector.tender_source_canonical("材料配比为1:2并充分搅拌"),
+            detector.tender_source_canonical("材料配比为12并充分搅拌"),
+        )
+
+    def test_tender_field_signature_rejects_free_form_or_merged_text(self):
+        detector = CollusionDetector()
+
+        self.assertEqual(
+            detector._tender_field_signature(
+                "项目名称、关联地图底图、配置项目基础属性信息"
+            ),
+            "",
+        )
+        self.assertEqual(
+            detector._tender_field_signature(
+                "包号：以本公司名义处理一切与之有关的事务"
+            ),
+            "",
+        )
+        self.assertEqual(
+            detector._tender_field_signature("日期间应完成全部现场复核工作"),
+            "",
+        )
+        self.assertEqual(
+            detector._tender_field_signature(
+                "项目编号：项目编号生成规则应与内部系统保持一致"
+            ),
+            "",
+        )
+        self.assertEqual(
+            detector._tender_field_signature("项目编号：1404992026CGK00239"),
+            "项目编号",
+        )
+
+    def test_concrete_tender_field_change_is_not_suppressed(self):
+        detector = CollusionDetector()
+        detector.tender_path = "mock-tender.pdf"
+        raw_text = (
+            "项目编号：（在此填写项目编号）\n"
+            "项目编号：A-001-2026"
+        )
+        pages = [(1, raw_text, detector.normalize(raw_text))]
+
+        with mock.patch.object(
+            detector,
+            "extract_text_with_pages",
+            return_value=(raw_text, pages, {}, {"extracted_chars": len(raw_text)}),
+        ):
+            detector.load_tender()
+
+        self.assertIn("项目编号", detector.tender_field_templates)
+        self.assertEqual(
+            detector.tender_field_values.get("项目编号"), {"a-001-2026"}
+        )
+        self.assertFalse(
+            detector._is_tender_copy(
+                detector.normalize("项目编号：A-002-2026")
+            )
+        )
+        for truncated in ("A-001", "001-2026", "2026"):
+            self.assertFalse(
+                detector._is_tender_copy(
+                    detector.normalize(f"项目编号：{truncated}")
+                )
+            )
+        self.assertTrue(
+            detector._is_tender_copy(
+                detector.normalize("项目编号：A-001-2026")
+            )
+        )
+
+    def test_tender_colon_boundary_indexes_bid_comma_fragment(self):
+        detector = CollusionDetector()
+        detector.tender_path = "mock-tender.pdf"
+        raw_text = "供应商应建立完善质量复核管理制度:并保存完整的全过程复核记录"
+        pages = [(1, raw_text, detector.normalize(raw_text))]
+
+        with mock.patch.object(
+            detector,
+            "extract_text_with_pages",
+            return_value=(raw_text, pages, {}, {"extracted_chars": len(raw_text)}),
+        ):
+            detector.load_tender()
+
+        fragments = (
+            "供应商应建立完善质量复核管理制度",
+            "并保存完整的全过程复核记录",
+        )
+        for fragment in fragments:
+            canonical = detector.tender_source_canonical(fragment)
+            self.assertIn(
+                detector._tender_source_digest(canonical),
+                detector.tender_source_hashes,
+            )
+
+    def test_tender_source_hashes_do_not_bridge_dropped_short_requirement(self):
+        detector = CollusionDetector()
+        detector.tender_path = "mock-tender.pdf"
+        first = "供应商应建立完善质量复核管理制度"
+        second = "并保存完整的全过程复核记录"
+        raw_text = f"{first}。不得。{second}。"
+        pages = [(1, raw_text, detector.normalize(raw_text))]
+
+        with mock.patch.object(
+            detector,
+            "extract_text_with_pages",
+            return_value=(raw_text, pages, {}, {"extracted_chars": len(raw_text)}),
+        ):
+            detector.load_tender()
+
+        deleted_requirement = detector.normalize(f"{first}:{second}")
+        self.assertFalse(detector._is_tender_copy(deleted_requirement))
+
+    def test_load_tender_builds_bounded_canonical_digest_index(self):
+        detector = CollusionDetector()
+        detector.tender_path = "mock-tender.pdf"
+        raw_text = (
+            "项目编号：（在此填写项目编号）\n"
+            "日期：（年月日）\n"
+            "供应商应建立（质量复核）制度，并保存全过程记录。"
+        )
+        pages = [(1, raw_text, detector.normalize(raw_text))]
+
+        with mock.patch.object(
+            detector,
+            "extract_text_with_pages",
+            return_value=(raw_text, pages, {}, {"extracted_chars": len(raw_text)}),
+        ):
+            detector.load_tender()
+
+        self.assertIn("项目编号", detector.tender_field_templates)
+        self.assertNotIn("日期", detector.tender_field_templates)
+        self.assertTrue(detector.tender_source_hashes)
+        self.assertTrue(
+            all(
+                isinstance(digest, bytes) and len(digest) == 16
+                for digest in detector.tender_source_hashes
+            )
+        )
+        self.assertFalse(hasattr(detector, "tender_full_canonical"))
+
+    def test_metadata_auxiliary_is_separate_and_marks_tender_common_value(self):
+        detector = CollusionDetector()
+
+        auxiliary = detector._build_metadata_auxiliary(
+            {
+                "author": "Review User",
+                "creator": "Office Suite",
+                "producer": "PDF Engine",
+            },
+            {
+                "author": "review user",
+                "creator": "Office Suite",
+                "producer": "PDF Engine",
+            },
+            {"producer": "PDF Engine"},
+        )
+
+        matches = {item["field"]: item for item in auxiliary["matches"]}
+        self.assertEqual(matches["author"]["strength"], "reference")
+        self.assertEqual(matches["creator"]["strength"], "weak")
+        self.assertTrue(matches["producer"]["also_in_tender"])
+        self.assertIn("不参与相似度分数", auxiliary["notice"])
+
+        invalid_auxiliary = detector._build_metadata_auxiliary(
+            {"author": "Unknown", "title": "N/A"},
+            {"author": "unknown", "title": "n/a"},
+        )
+        self.assertFalse(invalid_auxiliary["matches"])
+
+    def test_matching_metadata_does_not_create_collision_or_change_legacy_fields(self):
+        path_a = self.path("a.pdf")
+        path_b = self.path("b.pdf")
+        shared_metadata = {"author": "Same Author", "creator": "Same Office"}
+        create_pdf(path_a, ["Only file A content is present."], shared_metadata)
+        create_pdf(path_b, ["Only file B content is present."], shared_metadata)
+
+        result = compare_documents(
+            path_a, path_b, check_entity=False, check_text=False, check_spelling=False
+        )
+
+        self.assertFalse(result["paragraphs"])
+        self.assertEqual(result["summary"]["total"], 0)
+        self.assertEqual(result["metadata"]["file_a"]["author"], "Same Author")
+        matched_fields = {
+            item["field"] for item in result["metadata"]["auxiliary"]["matches"]
+        }
+        self.assertIn("author", matched_fields)
 
     def test_fuzzy_match_detects_small_rewrite(self):
         path_a = self.path("a.pdf")

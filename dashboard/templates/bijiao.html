@@ -228,6 +228,51 @@
             font-size: 1.15rem;
         }
 
+        .metadata-grid {
+            display: grid;
+            grid-template-columns: minmax(100px, 0.8fr) repeat(3, minmax(150px, 1fr));
+            gap: 1px;
+            margin-top: 14px;
+            overflow-x: auto;
+            background: #dbeafe;
+            border: 1px solid #dbeafe;
+            border-radius: 6px;
+        }
+
+        .metadata-grid > div {
+            min-width: 120px;
+            padding: 8px 10px;
+            background: #fff;
+            font-size: 0.82rem;
+            overflow-wrap: anywhere;
+        }
+
+        .metadata-grid .metadata-heading {
+            color: #1e3a8a;
+            font-weight: 600;
+            background: #eff6ff;
+        }
+
+        .metadata-clues {
+            margin-top: 12px;
+            padding: 10px 12px;
+            border-radius: 6px;
+            background: #f8fafc;
+            color: #475569;
+            font-size: 0.85rem;
+        }
+
+        .metadata-clue {
+            margin-top: 6px;
+        }
+
+        .metadata-notice {
+            margin: 10px 0 0;
+            color: #64748b;
+            font-size: 0.8rem;
+            line-height: 1.5;
+        }
+
         .result-toolbar {
             display: flex;
             align-items: center;
@@ -710,21 +755,45 @@
 
                 // Render Metadata
                 if (metadata) {
-                    const metaA = metadata.file_a.author;
-                    const metaB = metadata.file_b.author;
-                    const metaTender = metadata.tender ? metadata.tender.author : 'N/A';
+                    const auxiliary = metadata.auxiliary || {};
+                    const auxiliaryFiles = auxiliary.files || {};
+                    const metaFiles = {
+                        file_a: auxiliaryFiles.file_a || metadata.file_a || {},
+                        file_b: auxiliaryFiles.file_b || metadata.file_b || {},
+                        tender: auxiliaryFiles.tender || metadata.tender || {}
+                    };
                     const textStats = metadata.text_stats || {};
                     const statsA = textStats.file_a || {};
                     const statsB = textStats.file_b || {};
-
-                    const cleanA = metaA ? metaA.trim() : '';
-                    const cleanB = metaB ? metaB.trim() : '';
-
-                    const isValidA = cleanA !== '' && cleanA !== 'Unknown';
-                    const isValidB = cleanB !== '' && cleanB !== 'Unknown';
-
-                    const isSame = (isValidA && isValidB && cleanA === cleanB);
-                    const sameWarn = isSame ? `<div style="margin-top:10px; color:#ef4444; font-weight:bold;">⚠️ 警告：两份投标文件作者/创建者相同！</div>` : '';
+                    const metadataFields = [
+                        ['title', '文档标题'],
+                        ['author', '作者/创建者'],
+                        ['creator', '创建软件'],
+                        ['producer', 'PDF 生成工具'],
+                        ['creationDate', '创建时间'],
+                        ['modDate', '修改时间']
+                    ];
+                    const visibleFields = metadataFields.filter(([key]) =>
+                        metaFiles.file_a[key] || metaFiles.file_b[key] || (hasTender && metaFiles.tender[key])
+                    );
+                    const metadataRows = visibleFields.map(([key, label]) => `
+                        <div class="metadata-heading">${escapeHtml(label)}</div>
+                        <div>${escapeHtml(metaFiles.file_a[key] || '—')}</div>
+                        <div>${escapeHtml(metaFiles.file_b[key] || '—')}</div>
+                        <div>${hasTender ? escapeHtml(metaFiles.tender[key] || '—') : '未上传'}</div>
+                    `).join('');
+                    const matches = Array.isArray(auxiliary.matches) ? auxiliary.matches : [];
+                    const matchesHtml = matches.length ? `
+                        <div class="metadata-clues">
+                            <strong>相同属性辅助线索（${matches.length}）</strong>
+                            ${matches.map(match => `
+                                <div class="metadata-clue">
+                                    ${escapeHtml(match.label)}相同：${escapeHtml(match.value)}
+                                    ${match.also_in_tender ? '（招标文件也相同）' : ''}
+                                    ${match.strength === 'weak' ? ' · 弱线索' : ' · 建议结合正文核查'}
+                                </div>
+                            `).join('')}
+                        </div>` : '<div class="metadata-clues">未发现两份投标文件具有相同的有效文档属性。</div>';
 
                     const div = document.createElement('div');
                     div.id = 'metadata-area';
@@ -732,15 +801,21 @@
                     div.style.borderLeftColor = '#3b82f6';
                     div.style.background = 'linear-gradient(to right, #eff6ff, #fff)';
                     div.innerHTML = `
-                        <h3 style="margin-top: 0; color: #1e3a8a;">文档属性对比</h3>
-                        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; font-size: 0.9rem;">
-                            <div>📄 投标单位 A 作者: <strong>${escapeHtml(metaA)}</strong></div>
-                            <div>📄 投标单位 B 作者: <strong>${escapeHtml(metaB)}</strong></div>
-                            ${hasTender ? `<div>📘 招标文件 作者: <span style="color:#6b7280">${escapeHtml(metaTender)}</span></div>` : ''}
-                            <div>文件 A: <strong>${statsA.total_pages || 0}</strong> 页，疑似扫描 <strong>${statsA.suspected_scan_pages || 0}</strong> 页</div>
-                            <div>文件 B: <strong>${statsB.total_pages || 0}</strong> 页，疑似扫描 <strong>${statsB.suspected_scan_pages || 0}</strong> 页</div>
+                        <h3 style="margin-top: 0; color: #1e3a8a;">文档属性辅助线索</h3>
+                        <div style="font-size:0.85rem; color:#475569;">
+                            文件 A：<strong>${statsA.total_pages || 0}</strong> 页，疑似扫描 <strong>${statsA.suspected_scan_pages || 0}</strong> 页；
+                            文件 B：<strong>${statsB.total_pages || 0}</strong> 页，疑似扫描 <strong>${statsB.suspected_scan_pages || 0}</strong> 页
                         </div>
-                        ${sameWarn}
+                        ${metadataRows ? `
+                            <div class="metadata-grid">
+                                <div class="metadata-heading">属性</div>
+                                <div class="metadata-heading">投标文件 A</div>
+                                <div class="metadata-heading">投标文件 B</div>
+                                <div class="metadata-heading">招标文件</div>
+                                ${metadataRows}
+                            </div>` : ''}
+                        ${matchesHtml}
+                        <p class="metadata-notice">${escapeHtml(auxiliary.notice || '文档属性仅作辅助排查，不参与相似度分数和雷同结论。')}</p>
                     `;
                     document.querySelector('.summary-card').after(div);
 
