@@ -524,8 +524,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.confirm_rule_set(self.app, self.project["project_id"])
         storage.create_task(self.app, self.project["project_id"], "evaluate_all")
         with patch("dashboard.evaluation_workbench.worker.request_json", return_value={
-            "review_results": [{"rule_id": rule["rule_id"], "status": "satisfied", "evidence": "承诺函", "reason": "已提供", "risk_level": "low"}],
-            "objective_scores": [], "subjective_scores": [],
+            "results": [{"rule_id": rule["rule_id"], "status": "satisfied", "evidence": "承诺函", "reason": "已提供", "risk_level": "low"}],
         }):
             finished = self._run_next_task()
         _, reviews = storage.latest_review_results(self.app, self.project["project_id"])
@@ -613,11 +612,11 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.confirm_rule_set(self.app, self.project["project_id"])
         storage.create_task(self.app, self.project["project_id"], "evaluate_all")
 
-        with patch("dashboard.evaluation_workbench.worker.request_json", return_value={
-            "review_results": [{"rule_id": review_rule["rule_id"], "status": "satisfied", "evidence": "具备资质", "reason": "已提供", "risk_level": "low"}],
-            "objective_scores": [{"rule_id": objective_rule["rule_id"], "met": True, "evidence": "具备资质", "reason": "已提供"}],
-            "subjective_scores": [{"rule_id": subjective_rule["rule_id"], "suggested_score": 8, "evidence": "技术方案完整", "reason": "较完整"}],
-        }):
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[
+            {"results": [{"rule_id": review_rule["rule_id"], "status": "satisfied", "evidence": "具备资质", "reason": "已提供", "risk_level": "low"}]},
+            {"results": [{"rule_id": objective_rule["rule_id"], "met": True, "evidence": "具备资质", "reason": "已提供"}]},
+            {"results": [{"rule_id": subjective_rule["rule_id"], "suggested_score": 8, "evidence": "技术方案完整", "reason": "较完整"}]},
+        ]) as request_json:
             finished = self._run_next_task()
 
         _, reviews = storage.latest_review_results(self.app, self.project["project_id"])
@@ -628,8 +627,29 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(reviews[0]["status"], "satisfied")
         self.assertEqual(objectives[0]["suggested_score"], 5.0)
         self.assertEqual(subjectives[0]["suggested_score"], 8.0)
-        self.assertEqual(usage["call_count"], 1)
+        self.assertEqual(usage["call_count"], 3)
         self.assertEqual(usage["input_chars"] > 0, True)
+        self.assertEqual(request_json.call_args_list[0].args[0]["thinking_mode"], "adaptive")
+        self.assertEqual(request_json.call_args_list[1].args[0]["thinking_mode"], "disabled")
+        self.assertEqual(request_json.call_args_list[2].args[0]["thinking_mode"], "adaptive")
+
+    def test_combined_evaluation_splits_review_rules_into_small_groups(self):
+        self._add_pdf("bid.pdf", "bid", "甲公司", "投标文件包含全部承诺。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        for index in range(9):
+            storage.add_rule(self.app, self.project["project_id"], {
+                "category": "qualification", "title": f"承诺事项{index}", "source_text": "承诺事项",
+            })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value={"results": []}) as request_json:
+            finished = self._run_next_task()
+
+        self.assertEqual(finished["status"], "success")
+        self.assertEqual(finished["result"]["batch_count"], 2)
+        self.assertEqual(request_json.call_count, 2)
 
     def test_combined_evaluation_retries_only_invalid_json_document_with_compact_prompt(self):
         self._add_pdf("tender.pdf", "tender", "", "投标人具备资质得5分，技术方案满分10分。")
@@ -641,18 +661,17 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         subjective_rule = storage.add_rule(self.app, self.project["project_id"], {"category": "subjective", "title": "技术方案", "source_text": "技术方案满分10分", "scoring": {"max_score": 10}})
         storage.confirm_rule_set(self.app, self.project["project_id"])
         storage.create_task(self.app, self.project["project_id"], "evaluate_all")
-        valid = {
-            "review_results": [{"rule_id": review_rule["rule_id"], "status": "satisfied", "evidence": "具备资质", "reason": "已提供", "risk_level": "low"}],
-            "objective_scores": [{"rule_id": objective_rule["rule_id"], "met": True, "evidence": "具备资质", "reason": "已提供"}],
-            "subjective_scores": [{"rule_id": subjective_rule["rule_id"], "suggested_score": 8, "evidence": "技术方案完整", "reason": "较完整"}],
-        }
-
-        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[ValueError("模型未返回有效 JSON"), valid]) as request_json:
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[
+            ValueError("模型未返回有效 JSON"),
+            {"results": [{"rule_id": review_rule["rule_id"], "status": "satisfied", "evidence": "具备资质", "reason": "已提供", "risk_level": "low"}]},
+            {"results": [{"rule_id": objective_rule["rule_id"], "met": True, "evidence": "具备资质", "reason": "已提供"}]},
+            {"results": [{"rule_id": subjective_rule["rule_id"], "suggested_score": 8, "evidence": "技术方案完整", "reason": "较完整"}]},
+        ]) as request_json:
             finished = self._run_next_task()
 
         self.assertEqual(finished["status"], "success")
         self.assertEqual(finished["result"]["compact_retry_count"], 1)
-        self.assertEqual(request_json.call_count, 2)
+        self.assertEqual(request_json.call_count, 4)
 
     def test_token_usage_endpoint_returns_only_aggregated_metadata(self):
         task = storage.create_task(self.app, self.project["project_id"], "parse_documents")
@@ -705,8 +724,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
 
         with patch("dashboard.evaluation_workbench.worker.request_json", return_value={
-            "review_results": [{"rule_id": rule["rule_id"], "status": "ocr_required"}],
-            "objective_scores": [], "subjective_scores": [],
+            "results": [{"rule_id": rule["rule_id"], "status": "ocr_required"}],
         }) as request_json:
             finished = self._run_next_task()
 
@@ -724,7 +742,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         rule = storage.add_rule(self.app, self.project["project_id"], {"category": "qualification", "title": "有效资质", "source_text": "具备有效资质"})
         storage.confirm_rule_set(self.app, self.project["project_id"])
         storage.create_task(self.app, self.project["project_id"], "evaluate_all")
-        response = {"review_results": [{"rule_id": rule["rule_id"], "status": "satisfied", "evidence": "有效资质", "reason": "已提供", "risk_level": "low"}], "objective_scores": [], "subjective_scores": []}
+        response = {"results": [{"rule_id": rule["rule_id"], "status": "satisfied", "evidence": "有效资质", "reason": "已提供", "risk_level": "low"}]}
         with patch("dashboard.evaluation_workbench.worker.request_json", return_value=response):
             self._run_next_task()
 

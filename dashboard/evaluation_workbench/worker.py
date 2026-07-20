@@ -784,26 +784,80 @@ def _score_result_from_model(rule_id: str, suggested: float | None, max_score: f
             "review_reason": "" if auto_ready else "未得到高置信、可引用的建议分，需人工复核。"}
 
 
-def _combined_evaluation_prompt(app, document: dict, review_payload: list[dict], objective_payload: list[dict],
-                                 subjective_payload: list[dict], text: str, *, compact: bool) -> str:
-    limits = (
-        "每条 evidence 最多 60 个字符、reason 最多 50 个字符；证据不足时返回空字符串，不得解释输出格式。"
-        if compact else
-        "每条 evidence 最多 140 个字符、reason 最多 100 个字符；证据不足时简要说明，不得复述整段原文。"
-    )
-    return storage.render_prompt_template(app, "evaluate_all_user", retry_note="这是针对格式异常的紧凑重试，" if compact else "", limits=limits,
-                                          review_rules=json.dumps(review_payload, ensure_ascii=False, separators=(",", ":")),
-                                          objective_rules=json.dumps(objective_payload, ensure_ascii=False, separators=(",", ":")),
-                                          subjective_rules=json.dumps(subjective_payload, ensure_ascii=False, separators=(",", ":")),
-                                          document_name=document["original_name"], bidder_name=document["bidder_name"] or "未填写", text=text)
-
-
 def _is_invalid_json_model_response(exc: ValueError) -> bool:
     return str(exc).startswith("模型未返回有效 JSON")
 
 
+EVALUATION_BATCH_SIZES = {"review": 8, "objective": 8, "subjective": 6}
+
+
+def _rule_batches(rules: list[dict], size: int) -> list[list[dict]]:
+    return [rules[index:index + size] for index in range(0, len(rules), size)]
+
+
+def _combined_batch_prompt(app, component: str, document: dict, payload: list[dict], text: str, *, compact: bool) -> str:
+    template_id = f"evaluate_all_{component}_user"
+    return storage.render_prompt_template(
+        app, template_id, rules=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        document_name=document["original_name"], bidder_name=document["bidder_name"] or "未填写", text=text,
+        retry_note="这是针对格式异常的紧凑重试，" if compact else "",
+    )
+
+
+def _combined_batch_payload(component: str, rules: list[dict]) -> list[dict]:
+    if component == "review":
+        return [{"rule_id": item["rule_id"], "category": item["category"], "title": item["title"],
+                 "check_rule": item.get("check_rule") or item["title"], "source_text": item["source_text"],
+                 "ocr_required": item.get("check_mode") == "ocr"} for item in rules]
+    return _score_payload(rules)
+
+
+def _combined_batch_results(component: str, output: object, rules: list[dict], payload: list[dict]) -> list[dict]:
+    if component == "review":
+        return _normalise_review_results(output, rules)
+    return _normalise_score_results(output, payload, component)
+
+
+def _run_combined_batch(app, task: dict, profile: dict, document: dict, component: str, rules: list[dict],
+                        system_prompt: str, char_limit: int, label: str, depth: int = 0) -> tuple[list[dict], int, int, str]:
+    """运行一个可独立保存的综合评审规则组；异常时仅拆分当前组。"""
+    payload = _combined_batch_payload(component, rules)
+    context = build_rule_context(document["parsed_path"], rules, char_limit)
+    thinking_mode = "disabled" if component == "objective" else "adaptive"
+    try:
+        parsed = _request_task_json(
+            app, task, profile, f"evaluate_all_{component}_batch", system_prompt,
+            _combined_batch_prompt(app, component, document, payload, context["text"], compact=False),
+            document_id=document["document_id"], context_mode=f"{label}:{context['mode']}",
+            max_tokens=_output_token_budget(profile, max(1_200, 500 + len(rules) * 260)), thinking_mode=thinking_mode,
+        )
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list):
+            raise ValueError("模型返回格式不符合综合评审要求")
+        return _combined_batch_results(component, parsed["results"], rules, payload), 0, 0, context["mode"]
+    except ValueError as exc:
+        if not _is_invalid_json_model_response(exc):
+            raise
+        if len(rules) > 1 and depth < 3:
+            storage.update_task(app, task["task_id"], message=f"{label} 返回格式异常，正在仅拆分该规则组重试")
+            midpoint = max(1, len(rules) // 2)
+            left = _run_combined_batch(app, task, profile, document, component, rules[:midpoint], system_prompt, char_limit, f"{label}/拆分1", depth + 1)
+            right = _run_combined_batch(app, task, profile, document, component, rules[midpoint:], system_prompt, char_limit, f"{label}/拆分2", depth + 1)
+            return left[0] + right[0], left[1] + right[1], left[2] + right[2] + 1, "split"
+        storage.update_task(app, task["task_id"], message=f"{label} 返回格式异常，正在紧凑 JSON 重试")
+        retry_context = build_rule_context(document["parsed_path"], rules, min(char_limit, 120_000))
+        parsed = _request_task_json(
+            app, task, profile, f"evaluate_all_{component}_compact_retry", system_prompt,
+            _combined_batch_prompt(app, component, document, payload, retry_context["text"], compact=True),
+            document_id=document["document_id"], context_mode=f"{label}_compact:{retry_context['mode']}",
+            max_tokens=_output_token_budget(profile, max(1_500, 600 + len(rules) * 280)), thinking_mode=thinking_mode,
+        )
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list):
+            raise ValueError("模型返回格式不符合综合评审要求")
+        return _combined_batch_results(component, parsed["results"], rules, payload), 1, 0, retry_context["mode"]
+
+
 def _evaluate_all(app, task: dict) -> dict:
-    """可选的综合评审：每份投标文件仅发送一次正文，原有结果表分别落库。"""
+    """综合评审按规则小组运行并立即落库，避免单次混合 JSON 过大。"""
     rule_set, all_rules = storage.list_rules(app, task["project_id"])
     if not rule_set or rule_set["status"] != "confirmed":
         raise ValueError("请先确认当前评审规则集，再开始综合评审")
@@ -820,19 +874,15 @@ def _evaluate_all(app, task: dict) -> dict:
     review_run = storage.create_review_run(app, task["project_id"], task["task_id"], profile["profile_id"]) if review_rules else None
     objective_run = storage.create_score_run(app, task["project_id"], task["task_id"], "objective", profile["profile_id"]) if objective_rules else None
     subjective_run = storage.create_score_run(app, task["project_id"], task["task_id"], "subjective", profile["profile_id"]) if subjective_rules else None
-    review_payload = [{"rule_id": item["rule_id"], "category": item["category"], "title": item["title"],
-                       "check_rule": item.get("check_rule") or item["title"], "source_text": item["source_text"],
-                       "ocr_required": item.get("check_mode") == "ocr"} for item in review_rules]
-    objective_payload = _score_payload(objective_rules)
-    subjective_payload = _score_payload(subjective_rules)
     expected_rule_ids = {
         "review": {item["rule_id"] for item in review_rules},
         "objective": {item["rule_id"] for item in objective_rules},
         "subjective": {item["rule_id"] for item in subjective_rules},
     }
     system_prompt = _system_prompt(app, "evaluate_all")
-    compact_retry_count = 0
+    compact_retry_count = split_retry_count = 0
     reused_document_count = 0
+    batch_count = 0
     for index, document in enumerate(documents, start=1):
         storage.update_task(app, task["task_id"], progress=int((index - 1) * 100 / len(documents)), message=f"正在综合评审 {index}/{len(documents)}：{document['bidder_name'] or document['original_name']}")
         reusable = storage.reusable_evaluation_document_results(
@@ -847,38 +897,27 @@ def _evaluate_all(app, task: dict) -> dict:
                 storage.save_score_results(app, subjective_run["score_run_id"], document["document_id"], reusable["subjective"])
             reused_document_count += 1
             continue
-        context = build_rule_context(document["parsed_path"], all_rules, char_limit)
-        text = context["text"]
-        user_prompt = _combined_evaluation_prompt(app, document, review_payload, objective_payload, subjective_payload, text, compact=False)
-        try:
-            parsed = _request_task_json(app, task, profile, "evaluate_all", system_prompt, user_prompt,
-                                        document_id=document["document_id"], context_mode=context["mode"],
-                                        max_tokens=_output_token_budget(profile, 900 + len(all_rules) * 240))
-        except ValueError as exc:
-            if not _is_invalid_json_model_response(exc):
-                raise
-            compact_retry_count += 1
-            storage.update_task(app, task["task_id"], message=f"{document['bidder_name'] or document['original_name']} 返回格式异常，正在紧凑重试")
-            retry_context = build_rule_context(document["parsed_path"], all_rules, min(char_limit, 160_000))
-            retry_prompt = _combined_evaluation_prompt(
-                app, document, review_payload, objective_payload, subjective_payload, retry_context["text"], compact=True,
-            )
-            parsed = _request_task_json(app, task, profile, "evaluate_all_compact_retry", system_prompt, retry_prompt,
-                                        document_id=document["document_id"], context_mode=retry_context["mode"],
-                                        max_tokens=_output_token_budget(profile, 700 + len(all_rules) * 180))
-        if not isinstance(parsed, dict):
-            raise ValueError("模型返回格式不符合综合评审要求")
-        if review_run:
-            storage.save_review_results(app, review_run["review_run_id"], document["document_id"], _normalise_review_results(parsed.get("review_results"), review_rules))
-        if objective_run:
-            storage.save_score_results(app, objective_run["score_run_id"], document["document_id"], _normalise_score_results(parsed.get("objective_scores"), objective_payload, "objective"))
-        if subjective_run:
-            storage.save_score_results(app, subjective_run["score_run_id"], document["document_id"], _normalise_score_results(parsed.get("subjective_scores"), subjective_payload, "subjective"))
+        components = (("review", review_rules, review_run), ("objective", objective_rules, objective_run), ("subjective", subjective_rules, subjective_run))
+        for component, component_rules, run in components:
+            for group_index, group in enumerate(_rule_batches(component_rules, EVALUATION_BATCH_SIZES[component]), start=1):
+                label = f"{document['bidder_name'] or document['original_name']}·{component} 第{group_index}组"
+                storage.update_task(app, task["task_id"], message=f"正在综合评审：{label}")
+                results, compact_count, split_count, _ = _run_combined_batch(
+                    app, task, profile, document, component, group, system_prompt, char_limit, label,
+                )
+                # 每个规则组成功后立即持久化；后续组失败也不会丢失已完成组。
+                if component == "review" and run:
+                    storage.save_review_results(app, run["review_run_id"], document["document_id"], results)
+                elif run:
+                    storage.save_score_results(app, run["score_run_id"], document["document_id"], results)
+                compact_retry_count += compact_count
+                split_retry_count += split_count
+                batch_count += 1
     return {"review_run_id": review_run["review_run_id"] if review_run else None, "objective_run_id": objective_run["score_run_id"] if objective_run else None,
             "subjective_run_id": subjective_run["score_run_id"] if subjective_run else None, "document_count": len(documents),
             "reused_document_count": reused_document_count, "model_document_count": len(documents) - reused_document_count,
             "rule_count": len(all_rules), "profile": profile["display_name"], "compact_retry_count": compact_retry_count,
-            "prompt_version": PROMPT_VERSION}
+            "split_retry_count": split_retry_count, "batch_count": batch_count, "prompt_version": PROMPT_VERSION}
 
 
 def run_task(app, task: dict) -> None:
