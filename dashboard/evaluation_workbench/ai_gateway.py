@@ -25,7 +25,17 @@ def _decode_json_content(content) -> dict:
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         value = "\n".join(lines).strip()
-    parsed = json.loads(value)
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as original_error:
+        # 少量兼容接口仍可能在 JSON 前后附带简短说明；仅在能完整定位对象时兜底解析。
+        start, end = value.find("{"), value.rfind("}")
+        if start < 0 or end <= start:
+            raise original_error
+        try:
+            parsed = json.loads(value[start:end + 1])
+        except json.JSONDecodeError:
+            raise original_error
     if not isinstance(parsed, dict):
         raise ValueError("模型返回的 JSON 顶层必须是对象")
     return parsed
@@ -67,6 +77,26 @@ def _thinking_payload(profile: dict) -> dict | None:
     return None
 
 
+def _is_minimax_m3(profile: dict) -> bool:
+    return (
+        "api.minimaxi.com" in str(profile.get("base_url") or "").lower()
+        and str(profile.get("model_name") or "").lower() == "minimax-m3"
+    )
+
+
+def _invalid_json_error(content, finish_reason) -> str:
+    """返回不含模型正文的诊断，便于排查而不留存招标文件或模型原文。"""
+    details = []
+    if str(finish_reason or "").lower() in {"length", "max_tokens"}:
+        details.append("模型输出达到长度上限，JSON 可能未完整返回")
+    if isinstance(content, str):
+        stripped = content.lstrip().lower()
+        if stripped.startswith("<think>") and "</think>" not in stripped:
+            details.append("模型思考内容未闭合，最终 JSON 未完整返回")
+    suffix = f"（{'；'.join(details)}）" if details else ""
+    return f"模型未返回有效 JSON{suffix}，建议检查模型档案或稍后重试"
+
+
 def _raise_http_error(response, *, operation: str) -> None:
     if response.status_code == 401:
         raise ValueError(
@@ -92,6 +122,9 @@ def request_json(profile: dict, system_prompt: str, user_prompt: str, *, usage_c
     thinking = _thinking_payload(profile)
     if thinking:
         payload["thinking"] = thinking
+    if _is_minimax_m3(profile):
+        # MiniMax M3 将思考内容置于独立字段，content 仅保留最终结构化结论。
+        payload["reasoning_split"] = True
     if max_tokens is not None:
         payload["max_tokens"] = max(16, int(max_tokens))
     try:
@@ -106,14 +139,16 @@ def request_json(profile: dict, system_prompt: str, user_prompt: str, *, usage_c
     if not response.ok:
         _raise_http_error(response, operation="模型请求失败")
     body = response.json()
-    try:
-        content = body["choices"][0]["message"]["content"]
-        result = _decode_json_content(content)
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-        raise ValueError("模型未返回有效 JSON，建议检查模型档案或稍后重试") from exc
     if usage_callback:
         usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
         usage_callback(usage)
+    try:
+        choice = body["choices"][0]
+        content = choice["message"]["content"]
+        result = _decode_json_content(content)
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError, ValueError) as exc:
+        finish_reason = choice.get("finish_reason") if isinstance(locals().get("choice"), dict) else None
+        raise ValueError(_invalid_json_error(locals().get("content"), finish_reason)) from exc
     return result
 
 
@@ -131,6 +166,8 @@ def test_connection(profile: dict) -> str:
     thinking = _thinking_payload(profile)
     if thinking:
         payload["thinking"] = thinking
+    if _is_minimax_m3(profile):
+        payload["reasoning_split"] = True
     try:
         response = requests.post(
             f"{profile['base_url'].rstrip('/')}/chat/completions",

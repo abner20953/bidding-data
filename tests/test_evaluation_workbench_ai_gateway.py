@@ -33,6 +33,11 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
 
         self.assertEqual(decoded, {"rules": []})
 
+    def test_json_decoder_recovers_object_after_a_short_non_json_prefix(self):
+        decoded = _decode_json_content('提取结果如下：{"rules": []}')
+
+        self.assertEqual(decoded, {"rules": []})
+
     def test_connection_explains_authentication_failure_without_echoing_response(self):
         response = Mock(ok=False, status_code=401, text='{"error":"invalid api key"}')
         with patch("dashboard.evaluation_workbench.ai_gateway.requests.post", return_value=response):
@@ -63,6 +68,18 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
             test_connection(profile)
 
         self.assertEqual(post.call_args.kwargs["json"]["thinking"], {"type": "adaptive"})
+        self.assertTrue(post.call_args.kwargs["json"]["reasoning_split"])
+
+    def test_minimax_m3_separates_reasoning_when_thinking_uses_default_mode(self):
+        response = Mock(ok=True)
+        response.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        profile = self._profile(
+            base_url="https://api.minimaxi.com/v1", model_name="MiniMax-M3", thinking_mode="default"
+        )
+        with patch("dashboard.evaluation_workbench.ai_gateway.requests.post", return_value=response) as post:
+            test_connection(profile)
+
+        self.assertTrue(post.call_args.kwargs["json"]["reasoning_split"])
 
     def test_minimax_m2_omits_unsupported_disabled_thinking_parameter(self):
         response = Mock(ok=True)
