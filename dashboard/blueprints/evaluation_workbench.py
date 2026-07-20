@@ -17,7 +17,7 @@ from dashboard.evaluation_workbench.ai_gateway import test_connection
 
 
 evaluation_workbench_bp = Blueprint("evaluation_workbench", __name__)
-TASK_PROMPT_VERSION = "token-optimized-v3"
+TASK_PROMPT_VERSION = "fulltext-accuracy-v1"
 MODEL_CONFIGURATION_PASSWORD = "108"
 
 
@@ -253,7 +253,7 @@ def tasks_api(project_id):
             return jsonify({"error": "请先确认至少一条可执行的审查或评分规则"}), 400
     try:
         requested_profile_id = data.get("profile_id") or storage.default_model_profile_id(current_app)
-        payload = {"profile_id": requested_profile_id}
+        payload = {"profile_id": requested_profile_id, "prompt_version": TASK_PROMPT_VERSION}
         if task_type in {"compare_documents", "extract_rules", "review_documents", "score_objective", "score_subjective", "evaluate_all"}:
             payload["input_fingerprint"] = storage.task_input_fingerprint(
                 current_app, project_id, task_type, requested_profile_id, TASK_PROMPT_VERSION,

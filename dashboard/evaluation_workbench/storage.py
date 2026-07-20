@@ -1475,15 +1475,27 @@ def latest_review_results(app, project_id: str) -> tuple[dict | None, list[dict]
 
 
 def reusable_evaluation_document_results(app, project_id: str, rule_set_id: str, profile_id: str,
-                                         document_id: str, expected_rule_ids: dict[str, set[str]]) -> dict[str, list[dict]] | None:
+                                         document_id: str, expected_rule_ids: dict[str, set[str]],
+                                         prompt_version: str | None = None) -> dict[str, list[dict]] | None:
     """查找同规则、同模型下已完成任务的单份投标文件结果，用于增量评审。"""
     with connection(app) as conn:
         tasks = conn.execute(
-            """SELECT task_id FROM ew_tasks WHERE project_id=? AND task_type='evaluate_all' AND status='success'
+            """SELECT task_id, payload_json, result_json FROM ew_tasks WHERE project_id=? AND task_type='evaluate_all' AND status='success'
                ORDER BY finished_at DESC LIMIT 20""",
             (project_id,),
         ).fetchall()
         for task in tasks:
+            if prompt_version:
+                try:
+                    payload = json.loads(task["payload_json"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    payload = {}
+                try:
+                    task_result = json.loads(task["result_json"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    task_result = {}
+                if payload.get("prompt_version") != prompt_version and task_result.get("prompt_version") != prompt_version:
+                    continue
             copied: dict[str, list[dict]] = {}
             valid = True
             for component, rule_ids in expected_rule_ids.items():

@@ -12,7 +12,7 @@ from werkzeug.security import generate_password_hash
 from dashboard.blueprints.evaluation_workbench import create_worker_app, evaluation_workbench_bp
 from dashboard.evaluation_workbench import storage, worker
 from dashboard.evaluation_workbench.collusion_signals import build_cross_bid_analysis
-from dashboard.evaluation_workbench.prompt_context import build_rule_context
+from dashboard.evaluation_workbench.prompt_context import _anchors, build_rule_context, select_rule_chunks, split_full_text_chunks
 
 
 class EvaluationWorkbenchTests(unittest.TestCase):
@@ -619,6 +619,29 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("营业执照", context["text"])
         self.assertNotIn("[第3页]", context["text"])
 
+    def test_performance_rule_keeps_short_section_anchors_and_selects_performance_pages(self):
+        parsed = self.temp_dir / "performance-pages.txt"
+        parsed.write_text(
+            "[第1页]\n目录：近年的类似项目情况表见第10页。\n\n"
+            "[第2页]\n响应函。\n\n"
+            "[第10页]\n近年的类似项目情况表\n项目名称：无人机航测项目\n发包人：甲单位\n合同价格：59000元。\n",
+            encoding="utf-8",
+        )
+        rule = {
+            "rule_id": "performance",
+            "title": "商务业绩按数量计分",
+            "check_rule": "统计投标截止日期三个年度内同类型项目业绩数量，每个得3分，最高9分。",
+            "source_text": "同类型项目业绩每有一个得3分，最高9分",
+        }
+
+        chunks = split_full_text_chunks(parsed, target_chars=90, overlap_pages=0)
+
+        self.assertIn("业绩", _anchors(rule))
+        self.assertIn("类似项目", _anchors(rule))
+        selected = select_rule_chunks(chunks, [rule])
+        self.assertTrue(selected)
+        self.assertTrue(any("类似项目情况表" in item["text"] for item in chunks if item["chunk_id"] in selected))
+
     def test_combined_evaluation_persists_original_three_result_types(self):
         self._add_pdf("tender.pdf", "tender", "", "投标人具备资质得5分，技术方案满分10分。")
         self._add_pdf("bid.pdf", "bid", "甲公司", "本公司具备资质，技术方案完整。")
@@ -650,6 +673,64 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(request_json.call_args_list[0].args[0]["thinking_mode"], "adaptive")
         self.assertEqual(request_json.call_args_list[1].args[0]["thinking_mode"], "disabled")
         self.assertEqual(request_json.call_args_list[2].args[0]["thinking_mode"], "adaptive")
+
+    def test_long_document_is_fully_scanned_before_rule_group_synthesis(self):
+        self._add_pdf("bid.pdf", "bid", "甲公司", "近年的类似项目情况表：项目一。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "商务业绩按数量计分",
+            "check_rule": "每个同类型项目得3分，最高9分。",
+            "source_text": "每个同类型项目得3分，最高9分。",
+            "scoring": {"kind": "manual", "max_score": 9},
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        with patch.object(worker, "FULL_SCAN_THRESHOLD_CHARS", 1), patch.object(worker, "FULL_SCAN_CHUNK_CHARS", 100_000), patch(
+            "dashboard.evaluation_workbench.worker.request_json",
+            side_effect=[
+                {"findings": [{"rule_id": rule["rule_id"], "evidence": "项目一", "page_hint": "1", "observation": "发现一项业绩", "matched_count": 1}]},
+                {"results": [{"rule_id": rule["rule_id"], "suggested_score": 3, "matched_count": 1,
+                              "evidence_items": [{"name": "项目一", "page_hint": "1", "validity": "valid", "reason": "同类型"}],
+                              "calculation": "1项×3分=3分", "reason": "建议得3分", "confidence": "high"}]},
+            ],
+        ) as request_json:
+            finished = self._run_next_task()
+
+        _, results = storage.latest_score_results(self.app, self.project["project_id"], "objective")
+        self.assertEqual(finished["status"], "success")
+        self.assertEqual(finished["result"]["full_scan_document_count"], 1)
+        self.assertEqual(finished["result"]["full_scan_batch_count"], 1)
+        self.assertEqual(request_json.call_count, 2)
+        self.assertIn("全文覆盖扫描", request_json.call_args_list[0].args[2])
+        self.assertEqual(results[0]["suggested_score"], 3.0)
+        self.assertIn("AI共识别1项", results[0]["evidence"])
+        self.assertIn("项目一", results[0]["evidence"])
+        self.assertIn("1项×3分=3分", results[0]["reason"])
+
+    def test_manual_objective_score_can_be_calculated_from_matched_count(self):
+        payload = [{
+            "rule_id": "performance", "title": "业绩评分", "check_rule": "每个业绩得3分，最高9分",
+            "source_text": "每个业绩得3分，最高9分", "scoring": {"kind": "manual", "max_score": 9},
+        }]
+
+        results = worker._normalise_score_results(
+            [{"rule_id": "performance", "matched_count": 2, "evidence": "项目甲、项目乙", "reason": "均为同类项目"}],
+            payload, "objective",
+        )
+
+        self.assertEqual(results[0]["suggested_score"], 6.0)
+        self.assertIn("AI共识别2项", results[0]["evidence"])
+
+    def test_full_text_entity_candidates_keep_page_for_second_pass(self):
+        candidates = worker._local_entity_candidates([{
+            "chunk_id": "chunk_1",
+            "text": "[第7页]\n项目名称：临汾市无人机航测项目\n供应商：示例科技有限公司\n",
+        }])
+
+        self.assertTrue(any(item["kind"] == "项目名称" and item["page_hint"] == "7" for item in candidates))
+        self.assertTrue(any(item["kind"] == "公司名称" and item["page_hint"] == "7" for item in candidates))
+        self.assertTrue(any(item["kind"] == "地区名称" and item["value"] == "临汾市" for item in candidates))
 
     def test_combined_evaluation_splits_review_rules_into_small_groups(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "投标文件包含全部承诺。")
@@ -789,7 +870,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.add_rule(self.app, self.project["project_id"], {"category": "objective", "title": "资质得分", "source_text": "资质得5分", "scoring": {"kind": "boolean", "max_score": 5}})
         storage.add_rule(self.app, self.project["project_id"], {"category": "subjective", "title": "技术方案", "source_text": "技术方案满分10分", "scoring": {"max_score": 10}})
         storage.confirm_rule_set(self.app, self.project["project_id"])
-        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "token-optimized-v3")
+        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "fulltext-accuracy-v1")
         prior = storage.create_task(self.app, self.project["project_id"], "evaluate_all", {"profile_id": None, "input_fingerprint": fingerprint})
         storage.update_task(self.app, prior["task_id"], status="success", result={"cached": True})
 
@@ -853,6 +934,39 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(finished["result"]["model_document_count"], 1)
         self.assertEqual(request_json.call_count, 1)
         self.assertEqual(len(reviews), 2)
+
+    def test_combined_evaluation_does_not_reuse_results_from_old_prompt_version(self):
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "甲公司具备有效资质。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "有效资质", "source_text": "具备有效资质",
+        })
+        rule_set = storage.confirm_rule_set(self.app, self.project["project_id"])
+        profile = storage.get_model_profile(self.app, None)
+        old_task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        old_run = storage.create_review_run(self.app, self.project["project_id"], old_task["task_id"], profile["profile_id"])
+        storage.save_review_results(self.app, old_run["review_run_id"], document["document_id"], [{
+            "rule_id": rule["rule_id"], "status": "manual", "reason": "旧版未定位到上下文",
+        }])
+        storage.update_task(self.app, old_task["task_id"], status="success", result={
+            "review_run_id": old_run["review_run_id"], "prompt_version": "token-optimized-v3",
+            "rule_set_id": rule_set["rule_set_id"],
+        })
+        storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        response = {"results": [{
+            "rule_id": rule["rule_id"], "status": "satisfied", "evidence": "有效资质",
+            "reason": "全文确认已提供", "risk_level": "low",
+        }]}
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value=response) as request_json:
+            finished = self._run_next_task()
+
+        _, reviews = storage.latest_review_results(self.app, self.project["project_id"])
+        self.assertEqual(finished["result"]["reused_document_count"], 0)
+        self.assertEqual(finished["result"]["model_document_count"], 1)
+        self.assertEqual(request_json.call_count, 1)
+        self.assertEqual(reviews[0]["status"], "satisfied")
 
     def test_rule_extraction_does_not_hard_filter_model_returned_rules(self):
         self._add_pdf("tender.pdf", "tender", "", "资格审查和评分标准。")
