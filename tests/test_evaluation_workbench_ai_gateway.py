@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import Mock, patch
 
-from dashboard.evaluation_workbench.ai_gateway import test_connection
+from dashboard.evaluation_workbench.ai_gateway import _decode_json_content, test_connection
 
 
 class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
@@ -25,6 +25,13 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
                 test_connection(self._profile(_api_key="测试-key"))
 
         post.assert_not_called()
+
+    def test_json_decoder_ignores_minimax_thinking_block_before_json(self):
+        content = '<think>先分析规则与招标文件的对应关系。</think>\n\n```json\n{"rules": []}\n```'
+
+        decoded = _decode_json_content(content)
+
+        self.assertEqual(decoded, {"rules": []})
 
     def test_connection_explains_authentication_failure_without_echoing_response(self):
         response = Mock(ok=False, status_code=401, text='{"error":"invalid api key"}')

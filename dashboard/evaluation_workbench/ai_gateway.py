@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 import requests
 
@@ -14,6 +15,9 @@ def _decode_json_content(content) -> dict:
     if not isinstance(content, str):
         raise ValueError("模型响应正文为空")
     value = content.strip()
+    # MiniMax 在开启 thinking 时会将 <think>...</think> 放在 content 前面；
+    # 评标任务只解析其后的结构化结论，不保存或展示思考过程。
+    value = re.sub(r"^\s*<think>.*?</think>\s*", "", value, count=1, flags=re.IGNORECASE | re.DOTALL)
     if value.startswith("```"):
         lines = value.splitlines()
         if lines and lines[0].lstrip().startswith("```"):
