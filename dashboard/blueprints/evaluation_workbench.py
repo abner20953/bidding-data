@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import hmac
 import subprocess
 import sys
 import time
@@ -39,7 +40,16 @@ def _json_body() -> dict:
 
 
 def _new_project_password_is_valid(value: object) -> tuple[bool, str | None]:
-    """校验新建项目口令；口令本身只允许通过运行环境提供。"""
+    """校验新建项目口令；口令只从运行环境读取。"""
+    configured_plaintext = (
+        current_app.config.get("EVALUATION_WORKBENCH_NEW_PROJECT_PASSWORD")
+        or os.environ.get("EVALUATION_WORKBENCH_NEW_PROJECT_PASSWORD")
+    )
+    if configured_plaintext:
+        if not isinstance(value, str) or not hmac.compare_digest(value, str(configured_plaintext)):
+            return False, "新建项目口令错误"
+        return True, None
+
     configured_hash = (
         current_app.config.get("EVALUATION_WORKBENCH_NEW_PROJECT_PASSWORD_HASH")
         or os.environ.get("EVALUATION_WORKBENCH_NEW_PROJECT_PASSWORD_HASH")

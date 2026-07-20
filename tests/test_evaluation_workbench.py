@@ -105,6 +105,16 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(rejected.status_code, 403)
         self.assertEqual(accepted.status_code, 201)
 
+    def test_create_project_supports_plaintext_runtime_password(self):
+        client = self.app.test_client()
+        self.app.config["EVALUATION_WORKBENCH_NEW_PROJECT_PASSWORD"] = "plain-runtime-password"
+
+        rejected = client.post("/api/evaluation-workbench/projects", json={"name": "新项目", "password": "incorrect"})
+        accepted = client.post("/api/evaluation-workbench/projects", json={"name": "新项目", "password": "plain-runtime-password"})
+
+        self.assertEqual(rejected.status_code, 403)
+        self.assertEqual(accepted.status_code, 201)
+
     def test_multi_pdf_compare_creates_one_pair_result(self):
         self._add_pdf("tender.pdf", "tender", "", "采购需求：稳定运行。")
         self._add_pdf("bid-a.pdf", "bid", "甲公司", "技术方案：稳定运行，提供培训。")

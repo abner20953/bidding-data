@@ -18,9 +18,11 @@ import hashlib
 import json
 import copy
 import subprocess
+from dotenv import load_dotenv
 
 # 配置目录
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, '..', '.env'))
 RESULTS_DIR = os.path.join(BASE_DIR, '..', 'results')
 # 统一的数据库数据目录
 DATA_DIR = os.path.join(BASE_DIR, '..', 'data')
