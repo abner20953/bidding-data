@@ -74,6 +74,30 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "必须填写投标人名称"):
             self._add_pdf("bid.pdf", "bid", "  ", "技术方案：稳定运行。")
 
+    def test_full_scan_checkpoint_is_reusable_by_chunk_hash(self):
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案：稳定运行。")
+        findings = [{"rule_id": "rule-1", "chunk_id": "chunk_1", "evidence": "技术方案", "page_hint": "1"}]
+
+        storage.save_evaluation_scan_checkpoint(
+            self.app, self.project["project_id"], document["document_id"], "scan-v2", "chunk_1", "content-hash", findings,
+        )
+
+        self.assertEqual(
+            storage.get_evaluation_scan_checkpoint(self.app, document["document_id"], "scan-v2", "chunk_1", "content-hash"),
+            findings,
+        )
+        self.assertIsNone(storage.get_evaluation_scan_checkpoint(self.app, document["document_id"], "scan-v2", "chunk_1", "changed"))
+
+    def test_compact_full_scan_matches_are_normalised(self):
+        findings = worker._normalise_scan_findings(
+            [["rule-1", "7", "类似项目合同", "supports"]], {"rule-1"},
+            {"chunk_id": "chunk_1", "start_page": 7, "end_page": 7},
+        )
+
+        self.assertEqual(findings[0]["rule_id"], "rule-1")
+        self.assertEqual(findings[0]["page_hint"], "7")
+        self.assertEqual(findings[0]["tentative_status"], "supports")
+
     def test_parse_task_reuses_successful_parse_cache(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案：稳定运行。")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
@@ -702,7 +726,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(finished["result"]["full_scan_document_count"], 1)
         self.assertEqual(finished["result"]["full_scan_batch_count"], 1)
         self.assertEqual(request_json.call_count, 2)
-        self.assertIn("全文覆盖扫描", request_json.call_args_list[0].args[2])
+        self.assertIn("全文证据扫描", request_json.call_args_list[0].args[2])
         self.assertEqual(results[0]["suggested_score"], 3.0)
         self.assertIn("AI共识别1项", results[0]["evidence"])
         self.assertIn("项目一", results[0]["evidence"])
@@ -870,7 +894,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.add_rule(self.app, self.project["project_id"], {"category": "objective", "title": "资质得分", "source_text": "资质得5分", "scoring": {"kind": "boolean", "max_score": 5}})
         storage.add_rule(self.app, self.project["project_id"], {"category": "subjective", "title": "技术方案", "source_text": "技术方案满分10分", "scoring": {"max_score": 10}})
         storage.confirm_rule_set(self.app, self.project["project_id"])
-        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "fulltext-accuracy-v1")
+        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "fulltext-mapreduce-v2")
         prior = storage.create_task(self.app, self.project["project_id"], "evaluate_all", {"profile_id": None, "input_fingerprint": fingerprint})
         storage.update_task(self.app, prior["task_id"], status="success", result={"cached": True})
 

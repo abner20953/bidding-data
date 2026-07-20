@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import hashlib
 import json
 import os
 import re
@@ -25,7 +26,7 @@ from dashboard.utils.comparator import CollusionDetector, ComparisonLimitError
 MAX_PARSE_PAGES = 2000
 MAX_PARSED_CHARS = 2_000_000
 MAX_DOCX_XML_BYTES = 50 * 1024 * 1024
-PROMPT_VERSION = "fulltext-accuracy-v1"
+PROMPT_VERSION = "fulltext-mapreduce-v2"
 COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v2"
 COMPARE_AI_BATCH_SIZE = 24
 
@@ -867,8 +868,9 @@ EVALUATION_BATCH_SIZES = {"review": 8, "objective": 8, "subjective": 6}
 # 组发送全文，同样满足全文覆盖。所有索引都只存在于当前工作进程内。
 FULL_SCAN_THRESHOLD_CHARS = 24_000
 FULL_SCAN_CHUNK_CHARS = 11_000
-FULL_SCAN_RULE_BATCH_SIZE = 36
-FULL_SCAN_MIN_SPLIT_CHARS = 3_000
+# 首轮只建立候选证据索引：每个页块携带一次完整的精简规则目录。正常情况下
+# 不再形成“页块 × 规则批次”的矩阵；若模型确实输出超长，才仅拆规则目录一次。
+FULL_SCAN_CATALOG_RULE_CHARS = 220
 # 二次复核上下文上限。全文首轮已覆盖所有页面，此处只装入候选证据和重点原文。
 EVALUATION_BATCH_CONTEXT_CHARS = 72_000
 
@@ -910,20 +912,28 @@ def _combined_batch_payload(component: str, rules: list[dict]) -> list[dict]:
 
 
 def _full_scan_catalog(rules: list[dict]) -> list[dict]:
+    """生成首轮扫描专用的精简规则目录，详细评分规则留给最终汇总阶段。"""
     catalog = []
     for rule in rules:
+        query = re.sub(r"\s+", " ", f"{rule.get('title') or ''}；{rule.get('check_rule') or rule.get('title') or ''}").strip()
         item = {
+            "id": rule["rule_id"],
+            # 保留旧字段，避免用户在提示词配置中保留了旧版 findings 模板时无法对应规则。
             "rule_id": rule["rule_id"],
-            "category": rule["category"],
-            "title": rule["title"],
-            "check_rule": rule.get("check_rule") or rule["title"],
-            "ocr_required": rule.get("check_mode") == "ocr",
+            "q": query[:FULL_SCAN_CATALOG_RULE_CHARS],
+            "type": rule["category"],
         }
-        if rule["category"] in {"objective", "subjective"}:
+        if rule.get("check_mode") == "ocr":
+            item["ocr"] = 1
+        # 对业绩等数量/累计评分项保留极短的计分线索，避免首轮遗漏每一项材料；
+        # 不在此阶段给分或做有效性裁断。
+        if rule["category"] == "objective":
             try:
-                item["scoring"] = json.loads(rule.get("scoring_json") or "{}")
+                scoring = json.loads(rule.get("scoring_json") or "{}")
             except json.JSONDecodeError:
-                item["scoring"] = {}
+                scoring = {}
+            if scoring:
+                item["score_hint"] = json.dumps(scoring, ensure_ascii=False, separators=(",", ":"))[:160]
         catalog.append(item)
     return catalog
 
@@ -937,7 +947,7 @@ def _full_scan_chunk_label(chunk: dict) -> str:
 
 def _full_scan_prompt(app, document: dict, catalog: list[dict], chunk: dict, *, compact: bool) -> str:
     retry_note = (
-        "这是格式异常后的严格 JSON 重试：只输出一个 JSON 对象；每条 finding 的 evidence 和 observation 各限一句；"
+        "这是格式异常后的严格 JSON 重试：只输出一个 JSON 对象；matches 最多 16 条，每段摘录最多 90 字；"
         "不得使用 Markdown、注释或前后说明。\n"
         if compact else ""
     )
@@ -950,27 +960,37 @@ def _full_scan_prompt(app, document: dict, catalog: list[dict], chunk: dict, *, 
 
 
 def _normalise_scan_findings(output: object, allowed_ids: set[str], chunk: dict) -> list[dict]:
+    """兼容新版紧凑数组及用户遗留模板的 findings 对象。"""
     findings = []
     for raw in output if isinstance(output, list) else []:
-        if not isinstance(raw, dict) or raw.get("rule_id") not in allowed_ids:
+        if isinstance(raw, list) and len(raw) >= 4:
+            rule_id, page_hint, evidence, status = raw[:4]
+            observation, needs_ocr, confidence = "", False, "medium"
+        elif isinstance(raw, dict):
+            rule_id = raw.get("rule_id") or raw.get("id")
+            page_hint = raw.get("page_hint") or raw.get("page")
+            evidence = raw.get("evidence") or raw.get("quote")
+            status = raw.get("tentative_status") or raw.get("polarity") or raw.get("status")
+            observation, needs_ocr = raw.get("observation"), raw.get("needs_ocr") is True
+            confidence = raw.get("confidence")
+        else:
             continue
-        status = raw.get("tentative_status")
+        if rule_id not in allowed_ids:
+            continue
         if status not in {"supports", "contradicts", "partial", "suspected"}:
-            status = "suspected"
-        confidence = raw.get("confidence") if raw.get("confidence") in {"high", "medium", "low"} else "medium"
-        suggested = raw.get("suggested_score")
-        matched_count = raw.get("matched_count")
+            status = {"support": "supports", "contradict": "contradicts", "suspect": "suspected"}.get(str(status).lower(), "suspected")
+        confidence = confidence if confidence in {"high", "medium", "low"} else "medium"
         findings.append({
-            "rule_id": raw["rule_id"],
+            "rule_id": rule_id,
             "chunk_id": chunk["chunk_id"],
             "page_range": _full_scan_chunk_label(chunk),
-            "page_hint": _clean_model_text(raw.get("page_hint"))[:80],
-            "evidence": _clean_model_text(raw.get("evidence"))[:700],
-            "observation": _clean_model_text(raw.get("observation"))[:700],
+            "page_hint": _clean_model_text(page_hint)[:80],
+            "evidence": _clean_model_text(evidence)[:360],
+            "observation": _clean_model_text(observation)[:240],
             "tentative_status": status,
-            "matched_count": matched_count if isinstance(matched_count, (int, float)) and not isinstance(matched_count, bool) else None,
-            "suggested_score": suggested if isinstance(suggested, (int, float)) and not isinstance(suggested, bool) else None,
-            "needs_ocr": raw.get("needs_ocr") is True,
+            "matched_count": None,
+            "suggested_score": None,
+            "needs_ocr": needs_ocr,
             "confidence": confidence,
         })
     return findings
@@ -1010,20 +1030,24 @@ def _local_entity_candidates(chunks: list[dict], limit: int = 180) -> list[dict]
 
 
 def _run_full_scan_piece(app, task: dict, profile: dict, document: dict, catalog: list[dict], chunk: dict,
-                         system_prompt: str, depth: int = 0) -> tuple[list[dict], int, int, list[dict]]:
-    """扫描一个连续页块；坏 JSON 时严格重试并仅拆分当前页块。"""
-    allowed_ids = {item["rule_id"] for item in catalog}
-    max_tokens = _output_token_budget(profile, max(3_500, 1_200 + len(catalog) * 140))
+                          system_prompt: str, depth: int = 0) -> tuple[list[dict], int, int, list[dict]]:
+    """扫描一个连续页块；只在输出异常时拆分规则目录，绝不递归重发全文。"""
+    allowed_ids = {item["id"] for item in catalog}
+    # 首轮只是候选索引而非最终结论；固定且较小的输出预算能抑制模型逐条长篇解释。
+    max_tokens = _output_token_budget(profile, min(2_800, max(1_400, 800 + len(catalog) * 28)))
     try:
         parsed = _request_task_json(
             app, task, profile, "evaluate_all_full_scan", system_prompt,
             _full_scan_prompt(app, document, catalog, chunk, compact=False),
             document_id=document["document_id"], context_mode=f"full_scan:{chunk['chunk_id']}",
-            max_tokens=max_tokens, thinking_mode="adaptive",
+            max_tokens=max_tokens, thinking_mode="disabled",
         )
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("findings"), list):
+        values = parsed.get("matches") if isinstance(parsed, dict) else None
+        if values is None and isinstance(parsed, dict):
+            values = parsed.get("findings")  # 兼容用户尚未重置的旧自定义模板。
+        if not isinstance(values, list):
             raise ValueError("模型返回格式不符合全文扫描要求")
-        return _normalise_scan_findings(parsed["findings"], allowed_ids, chunk), 0, 0, []
+        return _normalise_scan_findings(values, allowed_ids, chunk), 0, 0, []
     except ValueError as exc:
         if not _is_model_format_error(exc) and not str(exc).startswith("模型返回格式不符合全文扫描要求"):
             raise
@@ -1035,32 +1059,28 @@ def _run_full_scan_piece(app, task: dict, profile: dict, document: dict, catalog
                 document_id=document["document_id"], context_mode=f"full_scan_compact:{chunk['chunk_id']}",
                 max_tokens=max_tokens, thinking_mode="disabled",
             )
-            if not isinstance(parsed, dict) or not isinstance(parsed.get("findings"), list):
+            values = parsed.get("matches") if isinstance(parsed, dict) else None
+            if values is None and isinstance(parsed, dict):
+                values = parsed.get("findings")
+            if not isinstance(values, list):
                 raise ValueError("模型返回格式不符合全文扫描要求")
-            return _normalise_scan_findings(parsed["findings"], allowed_ids, chunk), 1, 0, []
+            return _normalise_scan_findings(values, allowed_ids, chunk), 1, 0, []
         except ValueError as retry_exc:
             if not _is_model_format_error(retry_exc) and not str(retry_exc).startswith("模型返回格式不符合全文扫描要求"):
                 raise
-            text = str(chunk.get("text") or "")
-            if len(text) > FULL_SCAN_MIN_SPLIT_CHARS * 2 and depth < 3:
-                pieces = _split_rule_extraction_text(text, max(FULL_SCAN_MIN_SPLIT_CHARS, len(text) // 2))
-                if len(pieces) > 1:
-                    all_findings: list[dict] = []
-                    compact_count, split_count, failures = 1, 1, []
-                    for index, piece in enumerate(pieces, start=1):
-                        sub_chunk = {**chunk, "chunk_id": f"{chunk['chunk_id']}.{index}", "text": piece}
-                        result = _run_full_scan_piece(app, task, profile, document, catalog, sub_chunk, system_prompt, depth + 1)
-                        all_findings.extend(result[0])
-                        compact_count += result[1]
-                        split_count += result[2]
-                        failures.extend(result[3])
-                    return all_findings, compact_count, split_count, failures
-            # 不能再拆分时不静默丢页：二次复核会把此页块原文发送给每个规则组。
+            # 输出过长通常来自规则候选太密集，拆规则而非拆页块可避免全文被重复发送。
+            if len(catalog) > 12 and depth < 1:
+                midpoint = len(catalog) // 2
+                storage.update_task(app, task["task_id"], message=f"{document['bidder_name'] or document['original_name']} {_full_scan_chunk_label(chunk)} 扫描输出过长，正在仅拆分规则目录")
+                left = _run_full_scan_piece(app, task, profile, document, catalog[:midpoint], chunk, system_prompt, depth + 1)
+                right = _run_full_scan_piece(app, task, profile, document, catalog[midpoint:], chunk, system_prompt, depth + 1)
+                return left[0] + right[0], left[1] + right[1] + 1, left[2] + right[2] + 1, left[3] + right[3]
+            # 不能再拆分时不静默丢页：最终复核会把此页块原文发送给相关规则组。
             return [], 1, 0, [{**chunk, "scan_error": str(retry_exc)[:300]}]
 
 
 def _scan_document_fulltext(app, task: dict, profile: dict, document: dict, rules: list[dict],
-                            system_prompt: str) -> dict | None:
+                            system_prompt: str, *, progress_offset: int = 0, progress_total: int = 1) -> dict | None:
     try:
         text_length = int(document.get("text_length") or 0)
     except (TypeError, ValueError):
@@ -1073,24 +1093,36 @@ def _scan_document_fulltext(app, task: dict, profile: dict, document: dict, rule
     if not chunks:
         return None
     catalog = _full_scan_catalog(rules)
-    catalog_batches = [catalog[index:index + FULL_SCAN_RULE_BATCH_SIZE] for index in range(0, len(catalog), FULL_SCAN_RULE_BATCH_SIZE)]
+    scan_key = hashlib.sha256(json.dumps({
+        "version": PROMPT_VERSION, "profile": profile.get("profile_id"), "model": profile.get("model_name"),
+        "catalog": catalog, "template": storage.prompt_template(app, "evaluate_all_full_scan_user"),
+    }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
     findings: list[dict] = []
     failed_chunks: list[dict] = []
     compact_retry_count = split_retry_count = 0
-    total = max(1, len(chunks) * len(catalog_batches))
+    total = max(1, len(chunks))
     completed = 0
     for chunk in chunks:
-        for catalog_batch in catalog_batches:
-            completed += 1
-            storage.update_task(
-                app, task["task_id"],
-                message=f"正在全文扫描 {document['bidder_name'] or document['original_name']}：{_full_scan_chunk_label(chunk)}（{completed}/{total}）",
+        completed += 1
+        chunk_hash = hashlib.sha256(str(chunk.get("text") or "").encode("utf-8")).hexdigest()
+        progress = int((progress_offset + completed - 1) * 100 / max(1, progress_total))
+        storage.update_task(
+            app, task["task_id"], progress=progress,
+            message=f"正在全文证据扫描 {document['bidder_name'] or document['original_name']}：{_full_scan_chunk_label(chunk)}（{completed}/{total}）",
+        )
+        checkpoint = storage.get_evaluation_scan_checkpoint(app, document["document_id"], scan_key, chunk["chunk_id"], chunk_hash)
+        if checkpoint is not None:
+            findings.extend(checkpoint)
+            continue
+        result = _run_full_scan_piece(app, task, profile, document, catalog, chunk, system_prompt)
+        findings.extend(result[0])
+        compact_retry_count += result[1]
+        split_retry_count += result[2]
+        failed_chunks.extend(result[3])
+        if not result[3]:
+            storage.save_evaluation_scan_checkpoint(
+                app, task["project_id"], document["document_id"], scan_key, chunk["chunk_id"], chunk_hash, result[0],
             )
-            result = _run_full_scan_piece(app, task, profile, document, catalog_batch, chunk, system_prompt)
-            findings.extend(result[0])
-            compact_retry_count += result[1]
-            split_retry_count += result[2]
-            failed_chunks.extend(result[3])
     return {
         "chunks": chunks,
         "findings": findings,
@@ -1103,9 +1135,44 @@ def _scan_document_fulltext(app, task: dict, profile: dict, document: dict, rule
     }
 
 
+def _full_scan_chunk_count(document: dict) -> int:
+    """返回需要 AI 全文证据扫描的页块数；只在任务启动时短暂读取解析文本。"""
+    try:
+        text_length = int(document.get("text_length") or 0)
+    except (TypeError, ValueError):
+        text_length = 0
+    if text_length <= FULL_SCAN_THRESHOLD_CHARS or not document.get("parsed_path"):
+        return 0
+    return len(split_full_text_chunks(document["parsed_path"], FULL_SCAN_CHUNK_CHARS, overlap_pages=1))
+
+
+def _scan_strategy(rules: list[dict]) -> str:
+    """决定最终汇总优先携带哪类全文证据，不改变用户已确认的评审规则。"""
+    categories = {item.get("category") for item in rules}
+    raw = " ".join(f"{item.get('title', '')} {item.get('check_rule', '')}" for item in rules)
+    if "objective" in categories or any(term in raw for term in ("业绩", "数量", "累计", "每个", "项目数", "得分")):
+        return "counting"
+    if "subjective" in categories or any(term in raw for term in ("技术方案", "实施方案", "服务方案", "组织方案")):
+        return "section"
+    if any(term in raw for term in ("公司名称", "项目名称", "前后", "一致", "无关公司", "无关项目", "全文")):
+        return "consistency"
+    return "point"
+
+
 def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int) -> dict:
     rule_ids = {item["rule_id"] for item in rules}
     findings = [item for item in scan.get("findings", []) if item.get("rule_id") in rule_ids]
+    # 相同规则在同一页块的重复短摘录不重复送入最终模型；数量类保留不同项目名称，
+    # 由最终评分阶段统一去重并解释其有效性。
+    unique_findings, seen = [], set()
+    for item in findings:
+        signature = (item.get("rule_id"), item.get("chunk_id"), re.sub(r"\s+", "", str(item.get("evidence") or ""))[:160])
+        if signature in seen:
+            continue
+        seen.add(signature)
+        unique_findings.append(item)
+    findings = unique_findings
+    strategy = _scan_strategy(rules)
     # 首轮 AI 候选优先，其次用本地章节词加强召回；失败页块始终进入复核。
     selected_ids: list[str] = []
     for finding in findings:
@@ -1113,7 +1180,8 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int) ->
         root_id = chunk_id.split(".", 1)[0]
         if root_id and root_id not in selected_ids:
             selected_ids.append(root_id)
-    for chunk_id in select_rule_chunks(scan.get("chunks", []), rules, per_rule=4):
+    per_rule = 6 if strategy in {"counting", "section"} else 4
+    for chunk_id in select_rule_chunks(scan.get("chunks", []), rules, per_rule=per_rule):
         if chunk_id not in selected_ids:
             selected_ids.append(chunk_id)
     failed_root_ids = []
@@ -1123,7 +1191,8 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int) ->
             failed_root_ids.append(root_id)
         if root_id and root_id not in selected_ids:
             selected_ids.insert(0, root_id)
-    findings_packet = json.dumps(findings[:120], ensure_ascii=False, separators=(",", ":"))
+    findings_limit = 240 if strategy == "counting" else 160
+    findings_packet = json.dumps(findings[:findings_limit], ensure_ascii=False, separators=(",", ":"))
     rule_text = " ".join(f"{item.get('title', '')} {item.get('check_rule', '')} {item.get('source_text', '')}" for item in rules)
     entity_packet = ""
     if any(term in rule_text for term in ("公司名称", "项目名称", "地名", "地区", "无关公司", "无关项目", "全文")):
@@ -1132,7 +1201,7 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int) ->
             + json.dumps(scan.get("entity_candidates", [])[:120], ensure_ascii=False, separators=(",", ":"))
         )
     header = (
-        f"【全文覆盖说明】已按连续页块扫描全文，共 {scan.get('chunk_count', 0)} 个页块；"
+        f"【全文覆盖说明】已按连续页块扫描全文，共 {scan.get('chunk_count', 0)} 个页块；本规则组采用{strategy}汇总策略；"
         f"首轮为当前规则组报告 {len(findings)} 条候选证据。"
         "首轮未报告候选不等于技术失败，应结合规则给出‘全文扫描未发现’或其他最可能建议。"
     )
@@ -1283,10 +1352,11 @@ def _evaluate_all(app, task: dict) -> dict:
         len(_rule_batches(component_rules, EVALUATION_BATCH_SIZES[component]))
         for component, component_rules in (("review", review_rules), ("objective", objective_rules), ("subjective", subjective_rules))
     )
-    total_groups = max(1, len(documents) * groups_per_document)
-    completed_groups = 0
+    scan_units_by_document = {item["document_id"]: _full_scan_chunk_count(item) for item in documents}
+    total_work_units = max(1, sum(scan_units_by_document.values()) + len(documents) * groups_per_document)
+    completed_work_units = 0
     for index, document in enumerate(documents, start=1):
-        storage.update_task(app, task["task_id"], progress=int(completed_groups * 100 / total_groups), message=f"正在综合评审 {index}/{len(documents)}：{document['bidder_name'] or document['original_name']}")
+        storage.update_task(app, task["task_id"], progress=int(completed_work_units * 100 / total_work_units), message=f"正在综合评审 {index}/{len(documents)}：{document['bidder_name'] or document['original_name']}")
         reusable = storage.reusable_evaluation_document_results(
             app, task["project_id"], rule_set["rule_set_id"], profile["profile_id"], document["document_id"], expected_rule_ids,
             PROMPT_VERSION,
@@ -1299,12 +1369,14 @@ def _evaluate_all(app, task: dict) -> dict:
             if subjective_run:
                 storage.save_score_results(app, subjective_run["score_run_id"], document["document_id"], reusable["subjective"])
             reused_document_count += 1
-            completed_groups += groups_per_document
-            storage.update_task(app, task["task_id"], progress=int(completed_groups * 100 / total_groups), message=f"已复用 {document['bidder_name'] or document['original_name']} 的完整评审结果")
+            completed_work_units += scan_units_by_document[document["document_id"]] + groups_per_document
+            storage.update_task(app, task["task_id"], progress=int(completed_work_units * 100 / total_work_units), message=f"已复用 {document['bidder_name'] or document['original_name']} 的完整评审结果")
             continue
         scan_index = _scan_document_fulltext(
             app, task, profile, document, review_rules + objective_rules + subjective_rules, system_prompt,
+            progress_offset=completed_work_units, progress_total=total_work_units,
         )
+        completed_work_units += scan_units_by_document[document["document_id"]]
         if scan_index:
             full_scan_document_count += 1
             full_scan_batch_count += scan_index.get("scan_batch_count", 0)
@@ -1329,8 +1401,8 @@ def _evaluate_all(app, task: dict) -> dict:
                 split_retry_count += split_count
                 manual_fallback_rule_count += fallback_count
                 batch_count += 1
-                completed_groups += 1
-                storage.update_task(app, task["task_id"], progress=int(completed_groups * 100 / total_groups), message=f"已完成综合评审：{label}")
+                completed_work_units += 1
+                storage.update_task(app, task["task_id"], progress=int(completed_work_units * 100 / total_work_units), message=f"已完成综合评审：{label}")
     return {"review_run_id": review_run["review_run_id"] if review_run else None, "objective_run_id": objective_run["score_run_id"] if objective_run else None,
             "subjective_run_id": subjective_run["score_run_id"] if subjective_run else None, "document_count": len(documents),
             "reused_document_count": reused_document_count, "model_document_count": len(documents) - reused_document_count,
