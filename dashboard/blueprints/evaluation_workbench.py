@@ -72,6 +72,13 @@ def _model_configuration_access_error():
     return jsonify({"error": "请先输入配置口令"}), 403
 
 
+def _global_rule_mutation_access_error(data: dict):
+    """通用规则可公开查看，但每次变更都需单独核验口令。"""
+    if hmac.compare_digest(str(data.get("password", "")), MODEL_CONFIGURATION_PASSWORD):
+        return None
+    return jsonify({"error": "新增、修改或删除通用规则前请输入正确口令"}), 403
+
+
 def _project_or_404(project_id: str):
     project = storage.get_project(current_app, project_id)
     if not project:
@@ -337,12 +344,13 @@ def update_prompt_template_api(template_id):
 @evaluation_workbench_bp.route("/api/evaluation-workbench/global-rules", methods=["GET", "POST"])
 def global_rules_api():
     _init()
-    access_error = _model_configuration_access_error()
-    if access_error:
-        return access_error
     try:
         if request.method == "POST":
-            return jsonify({"rule": storage.create_global_rule(current_app, _json_body())}), 201
+            data = _json_body()
+            access_error = _global_rule_mutation_access_error(data)
+            if access_error:
+                return access_error
+            return jsonify({"rule": storage.create_global_rule(current_app, data)}), 201
         return jsonify({"rules": storage.list_global_rules(current_app)})
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
@@ -351,14 +359,15 @@ def global_rules_api():
 @evaluation_workbench_bp.route("/api/evaluation-workbench/global-rules/<global_rule_id>", methods=["PATCH", "DELETE"])
 def update_global_rule_api(global_rule_id):
     _init()
-    access_error = _model_configuration_access_error()
+    data = _json_body()
+    access_error = _global_rule_mutation_access_error(data)
     if access_error:
         return access_error
     try:
         if request.method == "DELETE":
             storage.delete_global_rule(current_app, global_rule_id)
             return jsonify({"status": "success"})
-        return jsonify({"rule": storage.update_global_rule(current_app, global_rule_id, _json_body())})
+        return jsonify({"rule": storage.update_global_rule(current_app, global_rule_id, data)})
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 

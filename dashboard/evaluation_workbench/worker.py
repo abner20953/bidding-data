@@ -326,6 +326,24 @@ def _rule_source_excerpt(text: str, budget: int) -> str:
     return selected[:budget] if selected else text[:budget]
 
 
+def _rule_extraction_prompt(text: str, *, compact: bool) -> str:
+    limits = (
+        "这是格式异常后的紧凑重试。最多返回 30 条规则；title 最多 30 字，check_rule 最多 90 字，source_text 最多 120 字。"
+        if compact else
+        "最多返回 45 条规则；title 最多 40 字，check_rule 最多 140 字，source_text 最多 220 字。"
+    )
+    return f"""请从以下招标文件原文提取可由 AI 审查的评标规则，只返回一个合法 JSON 对象：
+{{"rules":[{{"category":"qualification|compliance|substantive|rejection|objective|subjective","title":"简明规则名称","check_rule":"面向投标文件的明确检查指令","source_text":"招标原文短摘录","ocr_required":false,"scoring":{{"max_score":数字,"kind":"boolean|manual"}} }}]}}
+
+严格要求：不得使用 Markdown 或在 JSON 前后添加说明；不得逐条复述招标原文；同类要求合并为一条规则。{limits}
+只保留能通过已上传投标文件中可检索的文字、表格或元数据核验的事项，规则必须明确且能据文件内容判断。不要输出密封与递交要求、响应文件份数或电子版要求、递交地点/时间、开标现场、线下原件、纸质材料、投标文件本身无法体现的签收事项，以及其他无法仅凭投标文件核验的事项。若规则的关键证据只能依赖扫描图片、证照图片、签章或手写内容识别，请将 ocr_required 设为 true；其余为 false。
+
+分类说明：qualification 为资格性；compliance 为符合性；substantive 为实质性；rejection 为无效投标/废标；objective 为客观分；subjective 为主观分。objective 和 subjective 必须填写 scoring.max_score，且只能填写招标原文明确规定的满分；没有明确满分时不要输出为评分项。objective 仅“满足即满分”时 kind 为 boolean，分档、数量、累计或人工判断评分时 kind 为 manual；subjective 的 kind 为 manual。非评分项省略 scoring。
+
+招标文件原文：
+{text}"""
+
+
 def _extract_rules(app, task: dict) -> dict:
     documents = storage.list_documents(app, task["project_id"])
     tender = next((item for item in documents if item["role"] == "tender"), None)
@@ -356,18 +374,21 @@ def _extract_rules(app, task: dict) -> dict:
     text = "\n\n".join(source_parts)[:char_limit]
     storage.update_task(app, task["task_id"], progress=15, message="正在调用模型提取评审规则")
     system_prompt = _system_prompt(app, "extract_rules", "只能依据给出的招标文件原文，不得编造；必须遵守输出 JSON 结构。")
-    user_prompt = f"""请从以下招标文件原文提取可由 AI 审查的评标规则，返回 JSON 对象：
-{{"rules":[{{"category":"qualification|compliance|substantive|rejection|objective|subjective","title":"简明规则名称","check_rule":"面向投标文件的明确检查指令","source_text":"招标原文摘录","source_page":null,"ocr_required":false,"scoring":{{"max_score":数字,"kind":"boolean|manual"}} }}]}}
-
-只保留能通过已上传投标文件中可检索的文字、表格或元数据核验的事项，规则必须明确且能据文件内容判断。不要输出密封与递交要求、响应文件份数或电子版要求、递交地点/时间、开标现场、线下原件、纸质材料、投标文件本身无法体现的签收事项，以及其他无法仅凭投标文件核验的事项。若规则的关键证据只能依赖扫描图片、证照图片、签章或手写内容识别，请将 ocr_required 设为 true；其余为 false。
-
-分类说明：qualification 为资格性；compliance 为符合性；substantive 为实质性；rejection 为无效投标/废标；objective 为客观分；subjective 为主观分。没有明确页码时 source_page 返回 null。objective 和 subjective 必须填写 scoring.max_score，且只能填写招标原文明确规定的满分；没有明确满分时不要输出为评分项。objective 仅“满足即满分”时 kind 为 boolean，分档、数量、累计或人工判断评分时 kind 为 manual；subjective 的 kind 为 manual。非评分项省略 scoring。
-
-招标文件原文：
-{text}"""
-    parsed = _request_task_json(app, task, profile, "extract_rules", system_prompt, user_prompt,
-                                document_id=tender["document_id"], context_mode="full_prefix",
-                                max_tokens=_output_token_budget(profile, 8_000))
+    user_prompt = _rule_extraction_prompt(text, compact=False)
+    compact_retry_count = 0
+    try:
+        parsed = _request_task_json(app, task, profile, "extract_rules", system_prompt, user_prompt,
+                                    document_id=tender["document_id"], context_mode="full_prefix",
+                                    max_tokens=_output_token_budget(profile, 12_000))
+    except ValueError as exc:
+        if not _is_invalid_json_model_response(exc):
+            raise
+        compact_retry_count = 1
+        storage.update_task(app, task["task_id"], progress=40, message="模型输出过长，正在按紧凑格式重试")
+        retry_prompt = _rule_extraction_prompt(text, compact=True)
+        parsed = _request_task_json(app, task, profile, "extract_rules_compact_retry", system_prompt, retry_prompt,
+                                    document_id=tender["document_id"], context_mode="full_prefix_compact_retry",
+                                    max_tokens=_output_token_budget(profile, 8_000))
     raw_rules = parsed.get("rules") if isinstance(parsed, dict) else None
     if not isinstance(raw_rules, list):
         raise ValueError("模型返回格式不符合规则提取要求")
@@ -395,7 +416,8 @@ def _extract_rules(app, task: dict) -> dict:
     global_rule_count = rule_set.get("global_rule_count", 0)
     return {"rule_set_id": rule_set["rule_set_id"], "version": rule_set["version"], "rule_count": len(rules) + global_rule_count,
             "ai_rule_count": len(rules), "global_rule_count": global_rule_count,
-            "excluded_rule_count": excluded_rule_count, "profile": profile["display_name"]}
+            "excluded_rule_count": excluded_rule_count, "profile": profile["display_name"],
+            "compact_retry_count": compact_retry_count}
 
 
 def _review_documents(app, task: dict) -> dict:

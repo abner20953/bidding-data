@@ -238,6 +238,21 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(next(item for item in rules if item["title"] == "具备有效资质")["check_rule"], "核验是否提供有效资质材料")
         self.assertEqual(next(item for item in rules if item["title"] == "技术方案评分")["check_mode"], "ocr")
 
+    def test_rule_extraction_retries_with_compact_output_after_json_truncation(self):
+        self._add_pdf("tender.pdf", "tender", "", "投标人应具备有效资质。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        storage.create_task(self.app, self.project["project_id"], "extract_rules")
+        valid = {"rules": [{"category": "qualification", "title": "有效资质", "check_rule": "核验有效资质", "source_text": "应具备有效资质"}]}
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[ValueError("模型未返回有效 JSON（模型输出达到长度上限）"), valid]) as request_json:
+            finished = self._run_next_task()
+
+        self.assertEqual(finished["status"], "success")
+        self.assertEqual(finished["result"]["compact_retry_count"], 1)
+        self.assertEqual(request_json.call_count, 2)
+        self.assertEqual(request_json.call_args_list[0].kwargs["max_tokens"], 12000)
+
     def test_adding_to_confirmed_rules_creates_new_draft_version(self):
         storage.add_rule(self.app, self.project["project_id"], {"category": "qualification", "title": "资质"})
         confirmed = storage.confirm_rule_set(self.app, self.project["project_id"])
@@ -354,16 +369,16 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
     def test_global_rules_require_password_and_are_automatically_imported_for_new_projects(self):
         client = self.app.test_client()
-        self.assertEqual(client.get("/api/evaluation-workbench/global-rules").status_code, 403)
-        self._unlock_model_configuration(client)
+        self.assertEqual(client.get("/api/evaluation-workbench/global-rules").status_code, 200)
+        self.assertEqual(client.post("/api/evaluation-workbench/global-rules", json={"title": "无口令", "check_rule": "不应保存"}).status_code, 403)
         created = client.post("/api/evaluation-workbench/global-rules", json={
             "category": "substantive", "title": "营业执照有效性",
             "check_rule": "核验是否提供有效营业执照", "source_text": "投标人应提供有效营业执照。",
-            "ocr_required": True, "enabled": True,
+            "ocr_required": True, "enabled": True, "password": "108",
         })
         self.assertEqual(created.status_code, 201)
         disabled = client.post("/api/evaluation-workbench/global-rules", json={
-            "category": "other", "title": "不导入项", "check_rule": "不应自动导入", "enabled": False,
+            "category": "other", "title": "不导入项", "check_rule": "不应自动导入", "enabled": False, "password": "108",
         })
         self.assertEqual(disabled.status_code, 201)
 
@@ -376,7 +391,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(rules[0]["check_rule"], "核验是否提供有效营业执照")
         self.assertEqual(rules[0]["check_mode"], "ocr")
 
-        client.patch(f"/api/evaluation-workbench/global-rules/{created.get_json()['rule']['global_rule_id']}", json={"title": "更新名称"})
+        self.assertEqual(client.patch(f"/api/evaluation-workbench/global-rules/{created.get_json()['rule']['global_rule_id']}", json={"title": "更新名称"}).status_code, 403)
+        client.patch(f"/api/evaluation-workbench/global-rules/{created.get_json()['rule']['global_rule_id']}", json={"title": "更新名称", "password": "108"})
         self.assertEqual(storage.list_rules(self.app, new_project["project_id"])[1][0]["title"], "营业执照有效性")
 
     def test_rule_extraction_merges_enabled_global_rules_without_exact_duplicates(self):
