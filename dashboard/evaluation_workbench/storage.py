@@ -1267,7 +1267,7 @@ def complete_missing_rule_scores(app, rule_set_id: str) -> int:
 def update_rule(app, project_id: str, rule_id: str, payload: dict) -> dict:
     rule_set = current_rule_set(app, project_id)
     if not rule_set or rule_set["status"] != "draft":
-        raise ValueError("只能修改待确认规则集中的评分信息")
+        raise ValueError("只能修改待确认规则集中的规则")
     with connection(app) as conn:
         row = conn.execute("SELECT * FROM ew_rules WHERE rule_id = ? AND rule_set_id = ?", (rule_id, rule_set["rule_set_id"])).fetchone()
         if not row:
@@ -1278,6 +1278,11 @@ def update_rule(app, project_id: str, rule_id: str, payload: dict) -> dict:
             check_rule = str(payload.get("check_rule") or "").strip()
             if not check_rule:
                 raise ValueError("检查规则不能为空")
+        enabled = None
+        if "enabled" in payload:
+            if not isinstance(payload.get("enabled"), bool):
+                raise ValueError("启用状态必须为布尔值")
+            enabled = 1 if payload["enabled"] else 0
         scoring_json = None
         if "scoring" in payload:
             if rule["category"] not in {"objective", "subjective"}:
@@ -1295,6 +1300,8 @@ def update_rule(app, project_id: str, rule_id: str, payload: dict) -> dict:
             conn.execute("UPDATE ew_rules SET check_rule = ?, updated_at = ? WHERE rule_id = ?", (check_rule, now_iso(), rule_id))
         if scoring_json is not None:
             conn.execute("UPDATE ew_rules SET scoring_json = ?, updated_at = ? WHERE rule_id = ?", (scoring_json, now_iso(), rule_id))
+        if enabled is not None:
+            conn.execute("UPDATE ew_rules SET enabled = ?, updated_at = ? WHERE rule_id = ?", (enabled, now_iso(), rule_id))
         conn.execute("UPDATE ew_rule_sets SET updated_at = ? WHERE rule_set_id = ?", (now_iso(), rule_set["rule_set_id"]))
         updated = conn.execute("SELECT * FROM ew_rules WHERE rule_id = ?", (rule_id,)).fetchone()
     return dict(updated)

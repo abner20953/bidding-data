@@ -277,6 +277,51 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(request_json.call_count, 2)
         self.assertEqual(next(item for item in rules if item["title"] == "类似项目业绩评分")["scoring_json"], '{"max_score": 9, "kind": "manual"}')
 
+    def test_rule_extraction_checks_each_score_clause_not_only_score_rule_count(self):
+        tender_text = "\n".join([
+            "商务评分", "供应商业绩", "业绩每有一个得3分，最高9分。",
+            *[f"说明{i}" for i in range(10)], "报价评分", "报价得分最高25分。",
+        ])
+        self._add_pdf("tender.pdf", "tender", "", tender_text)
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        tender_document = next(item for item in storage.list_documents(self.app, self.project["project_id"]) if item["role"] == "tender")
+        Path(tender_document["parsed_path"]).write_text(tender_text, encoding="utf-8")
+        storage.create_task(self.app, self.project["project_id"], "extract_rules")
+        primary = {"rules": [
+            {"category": "objective", "title": "报价评分", "check_rule": "按报价公式计算", "source_text": "报价得分最高25分", "scoring": {"max_score": 25, "kind": "manual"}},
+            *[{"category": "subjective", "title": f"技术方案{i}评分", "check_rule": "评价技术方案", "source_text": "技术方案评分", "scoring": {"max_score": 5, "kind": "manual"}} for i in range(6)],
+        ]}
+        supplement = {"rules": [{"category": "objective", "title": "类似项目业绩评分", "check_rule": "每个同类型项目业绩计3分，最高9分", "source_text": "业绩每有一个得3分，最高9分", "scoring": {"max_score": 9, "kind": "manual"}}]}
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[primary, supplement]) as request_json:
+            finished = self._run_next_task()
+
+        _, rules = storage.list_rules(self.app, self.project["project_id"])
+        supplement_prompt = request_json.call_args_list[1].args[2]
+        self.assertEqual(finished["result"]["uncovered_score_clause_count"], 1)
+        self.assertEqual(request_json.call_count, 2)
+        self.assertIn("业绩每有一个得3分", supplement_prompt)
+        self.assertNotIn("报价得分最高25分", supplement_prompt)
+        self.assertIn("类似项目业绩评分", {item["title"] for item in rules})
+
+    def test_draft_rule_can_be_disabled_before_confirmation(self):
+        enabled_rule = storage.add_rule(self.app, self.project["project_id"], {"category": "qualification", "title": "保留审查项"})
+        disabled_rule = storage.add_rule(self.app, self.project["project_id"], {"category": "compliance", "title": "取消审查项"})
+
+        response = self.app.test_client().patch(
+            f"/api/evaluation-workbench/projects/{self.project['project_id']}/rules/{disabled_rule['rule_id']}",
+            json={"enabled": False},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["rule"]["enabled"], 0)
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        _, rules = storage.list_rules(self.app, self.project["project_id"])
+        status_by_rule = {item["rule_id"]: item["enabled"] for item in rules}
+        self.assertEqual(status_by_rule[enabled_rule["rule_id"]], 1)
+        self.assertEqual(status_by_rule[disabled_rule["rule_id"]], 0)
+
     def test_adding_to_confirmed_rules_creates_new_draft_version(self):
         storage.add_rule(self.app, self.project["project_id"], {"category": "qualification", "title": "资质"})
         confirmed = storage.confirm_rule_set(self.app, self.project["project_id"])

@@ -293,6 +293,7 @@ _UNREVIEWABLE_RULE_MARKERS = (
 )
 _RULE_SECTION_MARKERS = ("评标办法", "评分标准", "资格审查", "符合性审查", "废标", "无效投标", "否决投标", "资格条件")
 _SCORE_CLAUSE_PATTERN = re.compile(r"(?:得\s*\d+(?:\.\d+)?\s*分|最高(?:得)?\s*\d+(?:\.\d+)?\s*分|满分(?:为)?\s*\d+(?:\.\d+)?\s*分)")
+_SCORE_COVERAGE_IGNORED_TERMS = {"项目", "评分", "标准", "要求", "供应", "服务", "能力", "部分", "内容", "提供", "文件", "采购", "投标", "技术", "商务"}
 
 
 def _is_unreviewable_rule(item: dict) -> bool:
@@ -334,7 +335,8 @@ def _score_clause_packets(text: str, limit: int = 24) -> list[str]:
     for index, line in enumerate(lines):
         if not _SCORE_CLAUSE_PATTERN.search(re.sub(r"\s+", "", line)):
             continue
-        start, end = max(0, index - 4), min(len(lines), index + 5)
+        # 评分表的项目名称通常在得分行之前；不带后续行，避免把下一条评分项误判为当前条款已覆盖。
+        start, end = max(0, index - 6), min(len(lines), index + 1)
         if windows and start <= windows[-1][1] + 2:
             windows[-1] = (windows[-1][0], max(windows[-1][1], end))
         else:
@@ -347,6 +349,28 @@ def _score_clause_packets(text: str, limit: int = 24) -> list[str]:
         if value:
             packets.append(value)
     return packets
+
+
+def _score_rule_title_terms(rule: dict) -> set[str]:
+    """为本地覆盖校验提取规则名称中的低歧义词组，不参与评分或规则生成。"""
+    title = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]+", "", str(rule.get("title", "")))
+    title = title.replace("评分标准", "").replace("评分", "").replace("得分", "")
+    terms: set[str] = set()
+    for width in range(2, min(6, len(title)) + 1):
+        for index in range(len(title) - width + 1):
+            term = title[index:index + width]
+            if term not in _SCORE_COVERAGE_IGNORED_TERMS:
+                terms.add(term)
+    return terms
+
+
+def _score_packet_is_covered(packet: str, score_rules: list[dict]) -> bool:
+    """仅在评分项目名称有明确交集时视为已覆盖，不能用评分规则总数代替逐条核验。"""
+    compact_packet = re.sub(r"\s+", "", packet)
+    return any(
+        any(term in compact_packet for term in _score_rule_title_terms(rule))
+        for rule in score_rules
+    )
 
 
 def _rule_extraction_prompt(text: str, *, compact: bool, score_packets: list[str]) -> str:
@@ -443,13 +467,17 @@ def _extract_rules(app, task: dict) -> dict:
     if not isinstance(raw_rules, list):
         raise ValueError("模型返回格式不符合规则提取要求")
     primary_score_rules = [item for item in raw_rules if isinstance(item, dict) and item.get("category") in {"objective", "subjective"}]
+    uncovered_score_packets = [
+        packet for packet in score_packets
+        if not _score_packet_is_covered(packet, primary_score_rules)
+    ]
     scoring_supplement_count = 0
-    if score_packets and len(primary_score_rules) < len(score_packets):
+    if uncovered_score_packets:
         storage.update_task(app, task["task_id"], progress=60, message="正在核验评分条款覆盖并补充遗漏项")
         try:
             supplement = _request_task_json(
                 app, task, profile, "extract_rules_scoring_supplement", system_prompt,
-                _score_rule_supplement_prompt(score_packets, primary_score_rules), document_id=tender["document_id"],
+                _score_rule_supplement_prompt(uncovered_score_packets, primary_score_rules), document_id=tender["document_id"],
                 context_mode="score_clause_packets_only", max_tokens=_output_token_budget(profile, 4_000),
             )
             supplement_rules = supplement.get("rules") if isinstance(supplement, dict) else None
@@ -485,7 +513,7 @@ def _extract_rules(app, task: dict) -> dict:
             "ai_rule_count": len(rules), "global_rule_count": global_rule_count,
             "excluded_rule_count": excluded_rule_count, "profile": profile["display_name"],
             "compact_retry_count": compact_retry_count, "score_clause_count": len(score_packets),
-            "scoring_supplement_count": scoring_supplement_count}
+            "uncovered_score_clause_count": len(uncovered_score_packets), "scoring_supplement_count": scoring_supplement_count}
 
 
 def _review_documents(app, task: dict) -> dict:
