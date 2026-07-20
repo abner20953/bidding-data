@@ -56,7 +56,8 @@ def list_prompt_templates(app) -> list[dict]:
     overrides = _prompt_template_overrides(app)
     return [
         {"template_id": template_id, "name": meta["name"], "description": meta["description"],
-         "content": overrides.get(template_id, meta["content"]), "is_custom": template_id in overrides}
+         "content": overrides.get(template_id, meta["content"]), "is_custom": template_id in overrides,
+         "placeholders": list(meta.get("placeholders", ())) }
         for template_id, meta in PROMPT_TEMPLATES.items()
     ]
 
@@ -65,6 +66,16 @@ def prompt_template(app, template_id: str) -> str:
     if template_id not in PROMPT_TEMPLATES:
         raise ValueError("不支持的提示词流程")
     return _prompt_template_overrides(app).get(template_id, PROMPT_TEMPLATES[template_id]["content"])
+
+
+def render_prompt_template(app, template_id: str, **values: object) -> str:
+    """渲染用户可编辑模板；仅替换显式 {{占位符}}，不解释 JSON 花括号。"""
+    content = prompt_template(app, template_id)
+    required = PROMPT_TEMPLATES[template_id].get("placeholders", ())
+    missing = [name for name in required if name not in values]
+    if missing:
+        raise ValueError(f"提示词模板“{template_id}”缺少运行时变量：{', '.join(missing)}")
+    return re.sub(r"\{\{([a-z_]+)\}\}", lambda match: str(values.get(match.group(1), match.group(0))), content)
 
 
 def prompt_template_fingerprint(app) -> str:
@@ -78,6 +89,9 @@ def update_prompt_template(app, template_id: str, content: object) -> dict:
     value = str(content or "").strip()
     if not 20 <= len(value) <= 12_000:
         raise ValueError("提示词长度应在 20 到 12000 个字符之间")
+    missing = [name for name in PROMPT_TEMPLATES[template_id].get("placeholders", ()) if f"{{{{{name}}}}}" not in value]
+    if missing:
+        raise ValueError(f"提示词不能删除运行时变量：{', '.join('{{' + name + '}}' for name in missing)}")
     overrides = _prompt_template_overrides(app)
     overrides[template_id] = value
     with connection(app) as conn:

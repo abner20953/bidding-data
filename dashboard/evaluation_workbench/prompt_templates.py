@@ -1,48 +1,32 @@
-"""评标工作台可配置的通用系统提示词。
-
-动态证据、规则 JSON、输出格式与安全边界由 worker 在运行时追加，避免用户修改
-通用提示词后破坏结构化解析或扩大业务边界。
-"""
+"""评标工作台全部可编辑的 AI 提示词模板。"""
 
 from __future__ import annotations
 
 
 PROMPT_TEMPLATE_SETTING = "evaluation_workbench_prompt_templates"
 
+
+def _template(name: str, description: str, content: str, *placeholders: str) -> dict:
+    return {"name": name, "description": description, "content": content, "placeholders": placeholders}
+
+
 PROMPT_TEMPLATES = {
-    "compare_ai_assessment": {
-        "name": "文件查重 AI 复核",
-        "description": "用于复核本地筛查出的压缩查重证据包。",
-        "content": "你是招投标文件横向异常线索复核助手。应审慎评估固定规则证据的可靠性、替代解释和复核重点。",
-    },
-    "extract_rules": {
-        "name": "评审规则提取",
-        "description": "用于从招标文件及附件提取可由电子投标文件核验的规则。",
-        "content": "你是招投标评审规则提取助手。只能根据给出的招标文件原文提取明确、可核验的规则，不得编造。",
-    },
-    "review_documents": {
-        "name": "单项文件审查",
-        "description": "兼容保留的资格、符合、实质性及废标项单项审查流程。",
-        "content": "你是严谨的招投标电子文件审查助手。应逐项引用可见原文，审慎判断投标文件是否响应规则。",
-    },
-    "score_objective": {
-        "name": "客观分辅助评分",
-        "description": "兼容保留的客观评分单项流程。",
-        "content": "你是招投标客观评分辅助助手。应依据评分规则和投标文件原文提取证据，不得编造材料。",
-    },
-    "score_subjective": {
-        "name": "主观分辅助评分",
-        "description": "兼容保留的主观评分单项流程。",
-        "content": "你是招投标主观评分辅助助手。应依据评分规则和投标文件原文给出有证据支撑的评分建议。",
-    },
-    "evaluate_all": {
-        "name": "综合评审",
-        "description": "用于一次生成审查、客观分与主观分建议。",
-        "content": "你是严谨的招投标综合评审辅助助手。应依据规则与投标文件可见原文，给出审查和评分建议，不得编造。",
-    },
+    "model_connection_test": _template("模型连接测试 · 任务", "模型配置页的最小连通性测试请求。", "请仅返回 JSON 对象：{\"message\":\"连接成功\"}"),
+    "compare_ai_assessment": _template("文件查重 AI 复核 · 系统", "查重证据复核的角色与边界。", "你是招投标文件横向异常线索复核助手。应审慎评估固定规则证据的可靠性、替代解释和复核重点。只能评估固定规则提取的证据可靠性；不得认定串通投标、废标或作出法律结论；证据不足时必须保守输出 unassessable。"),
+    "compare_ai_assessment_user": _template("文件查重 AI 复核 · 任务", "压缩证据包及 JSON 输出要求。", "请按固定规则复核以下压缩证据包，只返回 JSON：\n{\"assessments\":[{\"signal_id\":\"ID\",\"decision\":\"confirmed_clue|suspected_clue|excluded|unassessable\",\"risk_level\":\"low|medium|high\",\"confidence\":\"high|medium|low\",\"reason\":\"简洁理由\",\"suggested_check\":\"建议核验事项\"}]}\n\n判定含义：confirmed_clue 仅表示该异常线索有较充分证据；suspected_clue 表示仍有合理替代解释；excluded 表示现有证据更可能为模板/公共来源；unassessable 表示证据不足。不得输出串标成立、废标或扣分结论。\n证据包：{{packets}}", "packets"),
+    "extract_rules": _template("评审规则提取 · 系统", "规则提取的角色与证据边界。", "你是招投标评审规则提取助手。只能根据给出的招标文件原文提取明确、可核验的规则，不得编造。只能依据给出的招标文件原文，不得编造；必须遵守输出 JSON 结构。"),
+    "extract_rules_user": _template("评审规则提取 · 任务", "招标原文、评分覆盖清单与完整输出规范。", "请从以下招标文件原文提取可由 AI 审查的评标规则，只返回一个合法 JSON 对象：\n{\"rules\":[{\"category\":\"qualification|compliance|substantive|rejection|objective|subjective\",\"title\":\"简明规则名称\",\"check_rule\":\"面向投标文件的明确检查指令\",\"source_text\":\"招标原文短摘录\",\"ocr_required\":false,\"scoring\":{\"max_score\":数字,\"kind\":\"boolean|manual\"}}]}\n\n严格要求：不得使用 Markdown 或在 JSON 前后添加说明；不得逐条复述招标原文；同类要求合并为一条规则。{{limits}}\n{{score_requirement}}\n只保留能通过已上传投标文件中可检索的文字、表格或元数据核验的事项，规则必须明确且能据文件内容判断。请根据完整语境判断，不要输出密封与递交要求、响应文件份数或电子版要求、递交地点/时间、开标现场、线下原件、纸质材料、投标文件本身无法体现的签收事项，以及其他无法仅凭投标文件核验的事项；但“投标截止日前若干年内的业绩”等仅用于界定业绩有效期、且可由投标文件证明的内容必须保留。若规则的关键证据只能依赖扫描图片、证照图片、签章或手写内容识别，请将 ocr_required 设为 true；其余为 false。\n\n分类说明：qualification 为资格性；compliance 为符合性；substantive 为实质性；rejection 为无效投标/废标；objective 为客观分；subjective 为主观分。objective 和 subjective 必须填写 scoring.max_score，且只能填写招标原文明确规定的满分；没有明确满分时不要输出为评分项。objective 仅“满足即满分”时 kind 为 boolean，分档、数量、累计或人工判断评分时 kind 为 manual；subjective 的 kind 为 manual。非评分项省略 scoring。\n\n评分条款覆盖清单：\n{{score_audit}}\n\n招标文件原文：\n{{text}}", "limits", "score_requirement", "score_audit", "text"),
+    "extract_rules_supplement_user": _template("评审规则提取 · 评分补充", "遗漏评分条款的补充提取。", "仅根据以下评分条款，补充主规则提取遗漏的明确评分项。只返回合法 JSON：\n{\"rules\":[{\"category\":\"objective|subjective\",\"title\":\"简明规则名称\",\"check_rule\":\"面向投标文件的明确检查指令\",\"source_text\":\"原文短摘录\",\"ocr_required\":false,\"scoring\":{\"max_score\":数字,\"kind\":\"boolean|manual\"}}]}\n\n已有评分规则：{{existing_rules}}\n必须仅返回缺失项，不得重复已有项；每个明确评分条款都要覆盖。objective 和 subjective 都必须有 scoring.max_score，且仅能填写原文明确的满分。不得使用 Markdown 或添加说明；title 最多 30 字，check_rule 最多 90 字，source_text 最多 120 字。\n\n评分条款：\n{{packet_text}}", "existing_rules", "packet_text"),
+    "review_documents": _template("单项文件审查 · 系统", "兼容单项审查流程的角色和边界。", "你是严谨的招投标电子文件审查助手。应逐项引用可见原文，审慎判断投标文件是否响应规则。只能基于规则与投标文件可见原文，不能推断图片、签字、盖章或线下材料。"),
+    "review_documents_user": _template("单项文件审查 · 任务", "规则、投标文件及 JSON 输出要求。", "请逐条审查投标文件。返回 JSON：\n{\"results\":[{\"rule_id\":\"规则ID\",\"status\":\"satisfied|not_satisfied|partial|not_found|manual|ocr_required\",\"evidence\":\"投标文件原文摘录\",\"page_hint\":null,\"reason\":\"简洁判断理由\",\"risk_level\":\"low|medium|high\",\"confidence\":\"high|medium|low\",\"evidence_quality\":\"sufficient|limited|missing\"}]}\n\n对于 ocr_required=true 的规则，当前系统未执行 OCR；若关键证据仅存在于图片、签章、证照或手写内容，必须返回 ocr_required，不能据此返回不满足。\n规则：\n{{rules}}\n\n投标文件：{{document_name}}；投标人：{{bidder_name}}\n原文：\n{{text}}", "rules", "document_name", "bidder_name", "text"),
+    "score_objective": _template("客观分辅助评分 · 系统", "兼容客观评分流程的角色与边界。", "你是招投标客观评分辅助助手。应依据评分规则和投标文件原文提取证据，不得编造材料。只能依据评分规则与投标文件原文，不得编造材料或超出评分上限。"),
+    "score_objective_user": _template("客观分辅助评分 · 任务", "客观评分规则、投标文件及 JSON 输出要求。", "返回 JSON：{\"results\":[{\"rule_id\":\"规则ID\",\"met\":true|false|null,\"needs_ocr\":true|false,\"evidence\":\"原文摘录\",\"reason\":\"判断理由\",\"confidence\":\"high|medium|low\"}]}。只判断证据是否满足，不自行计算分数。ocr_required=true 且关键证据仅在图片中时，needs_ocr 必须为 true，met 返回 null。\n评分规则：{{rules}}\n投标文件：{{document_name}}\n原文：\n{{text}}", "rules", "document_name", "text"),
+    "score_subjective": _template("主观分辅助评分 · 系统", "兼容主观评分流程的角色与边界。", "你是招投标主观评分辅助助手。应依据评分规则和投标文件原文给出有证据支撑的评分建议。只能依据评分规则与投标文件原文，不得编造材料或超出评分上限。"),
+    "score_subjective_user": _template("主观分辅助评分 · 任务", "主观评分规则、投标文件及 JSON 输出要求。", "返回 JSON：{\"results\":[{\"rule_id\":\"规则ID\",\"suggested_score\":数字,\"needs_ocr\":true|false,\"evidence\":\"原文摘录\",\"reason\":\"得扣分理由\",\"confidence\":\"high|medium|low\"}]}。分数不得超出规则 scoring.max_score。ocr_required=true 且关键证据仅在图片中时，needs_ocr 必须为 true，suggested_score 返回 null。\n评分规则：{{rules}}\n投标文件：{{document_name}}\n原文：\n{{text}}", "rules", "document_name", "text"),
+    "evaluate_all": _template("综合评审 · 系统", "综合评审的角色与边界。", "你是严谨的招投标综合评审辅助助手。应依据规则与投标文件可见原文，给出审查和评分建议，不得编造。只能依据规则与投标文件可见原文，不得编造、推断签字盖章或线下材料。"),
+    "evaluate_all_user": _template("综合评审 · 任务", "综合审查、评分及 JSON 输出要求。", "{{retry_note}}对同一份投标文件完成下列三类工作，并只返回一个合法 JSON 对象：\n{\"review_results\":[{\"rule_id\":\"规则ID\",\"status\":\"satisfied|not_satisfied|partial|not_found|manual|ocr_required\",\"evidence\":\"原文摘录\",\"page_hint\":null,\"reason\":\"简洁理由\",\"risk_level\":\"low|medium|high\",\"confidence\":\"high|medium|low\",\"evidence_quality\":\"sufficient|limited|missing\"}],\"objective_scores\":[{\"rule_id\":\"规则ID\",\"met\":true|false|null,\"needs_ocr\":true|false,\"evidence\":\"原文摘录\",\"reason\":\"判断理由\",\"confidence\":\"high|medium|low\"}],\"subjective_scores\":[{\"rule_id\":\"规则ID\",\"suggested_score\":数字,\"needs_ocr\":true|false,\"evidence\":\"原文摘录\",\"reason\":\"得扣分理由\",\"confidence\":\"high|medium|low\"}]}\n\n严格要求：不得使用 Markdown 代码块、不得在 JSON 前后添加说明、所有字符串必须使用标准 JSON 双引号和转义。{{limits}}\n审查规则：{{review_rules}}\n客观评分规则：{{objective_rules}}\n主观评分规则：{{subjective_rules}}\n对标记 ocr_required=true 的规则，当前系统未执行 OCR；若关键证据仅在图片、签章、证照或手写内容中，审查结果必须为 ocr_required，评分结果 needs_ocr=true 且不给分。客观分只判断证据是否满足，不自行计算分数。主观分不得超出规则 scoring.max_score。\n投标文件：{{document_name}}；投标人：{{bidder_name}}\n原文：\n{{text}}", "retry_note", "limits", "review_rules", "objective_rules", "subjective_rules", "document_name", "bidder_name", "text"),
 }
 
 
 def default_template(template_id: str) -> str:
     return PROMPT_TEMPLATES[template_id]["content"]
-

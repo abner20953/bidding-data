@@ -741,7 +741,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(request_json.call_count, 1)
         self.assertEqual(len(reviews), 2)
 
-    def test_rule_extraction_filters_unreviewable_submission_requirements(self):
+    def test_rule_extraction_does_not_hard_filter_model_returned_rules(self):
         self._add_pdf("tender.pdf", "tender", "", "资格审查和评分标准。")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
         self._run_next_task()
@@ -754,8 +754,27 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             finished = self._run_next_task()
 
         _, rules = storage.list_rules(self.app, self.project["project_id"])
-        self.assertEqual(finished["result"]["excluded_rule_count"], 1)
-        self.assertEqual([item["title"] for item in rules], ["具备资质"])
+        self.assertEqual(finished["result"]["excluded_rule_count"], 0)
+        self.assertEqual({item["title"] for item in rules}, {"具备资质", "响应文件份数"})
+
+    def test_rule_extraction_keeps_performance_score_with_bid_deadline_range(self):
+        self._add_pdf("tender.pdf", "tender", "", "业绩每有一个得3分，最高9分。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        storage.create_task(self.app, self.project["project_id"], "extract_rules")
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value={"rules": [
+            {"category": "objective", "title": "同类项目业绩", "check_rule": "核验投标截止日前三年内同类项目业绩，每个得3分，最高9分。", "source_text": "供应商提供投标截止日期三个年度内同类型项目业绩，每有一个得3分，最高9分。", "scoring": {"max_score": 9, "kind": "manual"}},
+            {"category": "compliance", "title": "响应文件份数", "check_rule": "核验是否按要求提交正副本份数", "source_text": "响应文件正本一份、副本两份"},
+        ]}):
+            finished = self._run_next_task()
+
+        _, rules = storage.list_rules(self.app, self.project["project_id"])
+        self.assertEqual(finished["status"], "success")
+        self.assertEqual(finished["result"]["excluded_rule_count"], 0)
+        performance_rule = next(item for item in rules if item["title"] == "同类项目业绩")
+        self.assertEqual(performance_rule["category"], "objective")
+        self.assertEqual(performance_rule["scoring_json"], '{"max_score": 9, "kind": "manual"}')
 
     def test_objective_score_calculates_confirmed_boolean_rule(self):
         self._add_pdf("tender.pdf", "tender", "", "具备有效资质得5分。")

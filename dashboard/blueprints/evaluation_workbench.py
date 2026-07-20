@@ -412,7 +412,7 @@ def test_model_profile_api(profile_id):
         return access_error
     try:
         profile = storage.get_model_profile(current_app, profile_id)
-        return jsonify({"message": test_connection(profile)})
+        return jsonify({"message": test_connection(profile, storage.prompt_template(current_app, "model_connection_test"))})
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 

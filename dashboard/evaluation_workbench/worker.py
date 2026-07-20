@@ -71,9 +71,8 @@ def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt
         )
 
 
-def _system_prompt(app, template_id: str, fixed_boundary: str) -> str:
-    """通用提示词可配置；输出格式、证据边界与法律边界始终由系统追加。"""
-    return f"{storage.prompt_template(app, template_id)}\n\n系统固定边界（不可由通用提示词覆盖）：{fixed_boundary}"
+def _system_prompt(app, template_id: str) -> str:
+    return storage.render_prompt_template(app, template_id)
 
 
 def _extract_docx_text(path: Path) -> str:
@@ -227,18 +226,11 @@ def _assess_compare_signals_with_ai(app, task: dict, analysis: dict) -> None:
         return
     by_id = {item["signal_id"]: item for item in signals}
     completed, failures = 0, []
-    system_prompt = _system_prompt(
-        app, "compare_ai_assessment",
-        "只能评估固定规则提取的证据可靠性；不得认定串通投标、废标或作出法律结论；证据不足时必须保守输出 unassessable。",
-    )
+    system_prompt = _system_prompt(app, "compare_ai_assessment")
     for start in range(0, len(signals), COMPARE_AI_BATCH_SIZE):
         batch = signals[start:start + COMPARE_AI_BATCH_SIZE]
         packets = [_compare_evidence_packet(item) for item in batch]
-        user_prompt = f"""请按固定规则复核以下压缩证据包，只返回 JSON：
-{{"assessments":[{{"signal_id":"ID","decision":"confirmed_clue|suspected_clue|excluded|unassessable","risk_level":"low|medium|high","confidence":"high|medium|low","reason":"简洁理由","suggested_check":"建议核验事项"}}]}}
-
-判定含义：confirmed_clue 仅表示该异常线索有较充分证据；suspected_clue 表示仍有合理替代解释；excluded 表示现有证据更可能为模板/公共来源；unassessable 表示证据不足。不得输出串标成立、废标或扣分结论。
-证据包：{json.dumps(packets, ensure_ascii=False, separators=(',', ':'))}"""
+        user_prompt = storage.render_prompt_template(app, "compare_ai_assessment_user", packets=json.dumps(packets, ensure_ascii=False, separators=(",", ":")))
         try:
             parsed = _request_task_json(app, task, profile, "compare_ai_assessment", system_prompt, user_prompt,
                                         context_mode="evidence_batch",
@@ -287,20 +279,9 @@ def _assess_compare_signals_with_ai(app, task: dict, analysis: dict) -> None:
     }
 
 
-_UNREVIEWABLE_RULE_MARKERS = (
-    "密封", "递交时间", "递交地点", "提交时间", "提交地点", "投标截止", "开标时间", "开标地点",
-    "开标现场", "响应文件份数", "电子版份数", "响应文件电子版", "电子响应文件",
-    "正本副本", "正本一份", "纸质正本", "纸质副本", "签收", "送达",
-)
 _RULE_SECTION_MARKERS = ("评标办法", "评分标准", "资格审查", "符合性审查", "废标", "无效投标", "否决投标", "资格条件")
 _SCORE_CLAUSE_PATTERN = re.compile(r"(?:得\s*\d+(?:\.\d+)?\s*分|最高(?:得)?\s*\d+(?:\.\d+)?\s*分|满分(?:为)?\s*\d+(?:\.\d+)?\s*分)")
 _SCORE_COVERAGE_IGNORED_TERMS = {"项目", "评分", "标准", "要求", "供应", "服务", "能力", "部分", "内容", "提供", "文件", "采购", "投标", "技术", "商务"}
-
-
-def _is_unreviewable_rule(item: dict) -> bool:
-    """过滤仅能在线下或开标环节核验的规则，避免只依赖模型服从提示词。"""
-    value = re.sub(r"\s+", "", f"{item.get('title', '')}{item.get('check_rule', '')}{item.get('source_text', '')}")
-    return any(marker in value for marker in _UNREVIEWABLE_RULE_MARKERS)
 
 
 def _rule_source_excerpt(text: str, budget: int) -> str:
@@ -410,7 +391,7 @@ def _split_rule_extraction_text(text: str, max_chars: int) -> list[str]:
     return chunks or [value[:max_chars]]
 
 
-def _rule_extraction_prompt(text: str, *, compact: bool, score_packets: list[str], max_rules: int = 45) -> str:
+def _rule_extraction_prompt(app, text: str, *, compact: bool, score_packets: list[str], max_rules: int = 45) -> str:
     limits = (
         f"这是格式异常后的紧凑重试。最多返回 {max_rules} 条规则；title 最多 30 字，check_rule 最多 90 字，source_text 最多 120 字。"
         if compact else
@@ -422,36 +403,18 @@ def _rule_extraction_prompt(text: str, *, compact: bool, score_packets: list[str
         "不得遗漏业绩、报价、人员、资质、方案等评分项。"
         if score_audit else "未定位到明确评分条款时，不要臆造评分规则。"
     )
-    return f"""请从以下招标文件原文提取可由 AI 审查的评标规则，只返回一个合法 JSON 对象：
-{{"rules":[{{"category":"qualification|compliance|substantive|rejection|objective|subjective","title":"简明规则名称","check_rule":"面向投标文件的明确检查指令","source_text":"招标原文短摘录","ocr_required":false,"scoring":{{"max_score":数字,"kind":"boolean|manual"}} }}]}}
-
-严格要求：不得使用 Markdown 或在 JSON 前后添加说明；不得逐条复述招标原文；同类要求合并为一条规则。{limits}
-{score_requirement}
-只保留能通过已上传投标文件中可检索的文字、表格或元数据核验的事项，规则必须明确且能据文件内容判断。不要输出密封与递交要求、响应文件份数或电子版要求、递交地点/时间、开标现场、线下原件、纸质材料、投标文件本身无法体现的签收事项，以及其他无法仅凭投标文件核验的事项。若规则的关键证据只能依赖扫描图片、证照图片、签章或手写内容识别，请将 ocr_required 设为 true；其余为 false。
-
-分类说明：qualification 为资格性；compliance 为符合性；substantive 为实质性；rejection 为无效投标/废标；objective 为客观分；subjective 为主观分。objective 和 subjective 必须填写 scoring.max_score，且只能填写招标原文明确规定的满分；没有明确满分时不要输出为评分项。objective 仅“满足即满分”时 kind 为 boolean，分档、数量、累计或人工判断评分时 kind 为 manual；subjective 的 kind 为 manual。非评分项省略 scoring。
-
-评分条款覆盖清单：
-{score_audit or '无'}
-
-招标文件原文：
-{text}"""
+    return storage.render_prompt_template(app, "extract_rules_user", limits=limits, score_requirement=score_requirement,
+                                          score_audit=score_audit or "无", text=text)
 
 
-def _score_rule_supplement_prompt(score_packets: list[str], existing_rules: list[dict]) -> str:
+def _score_rule_supplement_prompt(app, score_packets: list[str], existing_rules: list[dict]) -> str:
     existing = [
         {"category": item.get("category"), "title": item.get("title"), "check_rule": item.get("check_rule"), "max_score": (item.get("scoring") or {}).get("max_score")}
         for item in existing_rules if item.get("category") in {"objective", "subjective"}
     ]
     packet_text = "\n".join(f"【评分条款 {index}】\n{packet}" for index, packet in enumerate(score_packets, start=1))
-    return f"""仅根据以下评分条款，补充主规则提取遗漏的明确评分项。只返回合法 JSON：
-{{"rules":[{{"category":"objective|subjective","title":"简明规则名称","check_rule":"面向投标文件的明确检查指令","source_text":"原文短摘录","ocr_required":false,"scoring":{{"max_score":数字,"kind":"boolean|manual"}}}}]}}
-
-已有评分规则：{json.dumps(existing, ensure_ascii=False, separators=(',', ':'))}
-必须仅返回缺失项，不得重复已有项；每个明确评分条款都要覆盖。objective 和 subjective 都必须有 scoring.max_score，且仅能填写原文明确的满分。不得使用 Markdown 或添加说明；title 最多 30 字，check_rule 最多 90 字，source_text 最多 120 字。
-
-评分条款：
-{packet_text}"""
+    return storage.render_prompt_template(app, "extract_rules_supplement_user",
+                                          existing_rules=json.dumps(existing, ensure_ascii=False, separators=(",", ":")), packet_text=packet_text)
 
 
 def _rule_batch_output_tokens(text: str, compact: bool = False) -> int:
@@ -465,7 +428,7 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
     """提取一个小批次；截断时只二分当前批次，最小批次才紧凑重试。"""
     packets = _score_clause_packets(text)
     max_rules = 16 if depth == 0 else 10
-    user_prompt = _rule_extraction_prompt(text, compact=False, score_packets=packets, max_rules=max_rules)
+    user_prompt = _rule_extraction_prompt(app, text, compact=False, score_packets=packets, max_rules=max_rules)
     try:
         parsed = _request_task_json(
             app, task, profile, "extract_rules_batch", system_prompt, user_prompt,
@@ -495,7 +458,7 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
                     split_retries += split_count
                 return rules, compact_retries, split_retries + 1
         storage.update_task(app, task["task_id"], message=f"{batch_label} 格式异常，正在以紧凑 JSON 重试")
-        retry_prompt = _rule_extraction_prompt(text, compact=True, score_packets=packets, max_rules=max(8, max_rules))
+        retry_prompt = _rule_extraction_prompt(app, text, compact=True, score_packets=packets, max_rules=max(8, max_rules))
         parsed = _request_task_json(
             app, task, profile, "extract_rules_compact_retry", system_prompt, retry_prompt,
             document_id=document_id, context_mode=f"{batch_label}_compact_retry",
@@ -560,7 +523,7 @@ def _extract_rules(app, task: dict) -> dict:
     if not batches:
         raise ValueError("招标文件未提取到可供规则识别的正文")
     storage.update_task(app, task["task_id"], progress=15, message=f"正在分段提取评审规则（共 {len(batches)} 批）")
-    system_prompt = _system_prompt(app, "extract_rules", "只能依据给出的招标文件原文，不得编造；必须遵守输出 JSON 结构。")
+    system_prompt = _system_prompt(app, "extract_rules")
     raw_rules: list[dict] = []
     compact_retry_count = split_retry_count = 0
     for index, batch in enumerate(batches, start=1):
@@ -588,7 +551,7 @@ def _extract_rules(app, task: dict) -> dict:
             try:
                 supplement = _request_task_json(
                     app, task, profile, "extract_rules_scoring_supplement", system_prompt,
-                    _score_rule_supplement_prompt(packet_batch, primary_score_rules), document_id=tender["document_id"],
+                    _score_rule_supplement_prompt(app, packet_batch, primary_score_rules), document_id=tender["document_id"],
                     context_mode=f"score_clause_batch_{index // 6 + 1}",
                     max_tokens=_output_token_budget(profile, 3_500), thinking_mode="disabled",
                 )
@@ -601,8 +564,9 @@ def _extract_rules(app, task: dict) -> dict:
                 scoring_supplement_failures += 1
                 storage.update_task(app, task["task_id"], message=f"部分评分条款补充未完成：{exc}")
     candidates = _dedupe_rule_candidates([item for item in raw_rules if isinstance(item, dict) and str(item.get("title", "")).strip() and item.get("category") in {"qualification", "compliance", "substantive", "rejection", "objective", "subjective"}])
-    rules = [item for item in candidates if not _is_unreviewable_rule(item)]
-    excluded_rule_count = len(candidates) - len(rules)
+    # 是否可由投标文件核验交给完整提示词与人工确认判断；不以词表硬过滤，避免误删业绩有效期等规则。
+    rules = candidates
+    excluded_rule_count = 0
     for item in rules:
         if item.get("category") not in {"objective", "subjective"}:
             continue
@@ -650,17 +614,9 @@ def _review_documents(app, task: dict) -> dict:
     for index, document in enumerate(documents, start=1):
         storage.update_task(app, task["task_id"], progress=int((index - 1) * 100 / len(documents)), message=f"正在审查 {index}/{len(documents)}：{document['bidder_name'] or document['original_name']}")
         text = Path(document["parsed_path"]).read_text(encoding="utf-8", errors="ignore")
-        system_prompt = _system_prompt(app, "review_documents", "只能基于规则与投标文件可见原文，不能推断图片、签字、盖章或线下材料。")
-        user_prompt = f"""请逐条审查投标文件。返回 JSON：
-{{"results":[{{"rule_id":"规则ID","status":"satisfied|not_satisfied|partial|not_found|manual|ocr_required","evidence":"投标文件原文摘录","page_hint":null,"reason":"简洁判断理由","risk_level":"low|medium|high","confidence":"high|medium|low","evidence_quality":"sufficient|limited|missing"}}]}}
-
-对于 ocr_required=true 的规则，当前系统未执行 OCR；若关键证据仅存在于图片、签章、证照或手写内容，必须返回 ocr_required，不能据此返回不满足。
-规则：
-{rule_prompt}
-
-投标文件：{document['original_name']}；投标人：{document['bidder_name'] or '未填写'}
-原文：
-{text[:char_limit]}"""
+        system_prompt = _system_prompt(app, "review_documents")
+        user_prompt = storage.render_prompt_template(app, "review_documents_user", rules=json.dumps(rule_prompt, ensure_ascii=False, separators=(",", ":")),
+                                                     document_name=document["original_name"], bidder_name=document["bidder_name"] or "未填写", text=text[:char_limit])
         parsed = _request_task_json(app, task, profile, "review_documents", system_prompt, user_prompt,
                                     document_id=document["document_id"], context_mode="full_prefix",
                                     max_tokens=_output_token_budget(profile, 700 + len(rules) * 220))
@@ -706,12 +662,9 @@ def _score_documents(app, task: dict, score_type: str) -> dict:
         storage.update_task(app, task["task_id"], progress=int((index - 1) * 100 / len(documents)), message=f"正在{'客观' if score_type == 'objective' else '主观'}评分 {index}/{len(documents)}：{document['bidder_name'] or document['original_name']}")
         context = build_rule_context(document["parsed_path"], rules, char_limit)
         text = context["text"]
-        if score_type == "objective":
-            instruction = """返回 JSON：{\"results\":[{\"rule_id\":\"规则ID\",\"met\":true|false|null,\"needs_ocr\":true|false,\"evidence\":\"原文摘录\",\"reason\":\"判断理由\",\"confidence\":\"high|medium|low\"}]}。只判断证据是否满足，不自行计算分数。ocr_required=true 且关键证据仅在图片中时，needs_ocr 必须为 true，met 返回 null。"""
-        else:
-            instruction = """返回 JSON：{\"results\":[{\"rule_id\":\"规则ID\",\"suggested_score\":数字,\"needs_ocr\":true|false,\"evidence\":\"原文摘录\",\"reason\":\"得扣分理由\",\"confidence\":\"high|medium|low\"}]}。分数不得超出规则 scoring.max_score。ocr_required=true 且关键证据仅在图片中时，needs_ocr 必须为 true，suggested_score 返回 null。"""
-        system_prompt = _system_prompt(app, f"score_{score_type}", "只能依据评分规则与投标文件原文，不得编造材料或超出评分上限。")
-        user_prompt = f"{instruction}\n评分规则：{json.dumps(rule_payload, ensure_ascii=False, separators=(',', ':'))}\n投标文件：{document['original_name']}\n原文：\n{text}"
+        system_prompt = _system_prompt(app, f"score_{score_type}")
+        user_prompt = storage.render_prompt_template(app, f"score_{score_type}_user", rules=json.dumps(rule_payload, ensure_ascii=False, separators=(",", ":")),
+                                                     document_name=document["original_name"], text=text)
         parsed = _request_task_json(app, task, profile, f"score_{score_type}", system_prompt, user_prompt,
                                     document_id=document["document_id"], context_mode=context["mode"],
                                     max_tokens=_output_token_budget(profile, 600 + len(rules) * 180))
@@ -831,25 +784,18 @@ def _score_result_from_model(rule_id: str, suggested: float | None, max_score: f
             "review_reason": "" if auto_ready else "未得到高置信、可引用的建议分，需人工复核。"}
 
 
-def _combined_evaluation_prompt(document: dict, review_payload: list[dict], objective_payload: list[dict],
+def _combined_evaluation_prompt(app, document: dict, review_payload: list[dict], objective_payload: list[dict],
                                  subjective_payload: list[dict], text: str, *, compact: bool) -> str:
     limits = (
         "每条 evidence 最多 60 个字符、reason 最多 50 个字符；证据不足时返回空字符串，不得解释输出格式。"
         if compact else
         "每条 evidence 最多 140 个字符、reason 最多 100 个字符；证据不足时简要说明，不得复述整段原文。"
     )
-    retry_note = "这是针对格式异常的紧凑重试，" if compact else ""
-    return f"""{retry_note}对同一份投标文件完成下列三类工作，并只返回一个合法 JSON 对象：
-{{"review_results":[{{"rule_id":"规则ID","status":"satisfied|not_satisfied|partial|not_found|manual|ocr_required","evidence":"原文摘录","page_hint":null,"reason":"简洁理由","risk_level":"low|medium|high","confidence":"high|medium|low","evidence_quality":"sufficient|limited|missing"}}],"objective_scores":[{{"rule_id":"规则ID","met":true|false|null,"needs_ocr":true|false,"evidence":"原文摘录","reason":"判断理由","confidence":"high|medium|low"}}],"subjective_scores":[{{"rule_id":"规则ID","suggested_score":数字,"needs_ocr":true|false,"evidence":"原文摘录","reason":"得扣分理由","confidence":"high|medium|low"}}]}}
-
-严格要求：不得使用 Markdown 代码块、不得在 JSON 前后添加说明、所有字符串必须使用标准 JSON 双引号和转义。{limits}
-审查规则：{json.dumps(review_payload, ensure_ascii=False, separators=(',', ':'))}
-客观评分规则：{json.dumps(objective_payload, ensure_ascii=False, separators=(',', ':'))}
-主观评分规则：{json.dumps(subjective_payload, ensure_ascii=False, separators=(',', ':'))}
-对标记 ocr_required=true 的规则，当前系统未执行 OCR；若关键证据仅在图片、签章、证照或手写内容中，审查结果必须为 ocr_required，评分结果 needs_ocr=true 且不给分。客观分只判断证据是否满足，不自行计算分数。主观分不得超出规则 scoring.max_score。
-投标文件：{document['original_name']}；投标人：{document['bidder_name'] or '未填写'}
-原文：
-{text}"""
+    return storage.render_prompt_template(app, "evaluate_all_user", retry_note="这是针对格式异常的紧凑重试，" if compact else "", limits=limits,
+                                          review_rules=json.dumps(review_payload, ensure_ascii=False, separators=(",", ":")),
+                                          objective_rules=json.dumps(objective_payload, ensure_ascii=False, separators=(",", ":")),
+                                          subjective_rules=json.dumps(subjective_payload, ensure_ascii=False, separators=(",", ":")),
+                                          document_name=document["original_name"], bidder_name=document["bidder_name"] or "未填写", text=text)
 
 
 def _is_invalid_json_model_response(exc: ValueError) -> bool:
@@ -884,7 +830,7 @@ def _evaluate_all(app, task: dict) -> dict:
         "objective": {item["rule_id"] for item in objective_rules},
         "subjective": {item["rule_id"] for item in subjective_rules},
     }
-    system_prompt = _system_prompt(app, "evaluate_all", "只能依据规则与投标文件可见原文，不得编造、推断签字盖章或线下材料。")
+    system_prompt = _system_prompt(app, "evaluate_all")
     compact_retry_count = 0
     reused_document_count = 0
     for index, document in enumerate(documents, start=1):
@@ -903,7 +849,7 @@ def _evaluate_all(app, task: dict) -> dict:
             continue
         context = build_rule_context(document["parsed_path"], all_rules, char_limit)
         text = context["text"]
-        user_prompt = _combined_evaluation_prompt(document, review_payload, objective_payload, subjective_payload, text, compact=False)
+        user_prompt = _combined_evaluation_prompt(app, document, review_payload, objective_payload, subjective_payload, text, compact=False)
         try:
             parsed = _request_task_json(app, task, profile, "evaluate_all", system_prompt, user_prompt,
                                         document_id=document["document_id"], context_mode=context["mode"],
@@ -915,7 +861,7 @@ def _evaluate_all(app, task: dict) -> dict:
             storage.update_task(app, task["task_id"], message=f"{document['bidder_name'] or document['original_name']} 返回格式异常，正在紧凑重试")
             retry_context = build_rule_context(document["parsed_path"], all_rules, min(char_limit, 160_000))
             retry_prompt = _combined_evaluation_prompt(
-                document, review_payload, objective_payload, subjective_payload, retry_context["text"], compact=True,
+                app, document, review_payload, objective_payload, subjective_payload, retry_context["text"], compact=True,
             )
             parsed = _request_task_json(app, task, profile, "evaluate_all_compact_retry", system_prompt, retry_prompt,
                                         document_id=document["document_id"], context_mode=retry_context["mode"],

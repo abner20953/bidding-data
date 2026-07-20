@@ -160,12 +160,12 @@ def request_json(profile: dict, system_prompt: str, user_prompt: str, *, usage_c
     return result
 
 
-def test_connection(profile: dict) -> str:
+def test_connection(profile: dict, prompt_text: str) -> str:
     """发送极小请求验证模型地址、密钥和兼容参数；不写入业务数据。"""
     api_key = _api_key_for(profile)
     payload = {
         "model": profile["model_name"],
-        "messages": [{"role": "user", "content": "请仅返回 JSON 对象：{\"message\":\"连接成功\"}"}],
+        "messages": [{"role": "user", "content": prompt_text}],
         "temperature": 0,
         "max_tokens": 16,
     }
