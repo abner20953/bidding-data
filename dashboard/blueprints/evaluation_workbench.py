@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 
-from flask import Blueprint, current_app, jsonify, render_template, request
+from flask import Blueprint, current_app, jsonify, render_template, request, session
 from werkzeug.security import check_password_hash
 
 from dashboard.evaluation_workbench import storage
@@ -18,6 +18,7 @@ from dashboard.evaluation_workbench.ai_gateway import test_connection
 
 evaluation_workbench_bp = Blueprint("evaluation_workbench", __name__)
 TASK_PROMPT_VERSION = "token-optimized-v1"
+MODEL_CONFIGURATION_PASSWORD = "108"
 
 
 def create_worker_app():
@@ -59,6 +60,16 @@ def _new_project_password_is_valid(value: object) -> tuple[bool, str | None]:
     if not isinstance(value, str) or not check_password_hash(configured_hash, value):
         return False, "新建项目口令错误"
     return True, None
+
+
+def _model_configuration_is_unlocked() -> bool:
+    return bool(session.get("evaluation_workbench_model_configuration_unlocked"))
+
+
+def _model_configuration_access_error():
+    if _model_configuration_is_unlocked():
+        return None
+    return jsonify({"error": "请先输入模型配置口令"}), 403
 
 
 def _project_or_404(project_id: str):
@@ -293,10 +304,21 @@ def update_compare_signal_api(signal_id):
         return jsonify({"error": str(exc)}), 400
 
 
+@evaluation_workbench_bp.route("/api/evaluation-workbench/model-configuration/unlock", methods=["POST"])
+def unlock_model_configuration_api():
+    if not hmac.compare_digest(str(_json_body().get("password", "")), MODEL_CONFIGURATION_PASSWORD):
+        return jsonify({"error": "模型配置口令错误"}), 403
+    session["evaluation_workbench_model_configuration_unlocked"] = True
+    return jsonify({"status": "success"})
+
+
 @evaluation_workbench_bp.route("/api/evaluation-workbench/model-profiles", methods=["GET", "POST"])
 def model_profiles_api():
     _init()
     if request.method == "POST":
+        access_error = _model_configuration_access_error()
+        if access_error:
+            return access_error
         try:
             return jsonify({"profile": storage.create_model_profile(current_app, _json_body())}), 201
         except ValueError as exc:
@@ -307,6 +329,9 @@ def model_profiles_api():
 @evaluation_workbench_bp.route("/api/evaluation-workbench/model-profiles/<profile_id>", methods=["PATCH", "DELETE"])
 def update_model_profile_api(profile_id):
     _init()
+    access_error = _model_configuration_access_error()
+    if access_error:
+        return access_error
     if request.method == "DELETE":
         try:
             storage.delete_model_profile(current_app, profile_id)
@@ -322,6 +347,9 @@ def update_model_profile_api(profile_id):
 @evaluation_workbench_bp.route("/api/evaluation-workbench/model-profiles/<profile_id>/test", methods=["POST"])
 def test_model_profile_api(profile_id):
     _init()
+    access_error = _model_configuration_access_error()
+    if access_error:
+        return access_error
     try:
         profile = storage.get_model_profile(current_app, profile_id)
         return jsonify({"message": test_connection(profile)})
@@ -332,6 +360,9 @@ def test_model_profile_api(profile_id):
 @evaluation_workbench_bp.route("/api/evaluation-workbench/model-profiles/<profile_id>/default", methods=["POST"])
 def set_default_model_profile_api(profile_id):
     _init()
+    access_error = _model_configuration_access_error()
+    if access_error:
+        return access_error
     try:
         return jsonify({"profile": storage.set_default_model_profile(current_app, profile_id)})
     except ValueError as exc:

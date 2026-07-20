@@ -860,7 +860,7 @@ def _model_profile_values(app, payload: dict, *, existing: dict | None = None) -
         "context_limit": int(payload.get("context_limit") or 0) or None,
         "timeout_seconds": min(1800, max(30, int(payload.get("timeout_seconds") or 600))),
         "json_mode": 1 if payload.get("json_mode", True) else 0,
-        "thinking_mode": payload.get("thinking_mode") if payload.get("thinking_mode") in {"default", "enabled", "disabled"} else "default",
+        "thinking_mode": payload.get("thinking_mode") if payload.get("thinking_mode") in {"default", "enabled", "adaptive", "disabled"} else "default",
         "enabled": 1,
         "created_at": existing["created_at"] if existing else timestamp,
         "updated_at": timestamp,

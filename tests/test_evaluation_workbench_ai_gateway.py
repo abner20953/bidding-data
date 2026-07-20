@@ -45,3 +45,25 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
         self.assertEqual(post.call_args.kwargs["json"]["model"], "MiniMax-M2.7")
         self.assertNotIn("response_format", post.call_args.kwargs["json"])
         self.assertNotIn("thinking", post.call_args.kwargs["json"])
+
+    def test_minimax_m3_maps_legacy_enabled_thinking_to_adaptive(self):
+        response = Mock(ok=True)
+        response.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        profile = self._profile(
+            base_url="https://api.minimaxi.com/v1", model_name="MiniMax-M3", thinking_mode="enabled"
+        )
+        with patch("dashboard.evaluation_workbench.ai_gateway.requests.post", return_value=response) as post:
+            test_connection(profile)
+
+        self.assertEqual(post.call_args.kwargs["json"]["thinking"], {"type": "adaptive"})
+
+    def test_minimax_m2_omits_unsupported_disabled_thinking_parameter(self):
+        response = Mock(ok=True)
+        response.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        profile = self._profile(
+            base_url="https://api.minimaxi.com/v1", model_name="MiniMax-M2.7", thinking_mode="disabled"
+        )
+        with patch("dashboard.evaluation_workbench.ai_gateway.requests.post", return_value=response) as post:
+            test_connection(profile)
+
+        self.assertNotIn("thinking", post.call_args.kwargs["json"])

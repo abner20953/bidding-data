@@ -43,6 +43,26 @@ def _headers(api_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
 
+def _thinking_payload(profile: dict) -> dict | None:
+    """返回服务商兼容的 thinking 参数，避免 OpenAI-compatible 的方言差异。"""
+    mode = profile.get("thinking_mode")
+    model_name = str(profile.get("model_name") or "").lower()
+    base_url = str(profile.get("base_url") or "").lower()
+    if "api.minimaxi.com" in base_url:
+        if model_name.startswith("minimax-m2"):
+            # MiniMax M2.x 无法关闭 thinking，传入 disabled 也不会生效，因此直接省略。
+            return None
+        if model_name == "minimax-m3":
+            if mode == "enabled":
+                return {"type": "adaptive"}
+            if mode in {"adaptive", "disabled"}:
+                return {"type": mode}
+            return None
+    if mode in {"enabled", "disabled"}:
+        return {"type": mode}
+    return None
+
+
 def _raise_http_error(response, *, operation: str) -> None:
     if response.status_code == 401:
         raise ValueError(
@@ -65,8 +85,9 @@ def request_json(profile: dict, system_prompt: str, user_prompt: str, *, usage_c
     }
     if profile.get("json_mode"):
         payload["response_format"] = {"type": "json_object"}
-    if profile.get("thinking_mode") in {"enabled", "disabled"}:
-        payload["thinking"] = {"type": profile["thinking_mode"]}
+    thinking = _thinking_payload(profile)
+    if thinking:
+        payload["thinking"] = thinking
     if max_tokens is not None:
         payload["max_tokens"] = max(16, int(max_tokens))
     try:
@@ -103,8 +124,9 @@ def test_connection(profile: dict) -> str:
     }
     if profile.get("json_mode"):
         payload["response_format"] = {"type": "json_object"}
-    if profile.get("thinking_mode") in {"enabled", "disabled"}:
-        payload["thinking"] = {"type": profile["thinking_mode"]}
+    thinking = _thinking_payload(profile)
+    if thinking:
+        payload["thinking"] = thinking
     try:
         response = requests.post(
             f"{profile['base_url'].rstrip('/')}/chat/completions",

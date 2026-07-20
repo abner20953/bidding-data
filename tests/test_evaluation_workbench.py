@@ -19,6 +19,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = Path(tempfile.mkdtemp(prefix="evaluation_workbench_"))
         self.app = create_worker_app()
+        self.app.config["SECRET_KEY"] = "evaluation-workbench-test-secret"
         self.app.config["EVALUATION_WORKBENCH_DATA_DIR"] = str(self.temp_dir / "workspace")
         self.app.register_blueprint(evaluation_workbench_bp)
         storage.init_database(self.app)
@@ -50,6 +51,12 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIsNotNone(task)
         worker.run_task(self.app, task)
         return storage.get_task(self.app, task["task_id"])
+
+    @staticmethod
+    def _unlock_model_configuration(client):
+        response = client.post("/api/evaluation-workbench/model-configuration/unlock", json={"password": "108"})
+        if response.status_code != 200:
+            raise AssertionError(response.get_json())
 
     def test_parse_task_persists_document_metadata(self):
         self._add_pdf("tender.pdf", "tender", "", "采购需求：稳定运行。")
@@ -252,8 +259,10 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             "display_name": "测试模型", "base_url": "https://example.test/v1", "model_name": "test-model", "api_key": "secret-test-key",
         })
 
+        client = self.app.test_client()
+        self._unlock_model_configuration(client)
         with patch("dashboard.blueprints.evaluation_workbench.test_connection", return_value="连接成功：模型接口已响应") as test_connection:
-            response = self.app.test_client().post(f"/api/evaluation-workbench/model-profiles/{profile['profile_id']}/test")
+            response = client.post(f"/api/evaluation-workbench/model-profiles/{profile['profile_id']}/test")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["message"], "连接成功：模型接口已响应")
@@ -264,7 +273,9 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             "display_name": "待删除模型", "base_url": "https://example.test/v1", "model_name": "test-model", "api_key": "secret-test-key",
         })
 
-        response = self.app.test_client().delete(f"/api/evaluation-workbench/model-profiles/{profile['profile_id']}")
+        client = self.app.test_client()
+        self._unlock_model_configuration(client)
+        response = client.delete(f"/api/evaluation-workbench/model-profiles/{profile['profile_id']}")
 
         self.assertEqual(response.status_code, 200)
         self.assertNotIn(profile["profile_id"], {item["profile_id"] for item in storage.list_model_profiles(self.app)})
@@ -274,14 +285,31 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             "display_name": "默认测试模型", "base_url": "https://example.test/v1", "model_name": "default-test", "api_key": "test-key",
         })
 
-        response = self.app.test_client().post(f"/api/evaluation-workbench/model-profiles/{profile['profile_id']}/default")
+        client = self.app.test_client()
+        self._unlock_model_configuration(client)
+        response = client.post(f"/api/evaluation-workbench/model-profiles/{profile['profile_id']}/default")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(storage.get_model_profile(self.app, None)["profile_id"], profile["profile_id"])
         profiles = storage.list_model_profiles(self.app)
         self.assertTrue(next(item for item in profiles if item["profile_id"] == profile["profile_id"])["is_default"])
-        blocked = self.app.test_client().delete(f"/api/evaluation-workbench/model-profiles/{profile['profile_id']}")
+        blocked = client.delete(f"/api/evaluation-workbench/model-profiles/{profile['profile_id']}")
         self.assertEqual(blocked.status_code, 400)
+
+    def test_model_configuration_management_requires_password(self):
+        client = self.app.test_client()
+        locked = client.post("/api/evaluation-workbench/model-profiles", json={
+            "display_name": "锁定测试", "base_url": "https://example.test/v1", "model_name": "test-model", "api_key": "test-key",
+        })
+        wrong = client.post("/api/evaluation-workbench/model-configuration/unlock", json={"password": "wrong"})
+        self._unlock_model_configuration(client)
+        allowed = client.post("/api/evaluation-workbench/model-profiles", json={
+            "display_name": "解锁测试", "base_url": "https://example.test/v1", "model_name": "test-model", "api_key": "test-key",
+        })
+
+        self.assertEqual(locked.status_code, 403)
+        self.assertEqual(wrong.status_code, 403)
+        self.assertEqual(allowed.status_code, 201)
 
     def test_auto_results_can_be_confirmed_in_batch_while_exceptions_remain(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案。")
