@@ -27,10 +27,33 @@ def _decode_json_content(content) -> dict:
     return parsed
 
 
-def request_json(profile: dict, system_prompt: str, user_prompt: str, *, usage_callback=None, max_tokens: int | None = None) -> dict:
+def _api_key_for(profile: dict) -> str:
     api_key = str(profile.get("_api_key") or os.environ.get(profile.get("api_key_env", ""), "")).strip()
     if not api_key:
         raise ValueError(f"模型档案“{profile['display_name']}”尚未配置 API Key")
+    if any(not (0x21 <= ord(character) <= 0x7E) for character in api_key):
+        raise ValueError(
+            f"模型档案“{profile['display_name']}”的 API Key 含有中文、全角符号、空格或不可见字符；"
+            "请在模型配置中重新粘贴服务商控制台生成的纯文本 Key"
+        )
+    return api_key
+
+
+def _headers(api_key: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+
+def _raise_http_error(response, *, operation: str) -> None:
+    if response.status_code == 401:
+        raise ValueError(
+            f"{operation}鉴权失败（HTTP 401）：API Key 无效、已失效，或不属于当前服务商。"
+            "请从对应服务商控制台重新创建并完整复制 API Key；不要填入 API 地址、邮箱或带引号的文本。"
+        )
+    raise ValueError(f"{operation}（HTTP {response.status_code}）：{response.text[:500]}")
+
+
+def request_json(profile: dict, system_prompt: str, user_prompt: str, *, usage_callback=None, max_tokens: int | None = None) -> dict:
+    api_key = _api_key_for(profile)
     base_url = profile["base_url"].rstrip("/")
     payload = {
         "model": profile["model_name"],
@@ -49,14 +72,14 @@ def request_json(profile: dict, system_prompt: str, user_prompt: str, *, usage_c
     try:
         response = requests.post(
             f"{base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            headers=_headers(api_key),
             json=payload,
             timeout=min(1800, max(30, int(profile.get("timeout_seconds") or 600))),
         )
-    except requests.RequestException as exc:
+    except (requests.RequestException, UnicodeEncodeError) as exc:
         raise ValueError(f"模型连接失败：{exc}") from exc
     if not response.ok:
-        raise ValueError(f"模型请求失败（HTTP {response.status_code}）：{response.text[:500]}")
+        _raise_http_error(response, operation="模型请求失败")
     body = response.json()
     try:
         content = body["choices"][0]["message"]["content"]
@@ -71,9 +94,7 @@ def request_json(profile: dict, system_prompt: str, user_prompt: str, *, usage_c
 
 def test_connection(profile: dict) -> str:
     """发送极小请求验证模型地址、密钥和兼容参数；不写入业务数据。"""
-    api_key = str(profile.get("_api_key") or os.environ.get(profile.get("api_key_env", ""), "")).strip()
-    if not api_key:
-        raise ValueError(f"模型档案“{profile['display_name']}”尚未配置 API Key")
+    api_key = _api_key_for(profile)
     payload = {
         "model": profile["model_name"],
         "messages": [{"role": "user", "content": "请仅返回 JSON 对象：{\"message\":\"连接成功\"}"}],
@@ -87,14 +108,14 @@ def test_connection(profile: dict) -> str:
     try:
         response = requests.post(
             f"{profile['base_url'].rstrip('/')}/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            headers=_headers(api_key),
             json=payload,
             timeout=min(60, max(10, int(profile.get("timeout_seconds") or 30))),
         )
-    except requests.RequestException as exc:
+    except (requests.RequestException, UnicodeEncodeError) as exc:
         raise ValueError(f"模型连接失败：{exc}") from exc
     if not response.ok:
-        raise ValueError(f"模型测试失败（HTTP {response.status_code}）：{response.text[:300]}")
+        _raise_http_error(response, operation="模型测试失败")
     try:
         if not response.json().get("choices"):
             raise ValueError

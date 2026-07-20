@@ -240,6 +240,13 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn("api_key", returned)
         self.assertNotIn("api_key_encrypted", returned)
 
+    def test_model_profile_rejects_key_with_non_ascii_or_whitespace_characters(self):
+        with self.assertRaisesRegex(ValueError, "API Key 含有中文"):
+            storage.create_model_profile(self.app, {
+                "display_name": "格式错误模型", "base_url": "https://example.test/v1", "model_name": "test-model",
+                "api_key": "错误 key",
+            })
+
     def test_model_connection_endpoint_uses_saved_key_without_returning_it(self):
         profile = storage.create_model_profile(self.app, {
             "display_name": "测试模型", "base_url": "https://example.test/v1", "model_name": "test-model", "api_key": "secret-test-key",
