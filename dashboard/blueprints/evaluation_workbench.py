@@ -69,7 +69,7 @@ def _model_configuration_is_unlocked() -> bool:
 def _model_configuration_access_error():
     if _model_configuration_is_unlocked():
         return None
-    return jsonify({"error": "请先输入模型配置口令"}), 403
+    return jsonify({"error": "请先输入配置口令"}), 403
 
 
 def _project_or_404(project_id: str):
@@ -241,7 +241,7 @@ def tasks_api(project_id):
     if task_type == "evaluate_all":
         rule_set, rules = storage.list_rules(current_app, project_id)
         categories = {item["category"] for item in rules if item["enabled"]}
-        executable = categories & {"qualification", "compliance", "substantive", "rejection", "objective", "subjective"}
+        executable = categories & {"qualification", "compliance", "substantive", "rejection", "other", "objective", "subjective"}
         if not rule_set or rule_set["status"] != "confirmed" or not executable:
             return jsonify({"error": "请先确认至少一条可执行的审查或评分规则"}), 400
     try:
@@ -306,9 +306,61 @@ def update_compare_signal_api(signal_id):
 @evaluation_workbench_bp.route("/api/evaluation-workbench/model-configuration/unlock", methods=["POST"])
 def unlock_model_configuration_api():
     if not hmac.compare_digest(str(_json_body().get("password", "")), MODEL_CONFIGURATION_PASSWORD):
-        return jsonify({"error": "模型配置口令错误"}), 403
+        return jsonify({"error": "配置口令错误"}), 403
     session["evaluation_workbench_model_configuration_unlocked"] = True
     return jsonify({"status": "success"})
+
+
+@evaluation_workbench_bp.route("/api/evaluation-workbench/prompt-templates", methods=["GET"])
+def prompt_templates_api():
+    _init()
+    access_error = _model_configuration_access_error()
+    if access_error:
+        return access_error
+    return jsonify({"templates": storage.list_prompt_templates(current_app)})
+
+
+@evaluation_workbench_bp.route("/api/evaluation-workbench/prompt-templates/<template_id>", methods=["PATCH", "DELETE"])
+def update_prompt_template_api(template_id):
+    _init()
+    access_error = _model_configuration_access_error()
+    if access_error:
+        return access_error
+    try:
+        if request.method == "DELETE":
+            return jsonify({"template": storage.reset_prompt_template(current_app, template_id)})
+        return jsonify({"template": storage.update_prompt_template(current_app, template_id, _json_body().get("content"))})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@evaluation_workbench_bp.route("/api/evaluation-workbench/global-rules", methods=["GET", "POST"])
+def global_rules_api():
+    _init()
+    access_error = _model_configuration_access_error()
+    if access_error:
+        return access_error
+    try:
+        if request.method == "POST":
+            return jsonify({"rule": storage.create_global_rule(current_app, _json_body())}), 201
+        return jsonify({"rules": storage.list_global_rules(current_app)})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@evaluation_workbench_bp.route("/api/evaluation-workbench/global-rules/<global_rule_id>", methods=["PATCH", "DELETE"])
+def update_global_rule_api(global_rule_id):
+    _init()
+    access_error = _model_configuration_access_error()
+    if access_error:
+        return access_error
+    try:
+        if request.method == "DELETE":
+            storage.delete_global_rule(current_app, global_rule_id)
+            return jsonify({"status": "success"})
+        return jsonify({"rule": storage.update_global_rule(current_app, global_rule_id, _json_body())})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
 
 @evaluation_workbench_bp.route("/api/evaluation-workbench/model-profiles", methods=["GET", "POST"])

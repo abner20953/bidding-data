@@ -389,7 +389,7 @@ class CollusionDetector:
         self.tender_stats = stats
 
         for _, raw_text, _ in pages:
-            self.tender_entities.update(self.extract_entities(raw_text))
+            self.tender_entities.update(self.extract_typed_entities(raw_text))
 
         if self.build_text_index:
             tender_exact_units = self.get_exact_units(pages)
@@ -1431,6 +1431,47 @@ class CollusionDetector:
         )
         return entities
 
+    def extract_typed_entities(self, text):
+        """提取可横向核验的实体并保留类别，供评标工作台生成审慎线索。
+
+        姓名、地址只接受带明确字段标签的写法，避免把普通中文或公共模板误判为关联。
+        ``extract_entities`` 保持原返回值和行为，确保既有 /bijiao 流程兼容。
+        """
+        if not text:
+            return set()
+        normalized_text = unicodedata.normalize("NFKC", text)
+        typed = set()
+        separator_pattern = r"[\s\-—_]*"
+        identities = re.findall(
+            rf"(?<!\d)(?:(?:\d{separator_pattern}){{17}}[0-9Xx]|(?:\d{separator_pattern}){{14}}\d)(?!\d)",
+            normalized_text,
+        )
+        for identity in identities:
+            value = re.sub(r"[\s\-—_]+", "", identity).upper()
+            if self._is_valid_cn_id(value):
+                typed.add(("person_identity", value))
+        phones = re.findall(rf"(?<!\d)1{separator_pattern}[3-9](?:{separator_pattern}\d){{9}}(?!\d)", normalized_text)
+        typed.update(("phone", re.sub(r"[\s\-—_]+", "", phone)) for phone in phones)
+        emails = re.findall(r"(?<![a-zA-Z0-9._%+-])[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", normalized_text)
+        typed.update(("email", email.lower()) for email in emails)
+
+        name_pattern = re.compile(
+            r"(?:法定代表人|委托代理人|授权代表|项目负责人|项目经理|技术负责人|联系人|姓名)\s*(?:[:：]|[ \t]+)\s*([\u4e00-\u9fff]{2,4})(?![\u4e00-\u9fff])"
+        )
+        invalid_names = {"签字", "盖章", "姓名", "联系人", "负责人", "代理人", "项目经理", "技术负责人"}
+        for name in name_pattern.findall(normalized_text):
+            if name not in invalid_names:
+                typed.add(("person_name", name))
+
+        address_pattern = re.compile(r"(?:注册地址|办公地址|通讯地址|联系地址|住址|地址)[ \t]*[:：][ \t]*([^\r\n。；;]{6,100})")
+        address_markers = ("省", "市", "区", "县", "路", "街", "镇", "乡", "村", "号", "楼", "室", "园", "大厦", "街道")
+        for raw_address in address_pattern.findall(normalized_text):
+            value = re.split(r"(?:电话|邮编|邮箱|E-mail|Email)\s*[:：]", raw_address, maxsplit=1, flags=re.I)[0]
+            value = re.sub(r"\s+", "", value).strip("，,；;。")
+            if 6 <= len(value) <= 80 and "@" not in value and any(marker in value for marker in address_markers):
+                typed.add(("address", value))
+        return typed
+
     @staticmethod
     def _scan_warning(label, stats):
         if not stats:
@@ -1768,7 +1809,7 @@ class CollusionDetector:
             entities_a = set()
             entity_pages_a = {}
             for page_number, raw_text, _ in pages_a:
-                page_entities = self.extract_entities(raw_text)
+                page_entities = self.extract_typed_entities(raw_text)
                 entities_a.update(page_entities)
                 for entity in page_entities:
                     entity_pages_a.setdefault(entity, page_number)
@@ -1776,21 +1817,22 @@ class CollusionDetector:
             entities_b = set()
             entity_pages_b = {}
             for page_number, raw_text, _ in pages_b:
-                page_entities = self.extract_entities(raw_text)
+                page_entities = self.extract_typed_entities(raw_text)
                 entities_b.update(page_entities)
                 for entity in page_entities:
                     entity_pages_b.setdefault(entity, page_number)
 
-            for entity in sorted((entities_a & entities_b) - self.tender_entities):
+            for entity_kind, entity in sorted((entities_a & entities_b) - self.tender_entities):
                 collisions.append(
                     {
                         "type": "entity",
+                        "entity_kind": entity_kind,
                         "text_a": entity,
                         "text_b": entity,
-                        "page_a": entity_pages_a.get(entity, 0),
-                        "page_b": entity_pages_b.get(entity, 0),
+                        "page_a": entity_pages_a.get((entity_kind, entity), 0),
+                        "page_b": entity_pages_b.get((entity_kind, entity), 0),
                         "badges": ["敏感实体"],
-                        "desc": f"发现相同的实体信息: {entity}",
+                        "desc": f"发现相同的{entity_kind}实体信息: {entity}",
                     }
                 )
 

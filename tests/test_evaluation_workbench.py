@@ -167,6 +167,21 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         metadata = next(item for item in analysis["signals"] if item["dimension"] == "metadata")
         self.assertEqual(len(metadata["evidence"]), 1)
 
+    def test_cross_bid_analysis_separates_common_name_email_and_address(self):
+        left = {"document_id": "a", "bidder_name": "甲公司", "original_name": "a.pdf"}
+        right = {"document_id": "b", "bidder_name": "乙公司", "original_name": "b.pdf"}
+        result = {"paragraphs": [
+            {"type": "entity", "entity_kind": "person_name", "text_a": "张三", "text_b": "张三", "page_a": 2, "page_b": 4},
+            {"type": "entity", "entity_kind": "email", "text_a": "shared@example.com", "text_b": "shared@example.com", "page_a": 3, "page_b": 5},
+            {"type": "entity", "entity_kind": "address", "text_a": "北京市朝阳区建国路88号", "text_b": "北京市朝阳区建国路88号", "page_a": 6, "page_b": 7},
+        ]}
+
+        analysis = build_cross_bid_analysis("task-1", [(left, right, result)], tender_loaded=True)
+
+        self.assertEqual({item["dimension"] for item in analysis["signals"]}, {"person_name", "email", "address"})
+        self.assertNotIn("address", {item["dimension"] for item in analysis["not_executed_dimensions"]})
+        self.assertTrue(all(item["signal_type"] == "collusion_signal" for item in analysis["signals"]))
+
     def test_compare_ai_packet_is_limited_to_fixed_rule_evidence(self):
         packet = worker._compare_evidence_packet({
             "signal_id": "signal-1", "bidder_a": "甲公司", "bidder_b": "乙公司", "dimension_label": "正文雷同",
@@ -206,7 +221,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
 
         with patch("dashboard.evaluation_workbench.worker.request_json", return_value={"rules": [
-            {"category": "qualification", "title": "具备有效资质", "source_text": "投标人应具备有效资质", "check_mode": "auto"},
+            {"category": "qualification", "title": "具备有效资质", "check_rule": "核验是否提供有效资质材料", "source_text": "投标人应具备有效资质", "check_mode": "auto"},
             {"category": "subjective", "title": "技术方案评分", "source_text": "技术方案满分十分", "ocr_required": True, "scoring": {"max_score": 10}},
         ]}):
             finished = self._run_next_task()
@@ -216,6 +231,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(rule_set["status"], "draft")
         self.assertEqual(len(rules), 2)
         self.assertTrue(all(item["source_type"] == "ai" for item in rules))
+        self.assertEqual(next(item for item in rules if item["title"] == "具备有效资质")["check_rule"], "核验是否提供有效资质材料")
         self.assertEqual(next(item for item in rules if item["title"] == "技术方案评分")["check_mode"], "ocr")
 
     def test_adding_to_confirmed_rules_creates_new_draft_version(self):
@@ -312,6 +328,78 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(locked.status_code, 403)
         self.assertEqual(wrong.status_code, 403)
         self.assertEqual(allowed.status_code, 201)
+
+    def test_prompt_templates_require_password_and_can_be_updated_and_restored(self):
+        client = self.app.test_client()
+        locked = client.get("/api/evaluation-workbench/prompt-templates")
+        self.assertEqual(locked.status_code, 403)
+        self._unlock_model_configuration(client)
+        listed = client.get("/api/evaluation-workbench/prompt-templates")
+        self.assertEqual(listed.status_code, 200)
+        original = next(item for item in listed.get_json()["templates"] if item["template_id"] == "evaluate_all")
+        before_fingerprint = storage.prompt_template_fingerprint(self.app)
+        updated = client.patch("/api/evaluation-workbench/prompt-templates/evaluate_all", json={"content": "请严格逐项核验，并用简洁中文说明证据和理由。"})
+        self.assertEqual(updated.status_code, 200)
+        self.assertTrue(updated.get_json()["template"]["is_custom"])
+        self.assertEqual(storage.prompt_template(self.app, "evaluate_all"), "请严格逐项核验，并用简洁中文说明证据和理由。")
+        self.assertNotEqual(storage.prompt_template_fingerprint(self.app), before_fingerprint)
+        restored = client.delete("/api/evaluation-workbench/prompt-templates/evaluate_all")
+        self.assertEqual(restored.status_code, 200)
+        self.assertFalse(restored.get_json()["template"]["is_custom"])
+        self.assertEqual(storage.prompt_template(self.app, "evaluate_all"), original["content"])
+
+    def test_global_rules_require_password_and_are_automatically_imported_for_new_projects(self):
+        client = self.app.test_client()
+        self.assertEqual(client.get("/api/evaluation-workbench/global-rules").status_code, 403)
+        self._unlock_model_configuration(client)
+        created = client.post("/api/evaluation-workbench/global-rules", json={
+            "category": "substantive", "title": "营业执照有效性",
+            "check_rule": "核验是否提供有效营业执照", "source_text": "投标人应提供有效营业执照。",
+            "ocr_required": True, "enabled": True,
+        })
+        self.assertEqual(created.status_code, 201)
+        disabled = client.post("/api/evaluation-workbench/global-rules", json={
+            "category": "other", "title": "不导入项", "check_rule": "不应自动导入", "enabled": False,
+        })
+        self.assertEqual(disabled.status_code, 201)
+
+        new_project = storage.create_project(self.app, "自动导入项目")
+        rule_set, rules = storage.list_rules(self.app, new_project["project_id"])
+
+        self.assertEqual(rule_set["status"], "draft")
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0]["source_type"], "global")
+        self.assertEqual(rules[0]["check_rule"], "核验是否提供有效营业执照")
+        self.assertEqual(rules[0]["check_mode"], "ocr")
+
+        client.patch(f"/api/evaluation-workbench/global-rules/{created.get_json()['rule']['global_rule_id']}", json={"title": "更新名称"})
+        self.assertEqual(storage.list_rules(self.app, new_project["project_id"])[1][0]["title"], "营业执照有效性")
+
+    def test_manual_check_rule_is_preserved_and_can_be_updated(self):
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "营业执照", "check_rule": "核验是否提供有效营业执照", "source_text": "投标人应提供营业执照。",
+        })
+        self.assertEqual(rule["check_rule"], "核验是否提供有效营业执照")
+        updated = storage.update_rule(self.app, self.project["project_id"], rule["rule_id"], {"check_rule": "核验营业执照是否在有效期内"})
+        self.assertEqual(updated["check_rule"], "核验营业执照是否在有效期内")
+
+    def test_other_manual_rule_is_included_in_combined_review(self):
+        self._add_pdf("bid.pdf", "bid", "甲公司", "已提供承诺函。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "other", "title": "其他承诺", "check_rule": "核验是否提供承诺函", "source_text": "应提供承诺函。",
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value={
+            "review_results": [{"rule_id": rule["rule_id"], "status": "satisfied", "evidence": "承诺函", "reason": "已提供", "risk_level": "low"}],
+            "objective_scores": [], "subjective_scores": [],
+        }):
+            finished = self._run_next_task()
+        _, reviews = storage.latest_review_results(self.app, self.project["project_id"])
+        self.assertEqual(finished["status"], "success")
+        self.assertEqual(reviews[0]["category"], "other")
 
     def test_auto_results_can_be_confirmed_in_batch_while_exceptions_remain(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案。")

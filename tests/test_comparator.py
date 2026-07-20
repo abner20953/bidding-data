@@ -44,6 +44,31 @@ class ComparatorTests(unittest.TestCase):
         self.assertIn("test@example.com", entities)
         self.assertNotIn("110105194912310", entities)
 
+    def test_typed_entities_extract_labeled_name_email_and_address(self):
+        detector = CollusionDetector()
+
+        entities = detector.extract_typed_entities(
+            "法定代表人：张三\n邮箱：shared@example.com\n办公地址：北京市朝阳区建国路88号"
+        )
+
+        self.assertIn(("person_name", "张三"), entities)
+        self.assertIn(("email", "shared@example.com"), entities)
+        self.assertIn(("address", "北京市朝阳区建国路88号"), entities)
+
+    def test_collision_entities_keep_type_for_workbench_consumers(self):
+        detector = CollusionDetector()
+        text = "联系人：张三\n邮箱：shared@example.com\n办公地址：北京市朝阳区建国路88号"
+        pages = [(1, text, detector.normalize(text))]
+        stats = {"extracted_chars": len(text)}
+        with mock.patch.object(detector, "extract_text_with_pages", side_effect=[
+            (text, pages, {}, stats), (text, pages, {}, stats),
+        ]):
+            result = detector.find_collisions("a.pdf", "b.pdf", check_text=False)
+
+        kinds = {item.get("entity_kind") for item in result["paragraphs"] if item.get("type") == "entity"}
+        self.assertEqual(kinds, {"person_name", "email", "address"})
+        self.assertTrue(all(item["page_a"] == 1 and item["page_b"] == 1 for item in result["paragraphs"] if item.get("type") == "entity"))
+
     def test_pdf_page_limits_allow_2000_pages_per_file(self):
         self.assertEqual(comparator.MAX_PDF_PAGES, 2000)
         comparator._validate_total_page_budget((2000, 2000))

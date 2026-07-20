@@ -30,7 +30,7 @@ def _pages_from_text(text: str) -> dict[int, str]:
 
 
 def _anchors(rule: dict) -> list[str]:
-    raw = f"{rule.get('title', '')} {rule.get('source_text', '')}"
+    raw = f"{rule.get('title', '')} {rule.get('check_rule', '')} {rule.get('source_text', '')}"
     values: set[str] = set()
     for block in [*CHINESE_BLOCK.findall(raw), *ASCII_BLOCK.findall(raw)]:
         block = block.strip()

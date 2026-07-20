@@ -16,11 +16,13 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet, InvalidToken
+from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATE_SETTING, PROMPT_TEMPLATES
 
 
 MAX_BID_DOCUMENTS = 10
 MAX_QUEUED_TASKS = 3
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+GLOBAL_RULE_CATEGORIES = {"qualification", "compliance", "substantive", "other"}
 
 _SCORE_TOTAL_PATTERN = re.compile(r"(?:总计|共计|合计|最高(?:得)?|最多(?:得)?|满分(?:为)?)\s*(\d+(?:\.\d+)?)\s*分")
 _SCORE_VALUE_PATTERN = re.compile(r"(?:得|扣)\s*(\d+(?:\.\d+)?)\s*分")
@@ -36,6 +38,72 @@ def _validate_api_key_characters(api_key: str) -> None:
 
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _prompt_template_overrides(app) -> dict[str, str]:
+    with connection(app) as conn:
+        row = conn.execute("SELECT setting_value FROM ew_settings WHERE setting_key = ?", (PROMPT_TEMPLATE_SETTING,)).fetchone()
+    if not row:
+        return {}
+    try:
+        values = json.loads(row["setting_value"])
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return {key: value for key, value in values.items() if key in PROMPT_TEMPLATES and isinstance(value, str)} if isinstance(values, dict) else {}
+
+
+def list_prompt_templates(app) -> list[dict]:
+    overrides = _prompt_template_overrides(app)
+    return [
+        {"template_id": template_id, "name": meta["name"], "description": meta["description"],
+         "content": overrides.get(template_id, meta["content"]), "is_custom": template_id in overrides}
+        for template_id, meta in PROMPT_TEMPLATES.items()
+    ]
+
+
+def prompt_template(app, template_id: str) -> str:
+    if template_id not in PROMPT_TEMPLATES:
+        raise ValueError("不支持的提示词流程")
+    return _prompt_template_overrides(app).get(template_id, PROMPT_TEMPLATES[template_id]["content"])
+
+
+def prompt_template_fingerprint(app) -> str:
+    values = {item["template_id"]: item["content"] for item in list_prompt_templates(app)}
+    return hashlib.sha256(json.dumps(values, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def update_prompt_template(app, template_id: str, content: object) -> dict:
+    if template_id not in PROMPT_TEMPLATES:
+        raise ValueError("不支持的提示词流程")
+    value = str(content or "").strip()
+    if not 20 <= len(value) <= 12_000:
+        raise ValueError("提示词长度应在 20 到 12000 个字符之间")
+    overrides = _prompt_template_overrides(app)
+    overrides[template_id] = value
+    with connection(app) as conn:
+        conn.execute(
+            "INSERT INTO ew_settings(setting_key, setting_value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value, updated_at=excluded.updated_at",
+            (PROMPT_TEMPLATE_SETTING, json.dumps(overrides, ensure_ascii=False), now_iso()),
+        )
+    return next(item for item in list_prompt_templates(app) if item["template_id"] == template_id)
+
+
+def reset_prompt_template(app, template_id: str) -> dict:
+    if template_id not in PROMPT_TEMPLATES:
+        raise ValueError("不支持的提示词流程")
+    overrides = _prompt_template_overrides(app)
+    overrides.pop(template_id, None)
+    with connection(app) as conn:
+        if overrides:
+            conn.execute(
+                "INSERT INTO ew_settings(setting_key, setting_value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value, updated_at=excluded.updated_at",
+                (PROMPT_TEMPLATE_SETTING, json.dumps(overrides, ensure_ascii=False), now_iso()),
+            )
+        else:
+            conn.execute("DELETE FROM ew_settings WHERE setting_key = ?", (PROMPT_TEMPLATE_SETTING,))
+    return next(item for item in list_prompt_templates(app) if item["template_id"] == template_id)
 
 
 def data_dir(app) -> Path:
@@ -185,6 +253,7 @@ def init_database(app) -> None:
                 rule_set_id TEXT NOT NULL REFERENCES ew_rule_sets(rule_set_id) ON DELETE CASCADE,
                 category TEXT NOT NULL,
                 title TEXT NOT NULL,
+                check_rule TEXT NOT NULL DEFAULT '',
                 source_text TEXT NOT NULL DEFAULT '',
                 source_page INTEGER,
                 check_mode TEXT NOT NULL DEFAULT 'auto',
@@ -194,6 +263,19 @@ def init_database(app) -> None:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS ew_global_rules (
+                global_rule_id TEXT PRIMARY KEY,
+                category TEXT NOT NULL,
+                title TEXT NOT NULL,
+                check_rule TEXT NOT NULL,
+                source_text TEXT NOT NULL DEFAULT '',
+                check_mode TEXT NOT NULL DEFAULT 'auto',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ew_global_rules_enabled ON ew_global_rules(enabled, category, sort_order);
             CREATE TABLE IF NOT EXISTS ew_review_runs (
                 review_run_id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL REFERENCES ew_projects(project_id) ON DELETE CASCADE,
@@ -259,6 +341,8 @@ def init_database(app) -> None:
         _ensure_column(conn, "ew_score_results", "review_reason", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "ew_rules", "source_type", "TEXT")
         _ensure_column(conn, "ew_rules", "source_task_id", "TEXT")
+        _ensure_column(conn, "ew_rules", "check_rule", "TEXT NOT NULL DEFAULT ''")
+        conn.execute("UPDATE ew_rules SET check_rule = title WHERE check_rule IS NULL OR check_rule = ''")
         conn.execute("UPDATE ew_rules SET source_type = CASE WHEN rule_set_id IN (SELECT rule_set_id FROM ew_rule_sets WHERE source_task_id IS NOT NULL) THEN 'ai' ELSE 'manual' END WHERE source_type IS NULL OR source_type = ''")
         _seed_default_profiles(conn)
         _seed_default_model_setting(conn)
@@ -355,8 +439,95 @@ def create_project(app, name: str, project_number: str = "", section_name: str =
             "INSERT INTO ew_projects(project_id, name, project_number, section_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
             (project_id, name.strip(), project_number.strip(), section_name.strip(), timestamp, timestamp),
         )
+        _import_enabled_global_rules(conn, project_id, timestamp)
     project_dir(app, project_id)
     return get_project(app, project_id)
+
+
+def _import_enabled_global_rules(conn: sqlite3.Connection, project_id: str, timestamp: str) -> None:
+    """新项目只在创建时自动复制已启用的通用规则，避免后续配置变更影响历史项目。"""
+    templates = conn.execute(
+        "SELECT * FROM ew_global_rules WHERE enabled = 1 ORDER BY category, sort_order, created_at"
+    ).fetchall()
+    if not templates:
+        return
+    rule_set_id = str(uuid.uuid4())
+    conn.execute(
+        "INSERT INTO ew_rule_sets(rule_set_id, project_id, version, status, created_at, updated_at) VALUES (?, ?, 1, 'draft', ?, ?)",
+        (rule_set_id, project_id, timestamp, timestamp),
+    )
+    for position, template in enumerate(templates):
+        conn.execute(
+            """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode,
+               source_type, source_task_id, scoring_json, enabled, sort_order, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'global', NULL, NULL, 1, ?, ?, ?)""",
+            (str(uuid.uuid4()), rule_set_id, template["category"], template["title"], template["check_rule"],
+             template["source_text"], template["check_mode"], position, timestamp, timestamp),
+        )
+
+
+def _global_rule_payload(payload: dict, existing: dict | None = None) -> dict:
+    base = existing or {}
+    category = str(payload.get("category", base.get("category", "substantive"))).strip()
+    if category not in GLOBAL_RULE_CATEGORIES:
+        raise ValueError("通用规则仅支持资格性、符合性、实质性/废标项和其他规则")
+    title = str(payload.get("title", base.get("title", ""))).strip()
+    check_rule = str(payload.get("check_rule", base.get("check_rule", ""))).strip()
+    if not title:
+        raise ValueError("规则名称不能为空")
+    if not check_rule:
+        raise ValueError("检查规则不能为空")
+    ocr_required = payload.get("ocr_required", base.get("check_mode") == "ocr")
+    return {
+        "category": category,
+        "title": title,
+        "check_rule": check_rule,
+        "source_text": str(payload.get("source_text", base.get("source_text", ""))).strip(),
+        "check_mode": "ocr" if ocr_required or payload.get("check_mode") == "ocr" else "auto",
+        "enabled": 1 if bool(payload.get("enabled", base.get("enabled", True))) else 0,
+        "sort_order": int(payload.get("sort_order", base.get("sort_order", 0)) or 0),
+    }
+
+
+def list_global_rules(app) -> list[dict]:
+    with connection(app) as conn:
+        rows = conn.execute(
+            "SELECT * FROM ew_global_rules ORDER BY category, sort_order, created_at"
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_global_rule(app, payload: dict) -> dict:
+    rule = _global_rule_payload(payload)
+    rule.update({"global_rule_id": str(uuid.uuid4()), "created_at": now_iso(), "updated_at": now_iso()})
+    with connection(app) as conn:
+        conn.execute(
+            """INSERT INTO ew_global_rules(global_rule_id, category, title, check_rule, source_text, check_mode, enabled, sort_order, created_at, updated_at)
+               VALUES (:global_rule_id, :category, :title, :check_rule, :source_text, :check_mode, :enabled, :sort_order, :created_at, :updated_at)""",
+            rule,
+        )
+    return rule
+
+
+def update_global_rule(app, global_rule_id: str, payload: dict) -> dict:
+    with connection(app) as conn:
+        row = conn.execute("SELECT * FROM ew_global_rules WHERE global_rule_id = ?", (global_rule_id,)).fetchone()
+        if not row:
+            raise ValueError("通用规则不存在")
+        rule = _global_rule_payload(payload, dict(row))
+        rule.update({"global_rule_id": global_rule_id, "updated_at": now_iso()})
+        conn.execute(
+            """UPDATE ew_global_rules SET category=:category, title=:title, check_rule=:check_rule, source_text=:source_text,
+               check_mode=:check_mode, enabled=:enabled, sort_order=:sort_order, updated_at=:updated_at WHERE global_rule_id=:global_rule_id""",
+            rule,
+        )
+    return rule
+
+
+def delete_global_rule(app, global_rule_id: str) -> None:
+    with connection(app) as conn:
+        if not conn.execute("DELETE FROM ew_global_rules WHERE global_rule_id = ?", (global_rule_id,)).rowcount:
+            raise ValueError("通用规则不存在")
 
 
 def delete_project(app, project_id: str) -> None:
@@ -533,6 +704,8 @@ def task_input_fingerprint(app, project_id: str, task_type: str, profile_id: str
         "rule_set": (rule_set or {}).get("rule_set_id") if uses_rules else None,
         "rule_set_updated_at": (rule_set or {}).get("updated_at") if uses_rules else None,
         "profile": (profile.get("profile_id"), profile.get("model_name"), profile.get("base_url"), profile.get("updated_at"), profile.get("json_mode"), profile.get("thinking_mode")),
+        "comparison_version": "cross-bid-signals-v2" if task_type == "compare_documents" else None,
+        "prompt_templates": prompt_template_fingerprint(app) if task_type in {"compare_documents", "extract_rules", "review_documents", "score_objective", "score_subjective", "evaluate_all"} else None,
     }
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -985,12 +1158,13 @@ def add_rule(app, project_id: str, payload: dict) -> dict:
     if rule_set["status"] != "draft":
         rule_set = _clone_rule_set_as_draft(app, project_id, rule_set)
     category = str(payload.get("category", "substantive")).strip()
-    if category not in {"qualification", "compliance", "substantive", "rejection", "objective", "subjective"}:
+    if category not in {"qualification", "compliance", "substantive", "rejection", "other", "objective", "subjective"}:
         raise ValueError("不支持的规则分类")
     timestamp = now_iso()
     rule = {
         "rule_id": str(uuid.uuid4()), "rule_set_id": rule_set["rule_set_id"], "category": category,
-        "title": title, "source_text": str(payload.get("source_text", "")).strip(),
+        "title": title, "check_rule": str(payload.get("check_rule", "")).strip() or title,
+        "source_text": str(payload.get("source_text", "")).strip(),
         "source_page": int(payload["source_page"]) if str(payload.get("source_page", "")).isdigit() else None,
         "check_mode": "ocr" if payload.get("ocr_required") or payload.get("check_mode") == "ocr" else "auto",
         "source_type": "manual", "source_task_id": None,
@@ -999,9 +1173,9 @@ def add_rule(app, project_id: str, payload: dict) -> dict:
     }
     with connection(app) as conn:
         conn.execute(
-            """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, source_text, source_page, check_mode,
+            """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode,
             source_type, source_task_id, scoring_json, enabled, sort_order, created_at, updated_at)
-            VALUES (:rule_id, :rule_set_id, :category, :title, :source_text, :source_page, :check_mode,
+            VALUES (:rule_id, :rule_set_id, :category, :title, :check_rule, :source_text, :source_page, :check_mode,
             :source_type, :source_task_id, :scoring_json, :enabled, :sort_order, :created_at, :updated_at)""", rule,
         )
         conn.execute("UPDATE ew_rule_sets SET updated_at = ? WHERE rule_set_id = ?", (timestamp, rule_set["rule_set_id"]))
@@ -1017,9 +1191,9 @@ def _clone_rule_set_as_draft(app, project_id: str, source_rule_set: dict) -> dic
         rows = conn.execute("SELECT * FROM ew_rules WHERE rule_set_id = ? ORDER BY sort_order, created_at", (source_rule_set["rule_set_id"],)).fetchall()
         for row in rows:
             conn.execute(
-                """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, source_text, source_page, check_mode,
-                   source_type, source_task_id, scoring_json, enabled, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (str(uuid.uuid4()), draft["rule_set_id"], row["category"], row["title"], row["source_text"], row["source_page"],
+                """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode,
+                   source_type, source_task_id, scoring_json, enabled, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (str(uuid.uuid4()), draft["rule_set_id"], row["category"], row["title"], row["check_rule"] or row["title"], row["source_text"], row["source_page"],
                  "ocr" if row["check_mode"] == "ocr" else "auto", row["source_type"] or "manual", row["source_task_id"], row["scoring_json"], row["enabled"], row["sort_order"], timestamp, timestamp),
             )
     return draft
@@ -1096,17 +1270,28 @@ def update_rule(app, project_id: str, rule_id: str, payload: dict) -> dict:
         if not row:
             raise ValueError("规则不存在")
         rule = dict(row)
-        if rule["category"] not in {"objective", "subjective"}:
-            raise ValueError("只有评分规则可以修改满分")
-        scoring = payload.get("scoring") if isinstance(payload.get("scoring"), dict) else {}
-        max_score = _valid_max_score(scoring)
-        if max_score is None:
-            raise ValueError("请填写大于 0 的有效满分")
-        current = json.loads(rule["scoring_json"] or "{}") if rule["scoring_json"] else {}
-        current.update({"max_score": max_score, "source": "manual"})
-        if rule["category"] == "objective":
-            current["kind"] = "boolean" if scoring.get("kind") == "boolean" else "manual"
-        conn.execute("UPDATE ew_rules SET scoring_json = ?, updated_at = ? WHERE rule_id = ?", (json.dumps(current, ensure_ascii=False), now_iso(), rule_id))
+        check_rule = None
+        if "check_rule" in payload:
+            check_rule = str(payload.get("check_rule") or "").strip()
+            if not check_rule:
+                raise ValueError("检查规则不能为空")
+        scoring_json = None
+        if "scoring" in payload:
+            if rule["category"] not in {"objective", "subjective"}:
+                raise ValueError("只有评分规则可以修改满分")
+            scoring = payload.get("scoring") if isinstance(payload.get("scoring"), dict) else {}
+            max_score = _valid_max_score(scoring)
+            if max_score is None:
+                raise ValueError("请填写大于 0 的有效满分")
+            current = json.loads(rule["scoring_json"] or "{}") if rule["scoring_json"] else {}
+            current.update({"max_score": max_score, "source": "manual"})
+            if rule["category"] == "objective":
+                current["kind"] = "boolean" if scoring.get("kind") == "boolean" else "manual"
+            scoring_json = json.dumps(current, ensure_ascii=False)
+        if check_rule is not None:
+            conn.execute("UPDATE ew_rules SET check_rule = ?, updated_at = ? WHERE rule_id = ?", (check_rule, now_iso(), rule_id))
+        if scoring_json is not None:
+            conn.execute("UPDATE ew_rules SET scoring_json = ?, updated_at = ? WHERE rule_id = ?", (scoring_json, now_iso(), rule_id))
         conn.execute("UPDATE ew_rule_sets SET updated_at = ? WHERE rule_set_id = ?", (now_iso(), rule_set["rule_set_id"]))
         updated = conn.execute("SELECT * FROM ew_rules WHERE rule_id = ?", (rule_id,)).fetchone()
     return dict(updated)
@@ -1122,12 +1307,12 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
         for index, item in enumerate(rules):
             title = str(item.get("title", "")).strip()
             category = str(item.get("category", "")).strip()
-            if not title or category not in {"qualification", "compliance", "substantive", "rejection", "objective", "subjective"}:
+            if not title or category not in {"qualification", "compliance", "substantive", "rejection", "other", "objective", "subjective"}:
                 continue
             conn.execute(
-                """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, source_text, source_page, check_mode, source_type, source_task_id, scoring_json, enabled, sort_order, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'ai', ?, ?, 1, ?, ?, ?)""",
-                (str(uuid.uuid4()), rule_set["rule_set_id"], category, title, str(item.get("source_text", "")).strip(),
+                """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode, source_type, source_task_id, scoring_json, enabled, sort_order, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ai', ?, ?, 1, ?, ?, ?)""",
+                (str(uuid.uuid4()), rule_set["rule_set_id"], category, title, str(item.get("check_rule", "")).strip() or title, str(item.get("source_text", "")).strip(),
                  item.get("source_page") if isinstance(item.get("source_page"), int) else None,
                  "ocr" if item.get("ocr_required") or item.get("check_mode") == "ocr" else "auto",
                  task_id, json.dumps(item.get("scoring"), ensure_ascii=False) if item.get("scoring") else None, index, timestamp, timestamp),
@@ -1199,7 +1384,7 @@ def latest_review_results(app, project_id: str) -> tuple[dict | None, list[dict]
         if not run:
             return None, []
         rows = conn.execute(
-            """SELECT r.*, d.bidder_name, d.original_name, rule.category, rule.title
+            """SELECT r.*, d.bidder_name, d.original_name, rule.category, rule.title, rule.check_rule
             FROM ew_review_results r
             JOIN ew_documents d ON d.document_id = r.document_id
             JOIN ew_rules rule ON rule.rule_id = r.rule_id
@@ -1338,7 +1523,7 @@ def latest_score_results(app, project_id: str, score_type: str) -> tuple[dict | 
         if not run:
             return None, []
         rows = conn.execute(
-            """SELECT s.*, d.bidder_name, d.original_name, rule.title, rule.check_mode
+            """SELECT s.*, d.bidder_name, d.original_name, rule.title, rule.check_rule, rule.check_mode
             FROM ew_score_results s JOIN ew_documents d ON d.document_id=s.document_id
             JOIN ew_rules rule ON rule.rule_id=s.rule_id
             WHERE s.score_run_id=? ORDER BY d.bidder_name, rule.sort_order""", (run["score_run_id"],)
