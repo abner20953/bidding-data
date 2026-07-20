@@ -5,6 +5,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import re
 import sys
 import traceback
 import zipfile
@@ -24,8 +25,8 @@ from dashboard.utils.comparator import CollusionDetector, ComparisonLimitError
 MAX_PARSE_PAGES = 2000
 MAX_PARSED_CHARS = 2_000_000
 MAX_DOCX_XML_BYTES = 50 * 1024 * 1024
-PROMPT_VERSION = "token-optimized-v1"
-COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v1"
+PROMPT_VERSION = "token-optimized-v2"
+COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v2"
 COMPARE_AI_BATCH_SIZE = 24
 
 
@@ -43,7 +44,8 @@ def _lock_path(app) -> Path:
 
 
 def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt: str, user_prompt: str,
-                       *, document_id: str | None = None, context_mode: str = "full_prefix") -> dict:
+                       *, document_id: str | None = None, context_mode: str = "full_prefix",
+                       max_tokens: int | None = None) -> dict:
     """调用模型并只记录用量元数据，不记录正文或提示词。"""
     recorded = False
 
@@ -57,7 +59,7 @@ def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt
         )
 
     try:
-        return request_json(profile, system_prompt, user_prompt, usage_callback=record_usage)
+        return request_json(profile, system_prompt, user_prompt, usage_callback=record_usage, max_tokens=max_tokens)
     finally:
         # 部分兼容接口不返回 usage；仍保留发送字符数以便统计和优化。
         if not recorded:
@@ -198,6 +200,15 @@ def _compare_evidence_packet(signal: dict) -> dict:
     }
 
 
+def _output_token_budget(profile: dict, target: int) -> int | None:
+    """为结构化输出设置保守上限；MiniMax M2 思考不可关闭时不额外截断。"""
+    model_name = str(profile.get("model_name") or "").lower()
+    base_url = str(profile.get("base_url") or "").lower()
+    if "api.minimaxi.com" in base_url and model_name.startswith("minimax-m2"):
+        return None
+    return max(512, min(12_000, int(target)))
+
+
 def _assess_compare_signals_with_ai(app, task: dict, analysis: dict) -> None:
     signals = analysis.get("signals") or []
     if not signals:
@@ -224,7 +235,8 @@ def _assess_compare_signals_with_ai(app, task: dict, analysis: dict) -> None:
 证据包：{json.dumps(packets, ensure_ascii=False, separators=(',', ':'))}"""
         try:
             parsed = _request_task_json(app, task, profile, "compare_ai_assessment", system_prompt, user_prompt,
-                                        context_mode="evidence_batch")
+                                        context_mode="evidence_batch",
+                                        max_tokens=_output_token_budget(profile, 700 + len(batch) * 120))
             values = parsed.get("assessments") if isinstance(parsed, dict) else []
             for value in values if isinstance(values, list) else []:
                 if not isinstance(value, dict) or value.get("signal_id") not in by_id:
@@ -242,14 +254,71 @@ def _assess_compare_signals_with_ai(app, task: dict, analysis: dict) -> None:
                 }
                 completed += 1
         except Exception as exc:  # 保留确定性查重结果，不能因 AI 暂不可用而丢失证据。
-            failures.append(str(exc)[:180])
+            message = str(exc)[:180]
+            failures.append(message)
+            if "鉴权失败" in message or "尚未配置 API Key" in message or "HTTP 4" in message:
+                break
     for signal in signals:
         signal.setdefault("ai_assessment", {"decision": "unassessable", "risk_level": "medium", "confidence": "low", "reason": "AI 未返回该线索的可用判定。", "suggested_check": "请结合原始文件人工核验。"})
+    for summary in analysis.get("pair_summaries", []):
+        pair_ids = {summary.get("document_a_id"), summary.get("document_b_id")}
+        decisions = [
+            signal["ai_assessment"]["decision"] for signal in signals
+            if {signal.get("document_a_id"), signal.get("document_b_id")} == pair_ids
+        ]
+        if "confirmed_clue" in decisions:
+            summary["assessment_result"] = "confirmed_clue"
+        elif "suspected_clue" in decisions:
+            summary["assessment_result"] = "suspected_clue"
+        elif decisions and all(decision == "excluded" for decision in decisions):
+            summary["assessment_result"] = "excluded"
+        elif decisions:
+            summary["assessment_result"] = "unassessable"
     analysis["ai_assessment"] = {
         "status": "partial" if failures else "success", "assessed_count": completed, "signal_count": len(signals),
         "failure_count": len(failures), "reason": "；".join(failures), "profile": profile["display_name"],
         "prompt_version": COMPARE_AI_PROMPT_VERSION, "input_mode": "fixed_rule_evidence_packets_only",
     }
+
+
+_UNREVIEWABLE_RULE_MARKERS = (
+    "密封", "递交时间", "递交地点", "提交时间", "提交地点", "投标截止", "开标时间", "开标地点",
+    "开标现场", "响应文件份数", "电子版份数", "响应文件电子版", "电子响应文件",
+    "正本副本", "正本一份", "纸质正本", "纸质副本", "签收", "送达",
+)
+_RULE_SECTION_MARKERS = ("评标办法", "评分标准", "资格审查", "符合性审查", "废标", "无效投标", "否决投标", "资格条件")
+
+
+def _is_unreviewable_rule(item: dict) -> bool:
+    """过滤仅能在线下或开标环节核验的规则，避免只依赖模型服从提示词。"""
+    value = re.sub(r"\s+", "", f"{item.get('title', '')}{item.get('source_text', '')}")
+    return any(marker in value for marker in _UNREVIEWABLE_RULE_MARKERS)
+
+
+def _rule_source_excerpt(text: str, budget: int) -> str:
+    """优先保留评标相关章节，避免长招标文件的无关前缀挤掉评分附件。"""
+    if len(text) <= budget:
+        return text
+    windows: list[tuple[int, int]] = []
+    for marker in _RULE_SECTION_MARKERS:
+        start = 0
+        while len(windows) < 12:
+            found = text.find(marker, start)
+            if found < 0:
+                break
+            windows.append((max(0, found - 1_200), min(len(text), found + 8_000)))
+            start = found + len(marker)
+    if not windows:
+        return text[:budget]
+    windows.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in windows:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    selected = "\n\n".join(text[start:end] for start, end in merged)
+    return selected[:budget] if selected else text[:budget]
 
 
 def _extract_rules(app, task: dict) -> dict:
@@ -262,28 +331,44 @@ def _extract_rules(app, task: dict) -> dict:
         raise ValueError("主招标文件未提取到可用文本，扫描件需要先提供可检索版本")
     profile = storage.get_model_profile(app, task.get("payload", {}).get("profile_id"), "deepseek-v4-flash")
     char_limit = _prompt_char_limit(profile, 180_000, 400_000)
-    source_parts = [f"【主招标文件：{tender['original_name']}】\n{main_text}"]
+    source_documents = [(f"主招标文件：{tender['original_name']}", main_text)]
     attachments = [item for item in documents if item["role"] == "tender_attachment" and item.get("parse_status") == "success" and item.get("parsed_path")]
     for attachment in attachments:
         attachment_text = Path(attachment["parsed_path"]).read_text(encoding="utf-8", errors="ignore").strip()
         if attachment_text:
-            source_parts.append(f"【招标附件：{attachment['original_name']}】\n{attachment_text}")
+            source_documents.append((f"招标附件：{attachment['original_name']}", attachment_text))
+    if len(source_documents) == 1:
+        source_parts = [f"【{source_documents[0][0]}】\n{_rule_source_excerpt(source_documents[0][1], char_limit)}"]
+    else:
+        attachment_count = len(source_documents) - 1
+        minimum_attachment_budget = min(12_000, max(2_000, char_limit // (attachment_count + 2)))
+        main_budget = max(minimum_attachment_budget, min(int(char_limit * 0.6), char_limit - attachment_count * minimum_attachment_budget))
+        attachment_budget = max(1_000, int((char_limit - main_budget) / attachment_count))
+        source_parts = [
+            f"【{label}】\n{_rule_source_excerpt(value, main_budget if index == 0 else attachment_budget)}"
+            for index, (label, value) in enumerate(source_documents)
+        ]
     text = "\n\n".join(source_parts)[:char_limit]
     storage.update_task(app, task["task_id"], progress=15, message="正在调用模型提取评审规则")
     system_prompt = "你是招投标评审规则提取助手。只能根据用户给出的招标文件原文提取规则，不得编造。"
-    user_prompt = f"""请从以下招标文件原文提取评标工作台需要的规则，返回 JSON 对象：
-{{"rules":[{{"category":"qualification|compliance|substantive|rejection|objective|subjective","title":"简明规则名称","source_text":"原文摘录","source_page":null,"check_mode":"auto|manual","scoring":{{"max_score":数字,"kind":"boolean|manual"}} }}]}}
+    user_prompt = f"""请从以下招标文件原文提取可由 AI 审查的评标规则，返回 JSON 对象：
+{{"rules":[{{"category":"qualification|compliance|substantive|rejection|objective|subjective","title":"明确、可核验的规则名称","source_text":"原文摘录","source_page":null,"ocr_required":false,"scoring":{{"max_score":数字,"kind":"boolean|manual"}} }}]}}
+
+只保留能通过已上传投标文件中可检索的文字、表格或元数据核验的事项，规则必须明确且能据文件内容判断。不要输出密封与递交要求、响应文件份数或电子版要求、递交地点/时间、开标现场、线下原件、纸质材料、投标文件本身无法体现的签收事项，以及其他无法仅凭投标文件核验的事项。若规则的关键证据只能依赖扫描图片、证照图片、签章或手写内容识别，请将 ocr_required 设为 true；其余为 false。
 
 分类说明：qualification 为资格性；compliance 为符合性；substantive 为实质性；rejection 为无效投标/废标；objective 为客观分；subjective 为主观分。没有明确页码时 source_page 返回 null。objective 和 subjective 必须填写 scoring.max_score，且只能填写招标原文明确规定的满分；没有明确满分时不要输出为评分项。objective 仅“满足即满分”时 kind 为 boolean，分档、数量、累计或人工判断评分时 kind 为 manual；subjective 的 kind 为 manual。非评分项省略 scoring。
 
 招标文件原文：
 {text}"""
     parsed = _request_task_json(app, task, profile, "extract_rules", system_prompt, user_prompt,
-                                document_id=tender["document_id"], context_mode="full_prefix")
+                                document_id=tender["document_id"], context_mode="full_prefix",
+                                max_tokens=_output_token_budget(profile, 8_000))
     raw_rules = parsed.get("rules") if isinstance(parsed, dict) else None
     if not isinstance(raw_rules, list):
         raise ValueError("模型返回格式不符合规则提取要求")
-    rules = [item for item in raw_rules if isinstance(item, dict) and str(item.get("title", "")).strip() and item.get("category") in {"qualification", "compliance", "substantive", "rejection", "objective", "subjective"}]
+    candidates = [item for item in raw_rules if isinstance(item, dict) and str(item.get("title", "")).strip() and item.get("category") in {"qualification", "compliance", "substantive", "rejection", "objective", "subjective"}]
+    rules = [item for item in candidates if not _is_unreviewable_rule(item)]
+    excluded_rule_count = len(candidates) - len(rules)
     for item in rules:
         if item.get("category") not in {"objective", "subjective"}:
             continue
@@ -302,7 +387,8 @@ def _extract_rules(app, task: dict) -> dict:
         raise ValueError("模型未提取到可确认的有效规则，请检查招标文件文本或更换模型")
     storage.update_task(app, task["task_id"], progress=80, message="正在保存待确认规则")
     rule_set = storage.replace_rules_from_extraction(app, task["project_id"], task["task_id"], rules)
-    return {"rule_set_id": rule_set["rule_set_id"], "version": rule_set["version"], "rule_count": len(rules), "profile": profile["display_name"]}
+    return {"rule_set_id": rule_set["rule_set_id"], "version": rule_set["version"], "rule_count": len(rules),
+            "excluded_rule_count": excluded_rule_count, "profile": profile["display_name"]}
 
 
 def _review_documents(app, task: dict) -> dict:
@@ -318,14 +404,16 @@ def _review_documents(app, task: dict) -> dict:
     profile = storage.get_model_profile(app, task.get("payload", {}).get("profile_id"), "deepseek-v4-flash")
     char_limit = _prompt_char_limit(profile, 260_000, 600_000)
     review_run = storage.create_review_run(app, task["project_id"], task["task_id"], profile["profile_id"])
-    rule_prompt = [{"rule_id": item["rule_id"], "category": item["category"], "title": item["title"], "source_text": item["source_text"]} for item in rules]
+    rule_prompt = [{"rule_id": item["rule_id"], "category": item["category"], "title": item["title"],
+                    "source_text": item["source_text"], "ocr_required": item.get("check_mode") == "ocr"} for item in rules]
     for index, document in enumerate(documents, start=1):
         storage.update_task(app, task["task_id"], progress=int((index - 1) * 100 / len(documents)), message=f"正在审查 {index}/{len(documents)}：{document['bidder_name'] or document['original_name']}")
         text = Path(document["parsed_path"]).read_text(encoding="utf-8", errors="ignore")
         system_prompt = "你是严谨的招投标电子文件审查助手。只能基于给出的规则和投标文件原文判断，不能推断图片、签字、盖章或线下材料。"
         user_prompt = f"""请逐条审查投标文件。返回 JSON：
-{{"results":[{{"rule_id":"规则ID","status":"satisfied|not_satisfied|partial|not_found|manual","evidence":"投标文件原文摘录","page_hint":null,"reason":"简洁判断理由","risk_level":"low|medium|high","confidence":"high|medium|low","evidence_quality":"sufficient|limited|missing"}}]}}
+{{"results":[{{"rule_id":"规则ID","status":"satisfied|not_satisfied|partial|not_found|manual|ocr_required","evidence":"投标文件原文摘录","page_hint":null,"reason":"简洁判断理由","risk_level":"low|medium|high","confidence":"high|medium|low","evidence_quality":"sufficient|limited|missing"}}]}}
 
+对于 ocr_required=true 的规则，当前系统未执行 OCR；若关键证据仅存在于图片、签章、证照或手写内容，必须返回 ocr_required，不能据此返回不满足。
 规则：
 {rule_prompt}
 
@@ -333,7 +421,8 @@ def _review_documents(app, task: dict) -> dict:
 原文：
 {text[:char_limit]}"""
         parsed = _request_task_json(app, task, profile, "review_documents", system_prompt, user_prompt,
-                                    document_id=document["document_id"], context_mode="full_prefix")
+                                    document_id=document["document_id"], context_mode="full_prefix",
+                                    max_tokens=_output_token_budget(profile, 700 + len(rules) * 220))
         output = parsed.get("results") if isinstance(parsed, dict) else None
         if not isinstance(output, list):
             raise ValueError("模型返回格式不符合审查要求")
@@ -344,7 +433,7 @@ def _review_documents(app, task: dict) -> dict:
             if rule_id not in by_id:
                 continue
             status = item.get("status")
-            if status not in {"satisfied", "not_satisfied", "partial", "not_found", "manual"}:
+            if status not in {"satisfied", "not_satisfied", "partial", "not_found", "manual", "ocr_required"}:
                 status = "manual"
             normalized.append(_review_result_from_model(item, rule_id, status))
         returned_ids = {item["rule_id"] for item in normalized}
@@ -370,19 +459,21 @@ def _score_documents(app, task: dict, score_type: str) -> dict:
             scoring = json.loads(rule["scoring_json"]) if rule.get("scoring_json") else {}
         except json.JSONDecodeError:
             scoring = {}
-        rule_payload.append({"rule_id": rule["rule_id"], "title": rule["title"], "source_text": rule["source_text"], "scoring": scoring})
+        rule_payload.append({"rule_id": rule["rule_id"], "title": rule["title"], "source_text": rule["source_text"],
+                             "ocr_required": rule.get("check_mode") == "ocr", "scoring": scoring})
     for index, document in enumerate(documents, start=1):
         storage.update_task(app, task["task_id"], progress=int((index - 1) * 100 / len(documents)), message=f"正在{'客观' if score_type == 'objective' else '主观'}评分 {index}/{len(documents)}：{document['bidder_name'] or document['original_name']}")
         context = build_rule_context(document["parsed_path"], rules, char_limit)
         text = context["text"]
         if score_type == "objective":
-            instruction = """返回 JSON：{\"results\":[{\"rule_id\":\"规则ID\",\"met\":true|false|null,\"evidence\":\"原文摘录\",\"reason\":\"判断理由\",\"confidence\":\"high|medium|low\"}]}。只判断证据是否满足，不自行计算分数。"""
+            instruction = """返回 JSON：{\"results\":[{\"rule_id\":\"规则ID\",\"met\":true|false|null,\"needs_ocr\":true|false,\"evidence\":\"原文摘录\",\"reason\":\"判断理由\",\"confidence\":\"high|medium|low\"}]}。只判断证据是否满足，不自行计算分数。ocr_required=true 且关键证据仅在图片中时，needs_ocr 必须为 true，met 返回 null。"""
         else:
-            instruction = """返回 JSON：{\"results\":[{\"rule_id\":\"规则ID\",\"suggested_score\":数字,\"evidence\":\"原文摘录\",\"reason\":\"得扣分理由\",\"confidence\":\"high|medium|low\"}]}。分数不得超出规则 scoring.max_score。"""
+            instruction = """返回 JSON：{\"results\":[{\"rule_id\":\"规则ID\",\"suggested_score\":数字,\"needs_ocr\":true|false,\"evidence\":\"原文摘录\",\"reason\":\"得扣分理由\",\"confidence\":\"high|medium|low\"}]}。分数不得超出规则 scoring.max_score。ocr_required=true 且关键证据仅在图片中时，needs_ocr 必须为 true，suggested_score 返回 null。"""
         system_prompt = "你是招投标评分辅助助手。只能依据评分规则与投标文件原文，不得编造材料。"
         user_prompt = f"{instruction}\n评分规则：{json.dumps(rule_payload, ensure_ascii=False, separators=(',', ':'))}\n投标文件：{document['original_name']}\n原文：\n{text}"
         parsed = _request_task_json(app, task, profile, f"score_{score_type}", system_prompt, user_prompt,
-                                    document_id=document["document_id"], context_mode=context["mode"])
+                                    document_id=document["document_id"], context_mode=context["mode"],
+                                    max_tokens=_output_token_budget(profile, 600 + len(rules) * 180))
         output = parsed.get("results") if isinstance(parsed, dict) else None
         if not isinstance(output, list):
             raise ValueError("模型返回格式不符合评分要求")
@@ -396,14 +487,17 @@ def _score_documents(app, task: dict, score_type: str) -> dict:
                     max_score = 0.0
             except (TypeError, ValueError):
                 max_score = 0.0
+            needs_ocr = raw.get("needs_ocr") is True
             if score_type == "objective":
                 # 第一版只自动计算已确认的“满足即满分”客观规则；其他规则保留人工分。
                 kind = item["scoring"].get("kind", "boolean")
                 met = raw.get("met")
-                suggested = max_score if kind == "boolean" and met is True else (0.0 if kind == "boolean" and met is False else None)
+                suggested = None if needs_ocr else (max_score if kind == "boolean" and met is True else (0.0 if kind == "boolean" and met is False else None))
             else:
                 value = raw.get("suggested_score")
-                suggested = min(max_score, max(0.0, float(value))) if isinstance(value, (int, float)) and not isinstance(value, bool) and max_score > 0 else None
+                suggested = None if needs_ocr else (min(max_score, max(0.0, float(value))) if isinstance(value, (int, float)) and not isinstance(value, bool) and max_score > 0 else None)
+            if needs_ocr and not str(raw.get("reason", "")).strip():
+                raw = {**raw, "reason": "该评分项的关键证据需要 OCR 识别后才能评分。"}
             results.append(_score_result_from_model(item["rule_id"], suggested, max_score, raw))
         storage.save_score_results(app, score_run["score_run_id"], document["document_id"], results)
     return {"score_run_id": score_run["score_run_id"], "score_type": score_type, "document_count": len(documents), "rule_count": len(rules), "profile": profile["display_name"]}
@@ -417,7 +511,7 @@ def _normalise_review_results(output: object, rules: list[dict]) -> list[dict]:
         if rule_id not in by_id:
             continue
         status = item.get("status")
-        if status not in {"satisfied", "not_satisfied", "partial", "not_found", "manual"}:
+        if status not in {"satisfied", "not_satisfied", "partial", "not_found", "manual", "ocr_required"}:
             status = "manual"
         normalized.append(_review_result_from_model(item, rule_id, status))
     returned_ids = {item["rule_id"] for item in normalized}
@@ -431,6 +525,10 @@ def _review_result_from_model(item: dict, rule_id: str, status: str) -> dict:
     evidence_quality = item.get("evidence_quality") if item.get("evidence_quality") in {"sufficient", "limited", "missing"} else ("sufficient" if str(item.get("evidence", "")).strip() else "missing")
     risk = item.get("risk_level") if item.get("risk_level") in {"low", "medium", "high"} else "medium"
     # 仅对正向、低风险、证据充分的结论自动进入批量确认；否定/废标类风险不自动放行。
+    if status == "ocr_required":
+        confidence, evidence_quality, risk = "low", "missing", "medium"
+        if not str(item.get("reason", "")).strip():
+            item = {**item, "reason": "该规则的关键证据需要 OCR 识别后才能判定。"}
     auto_ready = status == "satisfied" and risk == "low" and confidence == "high" and evidence_quality == "sufficient"
     return {"rule_id": rule_id, "status": status, "evidence": str(item.get("evidence", ""))[:2000],
             "page_hint": str(item.get("page_hint", ""))[:80] or None, "reason": str(item.get("reason", ""))[:2000],
@@ -447,7 +545,8 @@ def _score_payload(rules: list[dict]) -> list[dict]:
             scoring = json.loads(rule["scoring_json"]) if rule.get("scoring_json") else {}
         except json.JSONDecodeError:
             scoring = {}
-        payload.append({"rule_id": rule["rule_id"], "title": rule["title"], "source_text": rule["source_text"], "scoring": scoring})
+        payload.append({"rule_id": rule["rule_id"], "title": rule["title"], "source_text": rule["source_text"],
+                        "ocr_required": rule.get("check_mode") == "ocr", "scoring": scoring})
     return payload
 
 
@@ -462,32 +561,36 @@ def _normalise_score_results(output: object, rule_payload: list[dict], score_typ
                 max_score = 0.0
         except (TypeError, ValueError):
             max_score = 0.0
+        needs_ocr = raw.get("needs_ocr") is True
         if score_type == "objective":
             kind = item["scoring"].get("kind", "boolean")
             met = raw.get("met")
-            suggested = max_score if kind == "boolean" and met is True else (0.0 if kind == "boolean" and met is False else None)
+            suggested = None if needs_ocr else (max_score if kind == "boolean" and met is True else (0.0 if kind == "boolean" and met is False else None))
         else:
             value = raw.get("suggested_score")
-            suggested = min(max_score, max(0.0, float(value))) if isinstance(value, (int, float)) and not isinstance(value, bool) and max_score > 0 else None
+            suggested = None if needs_ocr else (min(max_score, max(0.0, float(value))) if isinstance(value, (int, float)) and not isinstance(value, bool) and max_score > 0 else None)
+        if needs_ocr and not str(raw.get("reason", "")).strip():
+            raw = {**raw, "reason": "该评分项的关键证据需要 OCR 识别后才能评分。"}
         results.append(_score_result_from_model(item["rule_id"], suggested, max_score, raw))
     return results
 
 
 def _score_result_from_model(rule_id: str, suggested: float | None, max_score: float, raw: dict) -> dict:
     confidence = raw.get("confidence") if raw.get("confidence") in {"high", "medium", "low"} else "medium"
+    needs_ocr = raw.get("needs_ocr") is True
     has_evidence = bool(str(raw.get("evidence", "")).strip())
     auto_ready = suggested is not None and confidence == "high" and has_evidence
     return {"rule_id": rule_id, "suggested_score": suggested, "final_score": None,
             "effective_score": suggested if auto_ready else None, "max_score": max_score or None,
             "evidence": str(raw.get("evidence", ""))[:2000],
-            "reason": str(raw.get("reason", "模型未返回可确认结论，请人工评分。"))[:2000],
+            "reason": str(raw.get("reason", "该评分项需要 OCR 识别后才能评分。" if needs_ocr else "模型未返回可确认结论，请人工评分。"))[:2000],
             "confidence": confidence, "automation_status": "ready_for_batch_confirmation" if auto_ready else "needs_review",
             "requires_review": not auto_ready,
             "review_reason": "" if auto_ready else "未得到高置信、可引用的建议分，需人工复核。"}
 
 
 def _combined_evaluation_prompt(document: dict, review_payload: list[dict], objective_payload: list[dict],
-                                subjective_payload: list[dict], text: str, *, compact: bool) -> str:
+                                 subjective_payload: list[dict], text: str, *, compact: bool) -> str:
     limits = (
         "每条 evidence 最多 60 个字符、reason 最多 50 个字符；证据不足时返回空字符串，不得解释输出格式。"
         if compact else
@@ -495,13 +598,13 @@ def _combined_evaluation_prompt(document: dict, review_payload: list[dict], obje
     )
     retry_note = "这是针对格式异常的紧凑重试，" if compact else ""
     return f"""{retry_note}对同一份投标文件完成下列三类工作，并只返回一个合法 JSON 对象：
-{{"review_results":[{{"rule_id":"规则ID","status":"satisfied|not_satisfied|partial|not_found|manual","evidence":"原文摘录","page_hint":null,"reason":"简洁理由","risk_level":"low|medium|high","confidence":"high|medium|low","evidence_quality":"sufficient|limited|missing"}}],"objective_scores":[{{"rule_id":"规则ID","met":true|false|null,"evidence":"原文摘录","reason":"判断理由","confidence":"high|medium|low"}}],"subjective_scores":[{{"rule_id":"规则ID","suggested_score":数字,"evidence":"原文摘录","reason":"得扣分理由","confidence":"high|medium|low"}}]}}
+{{"review_results":[{{"rule_id":"规则ID","status":"satisfied|not_satisfied|partial|not_found|manual|ocr_required","evidence":"原文摘录","page_hint":null,"reason":"简洁理由","risk_level":"low|medium|high","confidence":"high|medium|low","evidence_quality":"sufficient|limited|missing"}}],"objective_scores":[{{"rule_id":"规则ID","met":true|false|null,"needs_ocr":true|false,"evidence":"原文摘录","reason":"判断理由","confidence":"high|medium|low"}}],"subjective_scores":[{{"rule_id":"规则ID","suggested_score":数字,"needs_ocr":true|false,"evidence":"原文摘录","reason":"得扣分理由","confidence":"high|medium|low"}}]}}
 
 严格要求：不得使用 Markdown 代码块、不得在 JSON 前后添加说明、所有字符串必须使用标准 JSON 双引号和转义。{limits}
 审查规则：{json.dumps(review_payload, ensure_ascii=False, separators=(',', ':'))}
 客观评分规则：{json.dumps(objective_payload, ensure_ascii=False, separators=(',', ':'))}
 主观评分规则：{json.dumps(subjective_payload, ensure_ascii=False, separators=(',', ':'))}
-客观分只判断证据是否满足，不自行计算分数。主观分不得超出规则 scoring.max_score。
+对标记 ocr_required=true 的规则，当前系统未执行 OCR；若关键证据仅在图片、签章、证照或手写内容中，审查结果必须为 ocr_required，评分结果 needs_ocr=true 且不给分。客观分只判断证据是否满足，不自行计算分数。主观分不得超出规则 scoring.max_score。
 投标文件：{document['original_name']}；投标人：{document['bidder_name'] or '未填写'}
 原文：
 {text}"""
@@ -519,28 +622,49 @@ def _evaluate_all(app, task: dict) -> dict:
     review_rules = [item for item in all_rules if item["enabled"] and item["category"] in {"qualification", "compliance", "substantive", "rejection"}]
     objective_rules = [item for item in all_rules if item["enabled"] and item["category"] == "objective"]
     subjective_rules = [item for item in all_rules if item["enabled"] and item["category"] == "subjective"]
-    if not review_rules or not objective_rules or not subjective_rules:
-        raise ValueError("综合评审需要已确认的审查、客观评分和主观评分规则")
+    if not (review_rules or objective_rules or subjective_rules):
+        raise ValueError("综合评审需要至少一条已确认的审查或评分规则")
     documents = [item for item in storage.list_documents(app, task["project_id"]) if item["role"] == "bid"]
     if not documents or any(item["parse_status"] != "success" or not item["parsed_path"] for item in documents):
         raise ValueError("请先成功解析全部投标文件")
     profile = storage.get_model_profile(app, task.get("payload", {}).get("profile_id"), "deepseek-v4-flash")
     char_limit = _prompt_char_limit(profile, 260_000, 600_000)
-    review_run = storage.create_review_run(app, task["project_id"], task["task_id"], profile["profile_id"])
-    objective_run = storage.create_score_run(app, task["project_id"], task["task_id"], "objective", profile["profile_id"])
-    subjective_run = storage.create_score_run(app, task["project_id"], task["task_id"], "subjective", profile["profile_id"])
-    review_payload = [{"rule_id": item["rule_id"], "category": item["category"], "title": item["title"], "source_text": item["source_text"]} for item in review_rules]
+    review_run = storage.create_review_run(app, task["project_id"], task["task_id"], profile["profile_id"]) if review_rules else None
+    objective_run = storage.create_score_run(app, task["project_id"], task["task_id"], "objective", profile["profile_id"]) if objective_rules else None
+    subjective_run = storage.create_score_run(app, task["project_id"], task["task_id"], "subjective", profile["profile_id"]) if subjective_rules else None
+    review_payload = [{"rule_id": item["rule_id"], "category": item["category"], "title": item["title"],
+                       "source_text": item["source_text"], "ocr_required": item.get("check_mode") == "ocr"} for item in review_rules]
     objective_payload = _score_payload(objective_rules)
     subjective_payload = _score_payload(subjective_rules)
+    expected_rule_ids = {
+        "review": {item["rule_id"] for item in review_rules},
+        "objective": {item["rule_id"] for item in objective_rules},
+        "subjective": {item["rule_id"] for item in subjective_rules},
+    }
     system_prompt = "你是严谨的招投标评审辅助助手。只能依据规则与投标文件可见原文，不得编造、推断签字盖章或线下材料。"
     compact_retry_count = 0
+    reused_document_count = 0
     for index, document in enumerate(documents, start=1):
         storage.update_task(app, task["task_id"], progress=int((index - 1) * 100 / len(documents)), message=f"正在综合评审 {index}/{len(documents)}：{document['bidder_name'] or document['original_name']}")
-        text = Path(document["parsed_path"]).read_text(encoding="utf-8", errors="ignore")[:char_limit]
+        reusable = storage.reusable_evaluation_document_results(
+            app, task["project_id"], rule_set["rule_set_id"], profile["profile_id"], document["document_id"], expected_rule_ids,
+        )
+        if reusable:
+            if review_run:
+                storage.save_review_results(app, review_run["review_run_id"], document["document_id"], reusable["review"])
+            if objective_run:
+                storage.save_score_results(app, objective_run["score_run_id"], document["document_id"], reusable["objective"])
+            if subjective_run:
+                storage.save_score_results(app, subjective_run["score_run_id"], document["document_id"], reusable["subjective"])
+            reused_document_count += 1
+            continue
+        context = build_rule_context(document["parsed_path"], all_rules, char_limit)
+        text = context["text"]
         user_prompt = _combined_evaluation_prompt(document, review_payload, objective_payload, subjective_payload, text, compact=False)
         try:
             parsed = _request_task_json(app, task, profile, "evaluate_all", system_prompt, user_prompt,
-                                        document_id=document["document_id"], context_mode="full_prefix")
+                                        document_id=document["document_id"], context_mode=context["mode"],
+                                        max_tokens=_output_token_budget(profile, 900 + len(all_rules) * 240))
         except ValueError as exc:
             if not _is_invalid_json_model_response(exc):
                 raise
@@ -551,14 +675,19 @@ def _evaluate_all(app, task: dict) -> dict:
                 document, review_payload, objective_payload, subjective_payload, retry_context["text"], compact=True,
             )
             parsed = _request_task_json(app, task, profile, "evaluate_all_compact_retry", system_prompt, retry_prompt,
-                                        document_id=document["document_id"], context_mode=retry_context["mode"])
+                                        document_id=document["document_id"], context_mode=retry_context["mode"],
+                                        max_tokens=_output_token_budget(profile, 700 + len(all_rules) * 180))
         if not isinstance(parsed, dict):
             raise ValueError("模型返回格式不符合综合评审要求")
-        storage.save_review_results(app, review_run["review_run_id"], document["document_id"], _normalise_review_results(parsed.get("review_results"), review_rules))
-        storage.save_score_results(app, objective_run["score_run_id"], document["document_id"], _normalise_score_results(parsed.get("objective_scores"), objective_payload, "objective"))
-        storage.save_score_results(app, subjective_run["score_run_id"], document["document_id"], _normalise_score_results(parsed.get("subjective_scores"), subjective_payload, "subjective"))
-    return {"review_run_id": review_run["review_run_id"], "objective_run_id": objective_run["score_run_id"],
-            "subjective_run_id": subjective_run["score_run_id"], "document_count": len(documents),
+        if review_run:
+            storage.save_review_results(app, review_run["review_run_id"], document["document_id"], _normalise_review_results(parsed.get("review_results"), review_rules))
+        if objective_run:
+            storage.save_score_results(app, objective_run["score_run_id"], document["document_id"], _normalise_score_results(parsed.get("objective_scores"), objective_payload, "objective"))
+        if subjective_run:
+            storage.save_score_results(app, subjective_run["score_run_id"], document["document_id"], _normalise_score_results(parsed.get("subjective_scores"), subjective_payload, "subjective"))
+    return {"review_run_id": review_run["review_run_id"] if review_run else None, "objective_run_id": objective_run["score_run_id"] if objective_run else None,
+            "subjective_run_id": subjective_run["score_run_id"] if subjective_run else None, "document_count": len(documents),
+            "reused_document_count": reused_document_count, "model_document_count": len(documents) - reused_document_count,
             "rule_count": len(all_rules), "profile": profile["display_name"], "compact_retry_count": compact_retry_count,
             "prompt_version": PROMPT_VERSION}
 

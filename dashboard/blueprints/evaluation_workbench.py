@@ -17,7 +17,7 @@ from dashboard.evaluation_workbench.ai_gateway import test_connection
 
 
 evaluation_workbench_bp = Blueprint("evaluation_workbench", __name__)
-TASK_PROMPT_VERSION = "token-optimized-v1"
+TASK_PROMPT_VERSION = "token-optimized-v2"
 MODEL_CONFIGURATION_PASSWORD = "108"
 
 
@@ -161,7 +161,7 @@ def project_api(project_id):
         return error
     if request.method == "GET":
         _start_worker_if_needed()
-        return jsonify({"project": project, "documents": storage.list_documents(current_app, project_id), "tasks": storage.list_tasks(current_app, project_id)})
+        return jsonify({"project": project, "documents": storage.list_documents(current_app, project_id), "tasks": storage.list_task_summaries(current_app, project_id)})
     if request.method == "DELETE":
         try:
             storage.delete_project(current_app, project_id)
@@ -241,10 +241,9 @@ def tasks_api(project_id):
     if task_type == "evaluate_all":
         rule_set, rules = storage.list_rules(current_app, project_id)
         categories = {item["category"] for item in rules if item["enabled"]}
-        needed = {"objective", "subjective"}
-        has_review = bool(categories & {"qualification", "compliance", "substantive", "rejection"})
-        if not rule_set or rule_set["status"] != "confirmed" or not has_review or not needed.issubset(categories):
-            return jsonify({"error": "请先确认包含审查、客观评分和主观评分项的规则集"}), 400
+        executable = categories & {"qualification", "compliance", "substantive", "rejection", "objective", "subjective"}
+        if not rule_set or rule_set["status"] != "confirmed" or not executable:
+            return jsonify({"error": "请先确认至少一条可执行的审查或评分规则"}), 400
     try:
         requested_profile_id = data.get("profile_id") or storage.default_model_profile_id(current_app)
         payload = {"profile_id": requested_profile_id}
@@ -252,7 +251,7 @@ def tasks_api(project_id):
             payload["input_fingerprint"] = storage.task_input_fingerprint(
                 current_app, project_id, task_type, requested_profile_id, TASK_PROMPT_VERSION,
             )
-            if data.get("reuse_completed") is True or (task_type == "compare_documents" and data.get("reuse_completed") is not False):
+            if data.get("force_rerun") is not True:
                 reusable = storage.find_reusable_task(current_app, project_id, task_type, payload["input_fingerprint"])
                 if reusable:
                     return jsonify({"task": reusable, "reused": True})

@@ -517,12 +517,21 @@ def task_input_fingerprint(app, project_id: str, task_type: str, profile_id: str
     documents = list_documents(app, project_id)
     rule_set = current_rule_set(app, project_id)
     profile = get_model_profile(app, profile_id, "deepseek-v4-flash")
+    relevant_roles = {
+        "compare_documents": {"tender", "bid"},
+        "extract_rules": {"tender", "tender_attachment"},
+        "review_documents": {"bid"},
+        "score_objective": {"bid"},
+        "score_subjective": {"bid"},
+        "evaluate_all": {"bid"},
+    }.get(task_type, {"tender", "tender_attachment", "bid"})
+    uses_rules = task_type in {"review_documents", "score_objective", "score_subjective", "evaluate_all"}
     value = {
         "task_type": task_type,
         "prompt_version": prompt_version,
-        "documents": sorted((item["document_id"], item["sha256"], item.get("updated_at"), item.get("parse_status")) for item in documents),
-        "rule_set": (rule_set or {}).get("rule_set_id"),
-        "rule_set_updated_at": (rule_set or {}).get("updated_at"),
+        "documents": sorted((item["document_id"], item["sha256"], item.get("updated_at"), item.get("parse_status")) for item in documents if item["role"] in relevant_roles),
+        "rule_set": (rule_set or {}).get("rule_set_id") if uses_rules else None,
+        "rule_set_updated_at": (rule_set or {}).get("updated_at") if uses_rules else None,
         "profile": (profile.get("profile_id"), profile.get("model_name"), profile.get("base_url"), profile.get("updated_at"), profile.get("json_mode"), profile.get("thinking_mode")),
     }
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
@@ -551,6 +560,17 @@ def list_tasks(app, project_id: str) -> list[dict]:
     with connection(app) as conn:
         rows = conn.execute("SELECT * FROM ew_tasks WHERE project_id = ? ORDER BY created_at DESC LIMIT 50", (project_id,)).fetchall()
     return [task_to_dict(row) for row in rows]
+
+
+def list_task_summaries(app, project_id: str) -> list[dict]:
+    """供轮询使用：不读取可能很大的任务结果 JSON。"""
+    with connection(app) as conn:
+        rows = conn.execute(
+            """SELECT task_id, project_id, task_type, status, progress, message, error, created_at, started_at, finished_at, updated_at
+               FROM ew_tasks WHERE project_id = ? ORDER BY created_at DESC LIMIT 50""",
+            (project_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def has_queued_tasks(app) -> bool:
@@ -909,7 +929,21 @@ def delete_model_profile(app, profile_id: str) -> None:
             raise ValueError("模型档案不存在")
         default_row = conn.execute("SELECT setting_value FROM ew_settings WHERE setting_key = 'default_model_profile_id'").fetchone()
         if default_row and default_row["setting_value"] == profile_id:
-            raise ValueError("该模型是全局默认模型，请先指定其他默认模型后再删除")
+            candidates = conn.execute(
+                "SELECT profile_id, api_key_env, api_key_encrypted FROM ew_model_profiles "
+                "WHERE profile_id != ? AND enabled = 1 ORDER BY created_at",
+                (profile_id,),
+            ).fetchall()
+            replacement = next((candidate for candidate in candidates if candidate["api_key_encrypted"] or (
+                candidate["api_key_env"] and os.environ.get(candidate["api_key_env"], "").strip()
+            )), None)
+            if replacement:
+                conn.execute(
+                    "UPDATE ew_settings SET setting_value = ?, updated_at = ? WHERE setting_key = 'default_model_profile_id'",
+                    (replacement["profile_id"], now_iso()),
+                )
+            else:
+                conn.execute("DELETE FROM ew_settings WHERE setting_key = 'default_model_profile_id'")
         active_rows = conn.execute(
             "SELECT payload_json FROM ew_tasks WHERE status IN ('queued', 'running')"
         ).fetchall()
@@ -958,7 +992,7 @@ def add_rule(app, project_id: str, payload: dict) -> dict:
         "rule_id": str(uuid.uuid4()), "rule_set_id": rule_set["rule_set_id"], "category": category,
         "title": title, "source_text": str(payload.get("source_text", "")).strip(),
         "source_page": int(payload["source_page"]) if str(payload.get("source_page", "")).isdigit() else None,
-        "check_mode": "auto" if payload.get("check_mode", "auto") == "auto" else "manual",
+        "check_mode": "ocr" if payload.get("ocr_required") or payload.get("check_mode") == "ocr" else "auto",
         "source_type": "manual", "source_task_id": None,
         "scoring_json": json.dumps(payload.get("scoring"), ensure_ascii=False) if payload.get("scoring") else None,
         "enabled": 1, "sort_order": int(payload.get("sort_order") or 0), "created_at": timestamp, "updated_at": timestamp,
@@ -986,7 +1020,7 @@ def _clone_rule_set_as_draft(app, project_id: str, source_rule_set: dict) -> dic
                 """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, source_text, source_page, check_mode,
                    source_type, source_task_id, scoring_json, enabled, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (str(uuid.uuid4()), draft["rule_set_id"], row["category"], row["title"], row["source_text"], row["source_page"],
-                 row["check_mode"], row["source_type"] or "manual", row["source_task_id"], row["scoring_json"], row["enabled"], row["sort_order"], timestamp, timestamp),
+                 "ocr" if row["check_mode"] == "ocr" else "auto", row["source_type"] or "manual", row["source_task_id"], row["scoring_json"], row["enabled"], row["sort_order"], timestamp, timestamp),
             )
     return draft
 
@@ -1095,7 +1129,7 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
                 VALUES (?, ?, ?, ?, ?, ?, ?, 'ai', ?, ?, 1, ?, ?, ?)""",
                 (str(uuid.uuid4()), rule_set["rule_set_id"], category, title, str(item.get("source_text", "")).strip(),
                  item.get("source_page") if isinstance(item.get("source_page"), int) else None,
-                 "manual" if item.get("check_mode") == "manual" else "auto",
+                 "ocr" if item.get("ocr_required") or item.get("check_mode") == "ocr" else "auto",
                  task_id, json.dumps(item.get("scoring"), ensure_ascii=False) if item.get("scoring") else None, index, timestamp, timestamp),
             )
     return rule_set
@@ -1160,7 +1194,7 @@ def latest_review_results(app, project_id: str) -> tuple[dict | None, list[dict]
             """SELECT r.* FROM ew_review_runs r JOIN ew_tasks t ON t.task_id = r.task_id
                WHERE r.project_id = ? AND t.status = 'success'
                AND r.rule_set_id = (SELECT rule_set_id FROM ew_rule_sets WHERE project_id = ? ORDER BY version DESC LIMIT 1)
-               ORDER BY r.created_at DESC LIMIT 1""", (project_id, project_id)
+               ORDER BY r.rowid DESC LIMIT 1""", (project_id, project_id)
         ).fetchone()
         if not run:
             return None, []
@@ -1175,6 +1209,59 @@ def latest_review_results(app, project_id: str) -> tuple[dict | None, list[dict]
                 rule.category, rule.sort_order""", (run["review_run_id"],)
         ).fetchall()
     return dict(run), [dict(row) for row in rows]
+
+
+def reusable_evaluation_document_results(app, project_id: str, rule_set_id: str, profile_id: str,
+                                         document_id: str, expected_rule_ids: dict[str, set[str]]) -> dict[str, list[dict]] | None:
+    """查找同规则、同模型下已完成任务的单份投标文件结果，用于增量评审。"""
+    with connection(app) as conn:
+        tasks = conn.execute(
+            """SELECT task_id FROM ew_tasks WHERE project_id=? AND task_type='evaluate_all' AND status='success'
+               ORDER BY finished_at DESC LIMIT 20""",
+            (project_id,),
+        ).fetchall()
+        for task in tasks:
+            copied: dict[str, list[dict]] = {}
+            valid = True
+            for component, rule_ids in expected_rule_ids.items():
+                if not rule_ids:
+                    continue
+                if component == "review":
+                    run = conn.execute(
+                        "SELECT review_run_id FROM ew_review_runs WHERE task_id=? AND rule_set_id=? AND profile_id=?",
+                        (task["task_id"], rule_set_id, profile_id),
+                    ).fetchone()
+                    if not run:
+                        valid = False
+                        break
+                    rows = conn.execute(
+                        """SELECT rule_id, status, evidence, page_hint, reason, risk_level, confidence, evidence_quality,
+                           automation_status, requires_review, review_reason FROM ew_review_results
+                           WHERE review_run_id=? AND document_id=?""",
+                        (run["review_run_id"], document_id),
+                    ).fetchall()
+                else:
+                    run = conn.execute(
+                        "SELECT score_run_id FROM ew_score_runs WHERE task_id=? AND rule_set_id=? AND profile_id=? AND score_type=?",
+                        (task["task_id"], rule_set_id, profile_id, component),
+                    ).fetchone()
+                    if not run:
+                        valid = False
+                        break
+                    rows = conn.execute(
+                        """SELECT rule_id, suggested_score, effective_score, max_score, evidence, reason, confidence,
+                           automation_status, requires_review, review_reason FROM ew_score_results
+                           WHERE score_run_id=? AND document_id=?""",
+                        (run["score_run_id"], document_id),
+                    ).fetchall()
+                values = [dict(row) for row in rows]
+                if {value["rule_id"] for value in values} != rule_ids:
+                    valid = False
+                    break
+                copied[component] = values
+            if valid:
+                return copied
+    return None
 
 
 def update_review_final_status(app, review_result_id: str, final_status: str) -> dict:
@@ -1245,13 +1332,13 @@ def latest_score_results(app, project_id: str, score_type: str) -> tuple[dict | 
             """SELECT r.* FROM ew_score_runs r JOIN ew_tasks t ON t.task_id = r.task_id
                WHERE r.project_id = ? AND r.score_type = ? AND t.status = 'success'
                AND r.rule_set_id = (SELECT rule_set_id FROM ew_rule_sets WHERE project_id = ? ORDER BY version DESC LIMIT 1)
-               ORDER BY r.created_at DESC LIMIT 1""",
+               ORDER BY r.rowid DESC LIMIT 1""",
             (project_id, score_type, project_id),
         ).fetchone()
         if not run:
             return None, []
         rows = conn.execute(
-            """SELECT s.*, d.bidder_name, d.original_name, rule.title
+            """SELECT s.*, d.bidder_name, d.original_name, rule.title, rule.check_mode
             FROM ew_score_results s JOIN ew_documents d ON d.document_id=s.document_id
             JOIN ew_rules rule ON rule.rule_id=s.rule_id
             WHERE s.score_run_id=? ORDER BY d.bidder_name, rule.sort_order""", (run["score_run_id"],)

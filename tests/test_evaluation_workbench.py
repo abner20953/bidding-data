@@ -207,7 +207,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         with patch("dashboard.evaluation_workbench.worker.request_json", return_value={"rules": [
             {"category": "qualification", "title": "具备有效资质", "source_text": "投标人应具备有效资质", "check_mode": "auto"},
-            {"category": "subjective", "title": "技术方案评分", "source_text": "技术方案满分十分", "check_mode": "manual", "scoring": {"max_score": 10}},
+            {"category": "subjective", "title": "技术方案评分", "source_text": "技术方案满分十分", "ocr_required": True, "scoring": {"max_score": 10}},
         ]}):
             finished = self._run_next_task()
 
@@ -216,6 +216,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(rule_set["status"], "draft")
         self.assertEqual(len(rules), 2)
         self.assertTrue(all(item["source_type"] == "ai" for item in rules))
+        self.assertEqual(next(item for item in rules if item["title"] == "技术方案评分")["check_mode"], "ocr")
 
     def test_adding_to_confirmed_rules_creates_new_draft_version(self):
         storage.add_rule(self.app, self.project["project_id"], {"category": "qualification", "title": "资质"})
@@ -280,7 +281,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertNotIn(profile["profile_id"], {item["profile_id"] for item in storage.list_model_profiles(self.app)})
 
-    def test_global_default_model_is_persisted_and_cannot_be_deleted(self):
+    def test_global_default_model_can_be_deleted_and_default_is_reassigned(self):
         profile = storage.create_model_profile(self.app, {
             "display_name": "默认测试模型", "base_url": "https://example.test/v1", "model_name": "default-test", "api_key": "test-key",
         })
@@ -293,8 +294,9 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(storage.get_model_profile(self.app, None)["profile_id"], profile["profile_id"])
         profiles = storage.list_model_profiles(self.app)
         self.assertTrue(next(item for item in profiles if item["profile_id"] == profile["profile_id"])["is_default"])
-        blocked = client.delete(f"/api/evaluation-workbench/model-profiles/{profile['profile_id']}")
-        self.assertEqual(blocked.status_code, 400)
+        deleted = client.delete(f"/api/evaluation-workbench/model-profiles/{profile['profile_id']}")
+        self.assertEqual(deleted.status_code, 200)
+        self.assertNotEqual(storage.get_model_profile(self.app, None)["profile_id"], profile["profile_id"])
 
     def test_model_configuration_management_requires_password(self):
         client = self.app.test_client()
@@ -454,18 +456,86 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.add_rule(self.app, self.project["project_id"], {"category": "objective", "title": "资质得分", "source_text": "资质得5分", "scoring": {"kind": "boolean", "max_score": 5}})
         storage.add_rule(self.app, self.project["project_id"], {"category": "subjective", "title": "技术方案", "source_text": "技术方案满分10分", "scoring": {"max_score": 10}})
         storage.confirm_rule_set(self.app, self.project["project_id"])
-        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "token-optimized-v1")
+        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "token-optimized-v2")
         prior = storage.create_task(self.app, self.project["project_id"], "evaluate_all", {"profile_id": None, "input_fingerprint": fingerprint})
         storage.update_task(self.app, prior["task_id"], status="success", result={"cached": True})
 
-        response = self.app.test_client().post(
-            f"/api/evaluation-workbench/projects/{self.project['project_id']}/tasks",
-            json={"task_type": "evaluate_all", "reuse_completed": True},
-        )
+        with patch("dashboard.blueprints.evaluation_workbench._start_worker_if_needed"):
+            response = self.app.test_client().post(
+                f"/api/evaluation-workbench/projects/{self.project['project_id']}/tasks",
+                json={"task_type": "evaluate_all"},
+            )
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["reused"])
         self.assertEqual(response.get_json()["task"]["task_id"], prior["task_id"])
+
+    def test_combined_evaluation_allows_only_review_rules_and_marks_ocr_requirement(self):
+        self._add_pdf("bid.pdf", "bid", "甲公司", "营业执照信息。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "证照图像", "source_text": "提供清晰证照图片", "ocr_required": True,
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        with patch("dashboard.blueprints.evaluation_workbench._start_worker_if_needed"):
+            response = self.app.test_client().post(
+                f"/api/evaluation-workbench/projects/{self.project['project_id']}/tasks",
+                json={"task_type": "evaluate_all"},
+            )
+        self.assertEqual(response.status_code, 202)
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value={
+            "review_results": [{"rule_id": rule["rule_id"], "status": "ocr_required"}],
+            "objective_scores": [], "subjective_scores": [],
+        }) as request_json:
+            finished = self._run_next_task()
+
+        _, reviews = storage.latest_review_results(self.app, self.project["project_id"])
+        self.assertEqual(finished["status"], "success")
+        self.assertEqual(request_json.call_count, 1)
+        self.assertEqual(reviews[0]["status"], "ocr_required")
+        self.assertIn("OCR", reviews[0]["reason"])
+
+    def test_combined_evaluation_reuses_unchanged_bid_documents_after_adding_a_bid(self):
+        self._add_pdf("bid-a.pdf", "bid", "甲公司", "甲公司具备有效资质。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        rule = storage.add_rule(self.app, self.project["project_id"], {"category": "qualification", "title": "有效资质", "source_text": "具备有效资质"})
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        response = {"review_results": [{"rule_id": rule["rule_id"], "status": "satisfied", "evidence": "有效资质", "reason": "已提供", "risk_level": "low"}], "objective_scores": [], "subjective_scores": []}
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value=response):
+            self._run_next_task()
+
+        self._add_pdf("bid-b.pdf", "bid", "乙公司", "乙公司具备有效资质。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value=response) as request_json:
+            finished = self._run_next_task()
+
+        _, reviews = storage.latest_review_results(self.app, self.project["project_id"])
+        self.assertEqual(finished["result"]["reused_document_count"], 1)
+        self.assertEqual(finished["result"]["model_document_count"], 1)
+        self.assertEqual(request_json.call_count, 1)
+        self.assertEqual(len(reviews), 2)
+
+    def test_rule_extraction_filters_unreviewable_submission_requirements(self):
+        self._add_pdf("tender.pdf", "tender", "", "资格审查和评分标准。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        storage.create_task(self.app, self.project["project_id"], "extract_rules")
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value={"rules": [
+            {"category": "qualification", "title": "具备资质", "source_text": "提供有效资质"},
+            {"category": "compliance", "title": "响应文件份数", "source_text": "响应文件正本一份、副本两份"},
+        ]}):
+            finished = self._run_next_task()
+
+        _, rules = storage.list_rules(self.app, self.project["project_id"])
+        self.assertEqual(finished["result"]["excluded_rule_count"], 1)
+        self.assertEqual([item["title"] for item in rules], ["具备资质"])
 
     def test_objective_score_calculates_confirmed_boolean_rule(self):
         self._add_pdf("tender.pdf", "tender", "", "具备有效资质得5分。")
