@@ -1307,19 +1307,43 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
         rule_set = {"rule_set_id": str(uuid.uuid4()), "project_id": project_id, "version": prior + 1, "status": "draft", "source_task_id": task_id, "created_at": timestamp, "updated_at": timestamp}
         conn.execute("UPDATE ew_rule_sets SET status = 'superseded', updated_at = ? WHERE project_id = ? AND status != 'superseded'", (timestamp, project_id))
         conn.execute("INSERT INTO ew_rule_sets(rule_set_id, project_id, version, status, source_task_id, created_at, updated_at) VALUES (:rule_set_id, :project_id, :version, :status, :source_task_id, :created_at, :updated_at)", rule_set)
+        signatures = set()
         for index, item in enumerate(rules):
             title = str(item.get("title", "")).strip()
             category = str(item.get("category", "")).strip()
             if not title or category not in {"qualification", "compliance", "substantive", "rejection", "other", "objective", "subjective"}:
                 continue
+            check_rule = str(item.get("check_rule", "")).strip() or title
+            signatures.add((category, re.sub(r"\s+", "", title).casefold(), re.sub(r"\s+", "", check_rule).casefold()))
             conn.execute(
                 """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode, source_type, source_task_id, scoring_json, enabled, sort_order, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ai', ?, ?, 1, ?, ?, ?)""",
-                (str(uuid.uuid4()), rule_set["rule_set_id"], category, title, str(item.get("check_rule", "")).strip() or title, str(item.get("source_text", "")).strip(),
+                (str(uuid.uuid4()), rule_set["rule_set_id"], category, title, check_rule, str(item.get("source_text", "")).strip(),
                  item.get("source_page") if isinstance(item.get("source_page"), int) else None,
                  "ocr" if item.get("ocr_required") or item.get("check_mode") == "ocr" else "auto",
                  task_id, json.dumps(item.get("scoring"), ensure_ascii=False) if item.get("scoring") else None, index, timestamp, timestamp),
             )
+        global_rule_count = 0
+        global_rules = conn.execute(
+            "SELECT * FROM ew_global_rules WHERE enabled = 1 ORDER BY category, sort_order, created_at"
+        ).fetchall()
+        for position, template in enumerate(global_rules, start=len(rules)):
+            signature = (
+                template["category"], re.sub(r"\s+", "", template["title"]).casefold(),
+                re.sub(r"\s+", "", template["check_rule"]).casefold(),
+            )
+            if signature in signatures:
+                continue
+            signatures.add(signature)
+            conn.execute(
+                """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode,
+                   source_type, source_task_id, scoring_json, enabled, sort_order, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'global', NULL, NULL, 1, ?, ?, ?)""",
+                (str(uuid.uuid4()), rule_set["rule_set_id"], template["category"], template["title"], template["check_rule"],
+                 template["source_text"], template["check_mode"], position, timestamp, timestamp),
+            )
+            global_rule_count += 1
+        rule_set["global_rule_count"] = global_rule_count
     return rule_set
 
 

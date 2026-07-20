@@ -379,6 +379,25 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         client.patch(f"/api/evaluation-workbench/global-rules/{created.get_json()['rule']['global_rule_id']}", json={"title": "更新名称"})
         self.assertEqual(storage.list_rules(self.app, new_project["project_id"])[1][0]["title"], "营业执照有效性")
 
+    def test_rule_extraction_merges_enabled_global_rules_without_exact_duplicates(self):
+        storage.create_global_rule(self.app, {
+            "category": "qualification", "title": "通用营业执照", "check_rule": "核验是否提供有效营业执照", "source_text": "通用基线",
+        })
+        storage.create_global_rule(self.app, {
+            "category": "compliance", "title": "完全重复规则", "check_rule": "核验响应文件是否完整", "source_text": "通用基线",
+        })
+
+        rule_set = storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-1", [
+            {"category": "compliance", "title": "完全重复规则", "check_rule": "核验响应文件是否完整", "source_text": "招标原文"},
+            {"category": "substantive", "title": "报价限制", "check_rule": "核验报价未超过最高限价", "source_text": "最高限价"},
+        ])
+        _, rules = storage.list_rules(self.app, self.project["project_id"])
+
+        self.assertEqual(rule_set["global_rule_count"], 1)
+        self.assertEqual(len(rules), 3)
+        self.assertEqual({item["source_type"] for item in rules}, {"ai", "global"})
+        self.assertEqual(sum(item["title"] == "完全重复规则" for item in rules), 1)
+
     def test_manual_check_rule_is_preserved_and_can_be_updated(self):
         rule = storage.add_rule(self.app, self.project["project_id"], {
             "category": "qualification", "title": "营业执照", "check_rule": "核验是否提供有效营业执照", "source_text": "投标人应提供营业执照。",

@@ -392,7 +392,9 @@ def _extract_rules(app, task: dict) -> dict:
         raise ValueError("模型未提取到可确认的有效规则，请检查招标文件文本或更换模型")
     storage.update_task(app, task["task_id"], progress=80, message="正在保存待确认规则")
     rule_set = storage.replace_rules_from_extraction(app, task["project_id"], task["task_id"], rules)
-    return {"rule_set_id": rule_set["rule_set_id"], "version": rule_set["version"], "rule_count": len(rules),
+    global_rule_count = rule_set.get("global_rule_count", 0)
+    return {"rule_set_id": rule_set["rule_set_id"], "version": rule_set["version"], "rule_count": len(rules) + global_rule_count,
+            "ai_rule_count": len(rules), "global_rule_count": global_rule_count,
             "excluded_rule_count": excluded_rule_count, "profile": profile["display_name"]}
 
 
