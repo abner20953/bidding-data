@@ -581,12 +581,15 @@ def document_path(app, document: dict) -> Path:
 
 
 def store_upload(app, project_id: str, role: str, bidder_name: str, upload) -> dict:
+    bidder_name = str(bidder_name or "").strip()
     original_name = Path(upload.filename or "").name
     extension = Path(original_name).suffix.lower()
     if extension not in {".pdf", ".docx"}:
         raise ValueError("评标工作台目前仅支持 PDF 和 DOCX 文件")
     if role not in {"tender", "tender_attachment", "bid"}:
         raise ValueError("不支持的文件角色")
+    if role == "bid" and not bidder_name:
+        raise ValueError("上传投标文件时必须填写投标人名称")
     existing_documents = list_documents(app, project_id)
     if role == "bid" and sum(item["role"] == "bid" for item in existing_documents) >= MAX_BID_DOCUMENTS:
         raise ValueError(f"每个项目最多上传 {MAX_BID_DOCUMENTS} 份投标文件")
@@ -622,7 +625,7 @@ def store_upload(app, project_id: str, role: str, bidder_name: str, upload) -> d
         "document_id": document_id,
         "project_id": project_id,
         "role": role,
-        "bidder_name": bidder_name.strip(),
+        "bidder_name": bidder_name,
         "original_name": original_name,
         "stored_name": stored_name,
         "extension": extension,

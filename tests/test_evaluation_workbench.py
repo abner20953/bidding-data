@@ -70,6 +70,10 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertTrue(all(item["parse_status"] == "success" for item in documents))
         self.assertTrue(all(item["text_length"] is not None for item in documents))
 
+    def test_bid_upload_requires_bidder_name(self):
+        with self.assertRaisesRegex(ValueError, "必须填写投标人名称"):
+            self._add_pdf("bid.pdf", "bid", "  ", "技术方案：稳定运行。")
+
     def test_parse_task_reuses_successful_parse_cache(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案：稳定运行。")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
