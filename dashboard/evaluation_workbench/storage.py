@@ -1446,8 +1446,10 @@ def save_review_results(app, review_run_id: str, document_id: str, results: list
 def latest_review_results(app, project_id: str) -> tuple[dict | None, list[dict]]:
     with connection(app) as conn:
         run = conn.execute(
-            """SELECT r.* FROM ew_review_runs r JOIN ew_tasks t ON t.task_id = r.task_id
-               WHERE r.project_id = ? AND t.status = 'success'
+            """SELECT r.*, t.status AS task_status, t.error AS task_error, t.progress AS task_progress
+               FROM ew_review_runs r JOIN ew_tasks t ON t.task_id = r.task_id
+               WHERE r.project_id = ? AND t.status IN ('success', 'error')
+               AND EXISTS (SELECT 1 FROM ew_review_results item WHERE item.review_run_id = r.review_run_id)
                AND r.rule_set_id = (SELECT rule_set_id FROM ew_rule_sets WHERE project_id = ? ORDER BY version DESC LIMIT 1)
                ORDER BY r.rowid DESC LIMIT 1""", (project_id, project_id)
         ).fetchone()
@@ -1590,8 +1592,10 @@ def save_score_results(app, score_run_id: str, document_id: str, results: list[d
 def latest_score_results(app, project_id: str, score_type: str) -> tuple[dict | None, list[dict]]:
     with connection(app) as conn:
         run = conn.execute(
-            """SELECT r.* FROM ew_score_runs r JOIN ew_tasks t ON t.task_id = r.task_id
-               WHERE r.project_id = ? AND r.score_type = ? AND t.status = 'success'
+            """SELECT r.*, t.status AS task_status, t.error AS task_error, t.progress AS task_progress
+               FROM ew_score_runs r JOIN ew_tasks t ON t.task_id = r.task_id
+               WHERE r.project_id = ? AND r.score_type = ? AND t.status IN ('success', 'error')
+               AND EXISTS (SELECT 1 FROM ew_score_results item WHERE item.score_run_id = r.score_run_id)
                AND r.rule_set_id = (SELECT rule_set_id FROM ew_rule_sets WHERE project_id = ? ORDER BY version DESC LIMIT 1)
                ORDER BY r.rowid DESC LIMIT 1""",
             (project_id, score_type, project_id),

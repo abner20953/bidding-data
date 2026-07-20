@@ -601,6 +601,24 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("营业执照", retrieved["text"])
         self.assertEqual(fallback["mode"], "full_prefix")
 
+    def test_partial_page_context_keeps_matched_rules_without_full_document_fallback(self):
+        parsed = self.temp_dir / "parsed-partial.txt"
+        parsed.write_text(
+            "[第1页]\n营业执照复印件。\n\n[第2页]\n技术方案和实施计划。\n\n[第3页]\n报价明细。\n",
+            encoding="utf-8",
+        )
+        rules = [
+            {"rule_id": "matched", "title": "营业执照", "source_text": "提供营业执照"},
+            {"rule_id": "unmatched", "title": "串通投标", "source_text": "不同投标人由同一单位编制"},
+        ]
+
+        context = build_rule_context(parsed, rules, 1000, allow_partial=True)
+
+        self.assertEqual(context["mode"], "retrieved_pages_partial")
+        self.assertEqual(context["unmatched_rule_ids"], ["unmatched"])
+        self.assertIn("营业执照", context["text"])
+        self.assertNotIn("[第3页]", context["text"])
+
     def test_combined_evaluation_persists_original_three_result_types(self):
         self._add_pdf("tender.pdf", "tender", "", "投标人具备资质得5分，技术方案满分10分。")
         self._add_pdf("bid.pdf", "bid", "甲公司", "本公司具备资质，技术方案完整。")
@@ -672,6 +690,32 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(finished["status"], "success")
         self.assertEqual(finished["result"]["compact_retry_count"], 1)
         self.assertEqual(request_json.call_count, 4)
+        self.assertEqual(request_json.call_args_list[0].args[0]["thinking_mode"], "adaptive")
+        self.assertEqual(request_json.call_args_list[1].args[0]["thinking_mode"], "disabled")
+
+    def test_combined_evaluation_keeps_completed_groups_visible_after_later_group_error(self):
+        self._add_pdf("bid.pdf", "bid", "甲公司", "投标文件包含全部承诺。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        for index in range(9):
+            storage.add_rule(self.app, self.project["project_id"], {
+                "category": "qualification", "title": f"承诺事项{index}", "source_text": "承诺事项",
+            })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[
+            {"results": []},
+            ValueError("模型未返回有效 JSON"),
+            ValueError("模型未返回有效 JSON"),
+        ]):
+            finished = self._run_next_task()
+
+        review_run, results = storage.latest_review_results(self.app, self.project["project_id"])
+        self.assertEqual(finished["status"], "error")
+        self.assertEqual(finished["progress"], 50)
+        self.assertEqual(review_run["task_status"], "error")
+        self.assertEqual(len(results), 8)
 
     def test_token_usage_endpoint_returns_only_aggregated_metadata(self):
         task = storage.create_task(self.app, self.project["project_id"], "parse_documents")
