@@ -693,7 +693,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(request_json.call_args_list[0].args[0]["thinking_mode"], "adaptive")
         self.assertEqual(request_json.call_args_list[1].args[0]["thinking_mode"], "disabled")
 
-    def test_combined_evaluation_keeps_completed_groups_visible_after_later_group_error(self):
+    def test_combined_evaluation_keeps_completed_groups_visible_after_later_connection_error(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "投标文件包含全部承诺。")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
         self._run_next_task()
@@ -706,8 +706,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[
             {"results": []},
-            ValueError("模型未返回有效 JSON"),
-            ValueError("模型未返回有效 JSON"),
+            ValueError("模型连接失败：timeout"),
         ]):
             finished = self._run_next_task()
 
@@ -716,6 +715,58 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(finished["progress"], 50)
         self.assertEqual(review_run["task_status"], "error")
         self.assertEqual(len(results), 8)
+
+    def test_combined_evaluation_keeps_running_when_single_rule_returns_invalid_json_twice(self):
+        self._add_pdf("bid.pdf", "bid", "甲公司", "投标文件包含承诺事项。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "承诺事项", "source_text": "承诺事项",
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[
+            ValueError("模型未返回有效 JSON"),
+            ValueError("模型未返回有效 JSON"),
+        ]):
+            finished = self._run_next_task()
+
+        review_run, results = storage.latest_review_results(self.app, self.project["project_id"])
+        self.assertEqual(finished["status"], "success")
+        self.assertEqual(finished["result"]["manual_fallback_rule_count"], 1)
+        self.assertEqual(review_run["task_status"], "success")
+        self.assertEqual(results[0]["rule_id"], rule["rule_id"])
+        self.assertEqual(results[0]["status"], "manual")
+        self.assertIn("格式异常", results[0]["reason"])
+
+    def test_combined_evaluation_strictly_retries_group_before_splitting_it(self):
+        self._add_pdf("bid.pdf", "bid", "甲公司", "投标文件包含资质和承诺。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        rules = [
+            storage.add_rule(self.app, self.project["project_id"], {
+                "category": "qualification", "title": title, "source_text": title,
+            })
+            for title in ("资质", "承诺")
+        ]
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        valid = lambda rule: {"results": [{"rule_id": rule["rule_id"], "status": "satisfied", "evidence": rule["title"], "reason": "已提供", "risk_level": "low"}]}
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[
+            ValueError("模型未返回有效 JSON"),
+            ValueError("模型未返回有效 JSON"),
+            valid(rules[0]),
+            valid(rules[1]),
+        ]) as request_json:
+            finished = self._run_next_task()
+
+        self.assertEqual(finished["status"], "success")
+        self.assertEqual(finished["result"]["compact_retry_count"], 1)
+        self.assertEqual(finished["result"]["split_retry_count"], 1)
+        self.assertEqual(request_json.call_count, 4)
+        self.assertEqual(request_json.call_args_list[1].args[0]["thinking_mode"], "disabled")
 
     def test_token_usage_endpoint_returns_only_aggregated_metadata(self):
         task = storage.create_task(self.app, self.project["project_id"], "parse_documents")
@@ -738,7 +789,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.add_rule(self.app, self.project["project_id"], {"category": "objective", "title": "资质得分", "source_text": "资质得5分", "scoring": {"kind": "boolean", "max_score": 5}})
         storage.add_rule(self.app, self.project["project_id"], {"category": "subjective", "title": "技术方案", "source_text": "技术方案满分10分", "scoring": {"max_score": 10}})
         storage.confirm_rule_set(self.app, self.project["project_id"])
-        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "token-optimized-v2")
+        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "token-optimized-v3")
         prior = storage.create_task(self.app, self.project["project_id"], "evaluate_all", {"profile_id": None, "input_fingerprint": fingerprint})
         storage.update_task(self.app, prior["task_id"], status="success", result={"cached": True})
 

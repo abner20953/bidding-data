@@ -41,6 +41,18 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
 
         self.assertEqual(decoded, {"rules": []})
 
+    def test_json_decoder_repairs_safe_model_syntax_noise(self):
+        decoded = _decode_json_content('{"results":[{"reason":"第一行\n第二行",}],}')
+
+        self.assertEqual(decoded, {"results": [{"reason": "第一行\n第二行"}]})
+
+    def test_json_decoder_accepts_text_content_blocks_and_double_encoded_object(self):
+        blocked = _decode_json_content([{"type": "text", "text": '{"results":[]}'}])
+        encoded = _decode_json_content('"{\\"results\\":[]}"')
+
+        self.assertEqual(blocked, {"results": []})
+        self.assertEqual(encoded, {"results": []})
+
     def test_connection_explains_authentication_failure_without_echoing_response(self):
         response = Mock(ok=False, status_code=401, text='{"error":"invalid api key"}')
         with patch("dashboard.evaluation_workbench.ai_gateway.requests.post", return_value=response):

@@ -9,12 +9,44 @@ import re
 import requests
 
 
+def _load_json_candidate(value: str) -> object:
+    """解析模型常见的轻微 JSON 瑕疵，不猜测缺失的业务内容。"""
+    attempts = [value]
+    # 部分模型会输出未转义的换行/制表符，strict=False 可安全接受这类控制字符。
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        pass
+    try:
+        return json.loads(value, strict=False)
+    except json.JSONDecodeError:
+        pass
+    # 仅修复不改变字段含义的语法噪声：尾逗号、全角结构符和不可见空格。
+    repaired = value.replace("\ufeff", "").replace("\u00a0", " ")
+    repaired = repaired.translate(str.maketrans({"：": ":", "，": ",", "｛": "{", "｝": "}", "［": "[", "］": "]"}))
+    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+    if repaired != value:
+        attempts.append(repaired)
+        try:
+            return json.loads(repaired, strict=False)
+        except json.JSONDecodeError:
+            pass
+    # 保留最早的严格 JSON 异常，调用方只记录安全诊断，不持久化正文。
+    return json.loads(attempts[0])
+
+
 def _decode_json_content(content) -> dict:
     if isinstance(content, dict):
         return content
+    if isinstance(content, list):
+        # 兼容少量 OpenAI-compatible 接口返回的文本内容块。
+        content = "".join(
+            str(item.get("text") or item.get("content") or "") if isinstance(item, dict) else str(item)
+            for item in content
+        )
     if not isinstance(content, str):
         raise ValueError("模型响应正文为空")
-    value = content.strip()
+    value = content.strip().lstrip("\ufeff")
     # MiniMax 在开启 thinking 时会将 <think>...</think> 放在 content 前面；
     # 评标任务只解析其后的结构化结论，不保存或展示思考过程。
     value = re.sub(r"^\s*<think>.*?</think>\s*", "", value, count=1, flags=re.IGNORECASE | re.DOTALL)
@@ -26,16 +58,19 @@ def _decode_json_content(content) -> dict:
             lines = lines[:-1]
         value = "\n".join(lines).strip()
     try:
-        parsed = json.loads(value)
+        parsed = _load_json_candidate(value)
     except json.JSONDecodeError as original_error:
         # 少量兼容接口仍可能在 JSON 前后附带简短说明；仅在能完整定位对象时兜底解析。
         start, end = value.find("{"), value.rfind("}")
         if start < 0 or end <= start:
             raise original_error
         try:
-            parsed = json.loads(value[start:end + 1])
+            parsed = _load_json_candidate(value[start:end + 1])
         except json.JSONDecodeError:
             raise original_error
+    # 某些兼容接口会把 JSON 对象再次序列化成字符串。
+    if isinstance(parsed, str):
+        parsed = _load_json_candidate(parsed)
     if not isinstance(parsed, dict):
         raise ValueError("模型返回的 JSON 顶层必须是对象")
     return parsed
