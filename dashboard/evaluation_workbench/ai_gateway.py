@@ -106,7 +106,8 @@ def _raise_http_error(response, *, operation: str) -> None:
     raise ValueError(f"{operation}（HTTP {response.status_code}）：{response.text[:500]}")
 
 
-def request_json(profile: dict, system_prompt: str, user_prompt: str, *, usage_callback=None, max_tokens: int | None = None) -> dict:
+def request_json(profile: dict, system_prompt: str, user_prompt: str, *, usage_callback=None,
+                 response_metadata_callback=None, max_tokens: int | None = None) -> dict:
     api_key = _api_key_for(profile)
     base_url = profile["base_url"].rstrip("/")
     payload = {
@@ -145,6 +146,13 @@ def request_json(profile: dict, system_prompt: str, user_prompt: str, *, usage_c
     try:
         choice = body["choices"][0]
         content = choice["message"]["content"]
+        if response_metadata_callback:
+            # 只记录长度与结束原因，绝不保存模型正文、提示词或思考内容。
+            response_metadata_callback({
+                "requested_max_tokens": payload.get("max_tokens"),
+                "finish_reason": choice.get("finish_reason"),
+                "response_chars": len(content) if isinstance(content, str) else 0,
+            })
         result = _decode_json_content(content)
     except (KeyError, IndexError, TypeError, json.JSONDecodeError, ValueError) as exc:
         finish_reason = choice.get("finish_reason") if isinstance(locals().get("choice"), dict) else None

@@ -196,6 +196,9 @@ def init_database(app) -> None:
                 completion_tokens INTEGER,
                 total_tokens INTEGER,
                 cache_hit_tokens INTEGER,
+                requested_max_tokens INTEGER,
+                finish_reason TEXT,
+                response_chars INTEGER,
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_ew_model_calls_project ON ew_model_calls(project_id, created_at);
@@ -342,6 +345,9 @@ def init_database(app) -> None:
         _ensure_column(conn, "ew_rules", "source_type", "TEXT")
         _ensure_column(conn, "ew_rules", "source_task_id", "TEXT")
         _ensure_column(conn, "ew_rules", "check_rule", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "ew_model_calls", "requested_max_tokens", "INTEGER")
+        _ensure_column(conn, "ew_model_calls", "finish_reason", "TEXT")
+        _ensure_column(conn, "ew_model_calls", "response_chars", "INTEGER")
         conn.execute("UPDATE ew_rules SET check_rule = title WHERE check_rule IS NULL OR check_rule = ''")
         conn.execute("UPDATE ew_rules SET source_type = CASE WHEN rule_set_id IN (SELECT rule_set_id FROM ew_rule_sets WHERE source_task_id IS NOT NULL) THEN 'ai' ELSE 'manual' END WHERE source_type IS NULL OR source_type = ''")
         _seed_default_profiles(conn)
@@ -821,11 +827,20 @@ def update_task(app, task_id: str, *, progress: int | None = None, message: str 
         conn.execute(f"UPDATE ew_tasks SET {', '.join(fields)} WHERE task_id = ?", values)
 
 
+def _safe_positive_int(value: object) -> int | None:
+    try:
+        return max(0, int(value)) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def record_model_call(app, task_id: str, project_id: str, phase: str, profile_id: str | None,
                       *, document_id: str | None = None, input_chars: int = 0,
-                      context_mode: str = "full", usage: dict | None = None) -> None:
+                      context_mode: str = "full", usage: dict | None = None,
+                      response_metadata: dict | None = None) -> None:
     """保存供应商返回的用量；不保存提示词、正文或密钥。"""
     usage = usage or {}
+    response_metadata = response_metadata or {}
 
     def number(*keys: str) -> int | None:
         for key in keys:
@@ -842,11 +857,15 @@ def record_model_call(app, task_id: str, project_id: str, phase: str, profile_id
     with connection(app) as conn:
         conn.execute(
             """INSERT INTO ew_model_calls(call_id, task_id, project_id, document_id, phase, profile_id,
-               context_mode, input_chars, prompt_tokens, completion_tokens, total_tokens, cache_hit_tokens, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               context_mode, input_chars, prompt_tokens, completion_tokens, total_tokens, cache_hit_tokens,
+               requested_max_tokens, finish_reason, response_chars, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (str(uuid.uuid4()), task_id, project_id, document_id, phase, profile_id, context_mode,
              max(0, int(input_chars)), prompt_tokens, completion_tokens, total_tokens,
-             number("prompt_cache_hit_tokens", "cache_hit_tokens", "cached_tokens"), now_iso()),
+             number("prompt_cache_hit_tokens", "cache_hit_tokens", "cached_tokens"),
+             _safe_positive_int(response_metadata.get("requested_max_tokens")),
+             str(response_metadata.get("finish_reason") or "")[:64] or None,
+             _safe_positive_int(response_metadata.get("response_chars")), now_iso()),
         )
 
 
@@ -1321,7 +1340,10 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
             if not title or category not in {"qualification", "compliance", "substantive", "rejection", "other", "objective", "subjective"}:
                 continue
             check_rule = str(item.get("check_rule", "")).strip() or title
-            signatures.add((category, re.sub(r"\s+", "", title).casefold(), re.sub(r"\s+", "", check_rule).casefold()))
+            signature = (category, re.sub(r"\s+", "", title).casefold(), re.sub(r"\s+", "", check_rule).casefold())
+            if signature in signatures:
+                continue
+            signatures.add(signature)
             conn.execute(
                 """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode, source_type, source_task_id, scoring_json, enabled, sort_order, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ai', ?, ?, 1, ?, ?, ?)""",

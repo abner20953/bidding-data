@@ -45,29 +45,30 @@ def _lock_path(app) -> Path:
 
 def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt: str, user_prompt: str,
                        *, document_id: str | None = None, context_mode: str = "full_prefix",
-                       max_tokens: int | None = None) -> dict:
+                       max_tokens: int | None = None, thinking_mode: str | None = None) -> dict:
     """调用模型并只记录用量元数据，不记录正文或提示词。"""
-    recorded = False
+    usage: dict = {}
+    response_metadata: dict = {"requested_max_tokens": max_tokens}
 
-    def record_usage(usage: dict) -> None:
-        nonlocal recorded
-        recorded = True
+    def record_usage(value: dict) -> None:
+        usage.update(value if isinstance(value, dict) else {})
+
+    def record_response_metadata(value: dict) -> None:
+        response_metadata.update(value if isinstance(value, dict) else {})
+
+    try:
+        effective_profile = {**profile, "thinking_mode": thinking_mode} if thinking_mode else profile
+        return request_json(
+            effective_profile, system_prompt, user_prompt, usage_callback=record_usage,
+            response_metadata_callback=record_response_metadata, max_tokens=max_tokens,
+        )
+    finally:
+        # 部分兼容接口不返回 usage；仍保留发送字符数与截断元数据以便统计和优化。
         storage.record_model_call(
             app, task["task_id"], task["project_id"], phase, profile.get("profile_id"),
             document_id=document_id, input_chars=len(system_prompt) + len(user_prompt),
-            context_mode=context_mode, usage=usage,
+            context_mode=context_mode, usage=usage, response_metadata=response_metadata,
         )
-
-    try:
-        return request_json(profile, system_prompt, user_prompt, usage_callback=record_usage, max_tokens=max_tokens)
-    finally:
-        # 部分兼容接口不返回 usage；仍保留发送字符数以便统计和优化。
-        if not recorded:
-            storage.record_model_call(
-                app, task["task_id"], task["project_id"], phase, profile.get("profile_id"),
-                document_id=document_id, input_chars=len(system_prompt) + len(user_prompt),
-                context_mode=context_mode,
-            )
 
 
 def _system_prompt(app, template_id: str, fixed_boundary: str) -> str:
@@ -206,7 +207,7 @@ def _compare_evidence_packet(signal: dict) -> dict:
 
 
 def _output_token_budget(profile: dict, target: int) -> int | None:
-    """为结构化输出设置保守上限；MiniMax M2 思考不可关闭时不额外截断。"""
+    """为结构化输出设置保守上限；规则提取已在调用前分段，不依赖放大总上限。"""
     model_name = str(profile.get("model_name") or "").lower()
     base_url = str(profile.get("base_url") or "").lower()
     if "api.minimaxi.com" in base_url and model_name.startswith("minimax-m2"):
@@ -373,11 +374,47 @@ def _score_packet_is_covered(packet: str, score_rules: list[dict]) -> bool:
     )
 
 
-def _rule_extraction_prompt(text: str, *, compact: bool, score_packets: list[str]) -> str:
+RULE_EXTRACTION_BATCH_CHARS = 11_000
+RULE_EXTRACTION_MIN_SPLIT_CHARS = 3_500
+
+
+def _split_rule_extraction_text(text: str, max_chars: int) -> list[str]:
+    """按页/段落切分原文，避免截断页面标记和评分表行。"""
+    value = text.strip()
+    if len(value) <= max_chars:
+        return [value] if value else []
+    parts = re.split(r"(?=\[第\d+页\])", value)
+    if len(parts) <= 1:
+        parts = re.split(r"(?<=\n)", value)
+    chunks: list[str] = []
+    current = ""
+    for part in parts:
+        if not part:
+            continue
+        if len(part) > max_chars:
+            if current:
+                chunks.append(current.strip())
+                current = ""
+            for start in range(0, len(part), max_chars):
+                piece = part[start:start + max_chars].strip()
+                if piece:
+                    chunks.append(piece)
+            continue
+        if current and len(current) + len(part) > max_chars:
+            chunks.append(current.strip())
+            current = part
+        else:
+            current += part
+    if current.strip():
+        chunks.append(current.strip())
+    return chunks or [value[:max_chars]]
+
+
+def _rule_extraction_prompt(text: str, *, compact: bool, score_packets: list[str], max_rules: int = 45) -> str:
     limits = (
-        "这是格式异常后的紧凑重试。最多返回 30 条规则；title 最多 30 字，check_rule 最多 90 字，source_text 最多 120 字。"
+        f"这是格式异常后的紧凑重试。最多返回 {max_rules} 条规则；title 最多 30 字，check_rule 最多 90 字，source_text 最多 120 字。"
         if compact else
-        "最多返回 45 条规则；title 最多 40 字，check_rule 最多 140 字，source_text 最多 220 字。"
+        f"最多返回 {max_rules} 条规则；title 最多 40 字，check_rule 最多 140 字，source_text 最多 220 字。"
     )
     score_audit = "\n".join(f"【评分条款 {index}】\n{packet}" for index, packet in enumerate(score_packets, start=1))
     score_requirement = (
@@ -417,6 +454,79 @@ def _score_rule_supplement_prompt(score_packets: list[str], existing_rules: list
 {packet_text}"""
 
 
+def _rule_batch_output_tokens(text: str, compact: bool = False) -> int:
+    """小批次按内容量分配输出；紧凑重试绝不降低输出上限。"""
+    target = max(2_500, min(6_000, 1_400 + len(text) // 3))
+    return max(target, 3_500) if compact else target
+
+
+def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text: str,
+                        *, document_id: str, batch_label: str, depth: int = 0) -> tuple[list[dict], int, int]:
+    """提取一个小批次；截断时只二分当前批次，最小批次才紧凑重试。"""
+    packets = _score_clause_packets(text)
+    max_rules = 16 if depth == 0 else 10
+    user_prompt = _rule_extraction_prompt(text, compact=False, score_packets=packets, max_rules=max_rules)
+    try:
+        parsed = _request_task_json(
+            app, task, profile, "extract_rules_batch", system_prompt, user_prompt,
+            document_id=document_id, context_mode=batch_label,
+            max_tokens=_output_token_budget(profile, _rule_batch_output_tokens(text)), thinking_mode="disabled",
+        )
+        rules = parsed.get("rules") if isinstance(parsed, dict) else None
+        if not isinstance(rules, list):
+            raise ValueError("模型返回格式不符合规则提取要求")
+        return [item for item in rules if isinstance(item, dict)], 0, 0
+    except ValueError as exc:
+        if not _is_invalid_json_model_response(exc):
+            raise
+        if len(text) > RULE_EXTRACTION_MIN_SPLIT_CHARS and depth < 3:
+            pieces = _split_rule_extraction_text(text, max(RULE_EXTRACTION_MIN_SPLIT_CHARS, (len(text) + 1) // 2))
+            if len(pieces) > 1:
+                storage.update_task(app, task["task_id"], message=f"{batch_label} 输出过长，正在仅拆分该批次重试")
+                rules: list[dict] = []
+                compact_retries = split_retries = 0
+                for index, piece in enumerate(pieces, start=1):
+                    value, compact_count, split_count = _extract_rule_batch(
+                        app, task, profile, system_prompt, piece, document_id=document_id,
+                        batch_label=f"{batch_label}/拆分{index}", depth=depth + 1,
+                    )
+                    rules.extend(value)
+                    compact_retries += compact_count
+                    split_retries += split_count
+                return rules, compact_retries, split_retries + 1
+        storage.update_task(app, task["task_id"], message=f"{batch_label} 格式异常，正在以紧凑 JSON 重试")
+        retry_prompt = _rule_extraction_prompt(text, compact=True, score_packets=packets, max_rules=max(8, max_rules))
+        parsed = _request_task_json(
+            app, task, profile, "extract_rules_compact_retry", system_prompt, retry_prompt,
+            document_id=document_id, context_mode=f"{batch_label}_compact_retry",
+            max_tokens=_output_token_budget(profile, _rule_batch_output_tokens(text, compact=True)), thinking_mode="disabled",
+        )
+        rules = parsed.get("rules") if isinstance(parsed, dict) else None
+        if not isinstance(rules, list):
+            raise ValueError("模型返回格式不符合规则提取要求")
+        return [item for item in rules if isinstance(item, dict)], 1, 0
+
+
+def _rule_signature(item: dict) -> tuple[str, str, str]:
+    return (
+        str(item.get("category", "")).strip(),
+        re.sub(r"\s+", "", str(item.get("title", ""))).casefold(),
+        re.sub(r"\s+", "", str(item.get("check_rule", "") or item.get("title", ""))).casefold(),
+    )
+
+
+def _dedupe_rule_candidates(items: list[dict]) -> list[dict]:
+    seen: set[tuple[str, str, str]] = set()
+    result = []
+    for item in items:
+        signature = _rule_signature(item)
+        if not all(signature) or signature in seen:
+            continue
+        seen.add(signature)
+        result.append(item)
+    return result
+
+
 def _extract_rules(app, task: dict) -> dict:
     documents = storage.list_documents(app, task["project_id"])
     tender = next((item for item in documents if item["role"] == "tender"), None)
@@ -446,48 +556,51 @@ def _extract_rules(app, task: dict) -> dict:
         ]
     text = "\n\n".join(source_parts)[:char_limit]
     score_packets = _score_clause_packets(text)
-    storage.update_task(app, task["task_id"], progress=15, message="正在调用模型提取评审规则")
+    batches = _split_rule_extraction_text(text, RULE_EXTRACTION_BATCH_CHARS)
+    if not batches:
+        raise ValueError("招标文件未提取到可供规则识别的正文")
+    storage.update_task(app, task["task_id"], progress=15, message=f"正在分段提取评审规则（共 {len(batches)} 批）")
     system_prompt = _system_prompt(app, "extract_rules", "只能依据给出的招标文件原文，不得编造；必须遵守输出 JSON 结构。")
-    user_prompt = _rule_extraction_prompt(text, compact=False, score_packets=score_packets)
-    compact_retry_count = 0
-    try:
-        parsed = _request_task_json(app, task, profile, "extract_rules", system_prompt, user_prompt,
-                                    document_id=tender["document_id"], context_mode="full_prefix",
-                                    max_tokens=_output_token_budget(profile, 12_000))
-    except ValueError as exc:
-        if not _is_invalid_json_model_response(exc):
-            raise
-        compact_retry_count = 1
-        storage.update_task(app, task["task_id"], progress=40, message="模型输出过长，正在按紧凑格式重试")
-        retry_prompt = _rule_extraction_prompt(text, compact=True, score_packets=score_packets)
-        parsed = _request_task_json(app, task, profile, "extract_rules_compact_retry", system_prompt, retry_prompt,
-                                    document_id=tender["document_id"], context_mode="full_prefix_compact_retry",
-                                    max_tokens=_output_token_budget(profile, 8_000))
-    raw_rules = parsed.get("rules") if isinstance(parsed, dict) else None
-    if not isinstance(raw_rules, list):
-        raise ValueError("模型返回格式不符合规则提取要求")
+    raw_rules: list[dict] = []
+    compact_retry_count = split_retry_count = 0
+    for index, batch in enumerate(batches, start=1):
+        progress = 15 + int((index - 1) * 45 / len(batches))
+        storage.update_task(app, task["task_id"], progress=progress, message=f"正在提取规则第 {index}/{len(batches)} 批")
+        extracted, compact_count, split_count = _extract_rule_batch(
+            app, task, profile, system_prompt, batch, document_id=tender["document_id"],
+            batch_label=f"rule_batch_{index}_of_{len(batches)}",
+        )
+        raw_rules.extend(extracted)
+        compact_retry_count += compact_count
+        split_retry_count += split_count
+    raw_rules = _dedupe_rule_candidates(raw_rules)
     primary_score_rules = [item for item in raw_rules if isinstance(item, dict) and item.get("category") in {"objective", "subjective"}]
     uncovered_score_packets = [
         packet for packet in score_packets
         if not _score_packet_is_covered(packet, primary_score_rules)
     ]
     scoring_supplement_count = 0
+    scoring_supplement_failures = 0
     if uncovered_score_packets:
         storage.update_task(app, task["task_id"], progress=60, message="正在核验评分条款覆盖并补充遗漏项")
-        try:
-            supplement = _request_task_json(
-                app, task, profile, "extract_rules_scoring_supplement", system_prompt,
-                _score_rule_supplement_prompt(uncovered_score_packets, primary_score_rules), document_id=tender["document_id"],
-                context_mode="score_clause_packets_only", max_tokens=_output_token_budget(profile, 4_000),
-            )
-            supplement_rules = supplement.get("rules") if isinstance(supplement, dict) else None
-            if isinstance(supplement_rules, list):
-                raw_rules.extend(item for item in supplement_rules if isinstance(item, dict))
-                scoring_supplement_count = len(supplement_rules)
-        except ValueError as exc:
-            # 主规则已提取成功时，补充调用异常不应丢弃已得到的规则集。
-            storage.update_task(app, task["task_id"], message=f"评分条款补充未完成：{exc}")
-    candidates = [item for item in raw_rules if isinstance(item, dict) and str(item.get("title", "")).strip() and item.get("category") in {"qualification", "compliance", "substantive", "rejection", "objective", "subjective"}]
+        for index in range(0, len(uncovered_score_packets), 6):
+            packet_batch = uncovered_score_packets[index:index + 6]
+            try:
+                supplement = _request_task_json(
+                    app, task, profile, "extract_rules_scoring_supplement", system_prompt,
+                    _score_rule_supplement_prompt(packet_batch, primary_score_rules), document_id=tender["document_id"],
+                    context_mode=f"score_clause_batch_{index // 6 + 1}",
+                    max_tokens=_output_token_budget(profile, 3_500), thinking_mode="disabled",
+                )
+                supplement_rules = supplement.get("rules") if isinstance(supplement, dict) else None
+                if isinstance(supplement_rules, list):
+                    raw_rules.extend(item for item in supplement_rules if isinstance(item, dict))
+                    scoring_supplement_count += len(supplement_rules)
+            except ValueError as exc:
+                # 主规则已提取成功时，单个评分补充批次异常不应丢弃已得到的规则集。
+                scoring_supplement_failures += 1
+                storage.update_task(app, task["task_id"], message=f"部分评分条款补充未完成：{exc}")
+    candidates = _dedupe_rule_candidates([item for item in raw_rules if isinstance(item, dict) and str(item.get("title", "")).strip() and item.get("category") in {"qualification", "compliance", "substantive", "rejection", "objective", "subjective"}])
     rules = [item for item in candidates if not _is_unreviewable_rule(item)]
     excluded_rule_count = len(candidates) - len(rules)
     for item in rules:
@@ -513,7 +626,9 @@ def _extract_rules(app, task: dict) -> dict:
             "ai_rule_count": len(rules), "global_rule_count": global_rule_count,
             "excluded_rule_count": excluded_rule_count, "profile": profile["display_name"],
             "compact_retry_count": compact_retry_count, "score_clause_count": len(score_packets),
-            "uncovered_score_clause_count": len(uncovered_score_packets), "scoring_supplement_count": scoring_supplement_count}
+            "uncovered_score_clause_count": len(uncovered_score_packets), "scoring_supplement_count": scoring_supplement_count,
+            "scoring_supplement_failure_count": scoring_supplement_failures, "batch_count": len(batches),
+            "split_retry_count": split_retry_count}
 
 
 def _review_documents(app, task: dict) -> dict:

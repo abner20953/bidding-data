@@ -251,7 +251,30 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(finished["status"], "success")
         self.assertEqual(finished["result"]["compact_retry_count"], 1)
         self.assertEqual(request_json.call_count, 2)
-        self.assertEqual(request_json.call_args_list[0].kwargs["max_tokens"], 12000)
+        self.assertEqual(request_json.call_args_list[0].kwargs["max_tokens"], 2500)
+        self.assertGreaterEqual(request_json.call_args_list[1].kwargs["max_tokens"], request_json.call_args_list[0].kwargs["max_tokens"])
+        self.assertEqual(request_json.call_args_list[0].args[0]["thinking_mode"], "disabled")
+
+    def test_rule_extraction_splits_long_source_into_bounded_batches(self):
+        self._add_pdf("tender.pdf", "tender", "", "用于建立解析文件")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        tender_document = next(item for item in storage.list_documents(self.app, self.project["project_id"]) if item["role"] == "tender")
+        long_text = "\n".join(
+            f"[第{index}页]\n" + ("投标人应提供有效资质证明材料。\n" * 400)
+            for index in range(1, 7)
+        )
+        Path(tender_document["parsed_path"]).write_text(long_text, encoding="utf-8")
+        storage.create_task(self.app, self.project["project_id"], "extract_rules")
+        response = {"rules": [{"category": "qualification", "title": "有效资质", "check_rule": "核验有效资质", "source_text": "应提供有效资质证明"}]}
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value=response) as request_json:
+            finished = self._run_next_task()
+
+        self.assertEqual(finished["status"], "success")
+        self.assertGreater(request_json.call_count, 1)
+        self.assertTrue(all(call.kwargs["max_tokens"] <= 6000 for call in request_json.call_args_list))
+        self.assertTrue(all(len(call.args[2]) < 16_000 for call in request_json.call_args_list))
 
     def test_rule_extraction_supplements_missing_score_clause_with_compact_packet(self):
         tender_text = "\n".join([
