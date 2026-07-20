@@ -9,6 +9,15 @@ import re
 import requests
 
 
+class InvalidJsonResponse(ValueError):
+    """结构化响应无法解析；正文仅在当前进程内用于低成本 JSON 修复。"""
+
+    def __init__(self, content: object, finish_reason: object = None):
+        self.raw_content = content if isinstance(content, str) else ""
+        self.finish_reason = str(finish_reason or "")
+        super().__init__(_invalid_json_error(content, finish_reason))
+
+
 def _load_json_candidate(value: str) -> object:
     """解析模型常见的轻微 JSON 瑕疵，不猜测缺失的业务内容。"""
     attempts = [value]
@@ -181,17 +190,19 @@ def request_json(profile: dict, system_prompt: str, user_prompt: str, *, usage_c
     try:
         choice = body["choices"][0]
         content = choice["message"]["content"]
-        if response_metadata_callback:
-            # 只记录长度与结束原因，绝不保存模型正文、提示词或思考内容。
-            response_metadata_callback({
-                "requested_max_tokens": payload.get("max_tokens"),
-                "finish_reason": choice.get("finish_reason"),
-                "response_chars": len(content) if isinstance(content, str) else 0,
-            })
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError("模型响应缺少 choices/message/content") from exc
+    if response_metadata_callback:
+        # 只记录长度与结束原因，绝不保存模型正文、提示词或思考内容。
+        response_metadata_callback({
+            "requested_max_tokens": payload.get("max_tokens"),
+            "finish_reason": choice.get("finish_reason"),
+            "response_chars": len(content) if isinstance(content, str) else 0,
+        })
+    try:
         result = _decode_json_content(content)
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError, ValueError) as exc:
-        finish_reason = choice.get("finish_reason") if isinstance(locals().get("choice"), dict) else None
-        raise ValueError(_invalid_json_error(locals().get("content"), finish_reason)) from exc
+    except (json.JSONDecodeError, ValueError, TypeError) as exc:
+        raise InvalidJsonResponse(content, choice.get("finish_reason")) from exc
     return result
 
 

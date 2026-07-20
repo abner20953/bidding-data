@@ -16,7 +16,7 @@ from xml.etree import ElementTree
 import fitz
 
 from dashboard.evaluation_workbench import storage
-from dashboard.evaluation_workbench.ai_gateway import request_json
+from dashboard.evaluation_workbench.ai_gateway import InvalidJsonResponse, request_json
 from dashboard.evaluation_workbench.collusion_signals import build_cross_bid_analysis
 from dashboard.evaluation_workbench.prompt_context import build_rule_context, select_rule_chunks, split_full_text_chunks
 from dashboard.blueprints.evaluation_workbench import create_worker_app
@@ -26,7 +26,7 @@ from dashboard.utils.comparator import CollusionDetector, ComparisonLimitError
 MAX_PARSE_PAGES = 2000
 MAX_PARSED_CHARS = 2_000_000
 MAX_DOCX_XML_BYTES = 50 * 1024 * 1024
-PROMPT_VERSION = "fulltext-mapreduce-v2"
+PROMPT_VERSION = "fulltext-coverage-v3"
 COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v2"
 COMPARE_AI_BATCH_SIZE = 24
 
@@ -74,6 +74,26 @@ def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt
 
 def _system_prompt(app, template_id: str) -> str:
     return storage.render_prompt_template(app, template_id)
+
+
+def _repair_invalid_json(app, task: dict, profile: dict, phase: str, error: InvalidJsonResponse,
+                         expected_field: str, *, document_id: str | None = None) -> dict:
+    """只回传异常响应修复 JSON，避免格式问题导致整份投标文件被重复发送。"""
+    if not error.raw_content.strip():
+        raise error
+    if error.finish_reason.lower() in {"length", "max_tokens"}:
+        # 输出已被截断时不存在可可靠修复的尾部，交由调用方拆小规则组。
+        raise error
+    prompt = storage.render_prompt_template(
+        app, "json_repair_user", expected_field=expected_field,
+        raw_response=error.raw_content[:80_000],
+    )
+    return _request_task_json(
+        app, task, profile, phase, _system_prompt(app, "json_repair"), prompt,
+        document_id=document_id, context_mode="response_only_json_repair",
+        max_tokens=_output_token_budget(profile, min(8_000, max(2_000, len(error.raw_content) // 2))),
+        thinking_mode="disabled",
+    )
 
 
 def _extract_docx_text(path: Path) -> str:
@@ -872,7 +892,13 @@ FULL_SCAN_CHUNK_CHARS = 11_000
 # 不再形成“页块 × 规则批次”的矩阵；若模型确实输出超长，才仅拆规则目录一次。
 FULL_SCAN_CATALOG_RULE_CHARS = 220
 # 二次复核上下文上限。全文首轮已覆盖所有页面，此处只装入候选证据和重点原文。
-EVALUATION_BATCH_CONTEXT_CHARS = 72_000
+EVALUATION_BATCH_CONTEXT_CHARS = 64_000
+EVALUATION_STRATEGY_CONTEXT_CHARS = {
+    "point": 42_000,
+    "consistency": 55_000,
+    "counting": 64_000,
+    "section": 64_000,
+}
 
 
 def _rule_batches(rules: list[dict], size: int) -> list[list[dict]]:
@@ -996,15 +1022,41 @@ def _normalise_scan_findings(output: object, allowed_ids: set[str], chunk: dict)
     return findings
 
 
-def _local_entity_candidates(chunks: list[dict], limit: int = 180) -> list[dict]:
-    """本地全文实体校对层：只提候选和页码，不自行判断是否属于异常。"""
-    patterns = (
-        ("公司名称", re.compile(r"[\u4e00-\u9fffA-Za-z0-9（）()·\-]{2,50}(?:有限责任公司|股份有限公司|有限公司|公司)")),
-        ("项目名称", re.compile(r"[\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,70}(?:项目|工程)")),
-        ("地区名称", re.compile(r"[\u4e00-\u9fff]{2,12}(?:省|市|区|县)")),
-    )
-    seen: set[tuple[str, str, str]] = set()
-    candidates: list[dict] = []
+REGION_PATTERN = re.compile(r"[\u4e00-\u9fff]{2,12}?(?:特别行政区|自治区|自治州|地区|省|市|盟|区|县|旗)")
+REGION_LEADING_NOISE = (
+    "以及", "并按", "按照", "根据", "符合", "执行", "遵守", "涉及", "位于", "地址", "地点",
+    "要求", "项目", "采购", "招标", "投标", "服务", "作业", "本地", "当地", "国家法规",
+)
+REGION_GENERIC_VALUES = {
+    "项目区", "服务区", "作业区", "办公区", "生活区", "管理区", "行政区", "城区", "市区", "辖区",
+}
+
+
+def _clean_region_value(value: str) -> str:
+    value = value.strip("，。；：、（）()【】[] ")
+    changed = True
+    while changed:
+        changed = False
+        for prefix in REGION_LEADING_NOISE:
+            if value.startswith(prefix) and len(value) - len(prefix) >= 3:
+                value, changed = value[len(prefix):], True
+                break
+    return value
+
+
+def _region_mentions(line: str) -> list[str]:
+    """提取轻量行政区名称；只用于召回候选，不据此作业务结论。"""
+    values = []
+    for match in REGION_PATTERN.finditer(line):
+        value = _clean_region_value(match.group(0))
+        if value in REGION_GENERIC_VALUES or not 3 <= len(value) <= 10:
+            continue
+        if value not in values:
+            values.append(value)
+    return values
+
+
+def _iter_chunk_lines(chunks: list[dict]):
     page_marker = re.compile(r"\[第(\d+)页\]")
     for chunk in chunks:
         current_page = ""
@@ -1014,19 +1066,113 @@ def _local_entity_candidates(chunks: list[dict], limit: int = 180) -> list[dict]
                 current_page = marker.group(1)
                 continue
             line = re.sub(r"\s+", "", raw_line.strip())
-            if len(line) < 3:
+            if len(line) >= 3:
+                yield str(chunk.get("chunk_id") or ""), current_page, line
+
+
+def _local_entity_candidates(chunks: list[dict], limit: int = 300) -> list[dict]:
+    """本地全文实体校对层；按类型独立限额，避免后半册地域被前页实体挤掉。"""
+    patterns = (
+        ("公司名称", re.compile(r"[\u4e00-\u9fffA-Za-z0-9（）()·\-]{2,50}(?:有限责任公司|股份有限公司|有限公司|公司)")),
+        ("项目名称", re.compile(r"[\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,70}(?:项目|工程)")),
+    )
+    per_kind_limit = max(40, limit // 3)
+    buckets: dict[str, list[dict]] = {"公司名称": [], "项目名称": [], "地区名称": []}
+    seen: dict[str, set[str]] = {key: set() for key in buckets}
+    for chunk_id, current_page, line in _iter_chunk_lines(chunks):
+        for kind, pattern in patterns:
+            if len(buckets[kind]) >= per_kind_limit:
                 continue
-            for kind, pattern in patterns:
-                for match in pattern.finditer(line):
-                    value = match.group(0)[-80:]
-                    signature = (kind, value)
-                    if signature in seen:
-                        continue
-                    seen.add(signature)
-                    candidates.append({"kind": kind, "value": value, "page_hint": current_page, "context": line[:180]})
-                    if len(candidates) >= limit:
-                        return candidates
-    return candidates
+            for match in pattern.finditer(line):
+                value = match.group(0)[-80:]
+                if value in seen[kind]:
+                    continue
+                seen[kind].add(value)
+                buckets[kind].append({"kind": kind, "value": value, "page_hint": current_page,
+                                      "chunk_id": chunk_id, "context": line[:220]})
+                if len(buckets[kind]) >= per_kind_limit:
+                    break
+        for value in _region_mentions(line):
+            kind = "地区名称"
+            if value in seen[kind]:
+                continue
+            seen[kind].add(value)
+            if len(buckets[kind]) < max(600, per_kind_limit * 4):
+                buckets[kind].append({"kind": kind, "value": value, "page_hint": current_page,
+                                      "chunk_id": chunk_id, "context": line[:220]})
+    # 轮转输出保证地区、公司和项目三类都能进入有限上下文；高风险异地政策另由
+    # geography_candidates 独立保留，不会因这里的均衡限额丢失。
+    ordered: list[dict] = []
+    kinds = ("地区名称", "公司名称", "项目名称")
+    for index in range(max(len(buckets[kind]) for kind in kinds)):
+        for kind in kinds:
+            if index < len(buckets[kind]):
+                ordered.append(buckets[kind][index])
+                if len(ordered) >= limit:
+                    return ordered
+    return ordered
+
+
+def _reference_regions(documents: list[dict]) -> list[str]:
+    """从招标文件及附件提取项目合法地域；不依赖常驻模型或外部地名库。"""
+    counts: dict[str, int] = {}
+    first_seen: list[str] = []
+    early_regions: set[str] = set()
+    for document in documents:
+        if document.get("role") not in {"tender", "tender_attachment"} or not document.get("parsed_path"):
+            continue
+        path = Path(document["parsed_path"])
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        char_offset = 0
+        for line in text.splitlines():
+            for value in _region_mentions(line):
+                if char_offset < 30_000:
+                    early_regions.add(value)
+                counts[value] = counts.get(value, 0) + 1
+                if value not in first_seen:
+                    first_seen.append(value)
+            char_offset += len(line) + 1
+    # 封面/项目概况中的地域和正文反复出现的地域作为基准；招标文件中偶然出现的
+    # 业绩示例或联系地址不应把异地复制线索“洗白”。
+    values = [item for item in first_seen if item in early_regions or counts[item] >= 2]
+    return sorted(values, key=lambda item: (-counts[item], first_seen.index(item)))[:40]
+
+
+def _geography_consistency_candidates(chunks: list[dict], reference_regions: list[str], limit: int = 80) -> list[dict]:
+    """召回异地政策/项目残留；地址和业绩场景降权，最终仍由 AI 结合原页判断。"""
+    references = set(reference_regions)
+    strong_terms = ("本地", "当地", "管控要求", "飞行管控", "作业区域", "作业区", "实施地点", "服务地点", "项目所在地")
+    exclusion_terms = ("注册地址", "住所", "住址", "通讯地址", "类似项目", "业绩", "合同名称", "项目名称", "发包人")
+    by_value: dict[str, dict] = {}
+    for chunk_id, page_hint, line in _iter_chunk_lines(chunks):
+        for value in _region_mentions(line):
+            if value in references:
+                continue
+            signal_score = sum(1 for term in strong_terms if term in line)
+            strong = signal_score > 0
+            excluded = any(term in line for term in exclusion_terms)
+            priority = 3 if strong and not excluded else 2 if not excluded else 1
+            candidate = {
+                "kind": "异地行政区候选", "value": value, "page_hint": page_hint,
+                "chunk_id": chunk_id, "context": line[:260],
+                "candidate_priority": "high" if priority == 3 else "medium" if priority == 2 else "low",
+                "likely_address_or_performance": excluded,
+                "signal_score": signal_score,
+            }
+            previous = by_value.get(value)
+            previous_rank = (
+                {"high": 3, "medium": 2, "low": 1}.get(previous.get("candidate_priority"), 0),
+                int(previous.get("signal_score") or 0),
+            ) if previous else (0, 0)
+            if (priority, signal_score) > previous_rank:
+                by_value[value] = candidate
+    candidates = list(by_value.values())
+    candidates.sort(key=lambda item: ({"high": 0, "medium": 1, "low": 2}[item["candidate_priority"]],
+                                      -int(item.get("signal_score") or 0),
+                                      int(item["page_hint"]) if str(item["page_hint"]).isdigit() else 10**9))
+    return candidates[:limit]
 
 
 def _run_full_scan_piece(app, task: dict, profile: dict, document: dict, catalog: list[dict], chunk: dict,
@@ -1035,6 +1181,16 @@ def _run_full_scan_piece(app, task: dict, profile: dict, document: dict, catalog
     allowed_ids = {item["id"] for item in catalog}
     # 首轮只是候选索引而非最终结论；固定且较小的输出预算能抑制模型逐条长篇解释。
     max_tokens = _output_token_budget(profile, min(2_800, max(1_400, 800 + len(catalog) * 28)))
+
+    def findings_from(parsed: object) -> list[dict]:
+        values = parsed.get("matches") if isinstance(parsed, dict) else None
+        if values is None and isinstance(parsed, dict):
+            values = parsed.get("findings")  # 兼容用户尚未重置的旧自定义模板。
+        if not isinstance(values, list):
+            raise ValueError("模型返回格式不符合全文扫描要求")
+        return _normalise_scan_findings(values, allowed_ids, chunk)
+
+    format_error: ValueError | None = None
     try:
         parsed = _request_task_json(
             app, task, profile, "evaluate_all_full_scan", system_prompt,
@@ -1042,45 +1198,59 @@ def _run_full_scan_piece(app, task: dict, profile: dict, document: dict, catalog
             document_id=document["document_id"], context_mode=f"full_scan:{chunk['chunk_id']}",
             max_tokens=max_tokens, thinking_mode="disabled",
         )
-        values = parsed.get("matches") if isinstance(parsed, dict) else None
-        if values is None and isinstance(parsed, dict):
-            values = parsed.get("findings")  # 兼容用户尚未重置的旧自定义模板。
-        if not isinstance(values, list):
-            raise ValueError("模型返回格式不符合全文扫描要求")
-        return _normalise_scan_findings(values, allowed_ids, chunk), 0, 0, []
+        return findings_from(parsed), 0, 0, []
+    except InvalidJsonResponse as exc:
+        format_error = exc
+        if exc.finish_reason.lower() not in {"length", "max_tokens"}:
+            storage.update_task(app, task["task_id"], message=f"{document['bidder_name'] or document['original_name']} {_full_scan_chunk_label(chunk)} 扫描 JSON 异常，正在仅修复响应")
+            try:
+                repaired = _repair_invalid_json(
+                    app, task, profile, "evaluate_all_full_scan_json_repair", exc, "matches",
+                    document_id=document["document_id"],
+                )
+                return findings_from(repaired), 1, 0, []
+            except ValueError as repair_exc:
+                if not _is_model_format_error(repair_exc) and not str(repair_exc).startswith("模型返回格式不符合全文扫描要求"):
+                    raise
+                format_error = repair_exc
     except ValueError as exc:
         if not _is_model_format_error(exc) and not str(exc).startswith("模型返回格式不符合全文扫描要求"):
             raise
-        storage.update_task(app, task["task_id"], message=f"{document['bidder_name'] or document['original_name']} {_full_scan_chunk_label(chunk)} 全文扫描格式异常，正在严格重试")
-        try:
-            parsed = _request_task_json(
-                app, task, profile, "evaluate_all_full_scan_compact_retry", system_prompt,
-                _full_scan_prompt(app, document, catalog, chunk, compact=True),
-                document_id=document["document_id"], context_mode=f"full_scan_compact:{chunk['chunk_id']}",
-                max_tokens=max_tokens, thinking_mode="disabled",
-            )
-            values = parsed.get("matches") if isinstance(parsed, dict) else None
-            if values is None and isinstance(parsed, dict):
-                values = parsed.get("findings")
-            if not isinstance(values, list):
-                raise ValueError("模型返回格式不符合全文扫描要求")
-            return _normalise_scan_findings(values, allowed_ids, chunk), 1, 0, []
-        except ValueError as retry_exc:
-            if not _is_model_format_error(retry_exc) and not str(retry_exc).startswith("模型返回格式不符合全文扫描要求"):
-                raise
-            # 输出过长通常来自规则候选太密集，拆规则而非拆页块可避免全文被重复发送。
-            if len(catalog) > 12 and depth < 1:
-                midpoint = len(catalog) // 2
-                storage.update_task(app, task["task_id"], message=f"{document['bidder_name'] or document['original_name']} {_full_scan_chunk_label(chunk)} 扫描输出过长，正在仅拆分规则目录")
-                left = _run_full_scan_piece(app, task, profile, document, catalog[:midpoint], chunk, system_prompt, depth + 1)
-                right = _run_full_scan_piece(app, task, profile, document, catalog[midpoint:], chunk, system_prompt, depth + 1)
-                return left[0] + right[0], left[1] + right[1] + 1, left[2] + right[2] + 1, left[3] + right[3]
-            # 不能再拆分时不静默丢页：最终复核会把此页块原文发送给相关规则组。
-            return [], 1, 0, [{**chunk, "scan_error": str(retry_exc)[:300]}]
+        format_error = exc
+
+    # 截断说明候选目录过密，直接拆目录比完整重发同一页块更快。
+    if isinstance(format_error, InvalidJsonResponse) and format_error.finish_reason.lower() in {"length", "max_tokens"} and len(catalog) > 12 and depth < 1:
+        midpoint = len(catalog) // 2
+        storage.update_task(app, task["task_id"], message=f"{document['bidder_name'] or document['original_name']} {_full_scan_chunk_label(chunk)} 扫描输出达到上限，正在仅拆分规则目录")
+        left = _run_full_scan_piece(app, task, profile, document, catalog[:midpoint], chunk, system_prompt, depth + 1)
+        right = _run_full_scan_piece(app, task, profile, document, catalog[midpoint:], chunk, system_prompt, depth + 1)
+        return left[0] + right[0], left[1] + right[1], left[2] + right[2] + 1, left[3] + right[3]
+
+    storage.update_task(app, task["task_id"], message=f"{document['bidder_name'] or document['original_name']} {_full_scan_chunk_label(chunk)} 全文扫描格式异常，正在严格重试")
+    try:
+        parsed = _request_task_json(
+            app, task, profile, "evaluate_all_full_scan_compact_retry", system_prompt,
+            _full_scan_prompt(app, document, catalog, chunk, compact=True),
+            document_id=document["document_id"], context_mode=f"full_scan_compact:{chunk['chunk_id']}",
+            max_tokens=max_tokens, thinking_mode="disabled",
+        )
+        return findings_from(parsed), 1, 0, []
+    except ValueError as retry_exc:
+        if not _is_model_format_error(retry_exc) and not str(retry_exc).startswith("模型返回格式不符合全文扫描要求"):
+            raise
+        if len(catalog) > 12 and depth < 1:
+            midpoint = len(catalog) // 2
+            storage.update_task(app, task["task_id"], message=f"{document['bidder_name'] or document['original_name']} {_full_scan_chunk_label(chunk)} 扫描仍异常，正在仅拆分规则目录")
+            left = _run_full_scan_piece(app, task, profile, document, catalog[:midpoint], chunk, system_prompt, depth + 1)
+            right = _run_full_scan_piece(app, task, profile, document, catalog[midpoint:], chunk, system_prompt, depth + 1)
+            return left[0] + right[0], left[1] + right[1] + 1, left[2] + right[2] + 1, left[3] + right[3]
+        # 不能再拆分时不静默丢页：最终复核会把此页块原文发送给相关规则组。
+        return [], 1, 0, [{**chunk, "scan_error": str(retry_exc)[:300]}]
 
 
 def _scan_document_fulltext(app, task: dict, profile: dict, document: dict, rules: list[dict],
-                            system_prompt: str, *, progress_offset: int = 0, progress_total: int = 1) -> dict | None:
+                            system_prompt: str, *, reference_regions: list[str] | None = None,
+                            progress_offset: int = 0, progress_total: int = 1) -> dict | None:
     try:
         text_length = int(document.get("text_length") or 0)
     except (TypeError, ValueError):
@@ -1127,6 +1297,8 @@ def _scan_document_fulltext(app, task: dict, profile: dict, document: dict, rule
         "chunks": chunks,
         "findings": findings,
         "entity_candidates": _local_entity_candidates(chunks),
+        "reference_regions": list(reference_regions or []),
+        "geography_candidates": _geography_consistency_candidates(chunks, list(reference_regions or [])),
         "failed_chunks": failed_chunks,
         "chunk_count": len(chunks),
         "scan_batch_count": total,
@@ -1184,6 +1356,17 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int) ->
     for chunk_id in select_rule_chunks(scan.get("chunks", []), rules, per_rule=per_rule):
         if chunk_id not in selected_ids:
             selected_ids.append(chunk_id)
+    rule_text = " ".join(f"{item.get('title', '')} {item.get('check_rule', '')} {item.get('source_text', '')}" for item in rules)
+    consistency_terms = ("公司名称", "项目名称", "地名", "地区", "无关", "矛盾", "技术方案", "项目一致", "全文")
+    if any(term in rule_text for term in consistency_terms):
+        # 高优先级异地政策候选对应原页必须进入最终判断，不能只给模型看正则摘录。
+        geo_ids = [str(item.get("chunk_id") or "").split(".", 1)[0]
+                   for item in scan.get("geography_candidates", [])
+                   if item.get("candidate_priority") == "high"]
+        for chunk_id in reversed([item for item in geo_ids if item]):
+            if chunk_id in selected_ids:
+                selected_ids.remove(chunk_id)
+            selected_ids.insert(0, chunk_id)
     failed_root_ids = []
     for chunk in scan.get("failed_chunks", []):
         root_id = str(chunk.get("chunk_id") or "").split(".", 1)[0]
@@ -1193,12 +1376,16 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int) ->
             selected_ids.insert(0, root_id)
     findings_limit = 240 if strategy == "counting" else 160
     findings_packet = json.dumps(findings[:findings_limit], ensure_ascii=False, separators=(",", ":"))
-    rule_text = " ".join(f"{item.get('title', '')} {item.get('check_rule', '')} {item.get('source_text', '')}" for item in rules)
     entity_packet = ""
-    if any(term in rule_text for term in ("公司名称", "项目名称", "地名", "地区", "无关公司", "无关项目", "全文")):
+    if any(term in rule_text for term in consistency_terms):
+        geography = scan.get("geography_candidates", [])
         entity_packet = (
-            "\n\n【本地全文实体校对候选】\n"
-            + json.dumps(scan.get("entity_candidates", [])[:120], ensure_ascii=False, separators=(",", ":"))
+            "\n\n【项目地域基准（来自招标文件，仅用于一致性比对）】\n"
+            + json.dumps(scan.get("reference_regions", []), ensure_ascii=False, separators=(",", ":"))
+            + "\n\n【异地行政区/当地政策一致性候选（须结合原页判断，地址与业绩已降权）】\n"
+            + json.dumps(geography[:80], ensure_ascii=False, separators=(",", ":"))
+            + "\n\n【本地全文公司/项目/地区实体校对候选】\n"
+            + json.dumps(scan.get("entity_candidates", [])[:180], ensure_ascii=False, separators=(",", ":"))
         )
     header = (
         f"【全文覆盖说明】已按连续页块扫描全文，共 {scan.get('chunk_count', 0)} 个页块；本规则组采用{strategy}汇总策略；"
@@ -1207,7 +1394,7 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int) ->
     )
     if failed_root_ids:
         header += f"有 {len(failed_root_ids)} 个首轮格式异常页块，下面已附原文供本轮直接复核。"
-    prefix = f"{header}\n\n【首轮 AI 候选证据】\n{findings_packet}{entity_packet}\n\n【重点原文】\n"
+    prefix = f"{header}{entity_packet}\n\n【首轮 AI 候选证据】\n{findings_packet}\n\n【重点原文】\n"
     if len(prefix) >= char_limit:
         prefix = prefix[:char_limit]
     chunks_by_id = {str(item.get("chunk_id")): item for item in scan.get("chunks", [])}
@@ -1257,12 +1444,34 @@ def _combined_manual_results(component: str, rules: list[dict], payload: list[di
     )
 
 
+def _is_minimax_m3_profile(profile: dict) -> bool:
+    return (
+        "api.minimaxi.com" in str(profile.get("base_url") or "").lower()
+        and str(profile.get("model_name") or "").lower() == "minimax-m3"
+    )
+
+
+def _ordered_combined_results(rules: list[dict], values: list[dict]) -> list[dict]:
+    by_id = {item.get("rule_id"): item for item in values}
+    return [by_id[item["rule_id"]] for item in rules if item["rule_id"] in by_id]
+
+
+def _normalise_partial_combined_results(component: str, output: list[dict], rules: list[dict]) -> tuple[list[dict], list[dict]]:
+    returned_ids = {item.get("rule_id") for item in output if isinstance(item, dict)}
+    present_rules = [item for item in rules if item["rule_id"] in returned_ids]
+    missing_rules = [item for item in rules if item["rule_id"] not in returned_ids]
+    payload = _combined_batch_payload(component, present_rules)
+    return _combined_batch_results(component, output, present_rules, payload), missing_rules
+
+
 def _run_combined_batch(app, task: dict, profile: dict, document: dict, component: str, rules: list[dict],
                         system_prompt: str, char_limit: int, label: str, depth: int = 0,
-                        scan_index: dict | None = None) -> tuple[list[dict], int, int, int, str]:
+                        scan_index: dict | None = None, allow_missing_retry: bool = True) -> tuple[list[dict], int, int, int, str]:
     """运行一个可独立保存的综合评审规则组；异常时仅拆分当前组。"""
     payload = _combined_batch_payload(component, rules)
-    context_limit = min(char_limit, EVALUATION_BATCH_CONTEXT_CHARS)
+    strategy = _scan_strategy(rules)
+    context_limit = min(char_limit, EVALUATION_BATCH_CONTEXT_CHARS,
+                        EVALUATION_STRATEGY_CONTEXT_CHARS.get(strategy, EVALUATION_BATCH_CONTEXT_CHARS))
     if scan_index:
         context = _full_scan_review_context(scan_index, rules, context_limit)
     else:
@@ -1278,7 +1487,34 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
     if context["mode"] == "unmatched_rules":
         reason = "本地页级检索未定位到该规则的直接证据，未发送无关全文；请结合投标文件人工核验。"
         return _combined_manual_results(component, rules, payload, reason), 0, 0, len(rules), context["mode"]
-    thinking_mode = "disabled" if component == "objective" else "adaptive"
+    # MiniMax M3 的结构化审查在 adaptive 下会把大量预算用于思考并偶发破坏 JSON；
+    # 审查/客观分禁用思考更稳定，主观评分仍保留 adaptive 以维持方案判断质量。
+    thinking_mode = "disabled" if component == "objective" or (
+        component == "review" and _is_minimax_m3_profile(profile)
+    ) else "adaptive"
+
+    def finish(parsed: object, retry_count: int, result_mode: str) -> tuple[list[dict], int, int, int, str]:
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list):
+            raise ValueError("模型返回格式不符合综合评审要求")
+        results, missing_rules = _normalise_partial_combined_results(component, parsed["results"], rules)
+        if missing_rules and results and allow_missing_retry:
+            storage.update_task(app, task["task_id"], message=f"{label} 有 {len(missing_rules)} 条未返回，正在仅补评缺失规则")
+            missing = _run_combined_batch(
+                app, task, profile, document, component, missing_rules, system_prompt, char_limit,
+                f"{label}/缺失补评", depth, scan_index, allow_missing_retry=False,
+            )
+            combined = _ordered_combined_results(rules, results + missing[0])
+            return combined, retry_count + missing[1], missing[2], missing[3], f"{result_mode}+missing_retry"
+        if missing_rules:
+            missing_payload = _combined_batch_payload(component, missing_rules)
+            results.extend(_combined_manual_results(
+                component, missing_rules, missing_payload,
+                "模型未返回该规则，已保留为空并提示人工复核。",
+            ))
+            return _ordered_combined_results(rules, results), retry_count, 0, len(missing_rules), "missing_manual"
+        return _ordered_combined_results(rules, results), retry_count, 0, 0, result_mode
+
+    format_error: ValueError | None = None
     try:
         parsed = _request_task_json(
             app, task, profile, f"evaluate_all_{component}_batch", system_prompt,
@@ -1286,14 +1522,38 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
             document_id=document["document_id"], context_mode=f"{label}:{context['mode']}",
             max_tokens=_output_token_budget(profile, _combined_batch_output_budget(component, len(rules))), thinking_mode=thinking_mode,
         )
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list):
-            raise ValueError("模型返回格式不符合综合评审要求")
-        return _combined_batch_results(component, parsed["results"], rules, payload), 0, 0, 0, context["mode"]
+        return finish(parsed, 0, context["mode"])
+    except InvalidJsonResponse as exc:
+        format_error = exc
+        if exc.finish_reason.lower() not in {"length", "max_tokens"}:
+            storage.update_task(app, task["task_id"], message=f"{label} 返回 JSON 语法异常，正在仅修复响应")
+            try:
+                repaired = _repair_invalid_json(
+                    app, task, profile, f"evaluate_all_{component}_json_repair", exc, "results",
+                    document_id=document["document_id"],
+                )
+                return finish(repaired, 1, "response_only_json_repair")
+            except ValueError as repair_exc:
+                if not _is_model_format_error(repair_exc):
+                    raise
+                format_error = repair_exc
     except ValueError as exc:
         if not _is_model_format_error(exc):
             raise
-        # 先对原规则组做一次禁用思考的严格 JSON 重试。云端实测失败响应均为
-        # finish_reason=stop，先拆分只会放大调用次数，并不能修复偶发语法错误。
+        format_error = exc
+
+    # 截断响应不能可靠补尾；直接拆小规则组，避免把同一大上下文完整重发一遍。
+    if isinstance(format_error, InvalidJsonResponse) and format_error.finish_reason.lower() in {"length", "max_tokens"} and len(rules) > 1 and depth < 3:
+        storage.update_task(app, task["task_id"], message=f"{label} 输出达到上限，正在仅拆分该规则组")
+        midpoint = max(1, len(rules) // 2)
+        left = _run_combined_batch(app, task, profile, document, component, rules[:midpoint], system_prompt, char_limit,
+                                   f"{label}/拆分1", depth + 1, scan_index, allow_missing_retry)
+        right = _run_combined_batch(app, task, profile, document, component, rules[midpoint:], system_prompt, char_limit,
+                                    f"{label}/拆分2", depth + 1, scan_index, allow_missing_retry)
+        return left[0] + right[0], left[1] + right[1], left[2] + right[2] + 1, left[3] + right[3], "split_after_length"
+
+    if format_error is not None:
+        # 非截断且无法做响应级修复时，保留一次禁用思考的紧凑重试作为兼容兜底。
         storage.update_task(app, task["task_id"], message=f"{label} 返回格式异常，正在严格 JSON 重试")
         try:
             parsed = _request_task_json(
@@ -1302,21 +1562,111 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
                 document_id=document["document_id"], context_mode=f"{label}_compact:{context['mode']}",
                 max_tokens=_output_token_budget(profile, _combined_batch_output_budget(component, len(rules))), thinking_mode="disabled",
             )
-            if not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list):
-                raise ValueError("模型返回格式不符合综合评审要求")
-            return _combined_batch_results(component, parsed["results"], rules, payload), 1, 0, 0, context["mode"]
+            return finish(parsed, 1, context["mode"])
         except ValueError as retry_exc:
             if not _is_model_format_error(retry_exc):
                 raise
             if len(rules) > 1 and depth < 3:
                 storage.update_task(app, task["task_id"], message=f"{label} 严格重试仍异常，正在仅拆分该规则组")
                 midpoint = max(1, len(rules) // 2)
-                left = _run_combined_batch(app, task, profile, document, component, rules[:midpoint], system_prompt, char_limit, f"{label}/拆分1", depth + 1, scan_index)
-                right = _run_combined_batch(app, task, profile, document, component, rules[midpoint:], system_prompt, char_limit, f"{label}/拆分2", depth + 1, scan_index)
+                left = _run_combined_batch(app, task, profile, document, component, rules[:midpoint], system_prompt, char_limit, f"{label}/拆分1", depth + 1, scan_index, allow_missing_retry)
+                right = _run_combined_batch(app, task, profile, document, component, rules[midpoint:], system_prompt, char_limit, f"{label}/拆分2", depth + 1, scan_index, allow_missing_retry)
                 return left[0] + right[0], left[1] + right[1] + 1, left[2] + right[2] + 1, left[3] + right[3], "split"
             reason = "模型连续两次返回格式异常，本规则未获得可靠 AI 结论；已保留任务并转为人工核验。"
             storage.update_task(app, task["task_id"], message=f"{label} 格式重试失败，已标记人工核验并继续")
             return _combined_manual_results(component, rules, payload, reason), 1, 0, len(rules), "manual_fallback"
+
+
+def _cross_bid_price_rules(rules: list[dict]) -> list[dict]:
+    """只有必须横向比较投标报价的规则才进入统一价格计算。"""
+    pattern = re.compile(r"最低(?:投标)?价|评审价|评标价|基准价|价格分|报价得分|投标报价[^，。；]{0,20}得分")
+    return [rule for rule in rules if pattern.search(
+        f"{rule.get('title', '')} {rule.get('check_rule', '')} {rule.get('source_text', '')}"
+    )]
+
+
+def _cross_bid_price_context(documents: list[dict], rules: list[dict]) -> str:
+    per_document_limit = min(24_000, max(10_000, 80_000 // max(1, len(documents))))
+    packets = []
+    for document in documents:
+        context = build_rule_context(document["parsed_path"], rules, per_document_limit)
+        packets.append({
+            "document_id": document["document_id"],
+            "bidder_name": document.get("bidder_name") or document.get("original_name"),
+            "filename": document.get("original_name"),
+            "text": context["text"],
+        })
+    return json.dumps(packets, ensure_ascii=False, separators=(",", ":"))
+
+
+def _run_cross_bid_price_scoring(app, task: dict, profile: dict, documents: list[dict], rules: list[dict],
+                                 score_run_id: str) -> dict:
+    """在单文件评审后统一计算最低价/基准价，补足跨文件公式无法单独判断的问题。"""
+    if len(documents) < 2 or not rules:
+        return {"rule_count": 0, "result_count": 0, "retry_count": 0, "missing_count": 0}
+    payload = _score_payload(rules)
+    document_packet = _cross_bid_price_context(documents, rules)
+    prompt = storage.render_prompt_template(
+        app, "evaluate_all_cross_bid_price_user",
+        rules=json.dumps(payload, ensure_ascii=False, separators=(",", ":")), documents=document_packet,
+    )
+    expected = {(document["document_id"], rule["rule_id"]) for document in documents for rule in rules}
+
+    def request(phase: str) -> dict:
+        return _request_task_json(
+            app, task, profile, phase, _system_prompt(app, "evaluate_all"), prompt,
+            context_mode="cross_bid_price", max_tokens=_output_token_budget(
+                profile, max(3_000, 1_000 + len(expected) * 450),
+            ), thinking_mode="disabled",
+        )
+
+    retry_count = 0
+
+    def request_with_repair(phase: str) -> dict | None:
+        nonlocal retry_count
+        try:
+            return request(phase)
+        except InvalidJsonResponse as exc:
+            retry_count += 1
+            storage.update_task(app, task["task_id"], message="跨投标人价格评分返回格式异常，正在仅修复响应")
+            try:
+                return _repair_invalid_json(
+                    app, task, profile, f"{phase}_json_repair", exc, "results",
+                )
+            except ValueError as repair_exc:
+                if not _is_model_format_error(repair_exc):
+                    raise
+                return None
+
+    parsed = request_with_repair("evaluate_all_cross_bid_price")
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list):
+        retry_count += 1
+        parsed = request_with_repair("evaluate_all_cross_bid_price_retry")
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list):
+        # 格式故障不能让已经完成的数十个审查结果整体失败；保留单文件阶段结果并明确统计缺失。
+        return {"rule_count": len(rules), "result_count": 0, "retry_count": retry_count,
+                "missing_count": len(expected), "format_failure": True}
+
+    rules_by_id = {rule["rule_id"]: item for rule, item in zip(rules, payload)}
+    documents_by_id = {document["document_id"]: document for document in documents}
+    received: set[tuple[str, str]] = set()
+    for raw in parsed["results"]:
+        if not isinstance(raw, dict):
+            continue
+        key = (str(raw.get("document_id") or ""), str(raw.get("rule_id") or ""))
+        if key not in expected:
+            continue
+        rule_payload = rules_by_id[key[1]]
+        try:
+            max_score = float(rule_payload.get("scoring", {}).get("max_score") or 0)
+        except (TypeError, ValueError):
+            max_score = 0.0
+        suggested = _suggested_score(rule_payload, raw, "objective", max_score)
+        result = _score_result_from_model(key[1], suggested, max_score, raw)
+        storage.save_score_results(app, score_run_id, documents_by_id[key[0]]["document_id"], [result])
+        received.add(key)
+    return {"rule_count": len(rules), "result_count": len(received), "retry_count": retry_count,
+            "missing_count": len(expected - received)}
 
 
 def _evaluate_all(app, task: dict) -> dict:
@@ -1327,9 +1677,11 @@ def _evaluate_all(app, task: dict) -> dict:
     review_rules = [item for item in all_rules if item["enabled"] and item["category"] in {"qualification", "compliance", "substantive", "rejection", "other"}]
     objective_rules = [item for item in all_rules if item["enabled"] and item["category"] == "objective"]
     subjective_rules = [item for item in all_rules if item["enabled"] and item["category"] == "subjective"]
+    cross_bid_price_rules = _cross_bid_price_rules(objective_rules)
     if not (review_rules or objective_rules or subjective_rules):
         raise ValueError("综合评审需要至少一条已确认的审查或评分规则")
-    documents = [item for item in storage.list_documents(app, task["project_id"]) if item["role"] == "bid"]
+    all_documents = storage.list_documents(app, task["project_id"])
+    documents = [item for item in all_documents if item["role"] == "bid"]
     if not documents or any(item["parse_status"] != "success" or not item["parsed_path"] for item in documents):
         raise ValueError("请先成功解析全部投标文件")
     profile = storage.get_model_profile(app, task.get("payload", {}).get("profile_id"), "deepseek-v4-flash")
@@ -1343,6 +1695,7 @@ def _evaluate_all(app, task: dict) -> dict:
         "subjective": {item["rule_id"] for item in subjective_rules},
     }
     system_prompt = _system_prompt(app, "evaluate_all")
+    reference_regions = _reference_regions(all_documents)
     compact_retry_count = split_retry_count = 0
     manual_fallback_rule_count = 0
     reused_document_count = 0
@@ -1353,7 +1706,8 @@ def _evaluate_all(app, task: dict) -> dict:
         for component, component_rules in (("review", review_rules), ("objective", objective_rules), ("subjective", subjective_rules))
     )
     scan_units_by_document = {item["document_id"]: _full_scan_chunk_count(item) for item in documents}
-    total_work_units = max(1, sum(scan_units_by_document.values()) + len(documents) * groups_per_document)
+    cross_bid_units = 1 if objective_run and len(documents) >= 2 and cross_bid_price_rules else 0
+    total_work_units = max(1, sum(scan_units_by_document.values()) + len(documents) * groups_per_document + cross_bid_units)
     completed_work_units = 0
     for index, document in enumerate(documents, start=1):
         storage.update_task(app, task["task_id"], progress=int(completed_work_units * 100 / total_work_units), message=f"正在综合评审 {index}/{len(documents)}：{document['bidder_name'] or document['original_name']}")
@@ -1374,6 +1728,7 @@ def _evaluate_all(app, task: dict) -> dict:
             continue
         scan_index = _scan_document_fulltext(
             app, task, profile, document, review_rules + objective_rules + subjective_rules, system_prompt,
+            reference_regions=reference_regions,
             progress_offset=completed_work_units, progress_total=total_work_units,
         )
         completed_work_units += scan_units_by_document[document["document_id"]]
@@ -1403,6 +1758,14 @@ def _evaluate_all(app, task: dict) -> dict:
                 batch_count += 1
                 completed_work_units += 1
                 storage.update_task(app, task["task_id"], progress=int(completed_work_units * 100 / total_work_units), message=f"已完成综合评审：{label}")
+    cross_bid_price = {"rule_count": 0, "result_count": 0, "retry_count": 0, "missing_count": 0}
+    if cross_bid_units and objective_run:
+        storage.update_task(app, task["task_id"], progress=int(completed_work_units * 100 / total_work_units),
+                            message="正在统一比较全部投标人的报价并计算价格分")
+        cross_bid_price = _run_cross_bid_price_scoring(
+            app, task, profile, documents, cross_bid_price_rules, objective_run["score_run_id"],
+        )
+        completed_work_units += 1
     return {"review_run_id": review_run["review_run_id"] if review_run else None, "objective_run_id": objective_run["score_run_id"] if objective_run else None,
             "subjective_run_id": subjective_run["score_run_id"] if subjective_run else None, "document_count": len(documents),
             "reused_document_count": reused_document_count, "model_document_count": len(documents) - reused_document_count,
@@ -1410,6 +1773,7 @@ def _evaluate_all(app, task: dict) -> dict:
             "split_retry_count": split_retry_count, "manual_fallback_rule_count": manual_fallback_rule_count,
             "batch_count": batch_count, "full_scan_document_count": full_scan_document_count,
             "full_scan_batch_count": full_scan_batch_count, "full_scan_failed_chunk_count": full_scan_failed_chunk_count,
+            "cross_bid_price": cross_bid_price,
             "prompt_version": PROMPT_VERSION}
 
 

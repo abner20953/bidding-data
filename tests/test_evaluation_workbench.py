@@ -732,6 +732,37 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("项目一", results[0]["evidence"])
         self.assertIn("1项×3分=3分", results[0]["reason"])
 
+    def test_cross_bid_price_rule_is_recalculated_with_all_bidders(self):
+        bid_a = self._add_pdf("a.pdf", "bid", "甲公司", "投标报价：100万元。")
+        bid_b = self._add_pdf("b.pdf", "bid", "乙公司", "投标报价：120万元。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "最低价报价得分",
+            "check_rule": "最低评审价得10分，其他报价按最低价比例得分。",
+            "source_text": "最低评审价得10分", "scoring": {"kind": "manual", "max_score": 10},
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        local = {"results": [{"rule_id": rule["rule_id"], "suggested_score": None, "reason": "需横向比较"}]}
+        cross = {"results": [
+            {"document_id": bid_a["document_id"], "rule_id": rule["rule_id"], "quoted_price": 100,
+             "suggested_score": 10, "evidence": "投标报价100万元", "calculation": "100/100×10=10", "confidence": "high"},
+            {"document_id": bid_b["document_id"], "rule_id": rule["rule_id"], "quoted_price": 120,
+             "suggested_score": 8.33, "evidence": "投标报价120万元", "calculation": "100/120×10=8.33", "confidence": "high"},
+        ]}
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[local, local, cross]) as request_json:
+            finished = self._run_next_task()
+
+        _, results = storage.latest_score_results(self.app, self.project["project_id"], "objective")
+        scores = {item["bidder_name"]: item["suggested_score"] for item in results}
+        self.assertEqual(finished["status"], "success")
+        self.assertEqual(finished["result"]["cross_bid_price"]["result_count"], 2)
+        self.assertEqual(scores["甲公司"], 10.0)
+        self.assertEqual(scores["乙公司"], 8.33)
+        self.assertIn(bid_a["document_id"], request_json.call_args_list[2].args[2])
+        self.assertIn(bid_b["document_id"], request_json.call_args_list[2].args[2])
+
     def test_manual_objective_score_can_be_calculated_from_matched_count(self):
         payload = [{
             "rule_id": "performance", "title": "业绩评分", "check_rule": "每个业绩得3分，最高9分",
@@ -754,6 +785,34 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         self.assertTrue(any(item["kind"] == "项目名称" and item["page_hint"] == "7" for item in candidates))
         self.assertTrue(any(item["kind"] == "公司名称" and item["page_hint"] == "7" for item in candidates))
+        self.assertTrue(any(item["kind"] == "地区名称" and item["value"] == "临汾市" for item in candidates))
+
+    def test_geography_consistency_keeps_late_local_policy_for_final_review(self):
+        chunks = [
+            {"chunk_id": "chunk_1", "start_page": 1, "end_page": 20,
+             "text": "[第1页]\n朔城区禁种铲毒航测服务项目。"},
+            {"chunk_id": "chunk_12", "start_page": 121, "end_page": 130,
+             "text": "[第127页]\n遵守山西省、临汾市本地无人机飞行管控要求，开展作业。"},
+        ]
+        candidates = worker._geography_consistency_candidates(chunks, ["山西省", "朔城区"])
+        self.assertTrue(any(item["value"] == "临汾市" and item["candidate_priority"] == "high" for item in candidates))
+        scan = {
+            "chunks": chunks, "findings": [], "failed_chunks": [], "chunk_count": 2,
+            "reference_regions": ["山西省", "朔城区"], "geography_candidates": candidates,
+            "entity_candidates": worker._local_entity_candidates(chunks),
+        }
+        rules = [{
+            "rule_id": "unrelated", "category": "other", "title": "投标文件出现无关内容",
+            "check_rule": "全文核对无关项目名称及技术方案矛盾", "source_text": "",
+        }]
+        context = worker._full_scan_review_context(scan, rules, 20_000)
+        self.assertIn("临汾市本地无人机飞行管控要求", context["text"])
+        self.assertIn("chunk_12", context["pages"])
+
+    def test_entity_candidate_caps_do_not_drop_late_region_kind(self):
+        lines = [f"[第{index + 1}页]\n示例企业{index}有限公司" for index in range(140)]
+        lines.append("[第200页]\n临汾市本地无人机飞行管控要求")
+        candidates = worker._local_entity_candidates([{"chunk_id": "chunk_1", "text": "\n".join(lines)}], limit=180)
         self.assertTrue(any(item["kind"] == "地区名称" and item["value"] == "临汾市" for item in candidates))
 
     def test_combined_evaluation_splits_review_rules_into_small_groups(self):
@@ -796,6 +855,29 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(finished["result"]["compact_retry_count"], 1)
         self.assertEqual(request_json.call_count, 4)
         self.assertEqual(request_json.call_args_list[0].args[0]["thinking_mode"], "adaptive")
+        self.assertEqual(request_json.call_args_list[1].args[0]["thinking_mode"], "disabled")
+
+    def test_combined_evaluation_repairs_only_raw_response_before_resending_document(self):
+        self._add_pdf("bid.pdf", "bid", "甲公司", "本公司具备有效资质，正文不应在修复调用中重发。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "有效资质", "source_text": "具备有效资质",
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        raw = '{"results":[{"rule_id":"%s","status":"satisfied",}]}' % rule["rule_id"]
+        repaired = {"results": [{"rule_id": rule["rule_id"], "status": "satisfied", "evidence": "有效资质"}]}
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[
+            worker.InvalidJsonResponse(raw, "stop"), repaired,
+        ]) as request_json:
+            finished = self._run_next_task()
+
+        self.assertEqual(finished["status"], "success")
+        self.assertEqual(request_json.call_count, 2)
+        self.assertIn(raw, request_json.call_args_list[1].args[2])
+        self.assertNotIn("正文不应在修复调用中重发", request_json.call_args_list[1].args[2])
         self.assertEqual(request_json.call_args_list[1].args[0]["thinking_mode"], "disabled")
 
     def test_combined_evaluation_keeps_completed_groups_visible_after_later_connection_error(self):
@@ -894,7 +976,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.add_rule(self.app, self.project["project_id"], {"category": "objective", "title": "资质得分", "source_text": "资质得5分", "scoring": {"kind": "boolean", "max_score": 5}})
         storage.add_rule(self.app, self.project["project_id"], {"category": "subjective", "title": "技术方案", "source_text": "技术方案满分10分", "scoring": {"max_score": 10}})
         storage.confirm_rule_set(self.app, self.project["project_id"])
-        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "fulltext-mapreduce-v2")
+        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "fulltext-coverage-v3")
         prior = storage.create_task(self.app, self.project["project_id"], "evaluate_all", {"profile_id": None, "input_fingerprint": fingerprint})
         storage.update_task(self.app, prior["task_id"], status="success", result={"cached": True})
 
