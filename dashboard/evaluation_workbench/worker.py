@@ -486,6 +486,31 @@ def _score_result_from_model(rule_id: str, suggested: float | None, max_score: f
             "review_reason": "" if auto_ready else "未得到高置信、可引用的建议分，需人工复核。"}
 
 
+def _combined_evaluation_prompt(document: dict, review_payload: list[dict], objective_payload: list[dict],
+                                subjective_payload: list[dict], text: str, *, compact: bool) -> str:
+    limits = (
+        "每条 evidence 最多 60 个字符、reason 最多 50 个字符；证据不足时返回空字符串，不得解释输出格式。"
+        if compact else
+        "每条 evidence 最多 140 个字符、reason 最多 100 个字符；证据不足时简要说明，不得复述整段原文。"
+    )
+    retry_note = "这是针对格式异常的紧凑重试，" if compact else ""
+    return f"""{retry_note}对同一份投标文件完成下列三类工作，并只返回一个合法 JSON 对象：
+{{"review_results":[{{"rule_id":"规则ID","status":"satisfied|not_satisfied|partial|not_found|manual","evidence":"原文摘录","page_hint":null,"reason":"简洁理由","risk_level":"low|medium|high","confidence":"high|medium|low","evidence_quality":"sufficient|limited|missing"}}],"objective_scores":[{{"rule_id":"规则ID","met":true|false|null,"evidence":"原文摘录","reason":"判断理由","confidence":"high|medium|low"}}],"subjective_scores":[{{"rule_id":"规则ID","suggested_score":数字,"evidence":"原文摘录","reason":"得扣分理由","confidence":"high|medium|low"}}]}}
+
+严格要求：不得使用 Markdown 代码块、不得在 JSON 前后添加说明、所有字符串必须使用标准 JSON 双引号和转义。{limits}
+审查规则：{json.dumps(review_payload, ensure_ascii=False, separators=(',', ':'))}
+客观评分规则：{json.dumps(objective_payload, ensure_ascii=False, separators=(',', ':'))}
+主观评分规则：{json.dumps(subjective_payload, ensure_ascii=False, separators=(',', ':'))}
+客观分只判断证据是否满足，不自行计算分数。主观分不得超出规则 scoring.max_score。
+投标文件：{document['original_name']}；投标人：{document['bidder_name'] or '未填写'}
+原文：
+{text}"""
+
+
+def _is_invalid_json_model_response(exc: ValueError) -> bool:
+    return str(exc).startswith("模型未返回有效 JSON")
+
+
 def _evaluate_all(app, task: dict) -> dict:
     """可选的综合评审：每份投标文件仅发送一次正文，原有结果表分别落库。"""
     rule_set, all_rules = storage.list_rules(app, task["project_id"])
@@ -508,21 +533,25 @@ def _evaluate_all(app, task: dict) -> dict:
     objective_payload = _score_payload(objective_rules)
     subjective_payload = _score_payload(subjective_rules)
     system_prompt = "你是严谨的招投标评审辅助助手。只能依据规则与投标文件可见原文，不得编造、推断签字盖章或线下材料。"
+    compact_retry_count = 0
     for index, document in enumerate(documents, start=1):
         storage.update_task(app, task["task_id"], progress=int((index - 1) * 100 / len(documents)), message=f"正在综合评审 {index}/{len(documents)}：{document['bidder_name'] or document['original_name']}")
         text = Path(document["parsed_path"]).read_text(encoding="utf-8", errors="ignore")[:char_limit]
-        user_prompt = f"""对同一份投标文件完成下列三类工作，并只返回 JSON 对象：
-{{"review_results":[{{"rule_id":"规则ID","status":"satisfied|not_satisfied|partial|not_found|manual","evidence":"原文摘录","page_hint":null,"reason":"简洁理由","risk_level":"low|medium|high","confidence":"high|medium|low","evidence_quality":"sufficient|limited|missing"}}],"objective_scores":[{{"rule_id":"规则ID","met":true|false|null,"evidence":"原文摘录","reason":"判断理由","confidence":"high|medium|low"}}],"subjective_scores":[{{"rule_id":"规则ID","suggested_score":数字,"evidence":"原文摘录","reason":"得扣分理由","confidence":"high|medium|low"}}]}}
-
-审查规则：{json.dumps(review_payload, ensure_ascii=False, separators=(',', ':'))}
-客观评分规则：{json.dumps(objective_payload, ensure_ascii=False, separators=(',', ':'))}
-主观评分规则：{json.dumps(subjective_payload, ensure_ascii=False, separators=(',', ':'))}
-客观分只判断证据是否满足，不自行计算分数。主观分不得超出规则 scoring.max_score。
-投标文件：{document['original_name']}；投标人：{document['bidder_name'] or '未填写'}
-原文：
-{text}"""
-        parsed = _request_task_json(app, task, profile, "evaluate_all", system_prompt, user_prompt,
-                                    document_id=document["document_id"], context_mode="full_prefix")
+        user_prompt = _combined_evaluation_prompt(document, review_payload, objective_payload, subjective_payload, text, compact=False)
+        try:
+            parsed = _request_task_json(app, task, profile, "evaluate_all", system_prompt, user_prompt,
+                                        document_id=document["document_id"], context_mode="full_prefix")
+        except ValueError as exc:
+            if not _is_invalid_json_model_response(exc):
+                raise
+            compact_retry_count += 1
+            storage.update_task(app, task["task_id"], message=f"{document['bidder_name'] or document['original_name']} 返回格式异常，正在紧凑重试")
+            retry_context = build_rule_context(document["parsed_path"], all_rules, min(char_limit, 160_000))
+            retry_prompt = _combined_evaluation_prompt(
+                document, review_payload, objective_payload, subjective_payload, retry_context["text"], compact=True,
+            )
+            parsed = _request_task_json(app, task, profile, "evaluate_all_compact_retry", system_prompt, retry_prompt,
+                                        document_id=document["document_id"], context_mode=retry_context["mode"])
         if not isinstance(parsed, dict):
             raise ValueError("模型返回格式不符合综合评审要求")
         storage.save_review_results(app, review_run["review_run_id"], document["document_id"], _normalise_review_results(parsed.get("review_results"), review_rules))
@@ -530,7 +559,8 @@ def _evaluate_all(app, task: dict) -> dict:
         storage.save_score_results(app, subjective_run["score_run_id"], document["document_id"], _normalise_score_results(parsed.get("subjective_scores"), subjective_payload, "subjective"))
     return {"review_run_id": review_run["review_run_id"], "objective_run_id": objective_run["score_run_id"],
             "subjective_run_id": subjective_run["score_run_id"], "document_count": len(documents),
-            "rule_count": len(all_rules), "profile": profile["display_name"], "prompt_version": PROMPT_VERSION}
+            "rule_count": len(all_rules), "profile": profile["display_name"], "compact_retry_count": compact_retry_count,
+            "prompt_version": PROMPT_VERSION}
 
 
 def run_task(app, task: dict) -> None:
