@@ -815,6 +815,10 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         candidates = worker._local_entity_candidates([{"chunk_id": "chunk_1", "text": "\n".join(lines)}], limit=180)
         self.assertTrue(any(item["kind"] == "地区名称" and item["value"] == "临汾市" for item in candidates))
 
+    def test_region_candidates_remove_sentence_prefixes_and_pseudo_places(self):
+        self.assertEqual(worker._region_mentions("2026年朔城区禁种铲毒项目，在朔州市实施"), ["朔城区", "朔州市"])
+        self.assertEqual(worker._region_mentions("供应商应提供市级证明，覆盖主要区域且不得低于市级标准"), [])
+
     def test_combined_evaluation_splits_review_rules_into_small_groups(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "投标文件包含全部承诺。")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")

@@ -1026,10 +1026,15 @@ REGION_PATTERN = re.compile(r"[\u4e00-\u9fff]{2,12}?(?:特别行政区|自治区
 REGION_LEADING_NOISE = (
     "以及", "并按", "按照", "根据", "符合", "执行", "遵守", "涉及", "位于", "地址", "地点",
     "要求", "项目", "采购", "招标", "投标", "服务", "作业", "本地", "当地", "国家法规",
+    "针对", "关于", "覆盖", "在", "于", "年",
 )
 REGION_GENERIC_VALUES = {
     "项目区", "服务区", "作业区", "办公区", "生活区", "管理区", "行政区", "城区", "市区", "辖区",
 }
+REGION_NOISE_FRAGMENTS = (
+    "应提供", "须提供", "重点区", "主要区", "高于", "低于", "不低于", "不少于", "不高于",
+    "等重点", "可覆盖", "供应商", "投标人",
+)
 
 
 def _clean_region_value(value: str) -> str:
@@ -1041,6 +1046,8 @@ def _clean_region_value(value: str) -> str:
             if value.startswith(prefix) and len(value) - len(prefix) >= 3:
                 value, changed = value[len(prefix):], True
                 break
+    if any(fragment in value for fragment in REGION_NOISE_FRAGMENTS):
+        return ""
     return value
 
 
