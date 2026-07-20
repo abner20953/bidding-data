@@ -5,6 +5,7 @@
   let wasTaskActive = false;
   let lastCompareTask = null;
   let globalRules = [];
+  let hasCurrentRules = false;
   const $ = (id) => document.getElementById(id);
   const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
   async function request(path, options = {}) { let response; try { response = await fetch(`${api}${path}`, options); } catch (_) { throw new Error('无法连接本地服务，请确认程序仍在运行后刷新页面重试'); } let data; try { data = await response.json(); } catch (_) { data = {error:`请求失败（HTTP ${response.status}）`}; } if (!response.ok) throw new Error(data.error || '请求失败'); return data; }
@@ -61,7 +62,7 @@
   }
   function categoryLabel(value) { return {qualification:'资格性', compliance:'符合性', substantive:'实质性/废标项', rejection:'实质性/废标项', other:'其他规则', objective:'客观分', subjective:'主观分'}[value] || value; }
   async function refreshRules() {
-    if (!activeProject) return; const data = await request(`/projects/${activeProject}/rules`); const set = data.rule_set; const isDraft = set?.status === 'draft';
+    if (!activeProject) return; const data = await request(`/projects/${activeProject}/rules`); const set = data.rule_set; const isDraft = set?.status === 'draft'; hasCurrentRules = data.rules.length > 0;
     $('rule-set-meta').textContent = set ? `版本 ${set.version} · ${set.status === 'confirmed' ? '已确认' : set.status === 'draft' ? '待确认' : '已替换'} · 共 ${data.rules.length} 条${set.source_task_id ? ' · AI 提取结果' : ''}` : '尚未提取或添加规则。'; $('confirm-rules').disabled = !isDraft;
     $('rules').innerHTML = data.rules.length ? `<div class="rule-card-list">${data.rules.map((r) => {
       const checkContent = isDraft ? `<textarea class="rule-check-rule" data-rule="${r.rule_id}" rows="4">${escapeHtml(r.check_rule || r.title)}</textarea>` : `<div class="rule-text">${escapeHtml(r.check_rule || r.title)}</div>`;
@@ -98,7 +99,7 @@
   $('file-drop-zone').addEventListener('drop', (event) => { const files = event.dataTransfer?.files; if (!files?.length) return; if (files.length > 1) alert('请一次拖入一个文件，并分别选择对应的文件角色和投标人。'); setSelectedUploadFile(files[0]); });
   $('upload-file').onclick = async () => { const file = selectedUploadFile || $('file-input').files[0]; const role = $('file-role').value; const bidderName = $('bidder-name').value.trim(); if (!file) return alert('请选择或拖入文件'); if (role === 'bid' && !bidderName) { $('bidder-name').focus(); return alert('上传投标文件时必须填写投标人名称'); } const form = new FormData(); form.append('file', file); form.append('role', role); form.append('bidder_name', bidderName); try { const response = await fetch(`${api}/projects/${activeProject}/documents`, {method:'POST', body:form}); const data = await response.json(); if (!response.ok) throw new Error(data.error); clearSelectedUploadFile(); $('bidder-name').value = ''; await refreshProject(); } catch (error) { alert(error.message); } };
   $('parse-documents').onclick = () => queue('parse_documents'); $('start-compare').onclick = () => queue('compare_documents');
-  $('extract-rules').onclick = async () => { try { const profile_id = $('rule-profile').value; await request(`/projects/${activeProject}/tasks`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({task_type:'extract_rules', profile_id})}); await refreshProject(); } catch (error) { alert(error.message); } };
+  $('extract-rules').onclick = async () => { if (hasCurrentRules && !confirm('重新提取会以新的 AI 结果和当前启用的通用规则替换当前待确认规则集。已确认的历史规则和结果不会删除，是否继续？')) return; try { const profile_id = $('rule-profile').value; await request(`/projects/${activeProject}/tasks`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({task_type:'extract_rules', profile_id, force_rerun:true})}); await refreshProject(); } catch (error) { alert(error.message); } };
   $('add-manual-rule').onclick = async () => { try { const payload = {category:$('manual-rule-category').value, title:$('manual-rule-title').value, check_rule:$('manual-rule-check').value, source_text:$('manual-rule-source').value, ocr_required:$('manual-rule-ocr').checked}; await request(`/projects/${activeProject}/rules`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}); $('manual-rule-title').value = ''; $('manual-rule-check').value = ''; $('manual-rule-source').value = ''; $('manual-rule-ocr').checked = false; await refreshRules(); } catch (error) { alert(error.message); } };
   $('confirm-rules').onclick = async () => { try { await request(`/projects/${activeProject}/rules/confirm`, {method:'POST'}); await refreshRules(); } catch (error) { alert(error.message); } };
   $('start-evaluate-all').onclick = async () => { try { const profile_id = $('all-profile').value; await request(`/projects/${activeProject}/tasks`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({task_type:'evaluate_all', profile_id})}); await refreshProject(); await Promise.all([refreshReview(), refreshScores(), refreshUsage()]); } catch (error) { alert(error.message); } };
