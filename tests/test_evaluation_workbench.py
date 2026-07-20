@@ -253,6 +253,30 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(request_json.call_count, 2)
         self.assertEqual(request_json.call_args_list[0].kwargs["max_tokens"], 12000)
 
+    def test_rule_extraction_supplements_missing_score_clause_with_compact_packet(self):
+        tender_text = "\n".join([
+            "商务评分", "供应商业绩", "业绩每有一个得3分，最高9分。",
+            *[f"说明{i}" for i in range(10)], "报价评分", "报价得分最高25分。",
+        ])
+        self._add_pdf("tender.pdf", "tender", "", tender_text)
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        tender_document = next(item for item in storage.list_documents(self.app, self.project["project_id"]) if item["role"] == "tender")
+        Path(tender_document["parsed_path"]).write_text(tender_text, encoding="utf-8")
+        storage.create_task(self.app, self.project["project_id"], "extract_rules")
+        primary = {"rules": [{"category": "objective", "title": "报价评分", "check_rule": "按报价公式计算", "source_text": "报价得分最高25分", "scoring": {"max_score": 25, "kind": "manual"}}]}
+        supplement = {"rules": [{"category": "objective", "title": "类似项目业绩评分", "check_rule": "每个同类型项目业绩计3分，最高9分", "source_text": "业绩每有一个得3分，最高9分", "scoring": {"max_score": 9, "kind": "manual"}}]}
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[primary, supplement]) as request_json:
+            finished = self._run_next_task()
+
+        _, rules = storage.list_rules(self.app, self.project["project_id"])
+        self.assertEqual(finished["status"], "success")
+        self.assertEqual(finished["result"]["score_clause_count"], 2)
+        self.assertEqual(finished["result"]["scoring_supplement_count"], 1)
+        self.assertEqual(request_json.call_count, 2)
+        self.assertEqual(next(item for item in rules if item["title"] == "类似项目业绩评分")["scoring_json"], '{"max_score": 9, "kind": "manual"}')
+
     def test_adding_to_confirmed_rules_creates_new_draft_version(self):
         storage.add_rule(self.app, self.project["project_id"], {"category": "qualification", "title": "资质"})
         confirmed = storage.confirm_rule_set(self.app, self.project["project_id"])
@@ -622,6 +646,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(finished["status"], "success")
         self.assertEqual(request_json.call_count, 1)
         self.assertEqual(reviews[0]["status"], "ocr_required")
+        self.assertEqual(reviews[0]["risk_level"], "low")
         self.assertIn("OCR", reviews[0]["reason"])
 
     def test_combined_evaluation_reuses_unchanged_bid_documents_after_adding_a_bid(self):
@@ -703,6 +728,23 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(scoring["max_score"], 2.0)
         self.assertEqual(scoring["kind"], "manual")
         self.assertEqual(scoring["source"], "source_text_inferred")
+
+    def test_manual_objective_and_subjective_rules_preserve_explicit_scoring(self):
+        objective = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "人工补充业绩评分", "check_rule": "核验业绩数量并按规则计分。",
+            "scoring": {"max_score": 9, "kind": "manual"},
+        })
+        subjective = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "subjective", "title": "人工补充方案评分", "check_rule": "评价方案完整性和可行性。",
+            "scoring": {"max_score": 15, "kind": "manual"},
+        })
+
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        _, rules = storage.list_rules(self.app, self.project["project_id"])
+        scoring_by_rule = {item["rule_id"]: __import__("json").loads(item["scoring_json"]) for item in rules}
+
+        self.assertEqual(scoring_by_rule[objective["rule_id"]], {"max_score": 9, "kind": "manual"})
+        self.assertEqual(scoring_by_rule[subjective["rule_id"]], {"max_score": 15, "kind": "manual"})
 
     def test_draft_scoring_rule_can_be_corrected_without_recreation(self):
         rule = storage.add_rule(self.app, self.project["project_id"], {

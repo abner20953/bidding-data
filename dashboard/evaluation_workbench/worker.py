@@ -292,6 +292,7 @@ _UNREVIEWABLE_RULE_MARKERS = (
     "正本副本", "正本一份", "纸质正本", "纸质副本", "签收", "送达",
 )
 _RULE_SECTION_MARKERS = ("评标办法", "评分标准", "资格审查", "符合性审查", "废标", "无效投标", "否决投标", "资格条件")
+_SCORE_CLAUSE_PATTERN = re.compile(r"(?:得\s*\d+(?:\.\d+)?\s*分|最高(?:得)?\s*\d+(?:\.\d+)?\s*分|满分(?:为)?\s*\d+(?:\.\d+)?\s*分)")
 
 
 def _is_unreviewable_rule(item: dict) -> bool:
@@ -326,22 +327,70 @@ def _rule_source_excerpt(text: str, budget: int) -> str:
     return selected[:budget] if selected else text[:budget]
 
 
-def _rule_extraction_prompt(text: str, *, compact: bool) -> str:
+def _score_clause_packets(text: str, limit: int = 24) -> list[str]:
+    """从评分表行中构造短片段，作为 AI 规则提取的覆盖清单，而非本地直接判分。"""
+    lines = [line.strip() for line in text.splitlines()]
+    windows: list[tuple[int, int]] = []
+    for index, line in enumerate(lines):
+        if not _SCORE_CLAUSE_PATTERN.search(re.sub(r"\s+", "", line)):
+            continue
+        start, end = max(0, index - 4), min(len(lines), index + 5)
+        if windows and start <= windows[-1][1] + 2:
+            windows[-1] = (windows[-1][0], max(windows[-1][1], end))
+        else:
+            windows.append((start, end))
+        if len(windows) >= limit:
+            break
+    packets = []
+    for start, end in windows:
+        value = "\n".join(line for line in lines[start:end] if line)[:900]
+        if value:
+            packets.append(value)
+    return packets
+
+
+def _rule_extraction_prompt(text: str, *, compact: bool, score_packets: list[str]) -> str:
     limits = (
         "这是格式异常后的紧凑重试。最多返回 30 条规则；title 最多 30 字，check_rule 最多 90 字，source_text 最多 120 字。"
         if compact else
         "最多返回 45 条规则；title 最多 40 字，check_rule 最多 140 字，source_text 最多 220 字。"
     )
+    score_audit = "\n".join(f"【评分条款 {index}】\n{packet}" for index, packet in enumerate(score_packets, start=1))
+    score_requirement = (
+        "本地已定位以下疑似评分条款。必须逐项核验并为每个不同的明确计分条款输出一条 objective 或 subjective 规则；"
+        "不得遗漏业绩、报价、人员、资质、方案等评分项。"
+        if score_audit else "未定位到明确评分条款时，不要臆造评分规则。"
+    )
     return f"""请从以下招标文件原文提取可由 AI 审查的评标规则，只返回一个合法 JSON 对象：
 {{"rules":[{{"category":"qualification|compliance|substantive|rejection|objective|subjective","title":"简明规则名称","check_rule":"面向投标文件的明确检查指令","source_text":"招标原文短摘录","ocr_required":false,"scoring":{{"max_score":数字,"kind":"boolean|manual"}} }}]}}
 
 严格要求：不得使用 Markdown 或在 JSON 前后添加说明；不得逐条复述招标原文；同类要求合并为一条规则。{limits}
+{score_requirement}
 只保留能通过已上传投标文件中可检索的文字、表格或元数据核验的事项，规则必须明确且能据文件内容判断。不要输出密封与递交要求、响应文件份数或电子版要求、递交地点/时间、开标现场、线下原件、纸质材料、投标文件本身无法体现的签收事项，以及其他无法仅凭投标文件核验的事项。若规则的关键证据只能依赖扫描图片、证照图片、签章或手写内容识别，请将 ocr_required 设为 true；其余为 false。
 
 分类说明：qualification 为资格性；compliance 为符合性；substantive 为实质性；rejection 为无效投标/废标；objective 为客观分；subjective 为主观分。objective 和 subjective 必须填写 scoring.max_score，且只能填写招标原文明确规定的满分；没有明确满分时不要输出为评分项。objective 仅“满足即满分”时 kind 为 boolean，分档、数量、累计或人工判断评分时 kind 为 manual；subjective 的 kind 为 manual。非评分项省略 scoring。
 
+评分条款覆盖清单：
+{score_audit or '无'}
+
 招标文件原文：
 {text}"""
+
+
+def _score_rule_supplement_prompt(score_packets: list[str], existing_rules: list[dict]) -> str:
+    existing = [
+        {"category": item.get("category"), "title": item.get("title"), "check_rule": item.get("check_rule"), "max_score": (item.get("scoring") or {}).get("max_score")}
+        for item in existing_rules if item.get("category") in {"objective", "subjective"}
+    ]
+    packet_text = "\n".join(f"【评分条款 {index}】\n{packet}" for index, packet in enumerate(score_packets, start=1))
+    return f"""仅根据以下评分条款，补充主规则提取遗漏的明确评分项。只返回合法 JSON：
+{{"rules":[{{"category":"objective|subjective","title":"简明规则名称","check_rule":"面向投标文件的明确检查指令","source_text":"原文短摘录","ocr_required":false,"scoring":{{"max_score":数字,"kind":"boolean|manual"}}}}]}}
+
+已有评分规则：{json.dumps(existing, ensure_ascii=False, separators=(',', ':'))}
+必须仅返回缺失项，不得重复已有项；每个明确评分条款都要覆盖。objective 和 subjective 都必须有 scoring.max_score，且仅能填写原文明确的满分。不得使用 Markdown 或添加说明；title 最多 30 字，check_rule 最多 90 字，source_text 最多 120 字。
+
+评分条款：
+{packet_text}"""
 
 
 def _extract_rules(app, task: dict) -> dict:
@@ -372,9 +421,10 @@ def _extract_rules(app, task: dict) -> dict:
             for index, (label, value) in enumerate(source_documents)
         ]
     text = "\n\n".join(source_parts)[:char_limit]
+    score_packets = _score_clause_packets(text)
     storage.update_task(app, task["task_id"], progress=15, message="正在调用模型提取评审规则")
     system_prompt = _system_prompt(app, "extract_rules", "只能依据给出的招标文件原文，不得编造；必须遵守输出 JSON 结构。")
-    user_prompt = _rule_extraction_prompt(text, compact=False)
+    user_prompt = _rule_extraction_prompt(text, compact=False, score_packets=score_packets)
     compact_retry_count = 0
     try:
         parsed = _request_task_json(app, task, profile, "extract_rules", system_prompt, user_prompt,
@@ -385,13 +435,30 @@ def _extract_rules(app, task: dict) -> dict:
             raise
         compact_retry_count = 1
         storage.update_task(app, task["task_id"], progress=40, message="模型输出过长，正在按紧凑格式重试")
-        retry_prompt = _rule_extraction_prompt(text, compact=True)
+        retry_prompt = _rule_extraction_prompt(text, compact=True, score_packets=score_packets)
         parsed = _request_task_json(app, task, profile, "extract_rules_compact_retry", system_prompt, retry_prompt,
                                     document_id=tender["document_id"], context_mode="full_prefix_compact_retry",
                                     max_tokens=_output_token_budget(profile, 8_000))
     raw_rules = parsed.get("rules") if isinstance(parsed, dict) else None
     if not isinstance(raw_rules, list):
         raise ValueError("模型返回格式不符合规则提取要求")
+    primary_score_rules = [item for item in raw_rules if isinstance(item, dict) and item.get("category") in {"objective", "subjective"}]
+    scoring_supplement_count = 0
+    if score_packets and len(primary_score_rules) < len(score_packets):
+        storage.update_task(app, task["task_id"], progress=60, message="正在核验评分条款覆盖并补充遗漏项")
+        try:
+            supplement = _request_task_json(
+                app, task, profile, "extract_rules_scoring_supplement", system_prompt,
+                _score_rule_supplement_prompt(score_packets, primary_score_rules), document_id=tender["document_id"],
+                context_mode="score_clause_packets_only", max_tokens=_output_token_budget(profile, 4_000),
+            )
+            supplement_rules = supplement.get("rules") if isinstance(supplement, dict) else None
+            if isinstance(supplement_rules, list):
+                raw_rules.extend(item for item in supplement_rules if isinstance(item, dict))
+                scoring_supplement_count = len(supplement_rules)
+        except ValueError as exc:
+            # 主规则已提取成功时，补充调用异常不应丢弃已得到的规则集。
+            storage.update_task(app, task["task_id"], message=f"评分条款补充未完成：{exc}")
     candidates = [item for item in raw_rules if isinstance(item, dict) and str(item.get("title", "")).strip() and item.get("category") in {"qualification", "compliance", "substantive", "rejection", "objective", "subjective"}]
     rules = [item for item in candidates if not _is_unreviewable_rule(item)]
     excluded_rule_count = len(candidates) - len(rules)
@@ -417,7 +484,8 @@ def _extract_rules(app, task: dict) -> dict:
     return {"rule_set_id": rule_set["rule_set_id"], "version": rule_set["version"], "rule_count": len(rules) + global_rule_count,
             "ai_rule_count": len(rules), "global_rule_count": global_rule_count,
             "excluded_rule_count": excluded_rule_count, "profile": profile["display_name"],
-            "compact_retry_count": compact_retry_count}
+            "compact_retry_count": compact_retry_count, "score_clause_count": len(score_packets),
+            "scoring_supplement_count": scoring_supplement_count}
 
 
 def _review_documents(app, task: dict) -> dict:
@@ -556,7 +624,8 @@ def _review_result_from_model(item: dict, rule_id: str, status: str) -> dict:
     risk = item.get("risk_level") if item.get("risk_level") in {"low", "medium", "high"} else "medium"
     # 仅对正向、低风险、证据充分的结论自动进入批量确认；否定/废标类风险不自动放行。
     if status == "ocr_required":
-        confidence, evidence_quality, risk = "low", "missing", "medium"
+        # OCR 缺失仅说明当前无法读取图像证据，并非投标文件本身存在风险。
+        confidence, evidence_quality, risk = "low", "missing", "low"
         if not str(item.get("reason", "")).strip():
             item = {**item, "reason": "该规则的关键证据需要 OCR 识别后才能判定。"}
     auto_ready = status == "satisfied" and risk == "low" and confidence == "high" and evidence_quality == "sufficient"

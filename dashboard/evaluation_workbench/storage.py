@@ -1417,10 +1417,16 @@ def latest_review_results(app, project_id: str) -> tuple[dict | None, list[dict]
             JOIN ew_rules rule ON rule.rule_id = r.rule_id
             WHERE r.review_run_id = ?
             ORDER BY d.bidder_name,
+                CASE WHEN r.status = 'ocr_required' THEN 1 ELSE 0 END,
                 CASE r.risk_level WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC,
                 rule.category, rule.sort_order""", (run["review_run_id"],)
         ).fetchall()
-    return dict(run), [dict(row) for row in rows]
+    results = [dict(row) for row in rows]
+    # 兼容历史评审结果：OCR 待识别不是风险结论，展示和报告均统一为低风险。
+    for result in results:
+        if result.get("status") == "ocr_required":
+            result["risk_level"] = "low"
+    return dict(run), results
 
 
 def reusable_evaluation_document_results(app, project_id: str, rule_set_id: str, profile_id: str,
