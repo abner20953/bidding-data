@@ -491,7 +491,14 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self._unlock_model_configuration(client)
         listed = client.get("/api/evaluation-workbench/prompt-templates")
         self.assertEqual(listed.status_code, 200)
-        original = next(item for item in listed.get_json()["templates"] if item["template_id"] == "evaluate_all")
+        templates = listed.get_json()["templates"]
+        self.assertEqual({item["configuration_group"] for item in templates}, {"business", "workflow", "system"})
+        self.assertEqual(
+            [item["template_id"] for item in templates if item["configuration_group"] == "business"],
+            ["compare_ai_assessment", "extract_rules_guidance", "evaluate_all_guidance"],
+        )
+        self.assertTrue(all(item["section"] and item["change_level"] for item in templates))
+        original = next(item for item in templates if item["template_id"] == "evaluate_all")
         before_fingerprint = storage.prompt_template_fingerprint(self.app)
         updated = client.patch("/api/evaluation-workbench/prompt-templates/evaluate_all", json={"content": "请严格逐项核验，并用简洁中文说明证据和理由。"})
         self.assertEqual(updated.status_code, 200)

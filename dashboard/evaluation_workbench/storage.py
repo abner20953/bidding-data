@@ -16,7 +16,9 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet, InvalidToken
-from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATE_SETTING, PROMPT_TEMPLATES
+from dashboard.evaluation_workbench.prompt_templates import (
+    PROMPT_TEMPLATE_SETTING, PROMPT_TEMPLATES, template_presentation,
+)
 
 
 MAX_BID_DOCUMENTS = 10
@@ -54,12 +56,13 @@ def _prompt_template_overrides(app) -> dict[str, str]:
 
 def list_prompt_templates(app) -> list[dict]:
     overrides = _prompt_template_overrides(app)
-    return [
+    values = [
         {"template_id": template_id, "name": meta["name"], "description": meta["description"],
          "content": overrides.get(template_id, meta["content"]), "is_custom": template_id in overrides,
-         "placeholders": list(meta.get("placeholders", ())) }
+         "placeholders": list(meta.get("placeholders", ())), **template_presentation(template_id)}
         for template_id, meta in PROMPT_TEMPLATES.items()
     ]
+    return sorted(values, key=lambda item: (item["sort_order"], item["name"]))
 
 
 def prompt_template(app, template_id: str) -> str:

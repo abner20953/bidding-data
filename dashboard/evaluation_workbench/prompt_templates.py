@@ -41,5 +41,55 @@ PROMPT_TEMPLATES = {
 }
 
 
+# 仅控制提示词配置界面的归类、排序和风险提示，不参与模型调用。业务原则集中
+# 展示，包含 JSON/占位符协议的流程模板次之，系统角色与兼容模板默认折叠。
+PROMPT_TEMPLATE_PRESENTATION = {
+    # 日常优先修改：不承载运行时 JSON 协议。
+    "compare_ai_assessment": ("business", "文件查重", 10, "recommended"),
+    "extract_rules_guidance": ("business", "评审规则", 20, "recommended"),
+    "evaluate_all_guidance": ("business", "综合评审", 30, "recommended"),
+
+    # 按流程修改：同时包含业务要求和结构化输出约定，修改时应保留字段与占位符。
+    "compare_ai_assessment_user": ("workflow", "文件查重", 110, "careful"),
+    "extract_rules_user": ("workflow", "评审规则", 120, "careful"),
+    "extract_rules_compile_user": ("workflow", "评审规则", 121, "careful"),
+    "extract_rules_coverage_user": ("workflow", "评审规则", 122, "careful"),
+    "extract_rules_supplement_user": ("workflow", "评审规则", 123, "careful"),
+    "evaluate_all_scope_profile_user": ("workflow", "综合评审", 130, "careful"),
+    "evaluate_all_full_scan_user": ("workflow", "综合评审", 131, "careful"),
+    "evaluate_all_review_user": ("workflow", "综合评审", 132, "careful"),
+    "evaluate_all_objective_user": ("workflow", "综合评审", 133, "careful"),
+    "evaluate_all_subjective_user": ("workflow", "综合评审", 134, "careful"),
+    "evaluate_all_cross_bid_price_user": ("workflow", "综合评审", 135, "careful"),
+
+    # 系统角色、格式修复和旧接口兼容模板；保留编辑能力但默认收起。
+    "model_connection_test": ("system", "连接与修复", 210, "advanced"),
+    "extract_rules": ("system", "系统角色", 220, "advanced"),
+    "evaluate_all": ("system", "系统角色", 221, "advanced"),
+    "evaluate_all_scope_profile": ("system", "系统角色", 222, "advanced"),
+    "json_repair": ("system", "连接与修复", 230, "advanced"),
+    "json_repair_user": ("system", "连接与修复", 231, "advanced"),
+    "review_documents": ("system", "兼容流程", 240, "advanced"),
+    "review_documents_user": ("system", "兼容流程", 241, "advanced"),
+    "score_objective": ("system", "兼容流程", 242, "advanced"),
+    "score_objective_user": ("system", "兼容流程", 243, "advanced"),
+    "score_subjective": ("system", "兼容流程", 244, "advanced"),
+    "score_subjective_user": ("system", "兼容流程", 245, "advanced"),
+    "evaluate_all_user": ("system", "兼容流程", 246, "advanced"),
+}
+
+
+def template_presentation(template_id: str) -> dict:
+    group, section, order, change_level = PROMPT_TEMPLATE_PRESENTATION.get(
+        template_id, ("system", "其他系统模板", 999, "advanced")
+    )
+    return {
+        "configuration_group": group,
+        "section": section,
+        "sort_order": order,
+        "change_level": change_level,
+    }
+
+
 def default_template(template_id: str) -> str:
     return PROMPT_TEMPLATES[template_id]["content"]
