@@ -26,7 +26,7 @@ from dashboard.utils.comparator import CollusionDetector, ComparisonLimitError
 MAX_PARSE_PAGES = 2000
 MAX_PARSED_CHARS = 2_000_000
 MAX_DOCX_XML_BYTES = 50 * 1024 * 1024
-PROMPT_VERSION = "fulltext-coverage-v3"
+PROMPT_VERSION = "project-scope-coverage-v4"
 COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v2"
 COMPARE_AI_BATCH_SIZE = 24
 
@@ -971,14 +971,15 @@ def _full_scan_chunk_label(chunk: dict) -> str:
     return str(chunk.get("chunk_id") or "连续文本块")
 
 
-def _full_scan_prompt(app, document: dict, catalog: list[dict], chunk: dict, *, compact: bool) -> str:
+def _full_scan_prompt(app, document: dict, catalog: list[dict], chunk: dict, project_scope: dict, *, compact: bool) -> str:
     retry_note = (
-        "这是格式异常后的严格 JSON 重试：只输出一个 JSON 对象；matches 最多 16 条，每段摘录最多 90 字；"
+        "这是格式异常后的严格 JSON 重试：只输出一个 JSON 对象；matches 最多 16 条、scope_anomalies 最多 4 条，每段摘录最多 90 字；"
         "不得使用 Markdown、注释或前后说明。\n"
         if compact else ""
     )
     return storage.render_prompt_template(
         app, "evaluate_all_full_scan_user", retry_note=retry_note,
+        project_scope=json.dumps(project_scope, ensure_ascii=False, separators=(",", ":")),
         rules=json.dumps(catalog, ensure_ascii=False, separators=(",", ":")),
         document_name=document["original_name"], bidder_name=document["bidder_name"] or "未填写",
         chunk_label=_full_scan_chunk_label(chunk), text=chunk["text"],
@@ -1022,186 +1023,146 @@ def _normalise_scan_findings(output: object, allowed_ids: set[str], chunk: dict)
     return findings
 
 
-REGION_PATTERN = re.compile(r"[\u4e00-\u9fff]{2,12}?(?:特别行政区|自治区|自治州|地区|省|市|盟|区|县|旗)")
-REGION_LEADING_NOISE = (
-    "以及", "并按", "按照", "根据", "符合", "执行", "遵守", "涉及", "位于", "地址", "地点",
-    "要求", "项目", "采购", "招标", "投标", "服务", "作业", "本地", "当地", "国家法规",
-    "针对", "关于", "覆盖", "在", "于", "年",
-)
-REGION_GENERIC_VALUES = {
-    "项目区", "服务区", "作业区", "办公区", "生活区", "管理区", "行政区", "城区", "市区", "辖区",
-}
-REGION_NOISE_FRAGMENTS = (
-    "应提供", "须提供", "重点区", "主要区", "高于", "低于", "不低于", "不少于", "不高于",
-    "等重点", "可覆盖", "供应商", "投标人",
-)
-
-
-def _clean_region_value(value: str) -> str:
-    value = value.strip("，。；：、（）()【】[] ")
-    changed = True
-    while changed:
-        changed = False
-        for prefix in REGION_LEADING_NOISE:
-            if value.startswith(prefix) and len(value) - len(prefix) >= 3:
-                value, changed = value[len(prefix):], True
-                break
-    if any(fragment in value for fragment in REGION_NOISE_FRAGMENTS):
-        return ""
-    return value
-
-
-def _region_mentions(line: str) -> list[str]:
-    """提取轻量行政区名称；只用于召回候选，不据此作业务结论。"""
-    values = []
-    for match in REGION_PATTERN.finditer(line):
-        value = _clean_region_value(match.group(0))
-        if value in REGION_GENERIC_VALUES or not 3 <= len(value) <= 10:
+def _normalise_scope_anomalies(output: object, chunk: dict) -> list[dict]:
+    """范围偏离为独立候选通道，不强制映射到任何既有规则或预设类型。"""
+    candidates = []
+    for raw in output if isinstance(output, list) else []:
+        if isinstance(raw, list) and len(raw) >= 6:
+            page_hint, dimension, priority, evidence, relation, observation = raw[:6]
+        elif isinstance(raw, dict):
+            page_hint = raw.get("page_hint") or raw.get("page")
+            dimension = raw.get("dimension") or raw.get("type") or "其他范围偏离"
+            priority = raw.get("priority") or raw.get("risk")
+            evidence = raw.get("evidence") or raw.get("quote")
+            relation = raw.get("relation") or raw.get("mismatch")
+            observation = raw.get("observation") or raw.get("reason")
+        else:
             continue
-        if value not in values:
-            values.append(value)
-    return values
-
-
-def _iter_chunk_lines(chunks: list[dict]):
-    page_marker = re.compile(r"\[第(\d+)页\]")
-    for chunk in chunks:
-        current_page = ""
-        for raw_line in str(chunk.get("text") or "").splitlines():
-            marker = page_marker.search(raw_line)
-            if marker:
-                current_page = marker.group(1)
-                continue
-            line = re.sub(r"\s+", "", raw_line.strip())
-            if len(line) >= 3:
-                yield str(chunk.get("chunk_id") or ""), current_page, line
-
-
-def _local_entity_candidates(chunks: list[dict], limit: int = 300) -> list[dict]:
-    """本地全文实体校对层；按类型独立限额，避免后半册地域被前页实体挤掉。"""
-    patterns = (
-        ("公司名称", re.compile(r"[\u4e00-\u9fffA-Za-z0-9（）()·\-]{2,50}(?:有限责任公司|股份有限公司|有限公司|公司)")),
-        ("项目名称", re.compile(r"[\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,70}(?:项目|工程)")),
-    )
-    per_kind_limit = max(40, limit // 3)
-    buckets: dict[str, list[dict]] = {"公司名称": [], "项目名称": [], "地区名称": []}
-    seen: dict[str, set[str]] = {key: set() for key in buckets}
-    for chunk_id, current_page, line in _iter_chunk_lines(chunks):
-        for kind, pattern in patterns:
-            if len(buckets[kind]) >= per_kind_limit:
-                continue
-            for match in pattern.finditer(line):
-                value = match.group(0)[-80:]
-                if value in seen[kind]:
-                    continue
-                seen[kind].add(value)
-                buckets[kind].append({"kind": kind, "value": value, "page_hint": current_page,
-                                      "chunk_id": chunk_id, "context": line[:220]})
-                if len(buckets[kind]) >= per_kind_limit:
-                    break
-        for value in _region_mentions(line):
-            kind = "地区名称"
-            if value in seen[kind]:
-                continue
-            seen[kind].add(value)
-            if len(buckets[kind]) < max(600, per_kind_limit * 4):
-                buckets[kind].append({"kind": kind, "value": value, "page_hint": current_page,
-                                      "chunk_id": chunk_id, "context": line[:220]})
-    # 轮转输出保证地区、公司和项目三类都能进入有限上下文；高风险异地政策另由
-    # geography_candidates 独立保留，不会因这里的均衡限额丢失。
-    ordered: list[dict] = []
-    kinds = ("地区名称", "公司名称", "项目名称")
-    for index in range(max(len(buckets[kind]) for kind in kinds)):
-        for kind in kinds:
-            if index < len(buckets[kind]):
-                ordered.append(buckets[kind][index])
-                if len(ordered) >= limit:
-                    return ordered
-    return ordered
-
-
-def _reference_regions(documents: list[dict]) -> list[str]:
-    """从招标文件及附件提取项目合法地域；不依赖常驻模型或外部地名库。"""
-    counts: dict[str, int] = {}
-    first_seen: list[str] = []
-    early_regions: set[str] = set()
-    for document in documents:
-        if document.get("role") not in {"tender", "tender_attachment"} or not document.get("parsed_path"):
+        priority = str(priority or "medium").lower()
+        if priority not in {"high", "medium", "low"}:
+            priority = "medium"
+        evidence = _clean_model_text(evidence)[:420]
+        dimension = _clean_model_text(dimension)[:80] or "其他范围偏离"
+        if not evidence:
             continue
-        path = Path(document["parsed_path"])
+        candidates.append({
+            "chunk_id": chunk["chunk_id"], "page_range": _full_scan_chunk_label(chunk),
+            "page_hint": _clean_model_text(page_hint)[:80], "dimension": dimension,
+            "candidate_priority": priority, "evidence": evidence,
+            "relation": _clean_model_text(relation)[:300], "observation": _clean_model_text(observation)[:360],
+        })
+    return candidates
+
+
+SCOPE_PROFILE_FIELDS = (
+    "project_identity", "scope_summary", "service_targets", "core_tasks", "technical_topics",
+    "equipment_or_materials", "deliverables", "standards_or_rules", "regions", "keywords",
+)
+
+
+def _scope_source(documents: list[dict], char_limit: int) -> str:
+    """构造项目范围画像依据；长招标文件保留前后段，并完整携带已确认规则作为补充。"""
+    sources = []
+    tender_documents = [item for item in documents if item.get("role") in {"tender", "tender_attachment"}]
+    # 平均分配预算，避免多个招标附件时前几份文件挤占全部上下文。
+    per_document = max(1, char_limit // max(1, len(tender_documents)))
+    for document in tender_documents:
+        path = Path(str(document.get("parsed_path") or ""))
         if not path.is_file():
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
-        char_offset = 0
-        for line in text.splitlines():
-            for value in _region_mentions(line):
-                if char_offset < 30_000:
-                    early_regions.add(value)
-                counts[value] = counts.get(value, 0) + 1
-                if value not in first_seen:
-                    first_seen.append(value)
-            char_offset += len(line) + 1
-    # 封面/项目概况中的地域和正文反复出现的地域作为基准；招标文件中偶然出现的
-    # 业绩示例或联系地址不应把异地复制线索“洗白”。
-    values = [item for item in first_seen if item in early_regions or counts[item] >= 2]
-    return sorted(values, key=lambda item: (-counts[item], first_seen.index(item)))[:40]
+        if len(text) > per_document:
+            head = int(per_document * 0.72)
+            tail = per_document - head
+            text = f"{text[:head]}\n\n【中间内容因长度省略；后段如下】\n\n{text[-tail:]}"
+        sources.append(f"【{document.get('original_name') or '招标文件'}】\n{text}")
+    return "\n\n".join(sources)[:char_limit]
 
 
-def _geography_consistency_candidates(chunks: list[dict], reference_regions: list[str], limit: int = 80) -> list[dict]:
-    """召回异地政策/项目残留；地址和业绩场景降权，最终仍由 AI 结合原页判断。"""
-    references = set(reference_regions)
-    strong_terms = ("本地", "当地", "管控要求", "飞行管控", "作业区域", "作业区", "实施地点", "服务地点", "项目所在地")
-    exclusion_terms = ("注册地址", "住所", "住址", "通讯地址", "类似项目", "业绩", "合同名称", "项目名称", "发包人")
-    by_value: dict[str, dict] = {}
-    for chunk_id, page_hint, line in _iter_chunk_lines(chunks):
-        for value in _region_mentions(line):
-            if value in references:
-                continue
-            signal_score = sum(1 for term in strong_terms if term in line)
-            strong = signal_score > 0
-            excluded = any(term in line for term in exclusion_terms)
-            priority = 3 if strong and not excluded else 2 if not excluded else 1
-            candidate = {
-                "kind": "异地行政区候选", "value": value, "page_hint": page_hint,
-                "chunk_id": chunk_id, "context": line[:260],
-                "candidate_priority": "high" if priority == 3 else "medium" if priority == 2 else "low",
-                "likely_address_or_performance": excluded,
-                "signal_score": signal_score,
-            }
-            previous = by_value.get(value)
-            previous_rank = (
-                {"high": 3, "medium": 2, "low": 1}.get(previous.get("candidate_priority"), 0),
-                int(previous.get("signal_score") or 0),
-            ) if previous else (0, 0)
-            if (priority, signal_score) > previous_rank:
-                by_value[value] = candidate
-    candidates = list(by_value.values())
-    candidates.sort(key=lambda item: ({"high": 0, "medium": 1, "low": 2}[item["candidate_priority"]],
-                                      -int(item.get("signal_score") or 0),
-                                      int(item["page_hint"]) if str(item["page_hint"]).isdigit() else 10**9))
-    return candidates[:limit]
+def _normalise_scope_profile(value: object) -> dict:
+    raw = value if isinstance(value, dict) else {}
+    profile: dict = {}
+    for field in SCOPE_PROFILE_FIELDS:
+        item = raw.get(field)
+        if field in {"project_identity", "scope_summary"}:
+            profile[field] = _clean_model_text(item)[:1200]
+        elif isinstance(item, list):
+            values = []
+            for candidate in item:
+                text = _clean_model_text(candidate)[:180]
+                if text and text not in values:
+                    values.append(text)
+                if len(values) >= 24:
+                    break
+            profile[field] = values
+        else:
+            profile[field] = []
+    return profile
+
+
+def _project_scope_profile(app, task: dict, profile: dict, documents: list[dict], rules: list[dict]) -> dict:
+    """按招标依据一次生成范围画像并缓存，不在投标文件间重复调用。"""
+    source_limit = _prompt_char_limit(profile, 100_000, 160_000)
+    tender_text = _scope_source(documents, source_limit)
+    if not tender_text:
+        return _normalise_scope_profile({})
+    project = storage.get_project(app, task["project_id"]) or {}
+    rule_packet = [{"title": item.get("title"), "check_rule": item.get("check_rule"), "source_text": item.get("source_text")}
+                   for item in rules]
+    scope_key = hashlib.sha256(json.dumps({
+        "version": PROMPT_VERSION, "profile": profile.get("profile_id"), "model": profile.get("model_name"),
+        "tender": tender_text, "rules": rule_packet,
+        "system": storage.prompt_template(app, "evaluate_all_scope_profile"),
+        "user": storage.prompt_template(app, "evaluate_all_scope_profile_user"),
+    }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    cached = storage.get_project_scope_checkpoint(app, task["project_id"], scope_key)
+    if cached is not None:
+        return _normalise_scope_profile(cached)
+    prompt = storage.render_prompt_template(
+        app, "evaluate_all_scope_profile_user", project_name=project.get("name") or "未填写",
+        rules=json.dumps(rule_packet, ensure_ascii=False, separators=(",", ":")), tender_text=tender_text,
+    )
+    try:
+        parsed = _request_task_json(
+            app, task, profile, "evaluate_all_scope_profile", _system_prompt(app, "evaluate_all_scope_profile"), prompt,
+            context_mode="project_scope_source", max_tokens=_output_token_budget(profile, 2_800), thinking_mode="disabled",
+        )
+    except InvalidJsonResponse as exc:
+        parsed = _repair_invalid_json(app, task, profile, "evaluate_all_scope_profile_json_repair", exc, "project_identity")
+    scope = _normalise_scope_profile(parsed)
+    storage.save_project_scope_checkpoint(app, task["project_id"], scope_key, scope)
+    return scope
 
 
 def _run_full_scan_piece(app, task: dict, profile: dict, document: dict, catalog: list[dict], chunk: dict,
-                          system_prompt: str, depth: int = 0) -> tuple[list[dict], int, int, list[dict]]:
+                          project_scope: dict, system_prompt: str, depth: int = 0) -> tuple[dict, int, int, list[dict]]:
     """扫描一个连续页块；只在输出异常时拆分规则目录，绝不递归重发全文。"""
     allowed_ids = {item["id"] for item in catalog}
     # 首轮只是候选索引而非最终结论；固定且较小的输出预算能抑制模型逐条长篇解释。
     max_tokens = _output_token_budget(profile, min(2_800, max(1_400, 800 + len(catalog) * 28)))
 
-    def findings_from(parsed: object) -> list[dict]:
+    def findings_from(parsed: object) -> dict:
         values = parsed.get("matches") if isinstance(parsed, dict) else None
         if values is None and isinstance(parsed, dict):
             values = parsed.get("findings")  # 兼容用户尚未重置的旧自定义模板。
         if not isinstance(values, list):
             raise ValueError("模型返回格式不符合全文扫描要求")
-        return _normalise_scan_findings(values, allowed_ids, chunk)
+        anomalies = parsed.get("scope_anomalies") if isinstance(parsed, dict) else []
+        # 旧版用户自定义提示词不含该字段时仍可继续完成规则审查。
+        if anomalies is None:
+            anomalies = []
+        if not isinstance(anomalies, list):
+            raise ValueError("模型返回的项目范围候选格式不正确")
+        return {
+            "findings": _normalise_scan_findings(values, allowed_ids, chunk),
+            "scope_anomalies": _normalise_scope_anomalies(anomalies, chunk),
+        }
 
     format_error: ValueError | None = None
     try:
         parsed = _request_task_json(
             app, task, profile, "evaluate_all_full_scan", system_prompt,
-            _full_scan_prompt(app, document, catalog, chunk, compact=False),
+            _full_scan_prompt(app, document, catalog, chunk, project_scope, compact=False),
             document_id=document["document_id"], context_mode=f"full_scan:{chunk['chunk_id']}",
             max_tokens=max_tokens, thinking_mode="disabled",
         )
@@ -1229,15 +1190,18 @@ def _run_full_scan_piece(app, task: dict, profile: dict, document: dict, catalog
     if isinstance(format_error, InvalidJsonResponse) and format_error.finish_reason.lower() in {"length", "max_tokens"} and len(catalog) > 12 and depth < 1:
         midpoint = len(catalog) // 2
         storage.update_task(app, task["task_id"], message=f"{document['bidder_name'] or document['original_name']} {_full_scan_chunk_label(chunk)} 扫描输出达到上限，正在仅拆分规则目录")
-        left = _run_full_scan_piece(app, task, profile, document, catalog[:midpoint], chunk, system_prompt, depth + 1)
-        right = _run_full_scan_piece(app, task, profile, document, catalog[midpoint:], chunk, system_prompt, depth + 1)
-        return left[0] + right[0], left[1] + right[1], left[2] + right[2] + 1, left[3] + right[3]
+        left = _run_full_scan_piece(app, task, profile, document, catalog[:midpoint], chunk, project_scope, system_prompt, depth + 1)
+        right = _run_full_scan_piece(app, task, profile, document, catalog[midpoint:], chunk, project_scope, system_prompt, depth + 1)
+        return {
+            "findings": left[0]["findings"] + right[0]["findings"],
+            "scope_anomalies": left[0]["scope_anomalies"] + right[0]["scope_anomalies"],
+        }, left[1] + right[1], left[2] + right[2] + 1, left[3] + right[3]
 
     storage.update_task(app, task["task_id"], message=f"{document['bidder_name'] or document['original_name']} {_full_scan_chunk_label(chunk)} 全文扫描格式异常，正在严格重试")
     try:
         parsed = _request_task_json(
             app, task, profile, "evaluate_all_full_scan_compact_retry", system_prompt,
-            _full_scan_prompt(app, document, catalog, chunk, compact=True),
+            _full_scan_prompt(app, document, catalog, chunk, project_scope, compact=True),
             document_id=document["document_id"], context_mode=f"full_scan_compact:{chunk['chunk_id']}",
             max_tokens=max_tokens, thinking_mode="disabled",
         )
@@ -1248,15 +1212,18 @@ def _run_full_scan_piece(app, task: dict, profile: dict, document: dict, catalog
         if len(catalog) > 12 and depth < 1:
             midpoint = len(catalog) // 2
             storage.update_task(app, task["task_id"], message=f"{document['bidder_name'] or document['original_name']} {_full_scan_chunk_label(chunk)} 扫描仍异常，正在仅拆分规则目录")
-            left = _run_full_scan_piece(app, task, profile, document, catalog[:midpoint], chunk, system_prompt, depth + 1)
-            right = _run_full_scan_piece(app, task, profile, document, catalog[midpoint:], chunk, system_prompt, depth + 1)
-            return left[0] + right[0], left[1] + right[1] + 1, left[2] + right[2] + 1, left[3] + right[3]
+            left = _run_full_scan_piece(app, task, profile, document, catalog[:midpoint], chunk, project_scope, system_prompt, depth + 1)
+            right = _run_full_scan_piece(app, task, profile, document, catalog[midpoint:], chunk, project_scope, system_prompt, depth + 1)
+            return {
+                "findings": left[0]["findings"] + right[0]["findings"],
+                "scope_anomalies": left[0]["scope_anomalies"] + right[0]["scope_anomalies"],
+            }, left[1] + right[1] + 1, left[2] + right[2] + 1, left[3] + right[3]
         # 不能再拆分时不静默丢页：最终复核会把此页块原文发送给相关规则组。
-        return [], 1, 0, [{**chunk, "scan_error": str(retry_exc)[:300]}]
+        return {"findings": [], "scope_anomalies": []}, 1, 0, [{**chunk, "scan_error": str(retry_exc)[:300]}]
 
 
 def _scan_document_fulltext(app, task: dict, profile: dict, document: dict, rules: list[dict],
-                            system_prompt: str, *, reference_regions: list[str] | None = None,
+                            project_scope: dict, system_prompt: str, *,
                             progress_offset: int = 0, progress_total: int = 1) -> dict | None:
     try:
         text_length = int(document.get("text_length") or 0)
@@ -1272,9 +1239,11 @@ def _scan_document_fulltext(app, task: dict, profile: dict, document: dict, rule
     catalog = _full_scan_catalog(rules)
     scan_key = hashlib.sha256(json.dumps({
         "version": PROMPT_VERSION, "profile": profile.get("profile_id"), "model": profile.get("model_name"),
-        "catalog": catalog, "template": storage.prompt_template(app, "evaluate_all_full_scan_user"),
+        "catalog": catalog, "project_scope": project_scope,
+        "template": storage.prompt_template(app, "evaluate_all_full_scan_user"),
     }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
     findings: list[dict] = []
+    scope_anomalies: list[dict] = []
     failed_chunks: list[dict] = []
     compact_retry_count = split_retry_count = 0
     total = max(1, len(chunks))
@@ -1289,10 +1258,16 @@ def _scan_document_fulltext(app, task: dict, profile: dict, document: dict, rule
         )
         checkpoint = storage.get_evaluation_scan_checkpoint(app, document["document_id"], scan_key, chunk["chunk_id"], chunk_hash)
         if checkpoint is not None:
-            findings.extend(checkpoint)
+            # 兼容 v3 已落库的纯 findings 检查点，避免升级时浪费一次扫描。
+            if isinstance(checkpoint, list):
+                findings.extend(checkpoint)
+            elif isinstance(checkpoint, dict):
+                findings.extend(checkpoint.get("findings") or [])
+                scope_anomalies.extend(checkpoint.get("scope_anomalies") or [])
             continue
-        result = _run_full_scan_piece(app, task, profile, document, catalog, chunk, system_prompt)
-        findings.extend(result[0])
+        result = _run_full_scan_piece(app, task, profile, document, catalog, chunk, project_scope, system_prompt)
+        findings.extend(result[0]["findings"])
+        scope_anomalies.extend(result[0]["scope_anomalies"])
         compact_retry_count += result[1]
         split_retry_count += result[2]
         failed_chunks.extend(result[3])
@@ -1303,9 +1278,8 @@ def _scan_document_fulltext(app, task: dict, profile: dict, document: dict, rule
     return {
         "chunks": chunks,
         "findings": findings,
-        "entity_candidates": _local_entity_candidates(chunks),
-        "reference_regions": list(reference_regions or []),
-        "geography_candidates": _geography_consistency_candidates(chunks, list(reference_regions or [])),
+        "project_scope": project_scope,
+        "scope_anomalies": scope_anomalies,
         "failed_chunks": failed_chunks,
         "chunk_count": len(chunks),
         "scan_batch_count": total,
@@ -1363,14 +1337,30 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int) ->
     for chunk_id in select_rule_chunks(scan.get("chunks", []), rules, per_rule=per_rule):
         if chunk_id not in selected_ids:
             selected_ids.append(chunk_id)
-    rule_text = " ".join(f"{item.get('title', '')} {item.get('check_rule', '')} {item.get('source_text', '')}" for item in rules)
-    consistency_terms = ("公司名称", "项目名称", "地名", "地区", "无关", "矛盾", "技术方案", "项目一致", "全文")
-    if any(term in rule_text for term in consistency_terms):
-        # 高优先级异地政策候选对应原页必须进入最终判断，不能只给模型看正则摘录。
-        geo_ids = [str(item.get("chunk_id") or "").split(".", 1)[0]
-                   for item in scan.get("geography_candidates", [])
-                   if item.get("candidate_priority") == "high"]
-        for chunk_id in reversed([item for item in geo_ids if item]):
+    review_categories = {"qualification", "compliance", "substantive", "rejection", "other"}
+    is_review_group = any(item.get("category") in review_categories for item in rules)
+    scope_anomalies, seen_scope = [], set()
+    priority_rank = {"high": 0, "medium": 1, "low": 2}
+    for item in scan.get("scope_anomalies", []):
+        signature = (
+            item.get("chunk_id"), item.get("dimension"),
+            re.sub(r"\s+", "", str(item.get("evidence") or ""))[:180],
+        )
+        if signature in seen_scope:
+            continue
+        seen_scope.add(signature)
+        scope_anomalies.append(item)
+    scope_anomalies.sort(key=lambda item: priority_rank.get(item.get("candidate_priority"), 1))
+    if is_review_group:
+        # 该通道不依赖“地区、项目名”等固定关键词：任何范围偏离候选的原页都会
+        # 进入审查组，最终是否构成问题仍完全由 AI 结合规则和原文判断。
+        anomaly_ids = []
+        # 每条候选同时需要保留原页；过多的摘要会挤掉原文，故保留优先级最高的 12 条。
+        for item in scope_anomalies[:12]:
+            root_id = str(item.get("chunk_id") or "").split(".", 1)[0]
+            if root_id and root_id not in anomaly_ids:
+                anomaly_ids.append(root_id)
+        for chunk_id in reversed(anomaly_ids):
             if chunk_id in selected_ids:
                 selected_ids.remove(chunk_id)
             selected_ids.insert(0, chunk_id)
@@ -1383,16 +1373,13 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int) ->
             selected_ids.insert(0, root_id)
     findings_limit = 240 if strategy == "counting" else 160
     findings_packet = json.dumps(findings[:findings_limit], ensure_ascii=False, separators=(",", ":"))
-    entity_packet = ""
-    if any(term in rule_text for term in consistency_terms):
-        geography = scan.get("geography_candidates", [])
-        entity_packet = (
-            "\n\n【项目地域基准（来自招标文件，仅用于一致性比对）】\n"
-            + json.dumps(scan.get("reference_regions", []), ensure_ascii=False, separators=(",", ":"))
-            + "\n\n【异地行政区/当地政策一致性候选（须结合原页判断，地址与业绩已降权）】\n"
-            + json.dumps(geography[:80], ensure_ascii=False, separators=(",", ":"))
-            + "\n\n【本地全文公司/项目/地区实体校对候选】\n"
-            + json.dumps(scan.get("entity_candidates", [])[:180], ensure_ascii=False, separators=(",", ":"))
+    scope_packet = ""
+    if is_review_group:
+        scope_packet = (
+            "\n\n【项目范围画像（来自招标文件和已确认规则）】\n"
+            + json.dumps(scan.get("project_scope", {}), ensure_ascii=False, separators=(",", ":"))
+            + "\n\n【项目范围偏离候选（仅供结合原页和规则核验，不是既成结论）】\n"
+            + json.dumps(scope_anomalies[:12], ensure_ascii=False, separators=(",", ":"))
         )
     header = (
         f"【全文覆盖说明】已按连续页块扫描全文，共 {scan.get('chunk_count', 0)} 个页块；本规则组采用{strategy}汇总策略；"
@@ -1401,7 +1388,7 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int) ->
     )
     if failed_root_ids:
         header += f"有 {len(failed_root_ids)} 个首轮格式异常页块，下面已附原文供本轮直接复核。"
-    prefix = f"{header}{entity_packet}\n\n【首轮 AI 候选证据】\n{findings_packet}\n\n【重点原文】\n"
+    prefix = f"{header}{scope_packet}\n\n【首轮 AI 候选证据】\n{findings_packet}\n\n【重点原文】\n"
     if len(prefix) >= char_limit:
         prefix = prefix[:char_limit]
     chunks_by_id = {str(item.get("chunk_id")): item for item in scan.get("chunks", [])}
@@ -1702,7 +1689,10 @@ def _evaluate_all(app, task: dict) -> dict:
         "subjective": {item["rule_id"] for item in subjective_rules},
     }
     system_prompt = _system_prompt(app, "evaluate_all")
-    reference_regions = _reference_regions(all_documents)
+    storage.update_task(app, task["task_id"], message="正在根据招标文件建立项目范围画像")
+    project_scope = _project_scope_profile(
+        app, task, profile, all_documents, review_rules + objective_rules + subjective_rules,
+    )
     compact_retry_count = split_retry_count = 0
     manual_fallback_rule_count = 0
     reused_document_count = 0
@@ -1734,8 +1724,7 @@ def _evaluate_all(app, task: dict) -> dict:
             storage.update_task(app, task["task_id"], progress=int(completed_work_units * 100 / total_work_units), message=f"已复用 {document['bidder_name'] or document['original_name']} 的完整评审结果")
             continue
         scan_index = _scan_document_fulltext(
-            app, task, profile, document, review_rules + objective_rules + subjective_rules, system_prompt,
-            reference_regions=reference_regions,
+            app, task, profile, document, review_rules + objective_rules + subjective_rules, project_scope, system_prompt,
             progress_offset=completed_work_units, progress_total=total_work_units,
         )
         completed_work_units += scan_units_by_document[document["document_id"]]

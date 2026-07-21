@@ -229,6 +229,16 @@ def init_database(app) -> None:
                 UNIQUE(document_id, scan_key, chunk_id, chunk_hash)
             );
             CREATE INDEX IF NOT EXISTS idx_ew_scan_cache_document ON ew_evaluation_scan_cache(document_id, scan_key);
+            CREATE TABLE IF NOT EXISTS ew_project_scope_cache (
+                scope_cache_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES ew_projects(project_id) ON DELETE CASCADE,
+                scope_key TEXT NOT NULL,
+                scope_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(project_id, scope_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_ew_scope_cache_project ON ew_project_scope_cache(project_id, scope_key);
             CREATE TABLE IF NOT EXISTS ew_compare_pairs (
                 pair_id TEXT PRIMARY KEY,
                 task_id TEXT NOT NULL REFERENCES ew_tasks(task_id) ON DELETE CASCADE,
@@ -896,7 +906,7 @@ def record_model_call(app, task_id: str, project_id: str, phase: str, profile_id
         )
 
 
-def get_evaluation_scan_checkpoint(app, document_id: str, scan_key: str, chunk_id: str, chunk_hash: str) -> list[dict] | None:
+def get_evaluation_scan_checkpoint(app, document_id: str, scan_key: str, chunk_id: str, chunk_hash: str) -> object | None:
     """读取可复用的全文扫描页块；只保存候选证据，不保存模型原始输出。"""
     with connection(app) as conn:
         row = conn.execute(
@@ -910,11 +920,11 @@ def get_evaluation_scan_checkpoint(app, document_id: str, scan_key: str, chunk_i
         value = json.loads(row["findings_json"])
     except (TypeError, json.JSONDecodeError):
         return None
-    return value if isinstance(value, list) else None
+    return value if isinstance(value, (list, dict)) else None
 
 
 def save_evaluation_scan_checkpoint(app, project_id: str, document_id: str, scan_key: str,
-                                    chunk_id: str, chunk_hash: str, findings: list[dict]) -> None:
+                                    chunk_id: str, chunk_hash: str, findings: object) -> None:
     """每个成功页块立即落库，工作进程中断后可继续使用。"""
     timestamp = now_iso()
     with connection(app) as conn:
@@ -925,7 +935,33 @@ def save_evaluation_scan_checkpoint(app, project_id: str, document_id: str, scan
                ON CONFLICT(document_id, scan_key, chunk_id, chunk_hash) DO UPDATE SET
                findings_json=excluded.findings_json, updated_at=excluded.updated_at""",
             (str(uuid.uuid4()), project_id, document_id, scan_key, chunk_id, chunk_hash,
-             json.dumps(findings, ensure_ascii=False), timestamp, timestamp),
+              json.dumps(findings, ensure_ascii=False), timestamp, timestamp),
+        )
+
+
+def get_project_scope_checkpoint(app, project_id: str, scope_key: str) -> dict | None:
+    with connection(app) as conn:
+        row = conn.execute(
+            "SELECT scope_json FROM ew_project_scope_cache WHERE project_id=? AND scope_key=?",
+            (project_id, scope_key),
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        value = json.loads(row["scope_json"])
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def save_project_scope_checkpoint(app, project_id: str, scope_key: str, scope: dict) -> None:
+    timestamp = now_iso()
+    with connection(app) as conn:
+        conn.execute(
+            """INSERT INTO ew_project_scope_cache(scope_cache_id, project_id, scope_key, scope_json, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(project_id, scope_key) DO UPDATE SET scope_json=excluded.scope_json, updated_at=excluded.updated_at""",
+            (str(uuid.uuid4()), project_id, scope_key, json.dumps(scope, ensure_ascii=False), timestamp, timestamp),
         )
 
 

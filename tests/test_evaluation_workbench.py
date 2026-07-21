@@ -88,6 +88,15 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         )
         self.assertIsNone(storage.get_evaluation_scan_checkpoint(self.app, document["document_id"], "scan-v2", "chunk_1", "changed"))
 
+    def test_project_scope_profile_checkpoint_is_reusable(self):
+        scope = {"project_identity": "测试项目", "technical_topics": ["无人机航测"]}
+
+        storage.save_project_scope_checkpoint(self.app, self.project["project_id"], "scope-v1", scope)
+
+        self.assertEqual(
+            storage.get_project_scope_checkpoint(self.app, self.project["project_id"], "scope-v1"), scope,
+        )
+
     def test_compact_full_scan_matches_are_normalised(self):
         findings = worker._normalise_scan_findings(
             [["rule-1", "7", "类似项目合同", "supports"]], {"rule-1"},
@@ -678,6 +687,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.create_task(self.app, self.project["project_id"], "evaluate_all")
 
         with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[
+            {"project_identity": "测试项目", "scope_summary": "资质与技术方案", "service_targets": [], "core_tasks": [],
+             "technical_topics": ["技术方案"], "equipment_or_materials": [], "deliverables": [], "standards_or_rules": [], "regions": [], "keywords": ["资质"]},
             {"results": [{"rule_id": review_rule["rule_id"], "status": "satisfied", "evidence": "具备资质", "reason": "已提供", "risk_level": "low"}]},
             {"results": [{"rule_id": objective_rule["rule_id"], "met": True, "evidence": "具备资质", "reason": "已提供"}]},
             {"results": [{"rule_id": subjective_rule["rule_id"], "suggested_score": 8, "evidence": "技术方案完整", "reason": "较完整"}]},
@@ -692,11 +703,12 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(reviews[0]["status"], "satisfied")
         self.assertEqual(objectives[0]["suggested_score"], 5.0)
         self.assertEqual(subjectives[0]["suggested_score"], 8.0)
-        self.assertEqual(usage["call_count"], 3)
+        self.assertEqual(usage["call_count"], 4)
         self.assertEqual(usage["input_chars"] > 0, True)
-        self.assertEqual(request_json.call_args_list[0].args[0]["thinking_mode"], "adaptive")
-        self.assertEqual(request_json.call_args_list[1].args[0]["thinking_mode"], "disabled")
-        self.assertEqual(request_json.call_args_list[2].args[0]["thinking_mode"], "adaptive")
+        self.assertEqual(request_json.call_args_list[0].args[0]["thinking_mode"], "disabled")
+        self.assertEqual(request_json.call_args_list[1].args[0]["thinking_mode"], "adaptive")
+        self.assertEqual(request_json.call_args_list[2].args[0]["thinking_mode"], "disabled")
+        self.assertEqual(request_json.call_args_list[3].args[0]["thinking_mode"], "adaptive")
 
     def test_long_document_is_fully_scanned_before_rule_group_synthesis(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "近年的类似项目情况表：项目一。")
@@ -777,47 +789,36 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(results[0]["suggested_score"], 6.0)
         self.assertIn("AI共识别2项", results[0]["evidence"])
 
-    def test_full_text_entity_candidates_keep_page_for_second_pass(self):
-        candidates = worker._local_entity_candidates([{
-            "chunk_id": "chunk_1",
-            "text": "[第7页]\n项目名称：临汾市无人机航测项目\n供应商：示例科技有限公司\n",
-        }])
-
-        self.assertTrue(any(item["kind"] == "项目名称" and item["page_hint"] == "7" for item in candidates))
-        self.assertTrue(any(item["kind"] == "公司名称" and item["page_hint"] == "7" for item in candidates))
-        self.assertTrue(any(item["kind"] == "地区名称" and item["value"] == "临汾市" for item in candidates))
-
-    def test_geography_consistency_keeps_late_local_policy_for_final_review(self):
+    def test_scope_anomaly_keeps_any_late_off_topic_content_for_final_review(self):
         chunks = [
             {"chunk_id": "chunk_1", "start_page": 1, "end_page": 20,
-             "text": "[第1页]\n朔城区禁种铲毒航测服务项目。"},
+             "text": "[第1页]\n无人机航测服务项目。"},
             {"chunk_id": "chunk_12", "start_page": 121, "end_page": 130,
-             "text": "[第127页]\n遵守山西省、临汾市本地无人机飞行管控要求，开展作业。"},
+             "text": "[第127页]\n锅炉燃烧控制设备安装与蒸汽管网调试方案。"},
         ]
-        candidates = worker._geography_consistency_candidates(chunks, ["山西省", "朔城区"])
-        self.assertTrue(any(item["value"] == "临汾市" and item["candidate_priority"] == "high" for item in candidates))
         scan = {
             "chunks": chunks, "findings": [], "failed_chunks": [], "chunk_count": 2,
-            "reference_regions": ["山西省", "朔城区"], "geography_candidates": candidates,
-            "entity_candidates": worker._local_entity_candidates(chunks),
+            "project_scope": {"scope_summary": "无人机航测服务", "technical_topics": ["无人机航测"]},
+            "scope_anomalies": [{"chunk_id": "chunk_12", "dimension": "无关技术与设备", "candidate_priority": "high",
+                                  "evidence": "锅炉燃烧控制设备安装", "relation": "与无人机航测无关", "observation": "需核验"}],
         }
         rules = [{
             "rule_id": "unrelated", "category": "other", "title": "投标文件出现无关内容",
             "check_rule": "全文核对无关项目名称及技术方案矛盾", "source_text": "",
         }]
         context = worker._full_scan_review_context(scan, rules, 20_000)
-        self.assertIn("临汾市本地无人机飞行管控要求", context["text"])
+        self.assertIn("锅炉燃烧控制设备安装", context["text"])
         self.assertIn("chunk_12", context["pages"])
 
-    def test_entity_candidate_caps_do_not_drop_late_region_kind(self):
-        lines = [f"[第{index + 1}页]\n示例企业{index}有限公司" for index in range(140)]
-        lines.append("[第200页]\n临汾市本地无人机飞行管控要求")
-        candidates = worker._local_entity_candidates([{"chunk_id": "chunk_1", "text": "\n".join(lines)}], limit=180)
-        self.assertTrue(any(item["kind"] == "地区名称" and item["value"] == "临汾市" for item in candidates))
+    def test_scope_anomaly_normalises_open_dimension_without_fixed_keywords(self):
+        candidates = worker._normalise_scope_anomalies(
+            [["127", "无关设备与工艺", "high", "锅炉燃烧控制设备", "不属于航测服务", "建议核验来源"]],
+            {"chunk_id": "chunk_12", "start_page": 121, "end_page": 130},
+        )
 
-    def test_region_candidates_remove_sentence_prefixes_and_pseudo_places(self):
-        self.assertEqual(worker._region_mentions("2026年朔城区禁种铲毒项目，在朔州市实施"), ["朔城区", "朔州市"])
-        self.assertEqual(worker._region_mentions("供应商应提供市级证明，覆盖主要区域且不得低于市级标准"), [])
+        self.assertEqual(candidates[0]["dimension"], "无关设备与工艺")
+        self.assertEqual(candidates[0]["candidate_priority"], "high")
+        self.assertEqual(candidates[0]["page_range"], "第121-130页")
 
     def test_combined_evaluation_splits_review_rules_into_small_groups(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "投标文件包含全部承诺。")
@@ -848,6 +849,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.confirm_rule_set(self.app, self.project["project_id"])
         storage.create_task(self.app, self.project["project_id"], "evaluate_all")
         with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[
+            {"project_identity": "测试项目", "scope_summary": "资质与技术方案", "service_targets": [], "core_tasks": [],
+             "technical_topics": [], "equipment_or_materials": [], "deliverables": [], "standards_or_rules": [], "regions": [], "keywords": []},
             ValueError("模型未返回有效 JSON"),
             {"results": [{"rule_id": review_rule["rule_id"], "status": "satisfied", "evidence": "具备资质", "reason": "已提供", "risk_level": "low"}]},
             {"results": [{"rule_id": objective_rule["rule_id"], "met": True, "evidence": "具备资质", "reason": "已提供"}]},
@@ -857,9 +860,10 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         self.assertEqual(finished["status"], "success")
         self.assertEqual(finished["result"]["compact_retry_count"], 1)
-        self.assertEqual(request_json.call_count, 4)
-        self.assertEqual(request_json.call_args_list[0].args[0]["thinking_mode"], "adaptive")
-        self.assertEqual(request_json.call_args_list[1].args[0]["thinking_mode"], "disabled")
+        self.assertEqual(request_json.call_count, 5)
+        self.assertEqual(request_json.call_args_list[0].args[0]["thinking_mode"], "disabled")
+        self.assertEqual(request_json.call_args_list[1].args[0]["thinking_mode"], "adaptive")
+        self.assertEqual(request_json.call_args_list[2].args[0]["thinking_mode"], "disabled")
 
     def test_combined_evaluation_repairs_only_raw_response_before_resending_document(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "本公司具备有效资质，正文不应在修复调用中重发。")
@@ -980,7 +984,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.add_rule(self.app, self.project["project_id"], {"category": "objective", "title": "资质得分", "source_text": "资质得5分", "scoring": {"kind": "boolean", "max_score": 5}})
         storage.add_rule(self.app, self.project["project_id"], {"category": "subjective", "title": "技术方案", "source_text": "技术方案满分10分", "scoring": {"max_score": 10}})
         storage.confirm_rule_set(self.app, self.project["project_id"])
-        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "fulltext-coverage-v3")
+        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "project-scope-coverage-v4")
         prior = storage.create_task(self.app, self.project["project_id"], "evaluate_all", {"profile_id": None, "input_fingerprint": fingerprint})
         storage.update_task(self.app, prior["task_id"], status="success", result={"cached": True})
 
