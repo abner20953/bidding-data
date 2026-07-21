@@ -17,7 +17,7 @@ from dashboard.evaluation_workbench.ai_gateway import test_connection
 
 
 evaluation_workbench_bp = Blueprint("evaluation_workbench", __name__)
-TASK_PROMPT_VERSION = "project-scope-coverage-v5"
+TASK_PROMPT_VERSION = "project-scope-coverage-v7"
 MODEL_CONFIGURATION_PASSWORD = "108"
 
 

@@ -81,9 +81,36 @@ def render_prompt_template(app, template_id: str, **values: object) -> str:
     return re.sub(r"\{\{([a-z_]+)\}\}", lambda match: str(values.get(match.group(1), match.group(0))), content)
 
 
-def prompt_template_fingerprint(app) -> str:
-    values = {item["template_id"]: item["content"] for item in list_prompt_templates(app)}
+def prompt_template_fingerprint(app, template_ids: set[str] | tuple[str, ...] | list[str] | None = None) -> str:
+    """生成提示词指纹；可限定到一个任务真正使用的模板集合。"""
+    selected = set(template_ids) if template_ids is not None else None
+    values = {
+        item["template_id"]: item["content"]
+        for item in list_prompt_templates(app)
+        if selected is None or item["template_id"] in selected
+    }
     return hashlib.sha256(json.dumps(values, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def task_prompt_template_fingerprint(app, task_type: str) -> str | None:
+    """只让会实际参与该任务的提示词影响缓存，避免无关编辑触发昂贵重跑。"""
+    templates_by_task = {
+        "compare_documents": {"compare_ai_assessment", "compare_ai_assessment_user", "json_repair", "json_repair_user"},
+        "extract_rules": {
+            "extract_rules", "extract_rules_guidance", "extract_rules_user", "extract_rules_compile_user",
+            "extract_rules_coverage_user", "extract_rules_supplement_user", "json_repair", "json_repair_user",
+        },
+        "review_documents": {"review_documents", "review_documents_user", "json_repair", "json_repair_user"},
+        "score_objective": {"score_objective", "score_objective_user", "json_repair", "json_repair_user"},
+        "score_subjective": {"score_subjective", "score_subjective_user", "json_repair", "json_repair_user"},
+        "evaluate_all": {
+            "evaluate_all", "evaluate_all_guidance", "evaluate_all_scope_profile", "evaluate_all_scope_profile_user",
+            "evaluate_all_full_scan_user", "evaluate_all_review_user", "evaluate_all_objective_user",
+            "evaluate_all_subjective_user", "evaluate_all_cross_bid_price_user", "json_repair", "json_repair_user",
+        },
+    }
+    template_ids = templates_by_task.get(task_type)
+    return prompt_template_fingerprint(app, template_ids) if template_ids else None
 
 
 def update_prompt_template(app, template_id: str, content: object) -> dict:
@@ -756,7 +783,7 @@ def task_input_fingerprint(app, project_id: str, task_type: str, profile_id: str
         "rule_set_updated_at": (rule_set or {}).get("updated_at") if uses_rules else None,
         "profile": (profile.get("profile_id"), profile.get("model_name"), profile.get("base_url"), profile.get("updated_at"), profile.get("json_mode"), profile.get("thinking_mode")),
         "comparison_version": "cross-bid-signals-v2" if task_type == "compare_documents" else None,
-        "prompt_templates": prompt_template_fingerprint(app) if task_type in {"compare_documents", "extract_rules", "review_documents", "score_objective", "score_subjective", "evaluate_all"} else None,
+        "prompt_templates": task_prompt_template_fingerprint(app, task_type),
     }
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -787,14 +814,31 @@ def list_tasks(app, project_id: str) -> list[dict]:
 
 
 def list_task_summaries(app, project_id: str) -> list[dict]:
-    """供轮询使用：不读取可能很大的任务结果 JSON。"""
+    """供轮询使用；综合评审仅携带很小的已完成投标人清单。"""
     with connection(app) as conn:
         rows = conn.execute(
-            """SELECT task_id, project_id, task_type, status, progress, message, error, created_at, started_at, finished_at, updated_at
+            """SELECT task_id, project_id, task_type, status, progress, message, error, created_at, started_at, finished_at, updated_at,
+                      CASE WHEN task_type = 'evaluate_all' THEN result_json ELSE NULL END AS result_json
                FROM ew_tasks WHERE project_id = ? ORDER BY created_at DESC LIMIT 50""",
             (project_id,),
         ).fetchall()
-    return [dict(row) for row in rows]
+    values = []
+    for row in rows:
+        value = dict(row)
+        raw_result = value.pop("result_json", None)
+        if raw_result:
+            try:
+                result = json.loads(raw_result)
+            except (TypeError, json.JSONDecodeError):
+                result = {}
+            completed = result.get("completed_documents") if isinstance(result, dict) else None
+            if isinstance(completed, list):
+                value["completed_documents"] = [
+                    item for item in completed
+                    if isinstance(item, dict) and item.get("document_id")
+                ]
+        values.append(value)
+    return values
 
 
 def has_queued_tasks(app) -> bool:
@@ -1595,9 +1639,9 @@ def save_review_results(app, review_run_id: str, document_id: str, results: list
 def latest_review_results(app, project_id: str) -> tuple[dict | None, list[dict]]:
     with connection(app) as conn:
         run = conn.execute(
-            """SELECT r.*, t.status AS task_status, t.error AS task_error, t.progress AS task_progress
+            """SELECT r.*, t.status AS task_status, t.error AS task_error, t.progress AS task_progress, t.result_json AS task_result_json
                FROM ew_review_runs r JOIN ew_tasks t ON t.task_id = r.task_id
-               WHERE r.project_id = ? AND t.status IN ('success', 'error')
+               WHERE r.project_id = ? AND t.status IN ('running', 'success', 'error')
                AND EXISTS (SELECT 1 FROM ew_review_results item WHERE item.review_run_id = r.review_run_id)
                AND r.rule_set_id = (SELECT rule_set_id FROM ew_rule_sets WHERE project_id = ? ORDER BY version DESC LIMIT 1)
                ORDER BY r.rowid DESC LIMIT 1""", (project_id, project_id)
@@ -1620,7 +1664,17 @@ def latest_review_results(app, project_id: str) -> tuple[dict | None, list[dict]
     for result in results:
         if result.get("status") == "ocr_required":
             result["risk_level"] = "low"
-    return dict(run), results
+    value = dict(run)
+    try:
+        partial = json.loads(value.pop("task_result_json", "") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        partial = {}
+    if isinstance(partial, dict) and isinstance(partial.get("completed_documents"), list):
+        value["completed_document_ids"] = [
+            item["document_id"] for item in partial["completed_documents"]
+            if isinstance(item, dict) and item.get("document_id")
+        ]
+    return value, results
 
 
 def reusable_evaluation_document_results(app, project_id: str, rule_set_id: str, profile_id: str,
@@ -1764,9 +1818,9 @@ def save_score_results(app, score_run_id: str, document_id: str, results: list[d
 def latest_score_results(app, project_id: str, score_type: str) -> tuple[dict | None, list[dict]]:
     with connection(app) as conn:
         run = conn.execute(
-            """SELECT r.*, t.status AS task_status, t.error AS task_error, t.progress AS task_progress
+            """SELECT r.*, t.status AS task_status, t.error AS task_error, t.progress AS task_progress, t.result_json AS task_result_json
                FROM ew_score_runs r JOIN ew_tasks t ON t.task_id = r.task_id
-               WHERE r.project_id = ? AND r.score_type = ? AND t.status IN ('success', 'error')
+               WHERE r.project_id = ? AND r.score_type = ? AND t.status IN ('running', 'success', 'error')
                AND EXISTS (SELECT 1 FROM ew_score_results item WHERE item.score_run_id = r.score_run_id)
                AND r.rule_set_id = (SELECT rule_set_id FROM ew_rule_sets WHERE project_id = ? ORDER BY version DESC LIMIT 1)
                ORDER BY r.rowid DESC LIMIT 1""",
@@ -1780,7 +1834,17 @@ def latest_score_results(app, project_id: str, score_type: str) -> tuple[dict | 
             JOIN ew_rules rule ON rule.rule_id=s.rule_id
             WHERE s.score_run_id=? ORDER BY d.bidder_name, rule.sort_order""", (run["score_run_id"],)
         ).fetchall()
-    return dict(run), [dict(row) for row in rows]
+    value = dict(run)
+    try:
+        partial = json.loads(value.pop("task_result_json", "") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        partial = {}
+    if isinstance(partial, dict) and isinstance(partial.get("completed_documents"), list):
+        value["completed_document_ids"] = [
+            item["document_id"] for item in partial["completed_documents"]
+            if isinstance(item, dict) and item.get("document_id")
+        ]
+    return value, [dict(row) for row in rows]
 
 
 def update_final_score(app, score_result_id: str, final_score: float) -> dict:

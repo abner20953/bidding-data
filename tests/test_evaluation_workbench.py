@@ -1,6 +1,8 @@
 import io
 import shutil
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -299,6 +301,30 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertGreaterEqual(request_json.call_args_list[1].kwargs["max_tokens"], request_json.call_args_list[0].kwargs["max_tokens"])
         self.assertEqual(request_json.call_args_list[0].args[0]["thinking_mode"], "disabled")
 
+    def test_rule_compilation_splits_only_the_overflowing_group_and_keeps_all_rules(self):
+        task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
+        profile = storage.get_model_profile(self.app, None)
+        candidates = [
+            {"category": "qualification", "title": f"资格条件{index}", "check_rule": f"核验资格条件{index}",
+             "source_text": f"投标人应满足资格条件{index}", "source_page": index}
+            for index in range(12)
+        ]
+        left_rules, right_rules = candidates[:6], candidates[6:]
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[
+            worker.InvalidJsonResponse('{"rules":[', "length"),
+            {"rules": left_rules}, {"missing_rules": []},
+            {"rules": right_rules}, {"missing_rules": []},
+        ]) as request_json:
+            compiled, missing, used = worker._compile_rule_candidates(
+                self.app, task, profile, "规则编译系统提示", candidates, 40_000,
+            )
+
+        self.assertTrue(used)
+        self.assertEqual(missing, [])
+        self.assertEqual({item["title"] for item in compiled}, {item["title"] for item in candidates})
+        self.assertEqual(request_json.call_count, 5)
+        self.assertEqual(request_json.call_args_list[0].kwargs["max_tokens"], 6240)
+
     def test_rule_extraction_splits_long_source_into_bounded_batches(self):
         self._add_pdf("tender.pdf", "tender", "", "用于建立解析文件")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
@@ -509,6 +535,21 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(restored.status_code, 200)
         self.assertFalse(restored.get_json()["template"]["is_custom"])
         self.assertEqual(storage.prompt_template(self.app, "evaluate_all"), original["content"])
+
+    def test_task_prompt_fingerprint_ignores_unrelated_template_changes(self):
+        client = self.app.test_client()
+        self._unlock_model_configuration(client)
+        before_evaluation = storage.task_prompt_template_fingerprint(self.app, "evaluate_all")
+        before_extraction = storage.task_prompt_template_fingerprint(self.app, "extract_rules")
+
+        response = client.patch(
+            "/api/evaluation-workbench/prompt-templates/extract_rules_guidance",
+            json={"content": "完整提取可由投标文件核验的评审规则，并保留评分条件、证明材料和分值上限。"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(storage.task_prompt_template_fingerprint(self.app, "evaluate_all"), before_evaluation)
+        self.assertNotEqual(storage.task_prompt_template_fingerprint(self.app, "extract_rules"), before_extraction)
 
     def test_global_rules_require_password_and_are_automatically_imported_for_new_projects(self):
         client = self.app.test_client()
@@ -728,6 +769,61 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(request_json.call_args_list[2].args[0]["thinking_mode"], "disabled")
         self.assertEqual(request_json.call_args_list[3].args[0]["thinking_mode"], "adaptive")
 
+    def test_combined_evaluation_runs_two_bidders_with_bounded_parallelism(self):
+        self._add_pdf("bid-a.pdf", "bid", "甲公司", "甲公司具备有效资质。")
+        self._add_pdf("bid-b.pdf", "bid", "乙公司", "乙公司具备有效资质。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "有效资质", "source_text": "具备有效资质",
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        active = peak = 0
+        lock = threading.Lock()
+
+        def response(*_args, **_kwargs):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            return {"results": [{"rule_id": rule["rule_id"], "status": "satisfied", "evidence": "有效资质", "reason": "已提供"}]}
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=response):
+            finished = self._run_next_task()
+
+        _, reviews = storage.latest_review_results(self.app, self.project["project_id"])
+        self.assertEqual(finished["status"], "success")
+        self.assertEqual(peak, 2)
+        self.assertEqual(len(reviews), 2)
+
+    def test_running_evaluation_exposes_only_completed_document_ids(self):
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "甲公司具备有效资质。")
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "有效资质", "source_text": "具备有效资质",
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        profile = storage.get_model_profile(self.app, None)
+        run = storage.create_review_run(self.app, self.project["project_id"], task["task_id"], profile["profile_id"])
+        storage.save_review_results(self.app, run["review_run_id"], document["document_id"], [{
+            "rule_id": rule["rule_id"], "status": "satisfied", "evidence": "有效资质", "reason": "已提供",
+        }])
+        storage.update_task(self.app, task["task_id"], status="running", result={
+            "partial": True, "completed_documents": [{"document_id": document["document_id"], "bidder_name": "甲公司"}],
+        })
+
+        review_run, reviews = storage.latest_review_results(self.app, self.project["project_id"])
+        summary = next(item for item in storage.list_task_summaries(self.app, self.project["project_id"]) if item["task_id"] == task["task_id"])
+
+        self.assertEqual(review_run["task_status"], "running")
+        self.assertEqual(review_run["completed_document_ids"], [document["document_id"]])
+        self.assertEqual(len(reviews), 1)
+        self.assertEqual(summary["completed_documents"][0]["document_id"], document["document_id"])
+
     def test_long_document_is_fully_scanned_before_rule_group_synthesis(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "近年的类似项目情况表：项目一。")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
@@ -827,6 +923,34 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         context = worker._full_scan_review_context(scan, rules, 20_000)
         self.assertIn("锅炉燃烧控制设备安装", context["text"])
         self.assertIn("chunk_12", context["pages"])
+
+    def test_full_scan_context_reserves_raw_evidence_for_each_rule(self):
+        late_a = "资质证书编号A-2026，满足资格条件。"
+        late_b = "项目业绩B-2025，累计业绩证明齐全。"
+        scan = {
+            "chunks": [
+                {"chunk_id": "chunk_1", "start_page": 1, "end_page": 10, "text": "甲" * 8_000 + late_a + "甲" * 2_000},
+                {"chunk_id": "chunk_2", "start_page": 11, "end_page": 20, "text": "乙" * 8_000 + late_b + "乙" * 2_000},
+            ],
+            "findings": [
+                {"rule_id": "rule-a", "chunk_id": "chunk_1", "page_hint": "8", "evidence": late_a,
+                 "tentative_status": "supports", "evidence_priority": "high", "confidence": "high"},
+                {"rule_id": "rule-b", "chunk_id": "chunk_2", "page_hint": "18", "evidence": late_b,
+                 "tentative_status": "supports", "evidence_priority": "high", "confidence": "high"},
+            ],
+            "failed_chunks": [], "chunk_count": 2, "scope_anomalies": [], "project_scope": {},
+        }
+        rules = [
+            {"rule_id": "rule-a", "category": "qualification", "title": "有效资质", "check_rule": "核验资质证书"},
+            {"rule_id": "rule-b", "category": "objective", "title": "类似业绩", "check_rule": "核验业绩数量"},
+        ]
+
+        context = worker._full_scan_review_context(scan, rules, 12_000)
+
+        self.assertIn(late_a, context["text"])
+        self.assertIn(late_b, context["text"])
+        self.assertEqual(context["pages"][:2], ["chunk_1", "chunk_2"])
+        self.assertLessEqual(len(context["text"]), 12_000)
 
     def test_scope_anomaly_normalises_open_dimension_without_fixed_keywords(self):
         candidates = worker._normalise_scope_anomalies(
@@ -1002,7 +1126,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.add_rule(self.app, self.project["project_id"], {"category": "objective", "title": "资质得分", "source_text": "资质得5分", "scoring": {"kind": "boolean", "max_score": 5}})
         storage.add_rule(self.app, self.project["project_id"], {"category": "subjective", "title": "技术方案", "source_text": "技术方案满分10分", "scoring": {"max_score": 10}})
         storage.confirm_rule_set(self.app, self.project["project_id"])
-        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "project-scope-coverage-v5")
+        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "project-scope-coverage-v7")
         prior = storage.create_task(self.app, self.project["project_id"], "evaluate_all", {"profile_id": None, "input_fingerprint": fingerprint})
         storage.update_task(self.app, prior["task_id"], status="success", result={"cached": True})
 

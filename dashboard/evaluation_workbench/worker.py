@@ -8,8 +8,11 @@ import json
 import os
 import re
 import sys
+import threading
+import time
 import traceback
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -26,9 +29,42 @@ from dashboard.utils.comparator import CollusionDetector, ComparisonLimitError
 MAX_PARSE_PAGES = 2000
 MAX_PARSED_CHARS = 2_000_000
 MAX_DOCX_XML_BYTES = 50 * 1024 * 1024
-PROMPT_VERSION = "project-scope-coverage-v6"
+PROMPT_VERSION = "project-scope-coverage-v7"
 COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v2"
 COMPARE_AI_BATCH_SIZE = 24
+
+
+class _EvaluationRequestGate:
+    """综合评审内的模型请求闸门；遇限流时自动收敛到单路。"""
+
+    def __init__(self, limit: int = 2):
+        self.limit = max(1, int(limit))
+        self.active = 0
+        self.condition = threading.Condition()
+
+    def acquire(self) -> None:
+        with self.condition:
+            while self.active >= self.limit:
+                self.condition.wait()
+            self.active += 1
+
+    def release(self) -> None:
+        with self.condition:
+            self.active = max(0, self.active - 1)
+            self.condition.notify_all()
+
+    def limit_to_one(self) -> bool:
+        with self.condition:
+            if self.limit == 1:
+                return False
+            self.limit = 1
+            self.condition.notify_all()
+            return True
+
+
+def _is_rate_limit_error(error: Exception) -> bool:
+    message = str(error).lower()
+    return "http 429" in message or "rate limit" in message or "too many requests" in message or "限流" in str(error)
 
 
 def _prompt_char_limit(profile: dict, default: int, ceiling: int) -> int:
@@ -57,12 +93,34 @@ def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt
     def record_response_metadata(value: dict) -> None:
         response_metadata.update(value if isinstance(value, dict) else {})
 
+    gate = task.get("_evaluation_request_gate")
     try:
         effective_profile = {**profile, "thinking_mode": thinking_mode} if thinking_mode else profile
-        return request_json(
-            effective_profile, system_prompt, user_prompt, usage_callback=record_usage,
-            response_metadata_callback=record_response_metadata, max_tokens=max_tokens,
-        )
+        for attempt in range(2):
+            retry_after_rate_limit = False
+            if gate:
+                gate.acquire()
+            try:
+                return request_json(
+                    effective_profile, system_prompt, user_prompt, usage_callback=record_usage,
+                    response_metadata_callback=record_response_metadata, max_tokens=max_tokens,
+                )
+            except ValueError as exc:
+                # 仅综合评审的双路并行会使用该闸门。服务商限流时让后续请求
+                # 自动改为单路，并只重试当前这一小次模型调用，不重发整份文件。
+                if gate and attempt == 0 and _is_rate_limit_error(exc):
+                    if gate.limit_to_one():
+                        storage.update_task(app, task["task_id"], message="模型接口限流，已自动切换为单路继续评审")
+                    retry_after_rate_limit = True
+                else:
+                    raise
+            finally:
+                if gate:
+                    gate.release()
+            if retry_after_rate_limit:
+                # 必须先释放并发位；否则失败请求在退避期间会无谓阻塞另一家投标人的收尾。
+                time.sleep(2)
+                continue
     finally:
         # 部分兼容接口不返回 usage；仍保留发送字符数与截断元数据以便统计和优化。
         storage.record_model_call(
@@ -548,6 +606,115 @@ def _rule_compilation_packet(items: list[dict], char_limit: int) -> str:
     return json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
 
 
+RULE_COMPILATION_INPUT_CHARS = 48_000
+
+
+def _split_rule_compilation_groups(items: list[dict], max_chars: int) -> list[list[dict]]:
+    """按完整规则切分编译输入，绝不截断 JSON 或静默丢弃尾部规则。"""
+    groups: list[list[dict]] = []
+    current: list[dict] = []
+    size = 2
+    for item in items:
+        encoded = _rule_compilation_packet([item], max_chars)
+        item_size = len(encoded) - 2
+        if current and size + item_size + 1 > max_chars:
+            groups.append(current)
+            current, size = [], 2
+        current.append(item)
+        size += item_size + 1
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _rule_compilation_output_tokens(item_count: int) -> int:
+    """规则编译必须容纳完整规范规则；不足时由递归分组处理，而不是回退原始条款。"""
+    return max(4_500, min(10_000, 1_200 + max(1, item_count) * 420))
+
+
+def _compile_rule_group(app, task: dict, profile: dict, system_prompt: str,
+                        candidates: list[dict], char_limit: int, *, depth: int = 0) -> tuple[list[dict], list[dict], bool]:
+    """编译一个完整规则组；长度或格式异常时仅二分该组，保留每个子组的覆盖审计。"""
+    if len(candidates) <= 1:
+        return candidates, [], False
+    input_limit = min(char_limit, RULE_COMPILATION_INPUT_CHARS)
+    groups = _split_rule_compilation_groups(candidates, input_limit)
+    if len(groups) > 1:
+        compiled, missing, used = [], [], False
+        for index, group in enumerate(groups, start=1):
+            storage.update_task(app, task["task_id"], message=f"正在分组编译评审规则（{index}/{len(groups)}）")
+            values, uncovered, group_used = _compile_rule_group(
+                app, task, profile, system_prompt, group, char_limit, depth=depth + 1,
+            )
+            compiled.extend(values)
+            missing.extend(uncovered)
+            used = used or group_used
+        return _dedupe_rule_candidates(compiled), _dedupe_rule_candidates(missing), used
+
+    packet = _rule_compilation_packet(candidates, input_limit)
+    try:
+        compiled_response = _request_task_json(
+            app, task, profile, "extract_rules_compile", system_prompt,
+            storage.render_prompt_template(app, "extract_rules_compile_user", candidates=packet),
+            context_mode=f"rule_semantic_compile_d{depth}",
+            max_tokens=_output_token_budget(profile, _rule_compilation_output_tokens(len(candidates))), thinking_mode="disabled",
+        )
+        compiled = compiled_response.get("rules") if isinstance(compiled_response, dict) else None
+        if not isinstance(compiled, list):
+            raise ValueError("模型返回格式不符合规则编译要求")
+        compiled = _dedupe_rule_candidates([item for item in compiled if isinstance(item, dict)])
+        if not compiled:
+            raise ValueError("规则编译未返回有效规则")
+    except ValueError as exc:
+        # 输出截断或 JSON 偶发异常只影响当前规则组。二分后每一半仍会走语义合并和覆盖审计，
+        # 不能再把整套规则退回未经编译的原始候选。
+        if _is_invalid_json_model_response(exc) or str(exc).startswith("模型返回格式不符合规则编译要求") or str(exc).startswith("规则编译未返回有效规则"):
+            if len(candidates) > 1 and depth < 6:
+                midpoint = len(candidates) // 2
+                storage.update_task(app, task["task_id"], message="规则编译输出异常，正在仅拆分该规则组重试")
+                left = _compile_rule_group(app, task, profile, system_prompt, candidates[:midpoint], char_limit, depth=depth + 1)
+                right = _compile_rule_group(app, task, profile, system_prompt, candidates[midpoint:], char_limit, depth=depth + 1)
+                return (
+                    _dedupe_rule_candidates(left[0] + right[0]),
+                    _dedupe_rule_candidates(left[1] + right[1]),
+                    left[2] or right[2],
+                )
+        raise
+
+    try:
+        storage.update_task(app, task["task_id"], message="正在审计规则覆盖范围")
+        coverage_response = _request_task_json(
+            app, task, profile, "extract_rules_coverage_audit", system_prompt,
+            storage.render_prompt_template(
+                app, "extract_rules_coverage_user", candidates=packet,
+                compiled_rules=_rule_compilation_packet(compiled, input_limit),
+            ),
+            context_mode=f"rule_coverage_audit_d{depth}",
+            max_tokens=_output_token_budget(profile, 4_500), thinking_mode="disabled",
+        )
+        missing = coverage_response.get("missing_rules") if isinstance(coverage_response, dict) else None
+        if missing is None and isinstance(coverage_response, dict):
+            missing = coverage_response.get("rules")  # 兼容少数模型的确定字段偏差。
+        if not isinstance(missing, list):
+            raise ValueError("模型返回格式不符合规则覆盖审计要求")
+        missing = [item for item in missing if isinstance(item, dict)]
+    except ValueError as exc:
+        # 编译结果本身已经是规范规则集；覆盖审计单独失败时保留它，并将失败上抛给调用方的
+        # 非格式降级路径处理。格式问题则把当前组拆小，争取完成审计而非静默遗漏。
+        if (_is_invalid_json_model_response(exc) or str(exc).startswith("模型返回格式不符合规则覆盖审计要求")) and len(candidates) > 1 and depth < 6:
+            midpoint = len(candidates) // 2
+            storage.update_task(app, task["task_id"], message="规则覆盖审计输出异常，正在仅拆分该规则组重试")
+            left = _compile_rule_group(app, task, profile, system_prompt, candidates[:midpoint], char_limit, depth=depth + 1)
+            right = _compile_rule_group(app, task, profile, system_prompt, candidates[midpoint:], char_limit, depth=depth + 1)
+            return (
+                _dedupe_rule_candidates(left[0] + right[0]),
+                _dedupe_rule_candidates(left[1] + right[1]),
+                left[2] or right[2],
+            )
+        raise
+    return _dedupe_rule_candidates(compiled + missing), _dedupe_rule_candidates(missing), True
+
+
 def _compile_rule_candidates(app, task: dict, profile: dict, system_prompt: str,
                              raw_rules: list[dict], char_limit: int) -> tuple[list[dict], list[dict], bool]:
     """用 AI 做语义归并和覆盖审计，取代跨批次的字符串去重。
@@ -557,38 +724,8 @@ def _compile_rule_candidates(app, task: dict, profile: dict, system_prompt: str,
     candidates = _dedupe_rule_candidates(raw_rules)
     if len(candidates) < 12:
         return candidates, [], False
-    packet = _rule_compilation_packet(candidates, char_limit)
     storage.update_task(app, task["task_id"], progress=68, message="正在统一编译并合并评审规则")
-    compiled_response = _request_task_json(
-        app, task, profile, "extract_rules_compile", system_prompt,
-        storage.render_prompt_template(app, "extract_rules_compile_user", candidates=packet),
-        context_mode="rule_semantic_compile",
-        max_tokens=_output_token_budget(profile, min(9_000, max(3_500, len(packet) // 4))), thinking_mode="disabled",
-    )
-    compiled = compiled_response.get("rules") if isinstance(compiled_response, dict) else None
-    if not isinstance(compiled, list):
-        raise ValueError("模型返回格式不符合规则编译要求")
-    compiled = _dedupe_rule_candidates([item for item in compiled if isinstance(item, dict)])
-    if not compiled:
-        raise ValueError("规则编译未返回有效规则")
-    storage.update_task(app, task["task_id"], progress=74, message="正在审计规则覆盖范围")
-    coverage_response = _request_task_json(
-        app, task, profile, "extract_rules_coverage_audit", system_prompt,
-        storage.render_prompt_template(
-            app, "extract_rules_coverage_user", candidates=packet,
-            compiled_rules=_rule_compilation_packet(compiled, char_limit),
-        ),
-        context_mode="rule_coverage_audit",
-        max_tokens=_output_token_budget(profile, 4_500), thinking_mode="disabled",
-    )
-    missing = coverage_response.get("missing_rules") if isinstance(coverage_response, dict) else None
-    if missing is None:
-        # 部分模型会把字段错误地命名为 rules；兼容该种确定的结构偏差，仍由后续去重保证安全。
-        missing = coverage_response.get("rules") if isinstance(coverage_response, dict) else None
-    if not isinstance(missing, list):
-        raise ValueError("模型返回格式不符合规则覆盖审计要求")
-    missing = [item for item in missing if isinstance(item, dict)]
-    return _dedupe_rule_candidates(compiled + missing), missing, True
+    return _compile_rule_group(app, task, profile, system_prompt, candidates, char_limit)
 
 
 def _extract_rules(app, task: dict) -> dict:
@@ -1167,7 +1304,7 @@ SCOPE_PROFILE_FIELDS = (
 
 
 def _scope_source(documents: list[dict], char_limit: int) -> str:
-    """构造项目范围画像依据；长招标文件保留前后段，并完整携带已确认规则作为补充。"""
+    """构造项目范围画像依据；长招标文件均衡保留前、中、后段。"""
     sources = []
     tender_documents = [item for item in documents if item.get("role") in {"tender", "tender_attachment"}]
     # 平均分配预算，避免多个招标附件时前几份文件挤占全部上下文。
@@ -1178,9 +1315,15 @@ def _scope_source(documents: list[dict], char_limit: int) -> str:
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
         if len(text) > per_document:
-            head = int(per_document * 0.72)
-            tail = per_document - head
-            text = f"{text[:head]}\n\n【中间内容因长度省略；后段如下】\n\n{text[-tail:]}"
+            # 项目范围、技术要求和评分附件常位于正文中段；只保留首尾会让范围画像产生
+            # 结构性盲区。三段等额抽样只用于建立范围基准，不替代后续投标文件全文扫描。
+            segment = max(1, (per_document - 100) // 3)
+            middle_start = max(0, len(text) // 2 - segment // 2)
+            text = (
+                f"【文件前段】\n{text[:segment]}\n\n"
+                f"【文件中段】\n{text[middle_start:middle_start + segment]}\n\n"
+                f"【文件后段】\n{text[-segment:]}"
+            )
         sources.append(f"【{document.get('original_name') or '招标文件'}】\n{text}")
     return "\n\n".join(sources)[:char_limit]
 
@@ -1335,7 +1478,8 @@ def _run_full_scan_piece(app, task: dict, profile: dict, document: dict, catalog
 
 def _scan_document_fulltext(app, task: dict, profile: dict, document: dict, rules: list[dict],
                             project_scope: dict, system_prompt: str, *,
-                            progress_offset: int = 0, progress_total: int = 1) -> dict | None:
+                            progress_offset: int = 0, progress_total: int = 1,
+                            progress_callback=None) -> dict | None:
     try:
         text_length = int(document.get("text_length") or 0)
     except (TypeError, ValueError):
@@ -1367,11 +1511,12 @@ def _scan_document_fulltext(app, task: dict, profile: dict, document: dict, rule
     for chunk in chunks:
         completed += 1
         chunk_hash = hashlib.sha256(str(chunk.get("text") or "").encode("utf-8")).hexdigest()
-        progress = int((progress_offset + completed - 1) * 100 / max(1, progress_total))
-        storage.update_task(
-            app, task["task_id"], progress=progress,
-            message=f"正在全文证据扫描 {document['bidder_name'] or document['original_name']}：{_full_scan_chunk_label(chunk)}（{completed}/{total}）",
-        )
+        message = f"正在全文证据扫描 {document['bidder_name'] or document['original_name']}：{_full_scan_chunk_label(chunk)}（{completed}/{total}）"
+        if progress_callback:
+            progress_callback(message)
+        else:
+            progress = int((progress_offset + completed - 1) * 100 / max(1, progress_total))
+            storage.update_task(app, task["task_id"], progress=progress, message=message)
         checkpoint = storage.get_evaluation_scan_checkpoint(app, document["document_id"], scan_key, chunk["chunk_id"], chunk_hash)
         if checkpoint is not None:
             # 兼容 v3 已落库的纯 findings 检查点，避免升级时浪费一次扫描。
@@ -1509,8 +1654,16 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int) ->
             failed_root_ids.append(root_id)
         if root_id and root_id not in selected_ids:
             selected_ids.insert(0, root_id)
-    findings_limit = 240 if strategy == "counting" else 160
-    findings_packet = json.dumps(ranked_findings[:findings_limit], ensure_ascii=False, separators=(",", ":"))
+    # 最终组不需要重发首轮记录的所有内部字段。压缩为可追溯的证据目录后，优先给原页
+    # 留出空间，避免“候选 JSON 很完整、重点原文却被截断”的反向退化。
+    compact_findings = [
+        {
+            "rule_id": item.get("rule_id"), "page": item.get("page_hint") or item.get("page_range"),
+            "evidence": item.get("evidence"), "status": item.get("tentative_status"),
+            "priority": item.get("evidence_priority"),
+        }
+        for item in ranked_findings
+    ]
     scope_packet = ""
     if is_review_group:
         scope_packet = (
@@ -1526,21 +1679,80 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int) ->
     )
     if failed_root_ids:
         header += f"有 {len(failed_root_ids)} 个首轮格式异常页块，下面已附原文供本轮直接复核。"
-    prefix = f"{header}{scope_packet}\n\n【首轮 AI 候选证据】\n{findings_packet}\n\n【重点原文】\n"
-    if len(prefix) >= char_limit:
-        prefix = prefix[:char_limit]
+    # 证据目录最多占 30%，且始终保留有效 JSON；原页至少获得约三分之二的上下文预算。
+    prefix_budget = min(max(3_200, char_limit // 3), max(3_200, int(char_limit * 0.30)))
+    static_prefix = f"{header}{scope_packet}\n\n【首轮 AI 候选证据】\n"
+    if len(static_prefix) > prefix_budget:
+        # 范围画像只是辅助线索；它过大时优先保留总览和候选原文，不能挤掉文件原页。
+        static_prefix = f"{header}\n\n【首轮 AI 候选证据】\n"
+    findings_budget = max(300, prefix_budget - len(static_prefix) - len("\n\n【重点原文】\n"))
+    selected_finding_values: list[dict] = []
+    findings_size = 2
+    for item in compact_findings:
+        encoded = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+        if selected_finding_values and findings_size + len(encoded) + 1 > findings_budget:
+            break
+        selected_finding_values.append(item)
+        findings_size += len(encoded) + 1
+    findings_packet = json.dumps(selected_finding_values, ensure_ascii=False, separators=(",", ":"))
+    prefix = f"{static_prefix}{findings_packet}\n\n【重点原文】\n"
     chunks_by_id = {str(item.get("chunk_id")): item for item in scan.get("chunks", [])}
     parts = [prefix]
     size = len(prefix)
     included = []
-    for chunk_id in selected_ids:
+    # 每条规则先分到一个直接候选页块；未命中时分到本地章节检索页块。这样单个规则的
+    # 原页不会被前面规则的大段材料饿死，最终模型仍可基于真实全文片段作判断。
+    rule_evidence: dict[str, list[str]] = {}
+    required_ids: list[str] = []
+    fallback_ids = iter(select_rule_chunks(scan.get("chunks", []), rules, per_rule=1))
+    for rule in rules:
+        rule_id = str(rule.get("rule_id") or "")
+        finding = best_by_rule.get(rule_id)
+        chunk_id = str((finding or {}).get("chunk_id") or "").split(".", 1)[0]
+        if not chunk_id:
+            chunk_id = next(fallback_ids, "")
+        if not chunk_id:
+            continue
+        if finding and finding.get("evidence"):
+            rule_evidence.setdefault(chunk_id, []).append(str(finding.get("evidence")))
+        if chunk_id not in required_ids:
+            required_ids.append(chunk_id)
+    ordered_ids = required_ids + [item for item in selected_ids if item not in required_ids]
+
+    def source_excerpt(chunk: dict, evidence_values: list[str], budget: int) -> str:
+        source = str(chunk.get("text") or "")
+        if len(source) <= budget:
+            return source
+        offset = 0
+        for evidence in evidence_values:
+            fragments = sorted(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]{6,}", evidence), key=len, reverse=True)
+            for fragment in fragments:
+                found = source.find(fragment)
+                if found >= 0:
+                    offset = found
+                    break
+            if offset:
+                break
+        start = max(0, offset - max(240, budget // 3))
+        end = min(len(source), start + budget)
+        start = max(0, end - budget)
+        return source[start:end]
+
+    for position, chunk_id in enumerate(ordered_ids):
         chunk = chunks_by_id.get(chunk_id)
         if not chunk:
             continue
-        piece = f"\n\n【{_full_scan_chunk_label(chunk)}】\n{chunk.get('text', '')}"
         remaining = char_limit - size
         if remaining <= 0:
             break
+        required_remaining = sum(1 for value in ordered_ids[position:] if value in required_ids)
+        # 已为同组所有规则选中的页块预留公平配额；额外页只使用最后的剩余空间。
+        fair_share = max(1_600, remaining // max(1, required_remaining)) if chunk_id in required_ids else remaining
+        body_budget = max(300, min(remaining - 40, fair_share - 40))
+        if body_budget <= 0:
+            break
+        body = source_excerpt(chunk, rule_evidence.get(chunk_id, []), body_budget)
+        piece = f"\n\n【{_full_scan_chunk_label(chunk)}】\n{body}"
         if len(piece) > remaining:
             piece = piece[:remaining]
         parts.append(piece)
@@ -1801,6 +2013,102 @@ def _run_cross_bid_price_scoring(app, task: dict, profile: dict, documents: list
             "missing_count": len(expected - received)}
 
 
+class _EvaluationProgress:
+    """汇总并行文件的进度，并在整份文件完成后发布可展示的部分结果。"""
+
+    def __init__(self, app, task: dict, total_units: int, document_count: int):
+        self.app = app
+        self.task = task
+        self.total_units = max(1, total_units)
+        self.document_count = document_count
+        self.completed_units = 0
+        self.completed_documents: list[dict] = []
+        self.lock = threading.Lock()
+
+    def _progress(self) -> int:
+        return int(self.completed_units * 100 / self.total_units)
+
+    def message(self, message: str) -> None:
+        with self.lock:
+            storage.update_task(self.app, self.task["task_id"], progress=self._progress(), message=message)
+
+    def advance(self, message: str, units: int = 1) -> None:
+        with self.lock:
+            self.completed_units = min(self.total_units, self.completed_units + max(0, units))
+            storage.update_task(self.app, self.task["task_id"], progress=self._progress(), message=message)
+
+    def document_completed(self, document: dict, *, reused: bool = False) -> None:
+        bidder_name = document["bidder_name"] or document["original_name"]
+        with self.lock:
+            if not any(item["document_id"] == document["document_id"] for item in self.completed_documents):
+                self.completed_documents.append({"document_id": document["document_id"], "bidder_name": bidder_name})
+            status = "已复用" if reused else "已完成"
+            storage.update_task(
+                self.app, self.task["task_id"], progress=self._progress(),
+                message=f"{status} {bidder_name} 的综合评审（{len(self.completed_documents)}/{self.document_count}）",
+                result={"partial": True, "completed_documents": list(self.completed_documents)},
+            )
+
+
+def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profile: dict, char_limit: int,
+                       expected_rule_ids: dict[str, set[str]], review_rules: list[dict], objective_rules: list[dict],
+                       subjective_rules: list[dict], review_run: dict | None, objective_run: dict | None,
+                       subjective_run: dict | None, project_scope: dict, system_prompt: str,
+                       scan_units: int, groups_per_document: int, progress: _EvaluationProgress) -> dict:
+    """处理一份投标文件；不同投标人可并行，单份文件内仍严格顺序执行。"""
+    bidder_name = document["bidder_name"] or document["original_name"]
+    progress.message(f"正在综合评审：{bidder_name}")
+    reusable = None if task.get("payload", {}).get("force_rerun") else storage.reusable_evaluation_document_results(
+        app, task["project_id"], rule_set["rule_set_id"], profile["profile_id"], document["document_id"], expected_rule_ids,
+        task.get("payload", {}).get("input_fingerprint"), PROMPT_VERSION,
+    )
+    if reusable:
+        if review_run:
+            storage.save_review_results(app, review_run["review_run_id"], document["document_id"], reusable["review"])
+        if objective_run:
+            storage.save_score_results(app, objective_run["score_run_id"], document["document_id"], reusable["objective"])
+        if subjective_run:
+            storage.save_score_results(app, subjective_run["score_run_id"], document["document_id"], reusable["subjective"])
+        progress.advance(f"已复用 {bidder_name} 的完整评审结果", scan_units + groups_per_document)
+        progress.document_completed(document, reused=True)
+        return {"reused_document_count": 1}
+
+    scan_index = _scan_document_fulltext(
+        app, task, profile, document, review_rules + objective_rules + subjective_rules, project_scope, system_prompt,
+        progress_callback=progress.advance,
+    )
+    values = {
+        "reused_document_count": 0,
+        "full_scan_document_count": 1 if scan_index else 0,
+        "full_scan_batch_count": scan_index.get("scan_batch_count", 0) if scan_index else 0,
+        "full_scan_failed_chunk_count": len(scan_index.get("failed_chunks", [])) if scan_index else 0,
+        "compact_retry_count": scan_index.get("compact_retry_count", 0) if scan_index else 0,
+        "split_retry_count": scan_index.get("split_retry_count", 0) if scan_index else 0,
+        "manual_fallback_rule_count": 0,
+        "batch_count": 0,
+    }
+    components = (("review", review_rules, review_run), ("objective", objective_rules, objective_run), ("subjective", subjective_rules, subjective_run))
+    for component, component_rules, run in components:
+        for group_index, group in enumerate(_rule_batches(component_rules, EVALUATION_BATCH_SIZES[component]), start=1):
+            label = f"{bidder_name}·{component} 第{group_index}组"
+            progress.message(f"正在综合评审：{label}")
+            results, compact_count, split_count, fallback_count, _ = _run_combined_batch(
+                app, task, profile, document, component, group, system_prompt, char_limit, label, scan_index=scan_index,
+            )
+            # 每个规则组成功后立即持久化；只有完成该投标人的全部规则后才对页面公开展示。
+            if component == "review" and run:
+                storage.save_review_results(app, run["review_run_id"], document["document_id"], results)
+            elif run:
+                storage.save_score_results(app, run["score_run_id"], document["document_id"], results)
+            values["compact_retry_count"] += compact_count
+            values["split_retry_count"] += split_count
+            values["manual_fallback_rule_count"] += fallback_count
+            values["batch_count"] += 1
+            progress.advance(f"已完成综合评审：{label}")
+    progress.document_completed(document)
+    return values
+
+
 def _evaluate_all(app, task: dict) -> dict:
     """综合评审按规则小组运行并立即落库，避免单次混合 JSON 过大。"""
     rule_set, all_rules = storage.list_rules(app, task["project_id"])
@@ -1843,63 +2151,45 @@ def _evaluate_all(app, task: dict) -> dict:
     scan_units_by_document = {item["document_id"]: _full_scan_chunk_count(item) for item in documents}
     cross_bid_units = 1 if objective_run and len(documents) >= 2 and cross_bid_price_rules else 0
     total_work_units = max(1, sum(scan_units_by_document.values()) + len(documents) * groups_per_document + cross_bid_units)
-    completed_work_units = 0
-    for index, document in enumerate(documents, start=1):
-        storage.update_task(app, task["task_id"], progress=int(completed_work_units * 100 / total_work_units), message=f"正在综合评审 {index}/{len(documents)}：{document['bidder_name'] or document['original_name']}")
-        reusable = None if task.get("payload", {}).get("force_rerun") else storage.reusable_evaluation_document_results(
-            app, task["project_id"], rule_set["rule_set_id"], profile["profile_id"], document["document_id"], expected_rule_ids,
-            task.get("payload", {}).get("input_fingerprint"), PROMPT_VERSION,
+    task["_evaluation_request_gate"] = _EvaluationRequestGate(2 if len(documents) > 1 else 1)
+    progress = _EvaluationProgress(app, task, total_work_units, len(documents))
+
+    def run_document(document: dict) -> dict:
+        return _evaluate_document(
+            app, task, document, rule_set=rule_set, profile=profile, char_limit=char_limit,
+            expected_rule_ids=expected_rule_ids, review_rules=review_rules, objective_rules=objective_rules,
+            subjective_rules=subjective_rules, review_run=review_run, objective_run=objective_run,
+            subjective_run=subjective_run, project_scope=project_scope, system_prompt=system_prompt,
+            scan_units=scan_units_by_document[document["document_id"]], groups_per_document=groups_per_document,
+            progress=progress,
         )
-        if reusable:
-            if review_run:
-                storage.save_review_results(app, review_run["review_run_id"], document["document_id"], reusable["review"])
-            if objective_run:
-                storage.save_score_results(app, objective_run["score_run_id"], document["document_id"], reusable["objective"])
-            if subjective_run:
-                storage.save_score_results(app, subjective_run["score_run_id"], document["document_id"], reusable["subjective"])
-            reused_document_count += 1
-            completed_work_units += scan_units_by_document[document["document_id"]] + groups_per_document
-            storage.update_task(app, task["task_id"], progress=int(completed_work_units * 100 / total_work_units), message=f"已复用 {document['bidder_name'] or document['original_name']} 的完整评审结果")
-            continue
-        scan_index = _scan_document_fulltext(
-            app, task, profile, document, review_rules + objective_rules + subjective_rules, project_scope, system_prompt,
-            progress_offset=completed_work_units, progress_total=total_work_units,
-        )
-        completed_work_units += scan_units_by_document[document["document_id"]]
-        if scan_index:
-            full_scan_document_count += 1
-            full_scan_batch_count += scan_index.get("scan_batch_count", 0)
-            full_scan_failed_chunk_count += len(scan_index.get("failed_chunks", []))
-            compact_retry_count += scan_index.get("compact_retry_count", 0)
-            split_retry_count += scan_index.get("split_retry_count", 0)
-        components = (("review", review_rules, review_run), ("objective", objective_rules, objective_run), ("subjective", subjective_rules, subjective_run))
-        for component, component_rules, run in components:
-            for group_index, group in enumerate(_rule_batches(component_rules, EVALUATION_BATCH_SIZES[component]), start=1):
-                label = f"{document['bidder_name'] or document['original_name']}·{component} 第{group_index}组"
-                storage.update_task(app, task["task_id"], message=f"正在综合评审：{label}")
-                results, compact_count, split_count, fallback_count, _ = _run_combined_batch(
-                    app, task, profile, document, component, group, system_prompt, char_limit, label,
-                    scan_index=scan_index,
-                )
-                # 每个规则组成功后立即持久化；后续组失败也不会丢失已完成组。
-                if component == "review" and run:
-                    storage.save_review_results(app, run["review_run_id"], document["document_id"], results)
-                elif run:
-                    storage.save_score_results(app, run["score_run_id"], document["document_id"], results)
-                compact_retry_count += compact_count
-                split_retry_count += split_count
-                manual_fallback_rule_count += fallback_count
-                batch_count += 1
-                completed_work_units += 1
-                storage.update_task(app, task["task_id"], progress=int(completed_work_units * 100 / total_work_units), message=f"已完成综合评审：{label}")
+
+    # 只有投标人之间的文件审查并行；单份文件仍保持页块、规则组的先后顺序。
+    # 模型请求由闸门限制为两路，触发服务商限流后会自动降为一路重试。
+    document_results: list[dict] = []
+    if len(documents) == 1:
+        document_results.append(run_document(documents[0]))
+    else:
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="evaluation-bid") as executor:
+            futures = [executor.submit(run_document, document) for document in documents]
+            for future in as_completed(futures):
+                document_results.append(future.result())
+    for value in document_results:
+        reused_document_count += value.get("reused_document_count", 0)
+        compact_retry_count += value.get("compact_retry_count", 0)
+        split_retry_count += value.get("split_retry_count", 0)
+        manual_fallback_rule_count += value.get("manual_fallback_rule_count", 0)
+        batch_count += value.get("batch_count", 0)
+        full_scan_document_count += value.get("full_scan_document_count", 0)
+        full_scan_batch_count += value.get("full_scan_batch_count", 0)
+        full_scan_failed_chunk_count += value.get("full_scan_failed_chunk_count", 0)
     cross_bid_price = {"rule_count": 0, "result_count": 0, "retry_count": 0, "missing_count": 0}
     if cross_bid_units and objective_run:
-        storage.update_task(app, task["task_id"], progress=int(completed_work_units * 100 / total_work_units),
-                            message="正在统一比较全部投标人的报价并计算价格分")
+        progress.message("正在统一比较全部投标人的报价并计算价格分")
         cross_bid_price = _run_cross_bid_price_scoring(
             app, task, profile, documents, cross_bid_price_rules, objective_run["score_run_id"],
         )
-        completed_work_units += 1
+        progress.advance("已完成全部投标人的报价比较与价格评分")
     recovery = storage.task_recovery_summary(app, task["task_id"])
     return {"review_run_id": review_run["review_run_id"] if review_run else None, "objective_run_id": objective_run["score_run_id"] if objective_run else None,
             "subjective_run_id": subjective_run["score_run_id"] if subjective_run else None, "document_count": len(documents),
