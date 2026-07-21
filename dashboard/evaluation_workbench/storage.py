@@ -979,6 +979,25 @@ def project_token_usage(app, project_id: str) -> dict:
     return dict(row)
 
 
+def task_recovery_summary(app, task_id: str) -> dict[str, int]:
+    """按实际模型调用区分结构化恢复路径，供任务结果和运行监控使用。"""
+    with connection(app) as conn:
+        rows = conn.execute(
+            "SELECT phase, context_mode FROM ew_model_calls WHERE task_id = ?", (task_id,)
+        ).fetchall()
+    summary = {"json_repair_count": 0, "compact_retry_count": 0, "missing_rule_retry_count": 0}
+    for row in rows:
+        phase = str(row["phase"] or "")
+        context_mode = str(row["context_mode"] or "")
+        if phase.endswith("_json_repair"):
+            summary["json_repair_count"] += 1
+        if phase.endswith("_compact_retry"):
+            summary["compact_retry_count"] += 1
+        if "/缺失补评" in context_mode:
+            summary["missing_rule_retry_count"] += 1
+    return summary
+
+
 def save_compare_pair(app, task_id: str, document_a_id: str, document_b_id: str, result: dict) -> None:
     with connection(app) as conn:
         conn.execute(

@@ -26,7 +26,7 @@ from dashboard.utils.comparator import CollusionDetector, ComparisonLimitError
 MAX_PARSE_PAGES = 2000
 MAX_PARSED_CHARS = 2_000_000
 MAX_DOCX_XML_BYTES = 50 * 1024 * 1024
-PROMPT_VERSION = "project-scope-coverage-v4"
+PROMPT_VERSION = "project-scope-coverage-v5"
 COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v2"
 COMPARE_AI_BATCH_SIZE = 24
 
@@ -1012,8 +1012,8 @@ def _normalise_scan_findings(output: object, allowed_ids: set[str], chunk: dict)
             "chunk_id": chunk["chunk_id"],
             "page_range": _full_scan_chunk_label(chunk),
             "page_hint": _clean_model_text(page_hint)[:80],
-            "evidence": _clean_model_text(evidence)[:360],
-            "observation": _clean_model_text(observation)[:240],
+            "evidence": _clean_model_text(evidence)[:240],
+            "observation": _clean_model_text(observation)[:120],
             "tentative_status": status,
             "matched_count": None,
             "suggested_score": None,
@@ -1027,8 +1027,9 @@ def _normalise_scope_anomalies(output: object, chunk: dict) -> list[dict]:
     """范围偏离为独立候选通道，不强制映射到任何既有规则或预设类型。"""
     candidates = []
     for raw in output if isinstance(output, list) else []:
-        if isinstance(raw, list) and len(raw) >= 6:
-            page_hint, dimension, priority, evidence, relation, observation = raw[:6]
+        if isinstance(raw, list) and len(raw) >= 5:
+            page_hint, dimension, priority, evidence, relation = raw[:5]
+            observation = raw[5] if len(raw) >= 6 else ""
         elif isinstance(raw, dict):
             page_hint = raw.get("page_hint") or raw.get("page")
             dimension = raw.get("dimension") or raw.get("type") or "其他范围偏离"
@@ -1041,16 +1042,20 @@ def _normalise_scope_anomalies(output: object, chunk: dict) -> list[dict]:
         priority = str(priority or "medium").lower()
         if priority not in {"high", "medium", "low"}:
             priority = "medium"
-        evidence = _clean_model_text(evidence)[:420]
+        evidence = _clean_model_text(evidence)[:240]
         dimension = _clean_model_text(dimension)[:80] or "其他范围偏离"
         if not evidence:
             continue
-        candidates.append({
+        candidate = {
             "chunk_id": chunk["chunk_id"], "page_range": _full_scan_chunk_label(chunk),
             "page_hint": _clean_model_text(page_hint)[:80], "dimension": dimension,
             "candidate_priority": priority, "evidence": evidence,
-            "relation": _clean_model_text(relation)[:300], "observation": _clean_model_text(observation)[:360],
-        })
+            "relation": _clean_model_text(relation)[:160],
+        }
+        observation = _clean_model_text(observation)[:120]
+        if observation:
+            candidate["observation"] = observation
+        candidates.append(candidate)
     return candidates
 
 
@@ -1762,11 +1767,19 @@ def _evaluate_all(app, task: dict) -> dict:
             app, task, profile, documents, cross_bid_price_rules, objective_run["score_run_id"],
         )
         completed_work_units += 1
+    recovery = storage.task_recovery_summary(app, task["task_id"])
     return {"review_run_id": review_run["review_run_id"] if review_run else None, "objective_run_id": objective_run["score_run_id"] if objective_run else None,
             "subjective_run_id": subjective_run["score_run_id"] if subjective_run else None, "document_count": len(documents),
             "reused_document_count": reused_document_count, "model_document_count": len(documents) - reused_document_count,
-            "rule_count": len(all_rules), "profile": profile["display_name"], "compact_retry_count": compact_retry_count,
-            "split_retry_count": split_retry_count, "manual_fallback_rule_count": manual_fallback_rule_count,
+            "rule_count": len(all_rules), "profile": profile["display_name"],
+            # format_recovery_count 保留旧任务结果的统计语义；其余字段按真实调用路径拆分，
+            # 避免把 JSON 修复误显示为“紧凑重试”。
+            "format_recovery_count": compact_retry_count,
+            "json_repair_count": recovery["json_repair_count"],
+            "compact_retry_count": recovery["compact_retry_count"],
+            "split_retry_count": split_retry_count, "rule_split_count": split_retry_count,
+            "missing_rule_retry_count": recovery["missing_rule_retry_count"],
+            "manual_fallback_rule_count": manual_fallback_rule_count,
             "batch_count": batch_count, "full_scan_document_count": full_scan_document_count,
             "full_scan_batch_count": full_scan_batch_count, "full_scan_failed_chunk_count": full_scan_failed_chunk_count,
             "cross_bid_price": cross_bid_price,

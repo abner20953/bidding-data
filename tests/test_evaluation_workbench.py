@@ -97,6 +97,17 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             storage.get_project_scope_checkpoint(self.app, self.project["project_id"], "scope-v1"), scope,
         )
 
+    def test_task_recovery_summary_separates_json_repair_and_compact_retry(self):
+        task = storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        storage.record_model_call(self.app, task["task_id"], self.project["project_id"], "evaluate_all_review_json_repair", None)
+        storage.record_model_call(self.app, task["task_id"], self.project["project_id"], "evaluate_all_review_compact_retry", None)
+        storage.record_model_call(self.app, task["task_id"], self.project["project_id"], "evaluate_all_subjective_batch", None,
+                                  context_mode="甲公司·subjective 第1组/缺失补评:full_scan_evidence")
+
+        self.assertEqual(storage.task_recovery_summary(self.app, task["task_id"]), {
+            "json_repair_count": 1, "compact_retry_count": 1, "missing_rule_retry_count": 1,
+        })
+
     def test_compact_full_scan_matches_are_normalised(self):
         findings = worker._normalise_scan_findings(
             [["rule-1", "7", "类似项目合同", "supports"]], {"rule-1"},
@@ -984,7 +995,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.add_rule(self.app, self.project["project_id"], {"category": "objective", "title": "资质得分", "source_text": "资质得5分", "scoring": {"kind": "boolean", "max_score": 5}})
         storage.add_rule(self.app, self.project["project_id"], {"category": "subjective", "title": "技术方案", "source_text": "技术方案满分10分", "scoring": {"max_score": 10}})
         storage.confirm_rule_set(self.app, self.project["project_id"])
-        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "project-scope-coverage-v4")
+        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "project-scope-coverage-v5")
         prior = storage.create_task(self.app, self.project["project_id"], "evaluate_all", {"profile_id": None, "input_fingerprint": fingerprint})
         storage.update_task(self.app, prior["task_id"], status="success", result={"cached": True})
 
