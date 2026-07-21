@@ -740,7 +740,9 @@ def task_input_fingerprint(app, project_id: str, task_type: str, profile_id: str
         "review_documents": {"bid"},
         "score_objective": {"bid"},
         "score_subjective": {"bid"},
-        "evaluate_all": {"bid"},
+        # 综合评审的项目范围画像和全文核验均依赖招标文件及其附件；遗漏这些
+        # 输入会使“招标文件已变、投标文件未变”的任务错误复用历史结果。
+        "evaluate_all": {"tender", "tender_attachment", "bid"},
     }.get(task_type, {"tender", "tender_attachment", "bid"})
     uses_rules = task_type in {"review_documents", "score_objective", "score_subjective", "evaluate_all"}
     value = {
@@ -1430,12 +1432,24 @@ def update_rule(app, project_id: str, rule_id: str, payload: dict) -> dict:
             if rule["category"] == "objective":
                 current["kind"] = "boolean" if scoring.get("kind") == "boolean" else "manual"
             scoring_json = json.dumps(current, ensure_ascii=False)
+        # AI 规则一旦被人工修改其检查语义、评分口径或启用选择，后续重新提取不得
+        # 覆盖该人工维护结果；否则取消勾选的规则会在重新提取后被悄然重新启用。
+        locked = rule.get("source_type") == "ai" and (check_rule is not None or scoring_json is not None or enabled is not None)
         if check_rule is not None:
-            conn.execute("UPDATE ew_rules SET check_rule = ?, updated_at = ? WHERE rule_id = ?", (check_rule, now_iso(), rule_id))
+            conn.execute(
+                "UPDATE ew_rules SET check_rule = ?, source_type = CASE WHEN ? THEN 'ai_locked' ELSE source_type END, updated_at = ? WHERE rule_id = ?",
+                (check_rule, 1 if locked else 0, now_iso(), rule_id),
+            )
         if scoring_json is not None:
-            conn.execute("UPDATE ew_rules SET scoring_json = ?, updated_at = ? WHERE rule_id = ?", (scoring_json, now_iso(), rule_id))
+            conn.execute(
+                "UPDATE ew_rules SET scoring_json = ?, source_type = CASE WHEN ? THEN 'ai_locked' ELSE source_type END, updated_at = ? WHERE rule_id = ?",
+                (scoring_json, 1 if locked else 0, now_iso(), rule_id),
+            )
         if enabled is not None:
-            conn.execute("UPDATE ew_rules SET enabled = ?, updated_at = ? WHERE rule_id = ?", (enabled, now_iso(), rule_id))
+            conn.execute(
+                "UPDATE ew_rules SET enabled = ?, source_type = CASE WHEN ? THEN 'ai_locked' ELSE source_type END, updated_at = ? WHERE rule_id = ?",
+                (enabled, 1 if locked else 0, now_iso(), rule_id),
+            )
         conn.execute("UPDATE ew_rule_sets SET updated_at = ? WHERE rule_set_id = ?", (now_iso(), rule_set["rule_set_id"]))
         updated = conn.execute("SELECT * FROM ew_rules WHERE rule_id = ?", (rule_id,)).fetchone()
     return dict(updated)
@@ -1443,12 +1457,41 @@ def update_rule(app, project_id: str, rule_id: str, payload: dict) -> dict:
 
 def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: list[dict]) -> dict:
     with connection(app) as conn:
+        # 新一轮 AI 提取仅刷新 AI 来源规则。人工补充及人工锁定的 AI 规则是用户
+        # 已确认的业务输入，必须随新草稿迁移，避免“重新提取”变成静默删除。
+        current = conn.execute(
+            "SELECT * FROM ew_rule_sets WHERE project_id = ? ORDER BY version DESC LIMIT 1", (project_id,)
+        ).fetchone()
+        preserved = []
+        if current:
+            preserved = conn.execute(
+                "SELECT * FROM ew_rules WHERE rule_set_id = ? AND source_type IN ('manual', 'ai_locked') ORDER BY sort_order, created_at",
+                (current["rule_set_id"],),
+            ).fetchall()
         prior = conn.execute("SELECT MAX(version) FROM ew_rule_sets WHERE project_id = ?", (project_id,)).fetchone()[0] or 0
         timestamp = now_iso()
         rule_set = {"rule_set_id": str(uuid.uuid4()), "project_id": project_id, "version": prior + 1, "status": "draft", "source_task_id": task_id, "created_at": timestamp, "updated_at": timestamp}
         conn.execute("UPDATE ew_rule_sets SET status = 'superseded', updated_at = ? WHERE project_id = ? AND status != 'superseded'", (timestamp, project_id))
         conn.execute("INSERT INTO ew_rule_sets(rule_set_id, project_id, version, status, source_task_id, created_at, updated_at) VALUES (:rule_set_id, :project_id, :version, :status, :source_task_id, :created_at, :updated_at)", rule_set)
         signatures = set()
+        preserved_rule_count = 0
+        for index, row in enumerate(preserved):
+            signature = (
+                row["category"], re.sub(r"\s+", "", row["title"]).casefold(),
+                re.sub(r"\s+", "", row["check_rule"] or row["title"]).casefold(),
+            )
+            if signature in signatures:
+                continue
+            signatures.add(signature)
+            conn.execute(
+                """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode,
+                   source_type, source_task_id, scoring_json, enabled, sort_order, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (str(uuid.uuid4()), rule_set["rule_set_id"], row["category"], row["title"], row["check_rule"] or row["title"],
+                 row["source_text"], row["source_page"], "ocr" if row["check_mode"] == "ocr" else "auto",
+                 row["source_type"], row["source_task_id"], row["scoring_json"], row["enabled"], index, timestamp, timestamp),
+            )
+            preserved_rule_count += 1
         for index, item in enumerate(rules):
             title = str(item.get("title", "")).strip()
             category = str(item.get("category", "")).strip()
@@ -1465,13 +1508,14 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
                 (str(uuid.uuid4()), rule_set["rule_set_id"], category, title, check_rule, str(item.get("source_text", "")).strip(),
                  item.get("source_page") if isinstance(item.get("source_page"), int) else None,
                  "ocr" if item.get("ocr_required") or item.get("check_mode") == "ocr" else "auto",
-                 task_id, json.dumps(item.get("scoring"), ensure_ascii=False) if item.get("scoring") else None, index, timestamp, timestamp),
+                 task_id, json.dumps(item.get("scoring"), ensure_ascii=False) if item.get("scoring") else None,
+                 preserved_rule_count + index, timestamp, timestamp),
             )
         global_rule_count = 0
         global_rules = conn.execute(
             "SELECT * FROM ew_global_rules WHERE enabled = 1 ORDER BY category, sort_order, created_at"
         ).fetchall()
-        for position, template in enumerate(global_rules, start=len(rules)):
+        for position, template in enumerate(global_rules, start=preserved_rule_count + len(rules)):
             signature = (
                 template["category"], re.sub(r"\s+", "", template["title"]).casefold(),
                 re.sub(r"\s+", "", template["check_rule"]).casefold(),
@@ -1488,6 +1532,7 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
             )
             global_rule_count += 1
         rule_set["global_rule_count"] = global_rule_count
+        rule_set["preserved_rule_count"] = preserved_rule_count
     return rule_set
 
 
@@ -1577,8 +1622,14 @@ def latest_review_results(app, project_id: str) -> tuple[dict | None, list[dict]
 
 def reusable_evaluation_document_results(app, project_id: str, rule_set_id: str, profile_id: str,
                                          document_id: str, expected_rule_ids: dict[str, set[str]],
+                                         execution_fingerprint: str | None = None,
                                          prompt_version: str | None = None) -> dict[str, list[dict]] | None:
-    """查找同规则、同模型下已完成任务的单份投标文件结果，用于增量评审。"""
+    """查找完全相同执行输入下的单份投标文件结果，用于增量评审。
+
+    execution_fingerprint 由 API 在排队时生成，涵盖招标/投标文件、规则集、
+    模型公开配置与全部提示词。未携带它的历史任务不再复用，避免旧提示词或
+    旧招标依据悄然混入新一轮结论。
+    """
     with connection(app) as conn:
         tasks = conn.execute(
             """SELECT task_id, payload_json, result_json FROM ew_tasks WHERE project_id=? AND task_type='evaluate_all' AND status='success'
@@ -1586,15 +1637,20 @@ def reusable_evaluation_document_results(app, project_id: str, rule_set_id: str,
             (project_id,),
         ).fetchall()
         for task in tasks:
-            if prompt_version:
+            if execution_fingerprint:
                 try:
                     payload = json.loads(task["payload_json"] or "{}")
                 except (TypeError, json.JSONDecodeError):
                     payload = {}
+                if payload.get("input_fingerprint") != execution_fingerprint:
+                    continue
+            elif prompt_version:
+                # 兼容早期直接创建任务的调用路径；新版 API 一定会走上面的完整指纹。
                 try:
+                    payload = json.loads(task["payload_json"] or "{}")
                     task_result = json.loads(task["result_json"] or "{}")
                 except (TypeError, json.JSONDecodeError):
-                    task_result = {}
+                    payload, task_result = {}, {}
                 if payload.get("prompt_version") != prompt_version and task_result.get("prompt_version") != prompt_version:
                     continue
             copied: dict[str, list[dict]] = {}

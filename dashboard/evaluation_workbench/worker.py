@@ -26,7 +26,7 @@ from dashboard.utils.comparator import CollusionDetector, ComparisonLimitError
 MAX_PARSE_PAGES = 2000
 MAX_PARSED_CHARS = 2_000_000
 MAX_DOCX_XML_BYTES = 50 * 1024 * 1024
-PROMPT_VERSION = "project-scope-coverage-v5"
+PROMPT_VERSION = "project-scope-coverage-v6"
 COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v2"
 COMPARE_AI_BATCH_SIZE = 24
 
@@ -73,7 +73,16 @@ def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt
 
 
 def _system_prompt(app, template_id: str) -> str:
-    return storage.render_prompt_template(app, template_id)
+    base = storage.render_prompt_template(app, template_id)
+    # 将长期维护的业务判断原则与可变的 JSON/任务模板分开。这样即使用户仍在使用
+    # 历史任务模板，新的通用原则也可独立查看、编辑和升级，不依赖业务硬编码。
+    overlay_id = {
+        "extract_rules": "extract_rules_guidance",
+        "evaluate_all": "evaluate_all_guidance",
+    }.get(template_id)
+    if overlay_id:
+        return f"{base}\n\n【通用业务指令】\n{storage.render_prompt_template(app, overlay_id)}"
+    return base
 
 
 def _repair_invalid_json(app, task: dict, profile: dict, phase: str, error: InvalidJsonResponse,
@@ -511,6 +520,77 @@ def _dedupe_rule_candidates(items: list[dict]) -> list[dict]:
     return result
 
 
+def _rule_compilation_packet(items: list[dict], char_limit: int) -> str:
+    """为规则编译阶段准备紧凑且可追溯的原始条款包。"""
+    values = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        values.append({
+            "category": item.get("category"), "title": item.get("title"),
+            "check_rule": item.get("check_rule") or item.get("title"),
+            "source_text": item.get("source_text"), "source_page": item.get("source_page"),
+            "ocr_required": bool(item.get("ocr_required") or item.get("check_mode") == "ocr"),
+            "scoring": item.get("scoring"),
+        })
+    packet = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+    # 不截断 JSON 数组，防止模型误把残缺条款当成完整依据；超量时以完整条款为单位收缩。
+    if len(packet) <= char_limit:
+        return packet
+    compact = []
+    size = 2
+    for item in values:
+        encoded = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+        if compact and size + len(encoded) + 1 > char_limit:
+            break
+        compact.append(item)
+        size += len(encoded) + 1
+    return json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+
+
+def _compile_rule_candidates(app, task: dict, profile: dict, system_prompt: str,
+                             raw_rules: list[dict], char_limit: int) -> tuple[list[dict], list[dict], bool]:
+    """用 AI 做语义归并和覆盖审计，取代跨批次的字符串去重。
+
+    小文件只有极少条规则时，直接保留映射结果，避免为了无收益的归并增加一次模型调用。
+    """
+    candidates = _dedupe_rule_candidates(raw_rules)
+    if len(candidates) < 12:
+        return candidates, [], False
+    packet = _rule_compilation_packet(candidates, char_limit)
+    storage.update_task(app, task["task_id"], progress=68, message="正在统一编译并合并评审规则")
+    compiled_response = _request_task_json(
+        app, task, profile, "extract_rules_compile", system_prompt,
+        storage.render_prompt_template(app, "extract_rules_compile_user", candidates=packet),
+        context_mode="rule_semantic_compile",
+        max_tokens=_output_token_budget(profile, min(9_000, max(3_500, len(packet) // 4))), thinking_mode="disabled",
+    )
+    compiled = compiled_response.get("rules") if isinstance(compiled_response, dict) else None
+    if not isinstance(compiled, list):
+        raise ValueError("模型返回格式不符合规则编译要求")
+    compiled = _dedupe_rule_candidates([item for item in compiled if isinstance(item, dict)])
+    if not compiled:
+        raise ValueError("规则编译未返回有效规则")
+    storage.update_task(app, task["task_id"], progress=74, message="正在审计规则覆盖范围")
+    coverage_response = _request_task_json(
+        app, task, profile, "extract_rules_coverage_audit", system_prompt,
+        storage.render_prompt_template(
+            app, "extract_rules_coverage_user", candidates=packet,
+            compiled_rules=_rule_compilation_packet(compiled, char_limit),
+        ),
+        context_mode="rule_coverage_audit",
+        max_tokens=_output_token_budget(profile, 4_500), thinking_mode="disabled",
+    )
+    missing = coverage_response.get("missing_rules") if isinstance(coverage_response, dict) else None
+    if missing is None:
+        # 部分模型会把字段错误地命名为 rules；兼容该种确定的结构偏差，仍由后续去重保证安全。
+        missing = coverage_response.get("rules") if isinstance(coverage_response, dict) else None
+    if not isinstance(missing, list):
+        raise ValueError("模型返回格式不符合规则覆盖审计要求")
+    missing = [item for item in missing if isinstance(item, dict)]
+    return _dedupe_rule_candidates(compiled + missing), missing, True
+
+
 def _extract_rules(app, task: dict) -> dict:
     documents = storage.list_documents(app, task["project_id"])
     tender = next((item for item in documents if item["role"] == "tender"), None)
@@ -584,7 +664,22 @@ def _extract_rules(app, task: dict) -> dict:
                 # 主规则已提取成功时，单个评分补充批次异常不应丢弃已得到的规则集。
                 scoring_supplement_failures += 1
                 storage.update_task(app, task["task_id"], message=f"部分评分条款补充未完成：{exc}")
-    candidates = _dedupe_rule_candidates([item for item in raw_rules if isinstance(item, dict) and str(item.get("title", "")).strip() and item.get("category") in {"qualification", "compliance", "substantive", "rejection", "objective", "subjective"}])
+    mapped_candidates = [
+        item for item in raw_rules if isinstance(item, dict) and str(item.get("title", "")).strip()
+        and item.get("category") in {"qualification", "compliance", "substantive", "rejection", "objective", "subjective"}
+    ]
+    compilation_failure_count = 0
+    try:
+        candidates, coverage_missing_rules, compilation_used = _compile_rule_candidates(
+            app, task, profile, system_prompt, mapped_candidates,
+            _prompt_char_limit(profile, 100_000, 180_000),
+        )
+    except ValueError as exc:
+        # 映射阶段已有可用规则时，语义编译/审计不应成为单点失败而丢掉整份规则集。
+        # 保留原始候选供人工确认，并在任务结果中明确记录本次未完成编译。
+        candidates, coverage_missing_rules, compilation_used = _dedupe_rule_candidates(mapped_candidates), [], False
+        compilation_failure_count = 1
+        storage.update_task(app, task["task_id"], progress=76, message=f"规则编译未完成，已保留原始提取结果：{exc}")
     # 是否可由投标文件核验交给完整提示词与人工确认判断；不以词表硬过滤，避免误删业绩有效期等规则。
     rules = candidates
     excluded_rule_count = 0
@@ -613,7 +708,9 @@ def _extract_rules(app, task: dict) -> dict:
             "compact_retry_count": compact_retry_count, "score_clause_count": len(score_packets),
             "uncovered_score_clause_count": len(uncovered_score_packets), "scoring_supplement_count": scoring_supplement_count,
             "scoring_supplement_failure_count": scoring_supplement_failures, "batch_count": len(batches),
-            "split_retry_count": split_retry_count}
+            "semantic_compilation_used": compilation_used, "coverage_missing_rule_count": len(coverage_missing_rules),
+            "semantic_compilation_failure_count": compilation_failure_count,
+            "preserved_rule_count": rule_set.get("preserved_rule_count", 0), "split_retry_count": split_retry_count}
 
 
 def _review_documents(app, task: dict) -> dict:
@@ -993,6 +1090,7 @@ def _normalise_scan_findings(output: object, allowed_ids: set[str], chunk: dict)
         if isinstance(raw, list) and len(raw) >= 4:
             rule_id, page_hint, evidence, status = raw[:4]
             observation, needs_ocr, confidence = "", False, "medium"
+            evidence_priority = raw[4] if len(raw) >= 5 else "medium"
         elif isinstance(raw, dict):
             rule_id = raw.get("rule_id") or raw.get("id")
             page_hint = raw.get("page_hint") or raw.get("page")
@@ -1000,6 +1098,7 @@ def _normalise_scan_findings(output: object, allowed_ids: set[str], chunk: dict)
             status = raw.get("tentative_status") or raw.get("polarity") or raw.get("status")
             observation, needs_ocr = raw.get("observation"), raw.get("needs_ocr") is True
             confidence = raw.get("confidence")
+            evidence_priority = raw.get("evidence_priority") or raw.get("priority")
         else:
             continue
         if rule_id not in allowed_ids:
@@ -1007,6 +1106,7 @@ def _normalise_scan_findings(output: object, allowed_ids: set[str], chunk: dict)
         if status not in {"supports", "contradicts", "partial", "suspected"}:
             status = {"support": "supports", "contradict": "contradicts", "suspect": "suspected"}.get(str(status).lower(), "suspected")
         confidence = confidence if confidence in {"high", "medium", "low"} else "medium"
+        evidence_priority = evidence_priority if evidence_priority in {"high", "medium", "low"} else "medium"
         findings.append({
             "rule_id": rule_id,
             "chunk_id": chunk["chunk_id"],
@@ -1019,6 +1119,7 @@ def _normalise_scan_findings(output: object, allowed_ids: set[str], chunk: dict)
             "suggested_score": None,
             "needs_ocr": needs_ocr,
             "confidence": confidence,
+            "evidence_priority": evidence_priority,
         })
     return findings
 
@@ -1115,7 +1216,12 @@ def _project_scope_profile(app, task: dict, profile: dict, documents: list[dict]
     rule_packet = [{"title": item.get("title"), "check_rule": item.get("check_rule"), "source_text": item.get("source_text")}
                    for item in rules]
     scope_key = hashlib.sha256(json.dumps({
-        "version": PROMPT_VERSION, "profile": profile.get("profile_id"), "model": profile.get("model_name"),
+        "version": PROMPT_VERSION,
+        # 与任务统一指纹绑定，模型档案、提示词、招标附件或规则变化时均不复用。
+        "execution": task.get("payload", {}).get("input_fingerprint"),
+        # 用户明确强制重跑时，范围画像也应重新生成，而不是只跳过最终结果复用。
+        "force_run": task.get("task_id") if task.get("payload", {}).get("force_rerun") else None,
+        "profile": profile.get("profile_id"), "model": profile.get("model_name"),
         "tender": tender_text, "rules": rule_packet,
         "system": storage.prompt_template(app, "evaluate_all_scope_profile"),
         "user": storage.prompt_template(app, "evaluate_all_scope_profile_user"),
@@ -1243,7 +1349,12 @@ def _scan_document_fulltext(app, task: dict, profile: dict, document: dict, rule
         return None
     catalog = _full_scan_catalog(rules)
     scan_key = hashlib.sha256(json.dumps({
-        "version": PROMPT_VERSION, "profile": profile.get("profile_id"), "model": profile.get("model_name"),
+        "version": PROMPT_VERSION,
+        # scan 缓存同样必须感知完整的执行输入，而不能只看模型名称和部分用户模板。
+        "execution": task.get("payload", {}).get("input_fingerprint"),
+        # 强制重跑代表用户要求重新获得模型判断，不能复用旧页块扫描结果。
+        "force_run": task.get("task_id") if task.get("payload", {}).get("force_rerun") else None,
+        "profile": profile.get("profile_id"), "model": profile.get("model_name"),
         "catalog": catalog, "project_scope": project_scope,
         "template": storage.prompt_template(app, "evaluate_all_full_scan_user"),
     }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
@@ -1331,9 +1442,32 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int) ->
         unique_findings.append(item)
     findings = unique_findings
     strategy = _scan_strategy(rules)
+    # 先为每条规则保留一条最直接的证据，再按诊断价值补充其余页面。旧实现按
+    # 扫描顺序加入，文档前部的普通命中会挤掉后部更有力的反证或计分材料。
+    priority_rank = {"high": 0, "medium": 1, "low": 2}
+    polarity_rank = {"contradicts": 0, "partial": 1, "suspected": 2, "supports": 3}
+    ranked_findings = sorted(
+        findings,
+        key=lambda item: (
+            priority_rank.get(item.get("evidence_priority"), 1),
+            polarity_rank.get(item.get("tentative_status"), 2),
+            -{"high": 3, "medium": 2, "low": 1}.get(item.get("confidence"), 2),
+        ),
+    )
+    best_by_rule: dict[str, dict] = {}
+    for finding in ranked_findings:
+        best_by_rule.setdefault(str(finding.get("rule_id") or ""), finding)
     # 首轮 AI 候选优先，其次用本地章节词加强召回；失败页块始终进入复核。
     selected_ids: list[str] = []
-    for finding in findings:
+    for rule in rules:
+        finding = best_by_rule.get(str(rule.get("rule_id") or ""))
+        if not finding:
+            continue
+        chunk_id = str(finding.get("chunk_id") or "")
+        root_id = chunk_id.split(".", 1)[0]
+        if root_id and root_id not in selected_ids:
+            selected_ids.append(root_id)
+    for finding in ranked_findings:
         chunk_id = str(finding.get("chunk_id") or "")
         root_id = chunk_id.split(".", 1)[0]
         if root_id and root_id not in selected_ids:
@@ -1345,7 +1479,6 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int) ->
     review_categories = {"qualification", "compliance", "substantive", "rejection", "other"}
     is_review_group = any(item.get("category") in review_categories for item in rules)
     scope_anomalies, seen_scope = [], set()
-    priority_rank = {"high": 0, "medium": 1, "low": 2}
     for item in scan.get("scope_anomalies", []):
         signature = (
             item.get("chunk_id"), item.get("dimension"),
@@ -1377,7 +1510,7 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int) ->
         if root_id and root_id not in selected_ids:
             selected_ids.insert(0, root_id)
     findings_limit = 240 if strategy == "counting" else 160
-    findings_packet = json.dumps(findings[:findings_limit], ensure_ascii=False, separators=(",", ":"))
+    findings_packet = json.dumps(ranked_findings[:findings_limit], ensure_ascii=False, separators=(",", ":"))
     scope_packet = ""
     if is_review_group:
         scope_packet = (
@@ -1713,9 +1846,9 @@ def _evaluate_all(app, task: dict) -> dict:
     completed_work_units = 0
     for index, document in enumerate(documents, start=1):
         storage.update_task(app, task["task_id"], progress=int(completed_work_units * 100 / total_work_units), message=f"正在综合评审 {index}/{len(documents)}：{document['bidder_name'] or document['original_name']}")
-        reusable = storage.reusable_evaluation_document_results(
+        reusable = None if task.get("payload", {}).get("force_rerun") else storage.reusable_evaluation_document_results(
             app, task["project_id"], rule_set["rule_set_id"], profile["profile_id"], document["document_id"], expected_rule_ids,
-            PROMPT_VERSION,
+            task.get("payload", {}).get("input_fingerprint"), PROMPT_VERSION,
         )
         if reusable:
             if review_run:

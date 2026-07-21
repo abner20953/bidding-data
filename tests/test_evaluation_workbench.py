@@ -1200,6 +1200,46 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(scoring["max_score"], 10.0)
         self.assertEqual(scoring["source"], "manual")
 
+    def test_reextract_preserves_manual_and_human_locked_rules(self):
+        first = storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-1", [{
+            "category": "qualification", "title": "营业执照", "check_rule": "核验营业执照", "source_text": "应提供营业执照。",
+        }])
+        _, rules = storage.list_rules(self.app, self.project["project_id"])
+        ai_rule = next(item for item in rules if item["source_type"] == "ai")
+        storage.update_rule(self.app, self.project["project_id"], ai_rule["rule_id"], {
+            "check_rule": "核验营业执照及其有效状态",
+        })
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "other", "title": "人工补充承诺", "check_rule": "核验承诺函", "source_text": "人工维护规则。",
+        })
+
+        second = storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-2", [{
+            "category": "qualification", "title": "投标人资质", "check_rule": "核验投标人资质", "source_text": "应具备资质。",
+        }])
+        _, refreshed = storage.list_rules(self.app, self.project["project_id"])
+
+        self.assertEqual(first["version"] + 1, second["version"])
+        self.assertEqual(second["preserved_rule_count"], 2)
+        self.assertEqual(next(item for item in refreshed if item["title"] == "营业执照")["source_type"], "ai_locked")
+        self.assertEqual(next(item for item in refreshed if item["title"] == "人工补充承诺")["source_type"], "manual")
+
+    def test_force_rerun_is_persisted_in_task_payload(self):
+        self._add_pdf("bid.pdf", "bid", "甲公司", "已提供资质。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        storage.add_rule(self.app, self.project["project_id"], {"category": "qualification", "title": "资质"})
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+
+        with patch("dashboard.blueprints.evaluation_workbench._start_worker_if_needed"):
+            response = self.app.test_client().post(
+                f"/api/evaluation-workbench/projects/{self.project['project_id']}/tasks",
+                json={"task_type": "evaluate_all", "force_rerun": True},
+            )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertTrue(response.get_json()["task"]["payload"]["force_rerun"])
+        self.assertTrue(response.get_json()["task"]["payload"]["input_fingerprint"])
+
     def test_printable_report_is_generated_on_demand(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案。")
         task = storage.create_task(self.app, self.project["project_id"], "compare_documents")
