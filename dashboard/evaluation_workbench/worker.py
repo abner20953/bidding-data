@@ -29,7 +29,7 @@ from dashboard.utils.comparator import CollusionDetector, ComparisonLimitError
 MAX_PARSE_PAGES = 2000
 MAX_PARSED_CHARS = 2_000_000
 MAX_DOCX_XML_BYTES = 50 * 1024 * 1024
-PROMPT_VERSION = "project-scope-coverage-v8"
+PROMPT_VERSION = "project-scope-coverage-v9"
 COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v2"
 COMPARE_AI_BATCH_SIZE = 24
 
@@ -1191,11 +1191,14 @@ def _full_scan_catalog(rules: list[dict]) -> list[dict]:
     catalog = []
     for rule in rules:
         query = re.sub(r"\s+", " ", f"{rule.get('title') or ''}；{rule.get('check_rule') or rule.get('title') or ''}").strip()
+        # 主观评分表常把多个有独立分值的子项写在一条规则中。首轮只截取通用长度
+        # 会丢掉末尾的子项，导致后续评分只能看到“总分”而不能看到完整评分维度。
+        query_limit = 420 if rule["category"] == "subjective" else FULL_SCAN_CATALOG_RULE_CHARS
         item = {
             "id": rule["rule_id"],
             # 保留旧字段，避免用户在提示词配置中保留了旧版 findings 模板时无法对应规则。
             "rule_id": rule["rule_id"],
-            "q": query[:FULL_SCAN_CATALOG_RULE_CHARS],
+            "q": query[:query_limit],
             "type": rule["category"],
         }
         if rule.get("check_mode") == "ocr":
@@ -1241,7 +1244,9 @@ def _normalise_scan_findings(output: object, allowed_ids: set[str], chunk: dict)
     for raw in output if isinstance(output, list) else []:
         if isinstance(raw, list) and len(raw) >= 4:
             rule_id, page_hint, evidence, status = raw[:4]
-            observation, needs_ocr, confidence = "", False, "medium"
+            # 第六项为证据来源标签；旧模板没有该项时仍按原有默认值兼容。
+            observation = raw[5] if len(raw) >= 6 else ""
+            needs_ocr, confidence = False, "medium"
             evidence_priority = raw[4] if len(raw) >= 5 else "medium"
         elif isinstance(raw, dict):
             rule_id = raw.get("rule_id") or raw.get("id")
@@ -1677,7 +1682,7 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
         {
             "rule_id": item.get("rule_id"), "page": item.get("page_hint") or item.get("page_range"),
             "evidence": item.get("evidence"), "status": item.get("tentative_status"),
-            "priority": item.get("evidence_priority"),
+            "priority": item.get("evidence_priority"), "evidence_origin": item.get("observation"),
         }
         for item in ranked_findings
     ]

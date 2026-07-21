@@ -120,6 +120,24 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(findings[0]["page_hint"], "7")
         self.assertEqual(findings[0]["tentative_status"], "supports")
 
+    def test_compact_full_scan_match_retains_evidence_origin(self):
+        findings = worker._normalise_scan_findings(
+            [["rule-1", "7", "技术方案正文", "supports", "high", "bidder_design"]], {"rule-1"},
+            {"chunk_id": "chunk_1", "start_page": 7, "end_page": 7},
+        )
+
+        self.assertEqual(findings[0]["observation"], "bidder_design")
+
+    def test_subjective_full_scan_catalog_keeps_long_scoring_rule(self):
+        rules = [{
+            "rule_id": "subjective-1", "category": "subjective", "title": "系统功能模块设计",
+            "check_rule": "模块要求：" + "甲" * 360 + "第七服务模块。", "source_text": "评分办法",
+        }]
+
+        catalog = worker._full_scan_catalog(rules)
+
+        self.assertIn("第七服务模块", catalog[0]["q"])
+
     def test_parse_task_reuses_successful_parse_cache(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案：稳定运行。")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
@@ -1165,7 +1183,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.add_rule(self.app, self.project["project_id"], {"category": "objective", "title": "资质得分", "source_text": "资质得5分", "scoring": {"kind": "boolean", "max_score": 5}})
         storage.add_rule(self.app, self.project["project_id"], {"category": "subjective", "title": "技术方案", "source_text": "技术方案满分10分", "scoring": {"max_score": 10}})
         storage.confirm_rule_set(self.app, self.project["project_id"])
-        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "project-scope-coverage-v8")
+        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "project-scope-coverage-v9")
         prior = storage.create_task(self.app, self.project["project_id"], "evaluate_all", {"profile_id": None, "input_fingerprint": fingerprint})
         storage.update_task(self.app, prior["task_id"], status="success", result={"cached": True})
 
