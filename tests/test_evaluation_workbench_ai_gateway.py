@@ -41,10 +41,20 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
 
         self.assertEqual(decoded, {"rules": []})
 
+    def test_json_decoder_uses_first_balanced_object_not_trailing_braces_in_explanation(self):
+        decoded = _decode_json_content('结果：{"rules": []}，字段说明 {rules}。')
+
+        self.assertEqual(decoded, {"rules": []})
+
     def test_json_decoder_repairs_safe_model_syntax_noise(self):
         decoded = _decode_json_content('{"results":[{"reason":"第一行\n第二行",}],}')
 
         self.assertEqual(decoded, {"results": [{"reason": "第一行\n第二行"}]})
+
+    def test_json_decoder_repairs_an_invalid_literal_backslash_without_changing_fields(self):
+        decoded = _decode_json_content('{"evidence":"编号\\A-01"}')
+
+        self.assertEqual(decoded, {"evidence": "编号\\A-01"})
 
     def test_json_decoder_accepts_text_content_blocks_and_double_encoded_object(self):
         blocked = _decode_json_content([{"type": "text", "text": '{"results":[]}'}])

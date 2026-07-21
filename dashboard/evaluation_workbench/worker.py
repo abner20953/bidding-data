@@ -29,7 +29,7 @@ from dashboard.utils.comparator import CollusionDetector, ComparisonLimitError
 MAX_PARSE_PAGES = 2000
 MAX_PARSED_CHARS = 2_000_000
 MAX_DOCX_XML_BYTES = 50 * 1024 * 1024
-PROMPT_VERSION = "project-scope-coverage-v7"
+PROMPT_VERSION = "project-scope-coverage-v8"
 COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v2"
 COMPARE_AI_BATCH_SIZE = 24
 
@@ -942,6 +942,14 @@ def _score_documents(app, task: dict, score_type: str) -> dict:
     return {"score_run_id": score_run["score_run_id"], "score_type": score_type, "document_count": len(documents), "rule_count": len(rules), "profile": profile["display_name"]}
 
 
+def _is_explicit_ocr_gap(item: dict, rule: dict) -> bool:
+    """只将明确的图像识别缺口标为 OCR，避免把一般人工复核误分类。"""
+    if rule.get("check_mode") == "ocr":
+        return True
+    text = f"{item.get('reason') or ''} {item.get('evidence') or ''}".lower()
+    return any(term in text for term in ("ocr", "扫描件", "扫描图片", "图像识别", "图片识别"))
+
+
 def _normalise_review_results(output: object, rules: list[dict]) -> list[dict]:
     by_id = {item["rule_id"]: item for item in rules}
     normalized = []
@@ -952,10 +960,17 @@ def _normalise_review_results(output: object, rules: list[dict]) -> list[dict]:
         status = item.get("status")
         if status not in {"satisfied", "not_satisfied", "partial", "not_found", "manual", "ocr_required"}:
             status = "manual"
+        if status == "manual" and _is_explicit_ocr_gap(item, by_id[rule_id]):
+            status = "ocr_required"
         normalized.append(_review_result_from_model(item, rule_id, status))
     returned_ids = {item["rule_id"] for item in normalized}
-    normalized.extend(_review_result_from_model({"reason": "模型未返回该规则的可验证结论，请人工复核。"}, rule["rule_id"], "manual")
-                      for rule in rules if rule["rule_id"] not in returned_ids)
+    normalized.extend(
+        _review_result_from_model(
+            {"reason": "模型未返回该规则的可验证结论，请人工复核。"}, rule["rule_id"],
+            "ocr_required" if rule.get("check_mode") == "ocr" else "manual",
+        )
+        for rule in rules if rule["rule_id"] not in returned_ids
+    )
     return normalized
 
 
@@ -1573,7 +1588,7 @@ def _scan_strategy(rules: list[dict]) -> str:
     return "point"
 
 
-def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int) -> dict:
+def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *, targeted: bool = False) -> dict:
     rule_ids = {item["rule_id"] for item in rules}
     findings = [item for item in scan.get("findings", []) if item.get("rule_id") in rule_ids]
     # 相同规则在同一页块的重复短摘录不重复送入最终模型；数量类保留不同项目名称，
@@ -1617,7 +1632,9 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int) ->
         root_id = chunk_id.split(".", 1)[0]
         if root_id and root_id not in selected_ids:
             selected_ids.append(root_id)
-    per_rule = 6 if strategy in {"counting", "section"} else 4
+    # 缺失规则补评只需要最直接的证据页；首次综合评审保持原有全文级证据覆盖，
+    # 以准确性优先。这样不会再为一条漏回规则重发约 6 万字上下文。
+    per_rule = 1 if targeted else (6 if strategy in {"counting", "section"} else 4)
     for chunk_id in select_rule_chunks(scan.get("chunks", []), rules, per_rule=per_rule):
         if chunk_id not in selected_ids:
             selected_ids.append(chunk_id)
@@ -1639,7 +1656,7 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int) ->
         # 进入审查组，最终是否构成问题仍完全由 AI 结合规则和原文判断。
         anomaly_ids = []
         # 每条候选同时需要保留原页；过多的摘要会挤掉原文，故保留优先级最高的 12 条。
-        for item in scope_anomalies[:12]:
+        for item in scope_anomalies[:(4 if targeted else 12)]:
             root_id = str(item.get("chunk_id") or "").split(".", 1)[0]
             if root_id and root_id not in anomaly_ids:
                 anomaly_ids.append(root_id)
@@ -1670,7 +1687,7 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int) ->
             "\n\n【项目范围画像（来自招标文件和已确认规则）】\n"
             + json.dumps(scan.get("project_scope", {}), ensure_ascii=False, separators=(",", ":"))
             + "\n\n【项目范围偏离候选（仅供结合原页和规则核验，不是既成结论）】\n"
-            + json.dumps(scope_anomalies[:12], ensure_ascii=False, separators=(",", ":"))
+            + json.dumps(scope_anomalies[:(4 if targeted else 12)], ensure_ascii=False, separators=(",", ":"))
         )
     header = (
         f"【全文覆盖说明】已按连续页块扫描全文，共 {scan.get('chunk_count', 0)} 个页块；本规则组采用{strategy}汇总策略；"
@@ -1778,7 +1795,7 @@ def _combined_manual_results(component: str, rules: list[dict], payload: list[di
         return [
             _review_result_from_model(
                 {"reason": reason, "risk_level": "low", "confidence": "low", "evidence_quality": "missing"},
-                rule["rule_id"], "manual",
+                rule["rule_id"], "ocr_required" if rule.get("check_mode") == "ocr" else "manual",
             )
             for rule in rules
         ]
@@ -1810,14 +1827,18 @@ def _normalise_partial_combined_results(component: str, output: list[dict], rule
 
 def _run_combined_batch(app, task: dict, profile: dict, document: dict, component: str, rules: list[dict],
                         system_prompt: str, char_limit: int, label: str, depth: int = 0,
-                        scan_index: dict | None = None, allow_missing_retry: bool = True) -> tuple[list[dict], int, int, int, str]:
+                        scan_index: dict | None = None, allow_missing_retry: bool = True,
+                        targeted_retry: bool = False) -> tuple[list[dict], int, int, int, str]:
     """运行一个可独立保存的综合评审规则组；异常时仅拆分当前组。"""
     payload = _combined_batch_payload(component, rules)
     strategy = _scan_strategy(rules)
     context_limit = min(char_limit, EVALUATION_BATCH_CONTEXT_CHARS,
                         EVALUATION_STRATEGY_CONTEXT_CHARS.get(strategy, EVALUATION_BATCH_CONTEXT_CHARS))
+    if targeted_retry:
+        # 仅补评一小组漏回规则：给足直接证据，但不再携带完整全文汇总包。
+        context_limit = min(context_limit, 14_000 if component == "review" else 18_000)
     if scan_index:
-        context = _full_scan_review_context(scan_index, rules, context_limit)
+        context = _full_scan_review_context(scan_index, rules, context_limit, targeted=targeted_retry)
     else:
         full_text = Path(document["parsed_path"]).read_text(encoding="utf-8", errors="ignore")
         if len(full_text) <= FULL_SCAN_THRESHOLD_CHARS:
@@ -1846,6 +1867,7 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
             missing = _run_combined_batch(
                 app, task, profile, document, component, missing_rules, system_prompt, char_limit,
                 f"{label}/缺失补评", depth, scan_index, allow_missing_retry=False,
+                targeted_retry=True,
             )
             combined = _ordered_combined_results(rules, results + missing[0])
             return combined, retry_count + missing[1], missing[2], missing[3], f"{result_mode}+missing_retry"

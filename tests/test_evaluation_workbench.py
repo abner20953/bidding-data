@@ -952,6 +952,45 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(context["pages"][:2], ["chunk_1", "chunk_2"])
         self.assertLessEqual(len(context["text"]), 12_000)
 
+    def test_targeted_full_scan_context_keeps_direct_evidence_with_small_budget(self):
+        evidence = "第88页：营业执照统一社会信用代码为91310000TEST。"
+        scan = {
+            "chunks": [
+                {"chunk_id": "chunk_1", "start_page": 1, "end_page": 40, "text": "甲" * 45_000},
+                {"chunk_id": "chunk_2", "start_page": 41, "end_page": 100,
+                 "text": "乙" * 20_000 + evidence + "乙" * 20_000},
+            ],
+            "findings": [{"rule_id": "license", "chunk_id": "chunk_2", "page_hint": "88", "evidence": evidence,
+                          "tentative_status": "supports", "evidence_priority": "high", "confidence": "high"}],
+            "failed_chunks": [], "chunk_count": 2, "scope_anomalies": [], "project_scope": {},
+        }
+        rules = [{"rule_id": "license", "category": "qualification", "title": "营业执照", "check_rule": "核验营业执照"}]
+
+        context = worker._full_scan_review_context(scan, rules, 14_000, targeted=True)
+
+        self.assertIn(evidence, context["text"])
+        self.assertEqual(context["pages"], ["chunk_2"])
+        self.assertLessEqual(len(context["text"]), 14_000)
+
+    def test_review_normalisation_marks_only_explicit_ocr_gap_as_ocr_required(self):
+        rules = [
+            {"rule_id": "image", "check_mode": "ocr"},
+            {"rule_id": "procedure", "check_mode": "auto"},
+        ]
+        output = [
+            {"rule_id": "image", "status": "manual", "reason": "营业执照扫描件需 OCR 识别"},
+            {"rule_id": "procedure", "status": "manual", "reason": "需要人工确认是否已签字盖章"},
+        ]
+
+        results = worker._normalise_review_results(output, rules)
+
+        self.assertEqual(results[0]["status"], "ocr_required")
+        self.assertEqual(results[0]["risk_level"], "low")
+        self.assertEqual(results[1]["status"], "manual")
+
+        missing = worker._normalise_review_results([], [rules[0]])
+        self.assertEqual(missing[0]["status"], "ocr_required")
+
     def test_scope_anomaly_normalises_open_dimension_without_fixed_keywords(self):
         candidates = worker._normalise_scope_anomalies(
             [["127", "无关设备与工艺", "high", "锅炉燃烧控制设备", "不属于航测服务", "建议核验来源"]],
@@ -1126,7 +1165,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.add_rule(self.app, self.project["project_id"], {"category": "objective", "title": "资质得分", "source_text": "资质得5分", "scoring": {"kind": "boolean", "max_score": 5}})
         storage.add_rule(self.app, self.project["project_id"], {"category": "subjective", "title": "技术方案", "source_text": "技术方案满分10分", "scoring": {"max_score": 10}})
         storage.confirm_rule_set(self.app, self.project["project_id"])
-        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "project-scope-coverage-v7")
+        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "project-scope-coverage-v8")
         prior = storage.create_task(self.app, self.project["project_id"], "evaluate_all", {"profile_id": None, "input_fingerprint": fingerprint})
         storage.update_task(self.app, prior["task_id"], status="success", result={"cached": True})
 

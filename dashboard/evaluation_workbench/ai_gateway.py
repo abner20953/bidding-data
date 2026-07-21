@@ -34,6 +34,9 @@ def _load_json_candidate(value: str) -> object:
     repaired = value.replace("\ufeff", "").replace("\u00a0", " ")
     repaired = repaired.translate(str.maketrans({"：": ":", "，": ",", "｛": "{", "｝": "}", "［": "[", "］": "]"}))
     repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+    # 个别兼容接口会在文件路径、编号等普通文本中留下无效反斜杠。只把无效转义
+    # 变为字面量反斜杠，不补全字段、不猜测业务内容。
+    repaired = re.sub(r"\\(?![\"\\/bfnrtu])", r"\\\\", repaired)
     if repaired != value:
         attempts.append(repaired)
         try:
@@ -42,6 +45,38 @@ def _load_json_candidate(value: str) -> object:
             pass
     # 保留最早的严格 JSON 异常，调用方只记录安全诊断，不持久化正文。
     return json.loads(attempts[0])
+
+
+def _balanced_object_candidates(value: str) -> list[str]:
+    """从附带说明的响应中找出完整对象，避免贪婪截取到后续的花括号。"""
+    candidates: list[str] = []
+    start = -1
+    depth = 0
+    in_string = False
+    escaped = False
+    for index, character in enumerate(value):
+        if start < 0:
+            if character == "{":
+                start, depth = index, 1
+            continue
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                candidates.append(value[start:index + 1])
+                start = -1
+    return candidates
 
 
 def _decode_json_content(content) -> dict:
@@ -69,13 +104,15 @@ def _decode_json_content(content) -> dict:
     try:
         parsed = _load_json_candidate(value)
     except json.JSONDecodeError as original_error:
-        # 少量兼容接口仍可能在 JSON 前后附带简短说明；仅在能完整定位对象时兜底解析。
-        start, end = value.find("{"), value.rfind("}")
-        if start < 0 or end <= start:
-            raise original_error
-        try:
-            parsed = _load_json_candidate(value[start:end + 1])
-        except json.JSONDecodeError:
+        # 少量兼容接口仍可能在 JSON 前后附带简短说明；只尝试结构完整的对象，
+        # 不以“第一个 { 到最后一个 }”的贪婪方式吞入说明文字。
+        for candidate in _balanced_object_candidates(value):
+            try:
+                parsed = _load_json_candidate(candidate)
+                break
+            except json.JSONDecodeError:
+                continue
+        else:
             raise original_error
     # 某些兼容接口会把 JSON 对象再次序列化成字符串。
     if isinstance(parsed, str):
