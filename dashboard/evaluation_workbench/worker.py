@@ -19,7 +19,7 @@ from xml.etree import ElementTree
 import fitz
 
 from dashboard.evaluation_workbench import storage
-from dashboard.evaluation_workbench.ai_gateway import InvalidJsonResponse, request_json
+from dashboard.evaluation_workbench.ai_gateway import InvalidJsonResponse, _recover_complete_json_array, request_json
 from dashboard.evaluation_workbench.collusion_signals import build_cross_bid_analysis
 from dashboard.evaluation_workbench.prompt_context import (
     build_rule_context, select_rule_chunk_map, select_rule_chunks, split_full_text_chunks,
@@ -562,6 +562,23 @@ def _score_rule_supplement_prompt(app, score_packets: list[object], existing_rul
                                           existing_rules=json.dumps(existing, ensure_ascii=False, separators=(",", ":")), packet_text=packet_text)
 
 
+def _rule_recovery_continue_prompt(app, text: str, recovered_rules: list[dict]) -> str:
+    """仅把已完整解析的必要字段交给续提，避免截断正文或重复输出放大上下文。"""
+    recovered = [
+        {
+            "category": item.get("category"), "title": item.get("title"),
+            "check_rule": item.get("check_rule"), "source_text": item.get("source_text"),
+            "source_page": item.get("source_page"), "source_clause_ids": item.get("source_clause_ids"),
+            "ocr_required": item.get("ocr_required"), "scoring": item.get("scoring"),
+        }
+        for item in recovered_rules if isinstance(item, dict)
+    ]
+    return storage.render_prompt_template(
+        app, "extract_rules_continue_user",
+        existing_rules=json.dumps(recovered, ensure_ascii=False, separators=(",", ":")), text=text,
+    )
+
+
 def _rule_batch_output_tokens(text: str, compact: bool = False) -> int:
     """小批次按内容量分配输出；紧凑重试绝不降低输出上限。"""
     target = max(2_500, min(6_000, 1_400 + len(text) // 3))
@@ -600,6 +617,71 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
         if not isinstance(rules, list):
             raise ValueError("模型返回格式不符合规则提取要求")
         return [item for item in rules if isinstance(item, dict)], 0, 0
+    except InvalidJsonResponse as exc:
+        # 响应已到达但尾部截断时，先回收每个边界完整、能独立 json.loads 的规则对象。
+        # 这一步绝不补全半截条款；随后仅请求模型补足遗漏项，避免把已成功的长输出整段重发。
+        recovered_payload = _recover_complete_json_array(exc.raw_content, "rules")
+        recovered_rules = recovered_payload.get("rules") if isinstance(recovered_payload, dict) else None
+        if isinstance(recovered_rules, list) and recovered_rules:
+            storage.update_task(
+                app, task["task_id"],
+                message=f"{batch_label} 格式异常，已在本地回收 {len(recovered_rules)} 条完整规则，正在补充遗漏项",
+            )
+            try:
+                continued = _request_task_json(
+                    app, task, profile, "extract_rules_local_recovery_continue", system_prompt,
+                    _rule_recovery_continue_prompt(app, text, recovered_rules), document_id=document_id,
+                    context_mode=f"{batch_label}_local_json_continue",
+                    max_tokens=_output_token_budget(profile, _rule_batch_output_tokens(text, compact=True)),
+                    thinking_mode="disabled",
+                )
+                missing_rules = continued.get("rules") if isinstance(continued, dict) else None
+                if not isinstance(missing_rules, list):
+                    raise ValueError("模型返回格式不符合规则续提要求")
+                return _dedupe_rule_candidates(
+                    [item for item in recovered_rules + missing_rules if isinstance(item, dict)]
+                ), 0, 0
+            except ValueError:
+                # 续提只是节省重发的优先路径；它异常时仍完整回到原有拆分/紧凑重试，
+                # 不能以局部恢复替代全量提取而遗漏规则。
+                storage.update_task(app, task["task_id"], message=f"{batch_label} 规则续提异常，正在按完整策略重试")
+        if exc.finish_reason.lower() not in {"length", "max_tokens"}:
+            try:
+                repaired = _repair_invalid_json(
+                    app, task, profile, "extract_rules_batch_json_repair", exc, "rules", document_id=document_id,
+                )
+                repaired_rules = repaired.get("rules") if isinstance(repaired, dict) else None
+                if not isinstance(repaired_rules, list):
+                    raise ValueError("模型返回格式不符合规则提取要求")
+                return [item for item in repaired_rules if isinstance(item, dict)], 0, 0
+            except ValueError:
+                storage.update_task(app, task["task_id"], message=f"{batch_label} 本地修复未完成，正在按完整策略重试")
+        if len(text) > RULE_EXTRACTION_MIN_SPLIT_CHARS and depth < 3:
+            pieces = _split_rule_extraction_text(text, max(RULE_EXTRACTION_MIN_SPLIT_CHARS, (len(text) + 1) // 2))
+            if len(pieces) > 1:
+                storage.update_task(app, task["task_id"], message=f"{batch_label} 输出过长，正在仅拆分该批次重试")
+                rules: list[dict] = []
+                compact_retries = split_retries = 0
+                for index, piece in enumerate(pieces, start=1):
+                    value, compact_count, split_count = _extract_rule_batch(
+                        app, task, profile, system_prompt, piece, document_id=document_id,
+                        batch_label=f"{batch_label}/拆分{index}", depth=depth + 1,
+                    )
+                    rules.extend(value)
+                    compact_retries += compact_count
+                    split_retries += split_count
+                return rules, compact_retries, split_retries + 1
+        storage.update_task(app, task["task_id"], message=f"{batch_label} 格式异常，正在以紧凑 JSON 重试")
+        retry_prompt = _rule_extraction_prompt(app, text, compact=True, score_packets=packets, max_rules=max(8, max_rules))
+        parsed = _request_task_json(
+            app, task, profile, "extract_rules_compact_retry", system_prompt, retry_prompt,
+            document_id=document_id, context_mode=f"{batch_label}_compact_retry",
+            max_tokens=_output_token_budget(profile, _rule_batch_output_tokens(text, compact=True)), thinking_mode="disabled",
+        )
+        rules = parsed.get("rules") if isinstance(parsed, dict) else None
+        if not isinstance(rules, list):
+            raise ValueError("模型返回格式不符合规则提取要求")
+        return [item for item in rules if isinstance(item, dict)], 1, 0
     except ValueError as exc:
         if not _is_invalid_json_model_response(exc):
             raise
@@ -629,6 +711,43 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
         if not isinstance(rules, list):
             raise ValueError("模型返回格式不符合规则提取要求")
         return [item for item in rules if isinstance(item, dict)], 1, 0
+
+
+def _extract_rule_batches(app, task: dict, profile: dict, system_prompt: str, batches: list[str], *, document_id: str) -> tuple[list[dict], int, int]:
+    """在两个受闸门保护的工作位中完成互不依赖的原文映射，按原文顺序汇总结果。"""
+    if not batches:
+        return [], 0, 0
+    total = len(batches)
+    results: list[tuple[list[dict], int, int] | None] = [None] * total
+    workers = min(2, total)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_index = {
+            executor.submit(
+                _extract_rule_batch, app, task, profile, system_prompt, batch,
+                document_id=document_id, batch_label=f"rule_batch_{index + 1}_of_{total}",
+            ): index
+            for index, batch in enumerate(batches)
+        }
+        completed = 0
+        for future in as_completed(future_to_index):
+            index = future_to_index[future]
+            results[index] = future.result()
+            completed += 1
+            progress = 15 + int(completed * 45 / total)
+            storage.update_task(
+                app, task["task_id"], progress=progress,
+                message=f"正在分段提取评审规则（已完成 {completed}/{total} 批，受控双并发）",
+            )
+    raw_rules: list[dict] = []
+    compact_retries = split_retries = 0
+    for result in results:
+        if result is None:
+            continue
+        extracted, compact_count, split_count = result
+        raw_rules.extend(extracted)
+        compact_retries += compact_count
+        split_retries += split_count
+    return raw_rules, compact_retries, split_retries
 
 
 def _rule_signature(item: dict) -> tuple[str, str, str]:
@@ -785,14 +904,37 @@ def _compile_rule_group(app, task: dict, profile: dict, system_prompt: str,
     groups = _split_rule_compilation_groups(candidates, input_limit)
     if len(groups) > 1:
         compiled, missing, used = [], [], False
-        for index, group in enumerate(groups, start=1):
-            storage.update_task(app, task["task_id"], message=f"正在分组编译评审规则（{index}/{len(groups)}）")
-            values, uncovered, group_used = _compile_rule_group(
-                app, task, profile, system_prompt, group, char_limit, depth=depth + 1,
-            )
-            compiled.extend(values)
-            missing.extend(uncovered)
-            used = used or group_used
+        # 原始映射完成后，多个大规则组之间互不依赖。只在顶层受控双并发，子组内
+        # 保持串行，最终仍由全局合并统一消重和保留评分覆盖，避免嵌套并发打满接口。
+        parallel_groups = depth == 0 and task.get("_evaluation_request_gate") is not None
+        if parallel_groups:
+            storage.update_task(app, task["task_id"], message=f"正在分组编译评审规则（{len(groups)} 组，受控双并发）")
+            group_results: list[tuple[list[dict], list[dict], bool] | None] = [None] * len(groups)
+            with ThreadPoolExecutor(max_workers=min(2, len(groups))) as executor:
+                future_to_index = {
+                    executor.submit(
+                        _compile_rule_group, app, task, profile, system_prompt, group, char_limit, depth=depth + 1,
+                    ): index
+                    for index, group in enumerate(groups)
+                }
+                for future in as_completed(future_to_index):
+                    group_results[future_to_index[future]] = future.result()
+            for result in group_results:
+                if result is None:
+                    continue
+                values, uncovered, group_used = result
+                compiled.extend(values)
+                missing.extend(uncovered)
+                used = used or group_used
+        else:
+            for index, group in enumerate(groups, start=1):
+                storage.update_task(app, task["task_id"], message=f"正在分组编译评审规则（{index}/{len(groups)}）")
+                values, uncovered, group_used = _compile_rule_group(
+                    app, task, profile, system_prompt, group, char_limit, depth=depth + 1,
+                )
+                compiled.extend(values)
+                missing.extend(uncovered)
+                used = used or group_used
         return _merge_compiled_rule_groups(
             app, task, profile, system_prompt, compiled, char_limit,
         ), _dedupe_rule_candidates(missing), used
@@ -1055,18 +1197,12 @@ def _extract_rules(app, task: dict) -> dict:
         raise ValueError("招标文件未提取到可供规则识别的正文")
     storage.update_task(app, task["task_id"], progress=15, message=f"正在分段提取评审规则（共 {len(batches)} 批）")
     system_prompt = _system_prompt(app, "extract_rules")
-    raw_rules: list[dict] = []
-    compact_retry_count = split_retry_count = 0
-    for index, batch in enumerate(batches, start=1):
-        progress = 15 + int((index - 1) * 45 / len(batches))
-        storage.update_task(app, task["task_id"], progress=progress, message=f"正在提取规则第 {index}/{len(batches)} 批")
-        extracted, compact_count, split_count = _extract_rule_batch(
-            app, task, profile, system_prompt, batch, document_id=tender["document_id"],
-            batch_label=f"rule_batch_{index}_of_{len(batches)}",
-        )
-        raw_rules.extend(extracted)
-        compact_retry_count += compact_count
-        split_retry_count += split_count
+    # 规则映射和顶层规则组编译共用同一限流闸门：默认至多两路，接口繁忙时自动回落单路。
+    # 这只限制远端请求，并不创建常驻线程或后台进程。
+    task["_evaluation_request_gate"] = _EvaluationRequestGate(limit=2, max_limit=2)
+    raw_rules, compact_retry_count, split_retry_count = _extract_rule_batches(
+        app, task, profile, system_prompt, batches, document_id=tender["document_id"],
+    )
     raw_rules = _dedupe_rule_candidates(raw_rules)
     primary_score_rules = [item for item in raw_rules if isinstance(item, dict) and item.get("category") in {"objective", "subjective"}]
     uncovered_score_packets = [

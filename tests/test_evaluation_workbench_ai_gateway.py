@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import Mock, patch
 
-from dashboard.evaluation_workbench.ai_gateway import _decode_json_content, test_connection
+from dashboard.evaluation_workbench.ai_gateway import _decode_json_content, _recover_complete_json_array, test_connection
 
 
 CONNECTION_TEST_PROMPT = '请仅返回 JSON 对象：{"message":"连接成功"}'
@@ -62,6 +62,14 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
 
         self.assertEqual(blocked, {"results": []})
         self.assertEqual(encoded, {"results": []})
+
+    def test_json_recovery_keeps_only_complete_array_items(self):
+        recovered = _recover_complete_json_array(
+            '```json\n{"rules":[{"title":"营业执照","source_text":"提供有效营业执照"},{"title":"截断',
+            "rules",
+        )
+
+        self.assertEqual(recovered, {"rules": [{"title": "营业执照", "source_text": "提供有效营业执照"}]})
 
     def test_connection_explains_authentication_failure_without_echoing_response(self):
         response = Mock(ok=False, status_code=401, text='{"error":"invalid api key"}')

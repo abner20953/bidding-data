@@ -92,6 +92,64 @@ def _balanced_object_candidates(value: str) -> list[str]:
     return candidates
 
 
+def _normalise_json_response_text(content: str) -> str:
+    """去掉兼容模型常见包装；只移除非 JSON 外壳，不改动业务正文。"""
+    value = content.strip().lstrip("\ufeff")
+    value = re.sub(r"^\s*<think>.*?</think>\s*", "", value, count=1, flags=re.IGNORECASE | re.DOTALL)
+    if value.startswith("```"):
+        lines = value.splitlines()
+        if lines and lines[0].lstrip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        value = "\n".join(lines).strip()
+    return value
+
+
+def _recover_complete_json_array(content: object, expected_field: str) -> dict | None:
+    """从被截断的顶层数组中回收完整对象，绝不补写或猜测截断对象。"""
+    if not isinstance(content, str) or not expected_field:
+        return None
+    value = _normalise_json_response_text(content)
+    match = re.search(rf'"{re.escape(expected_field)}"\s*:\s*\[', value)
+    if not match:
+        return None
+    recovered: list[dict] = []
+    object_start: int | None = None
+    object_depth = 0
+    in_string = False
+    escaped = False
+    for index in range(match.end(), len(value)):
+        character = value[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character == "{":
+            if object_depth == 0:
+                object_start = index
+            object_depth += 1
+        elif character == "}" and object_depth:
+            object_depth -= 1
+            if object_depth == 0 and object_start is not None:
+                try:
+                    item = _load_json_candidate(value[object_start:index + 1])
+                except json.JSONDecodeError:
+                    item = None
+                if isinstance(item, dict):
+                    recovered.append(item)
+                object_start = None
+        elif character == "]" and object_depth == 0:
+            break
+    return {expected_field: recovered} if recovered else None
+
+
 def _decode_json_content(content) -> dict:
     if isinstance(content, dict):
         return content
@@ -103,17 +161,7 @@ def _decode_json_content(content) -> dict:
         )
     if not isinstance(content, str):
         raise ValueError("模型响应正文为空")
-    value = content.strip().lstrip("\ufeff")
-    # MiniMax 在开启 thinking 时会将 <think>...</think> 放在 content 前面；
-    # 评标任务只解析其后的结构化结论，不保存或展示思考过程。
-    value = re.sub(r"^\s*<think>.*?</think>\s*", "", value, count=1, flags=re.IGNORECASE | re.DOTALL)
-    if value.startswith("```"):
-        lines = value.splitlines()
-        if lines and lines[0].lstrip().startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        value = "\n".join(lines).strip()
+    value = _normalise_json_response_text(content)
     try:
         parsed = _load_json_candidate(value)
     except json.JSONDecodeError as original_error:

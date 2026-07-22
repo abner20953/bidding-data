@@ -324,6 +324,59 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertGreaterEqual(request_json.call_args_list[1].kwargs["max_tokens"], request_json.call_args_list[0].kwargs["max_tokens"])
         self.assertEqual(request_json.call_args_list[0].args[0]["thinking_mode"], "disabled")
 
+    def test_rule_extraction_recovers_complete_json_items_before_requesting_only_missing_rules(self):
+        task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
+        profile = storage.get_model_profile(self.app, None)
+        recovered = {
+            "category": "qualification", "title": "营业执照", "check_rule": "核验有效营业执照",
+            "source_text": "提供有效营业执照",
+        }
+        missing = {
+            "category": "qualification", "title": "法定代表人身份证明", "check_rule": "核验身份证明",
+            "source_text": "提供法定代表人身份证明",
+        }
+        raw = '{"rules":[' + json.dumps(recovered, ensure_ascii=False) + ',{"title":"截断'
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[
+            worker.InvalidJsonResponse(raw, "length"), {"rules": [missing]},
+        ]) as request_json:
+            rules, compact_retries, split_retries = worker._extract_rule_batch(
+                self.app, task, profile, "规则提取系统提示", "投标人应提供营业执照和身份证明。",
+                document_id=None, batch_label="rule_batch_1_of_1",
+            )
+
+        self.assertEqual({item["title"] for item in rules}, {"营业执照", "法定代表人身份证明"})
+        self.assertEqual((compact_retries, split_retries), (0, 0))
+        self.assertEqual(request_json.call_count, 2)
+        self.assertIn("已回收规则", request_json.call_args_list[1].args[2])
+        self.assertIn("营业执照", request_json.call_args_list[1].args[2])
+
+    def test_rule_extraction_mapping_uses_at_most_two_workers_and_preserves_source_order(self):
+        task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
+        profile = storage.get_model_profile(self.app, None)
+        lock = threading.Lock()
+        active = 0
+        peak = 0
+
+        def fake_extract(_app, _task, _profile, _system, text, **_kwargs):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.03)
+            with lock:
+                active -= 1
+            return ([{"category": "qualification", "title": text, "check_rule": f"核验{text}"}], 0, 0)
+
+        with patch("dashboard.evaluation_workbench.worker._extract_rule_batch", side_effect=fake_extract):
+            rules, compact_retries, split_retries = worker._extract_rule_batches(
+                self.app, task, profile, "规则提取系统提示", ["第一批", "第二批", "第三批"], document_id="tender-1",
+            )
+
+        self.assertEqual(peak, 2)
+        self.assertEqual([item["title"] for item in rules], ["第一批", "第二批", "第三批"])
+        self.assertEqual((compact_retries, split_retries), (0, 0))
+
     def test_rule_compilation_splits_only_the_overflowing_group_and_keeps_all_rules(self):
         task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
         profile = storage.get_model_profile(self.app, None)
