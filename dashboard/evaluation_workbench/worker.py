@@ -407,8 +407,9 @@ def _score_clause_packets(text: str, limit: int = 240) -> list[dict]:
                 if re.fullmatch(r"\[第\d+页\]", lines[position])
             ), "")
             identity = f"{page_marker}\n" + "\n".join(item for item in lines[identity_start:index + 1] if item)
+            identity_digest_source = re.sub(r"\s+", "", identity or compact)
             packets.append({
-                "clause_id": f"SC-{hashlib.sha1(re.sub(r'\s+', '', identity or compact).encode('utf-8')).hexdigest()[:10]}",
+                "clause_id": f"SC-{hashlib.sha1(identity_digest_source.encode('utf-8')).hexdigest()[:10]}",
                 "text": value,
                 "score_line": line[:360],
             })
