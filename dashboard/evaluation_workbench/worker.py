@@ -779,6 +779,13 @@ VISUAL_EVIDENCE_PATTERNS = (
     r"营业执照|许可证|合格证|资质证书|资格证书|执业证书|操控员执照|身份证",
     r"转账凭证|缴款凭证|支付凭证|银行回单|支票|汇票|保函",
 )
+DECISIVE_VISUAL_EVIDENCE_PATTERN = re.compile(
+    r"(?:核验|审查|检查|确认|辨认|比对|提供|附(?:有|具)?|提交|包含|齐备).{0,45}"
+    r"(?:签字|签章|盖章|公章|印章|骑缝章|手写|指印|截图|复印件|扫描件|影印件|照片|保函|票据|银行回单)"
+    r"|(?:签字|签章|盖章|公章|印章|骑缝章|手写|指印|截图|复印件|扫描件|影印件|照片|保函|票据|银行回单).{0,45}"
+    r"(?:核验|审查|检查|确认|辨认|比对|提供|附(?:有|具)?|提交|包含|齐备)",
+    flags=re.IGNORECASE,
+)
 
 
 def _rule_requires_visual_verification(item: dict) -> bool:
@@ -786,10 +793,14 @@ def _rule_requires_visual_verification(item: dict) -> bool:
     # 触发词把整条规则强行升级为 OCR。混合型规则可能以文字为决定性证据，视觉
     # 兜底只服务于旧规则或没有给出明确分类的输入。
     explicit = item.get("ocr_required")
-    if isinstance(explicit, bool):
-        return explicit
+    if explicit is True:
+        return True
     if item.get("check_mode") == "ocr":
         return True
+    if explicit is False:
+        # 模型给出 false 时仍保留一个窄而通用的兜底：只有检查指令明确要求核验
+        # 签章、截图、复印件等视觉形态才升级 OCR；仅提到证书名称或承诺内容不升级。
+        return bool(DECISIVE_VISUAL_EVIDENCE_PATTERN.search(str(item.get("check_rule") or "")))
     text = " ".join(str(item.get(key) or "") for key in ("title", "check_rule", "source_text"))
     return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in VISUAL_EVIDENCE_PATTERNS)
 
@@ -1302,19 +1313,14 @@ def _finalise_rule_operations(app, task: dict, profile: dict, system_prompt: str
     if len(rules) < RULE_FINALISATION_MIN_RULES:
         return rules, stats
     passes = (
-        (
-            "文件边界",
-            "只处理当前电子投标文件无法直接核验的内容：整条均为外部平台/官网/原件状态、评审流程、未来履约事实时 drops；规则主体有效但混入上述越界内容时 rewrites。merges 必须为空，不处理重复或上位规则。",
-        ),
-        (
-            "重复归并",
-            "只处理重复、条件模板和已被具体子规则覆盖的上位规则：同一底层事实 merges，纯重复或上位汇总 drops。不得删除独立事实；rewrites 仅用于去掉上位兜底措辞并保留其中尚未被承接的具体事实。",
-        ),
+        ("文件边界", "extract_rules_finalise_boundary_focus"),
+        ("重复归并", "extract_rules_finalise_merge_focus"),
     )
     result = rules
-    for focus_key, focus in passes:
+    for focus_key, focus_template_id in passes:
         result, pass_stats = _finalise_rule_operations_pass(
-            app, task, profile, system_prompt, result, focus_key=focus_key, focus=focus,
+            app, task, profile, system_prompt, result, focus_key=focus_key,
+            focus=storage.render_prompt_template(app, focus_template_id),
         )
         stats["applied"] = stats["applied"] or pass_stats["applied"]
         for key in ("dropped_count", "rewritten_count", "merged_count", "failure_count"):
@@ -1441,6 +1447,9 @@ def _extract_rules(app, task: dict) -> dict:
     rules, finalisation = _finalise_rule_operations(
         app, task, profile, system_prompt, rules,
     )
+    for item in rules:
+        if _rule_requires_visual_verification(item):
+            item["ocr_required"] = True
     if not rules:
         raise ValueError("模型未提取到可确认的有效规则，请检查招标文件文本或更换模型")
     storage.update_task(app, task["task_id"], progress=80, message="正在保存待确认规则")

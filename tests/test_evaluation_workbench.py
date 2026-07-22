@@ -590,6 +590,16 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(stats["failure_count"], 2)
         self.assertFalse(stats["applied"])
 
+    def test_explicit_non_ocr_is_overridden_only_by_decisive_visual_evidence(self):
+        self.assertTrue(worker._rule_requires_visual_verification({
+            "ocr_required": False,
+            "check_rule": "核验管理体系证书，并同时提供平台查询截图与证书复印件。",
+        }))
+        self.assertFalse(worker._rule_requires_visual_verification({
+            "ocr_required": False,
+            "check_rule": "核验投标文件文字中列明的证书编号、有效期和适用范围。",
+        }))
+
     def test_rule_extraction_splits_long_source_into_bounded_batches(self):
         self._add_pdf("tender.pdf", "tender", "", "用于建立解析文件")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
