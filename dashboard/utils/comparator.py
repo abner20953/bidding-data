@@ -1432,7 +1432,7 @@ class CollusionDetector:
         return entities
 
     def extract_typed_entities(self, text):
-        """提取可横向核验的实体并保留类别，供评标工作台生成审慎线索。
+        """提取可横向核验的实体并保留类别，供工作台生成审慎线索。
 
         姓名、地址只接受带明确字段标签的写法，避免把普通中文或公共模板误判为关联。
         ``extract_entities`` 保持原返回值和行为，确保既有 /bijiao 流程兼容。

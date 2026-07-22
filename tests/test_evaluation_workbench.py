@@ -1,4 +1,5 @@
 import io
+import re
 import shutil
 import tempfile
 import threading
@@ -15,6 +16,7 @@ from dashboard.blueprints.evaluation_workbench import create_worker_app, evaluat
 from dashboard.evaluation_workbench import storage, worker
 from dashboard.evaluation_workbench.collusion_signals import build_cross_bid_analysis
 from dashboard.evaluation_workbench.prompt_context import _anchors, build_rule_context, select_rule_chunks, split_full_text_chunks
+from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
 
 
 class EvaluationWorkbenchTests(unittest.TestCase):
@@ -528,11 +530,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(wrong.status_code, 403)
         self.assertEqual(allowed.status_code, 201)
 
-    def test_prompt_templates_require_password_and_can_be_updated_and_restored(self):
+    def test_prompt_templates_are_publicly_readable_but_mutations_require_password(self):
         client = self.app.test_client()
-        locked = client.get("/api/evaluation-workbench/prompt-templates")
-        self.assertEqual(locked.status_code, 403)
-        self._unlock_model_configuration(client)
         listed = client.get("/api/evaluation-workbench/prompt-templates")
         self.assertEqual(listed.status_code, 200)
         templates = listed.get_json()["templates"]
@@ -542,27 +541,62 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             ["compare_ai_assessment", "extract_rules_guidance", "evaluate_all_guidance"],
         )
         self.assertTrue(all(item["section"] and item["change_level"] for item in templates))
+        extraction_template = next(item for item in templates if item["template_id"] == "extract_rules_user")
+        self.assertIn("不得逐条复述招标原文", extraction_template["content"])
         original = next(item for item in templates if item["template_id"] == "evaluate_all")
         before_fingerprint = storage.prompt_template_fingerprint(self.app)
-        updated = client.patch("/api/evaluation-workbench/prompt-templates/evaluate_all", json={"content": "请严格逐项核验，并用简洁中文说明证据和理由。"})
+        locked = client.patch("/api/evaluation-workbench/prompt-templates/evaluate_all", json={"content": "请严格逐项核验，并用简洁中文说明证据和理由。"})
+        updated = client.patch("/api/evaluation-workbench/prompt-templates/evaluate_all", json={"content": "请严格逐项核验，并用简洁中文说明证据和理由。", "password": "108"})
+        self.assertEqual(locked.status_code, 403)
         self.assertEqual(updated.status_code, 200)
         self.assertTrue(updated.get_json()["template"]["is_custom"])
         self.assertEqual(storage.prompt_template(self.app, "evaluate_all"), "请严格逐项核验，并用简洁中文说明证据和理由。")
         self.assertNotEqual(storage.prompt_template_fingerprint(self.app), before_fingerprint)
-        restored = client.delete("/api/evaluation-workbench/prompt-templates/evaluate_all")
+        restored = client.delete("/api/evaluation-workbench/prompt-templates/evaluate_all", json={"password": "108"})
         self.assertEqual(restored.status_code, 200)
         self.assertFalse(restored.get_json()["template"]["is_custom"])
         self.assertEqual(storage.prompt_template(self.app, "evaluate_all"), original["content"])
 
+    def test_default_prompt_templates_keep_runtime_contracts(self):
+        for template_id, meta in PROMPT_TEMPLATES.items():
+            content = meta["content"]
+            declared = set(meta.get("placeholders") or ())
+            actual = set(re.findall(r"\{\{([a-z_]+)\}\}", content))
+            self.assertEqual(actual, declared, template_id)
+            self.assertGreaterEqual(len(content), 20, template_id)
+            self.assertLessEqual(len(content), 12_000, template_id)
+            rendered = storage.render_prompt_template(
+                self.app, template_id, **{name: f"<{name}>" for name in declared},
+            )
+            self.assertIsNone(re.search(r"\{\{[a-z_]+\}\}", rendered), template_id)
+
+        extraction = PROMPT_TEMPLATES["extract_rules_user"]["content"]
+        self.assertIn('"source_page":数字或null', extraction)
+        self.assertIn("机器可读文字、表格、元数据或后续 OCR", extraction)
+        for template_id in (
+            "compare_ai_assessment_user", "review_documents_user", "score_objective_user",
+            "score_subjective_user", "evaluate_all_review_user", "evaluate_all_objective_user",
+            "evaluate_all_subjective_user",
+        ):
+            self.assertIn("恰好返回一次", PROMPT_TEMPLATES[template_id]["content"], template_id)
+        self.assertIn("不得自行给分", PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
+        self.assertIn('"page_hint":"页码或null"', PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
+
+        compact_scan = worker._full_scan_prompt(
+            self.app, {"original_name": "投标文件.pdf", "bidder_name": "投标人"},
+            [], {"chunk_id": "chunk-1", "text": "正文"}, {}, compact=True,
+        )
+        self.assertIn("每段摘录最多 60 字", compact_scan)
+        self.assertNotIn("每段摘录最多 90 字", compact_scan)
+
     def test_task_prompt_fingerprint_ignores_unrelated_template_changes(self):
         client = self.app.test_client()
-        self._unlock_model_configuration(client)
         before_evaluation = storage.task_prompt_template_fingerprint(self.app, "evaluate_all")
         before_extraction = storage.task_prompt_template_fingerprint(self.app, "extract_rules")
 
         response = client.patch(
             "/api/evaluation-workbench/prompt-templates/extract_rules_guidance",
-            json={"content": "完整提取可由投标文件核验的评审规则，并保留评分条件、证明材料和分值上限。"},
+            json={"content": "完整提取可由投标文件核验的评审规则，并保留评分条件、证明材料和分值上限。", "password": "108"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -1009,6 +1043,43 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         missing = worker._normalise_review_results([], [rules[0]])
         self.assertEqual(missing[0]["status"], "ocr_required")
 
+    def test_review_normalisation_downgrades_unread_ocr_rule_instead_of_high_risk_failure(self):
+        rules = [{"rule_id": "license", "check_mode": "ocr"}]
+        output = [{
+            "rule_id": "license", "status": "not_satisfied", "risk_level": "high",
+            "confidence": "high", "evidence_quality": "missing",
+            "reason": "文本未检索到许可证复印件",
+        }]
+
+        result = worker._normalise_review_results(output, rules)[0]
+
+        self.assertEqual(result["status"], "ocr_required")
+        self.assertEqual(result["risk_level"], "low")
+        self.assertEqual(result["confidence"], "low")
+        self.assertIn("当前未执行 OCR", result["reason"])
+
+        legacy = worker._normalise_review_results([{
+            "rule_id": "signature", "status": "satisfied", "risk_level": "low",
+            "evidence": "响应函列有法定代表人签字栏",
+        }], [{
+            "rule_id": "signature", "check_mode": "auto", "title": "响应函签章",
+            "check_rule": "核验法定代表人签字并加盖单位章",
+        }])[0]
+        self.assertEqual(legacy["status"], "ocr_required")
+        self.assertEqual(legacy["risk_level"], "low")
+        self.assertIn("当前未执行 OCR", legacy["reason"])
+
+    def test_visual_evidence_rules_receive_ocr_fallback_without_project_keywords(self):
+        self.assertTrue(worker._rule_requires_visual_verification({
+            "title": "人员资格", "check_rule": "核验操控员执照复印件的有效性",
+        }))
+        self.assertTrue(worker._rule_requires_visual_verification({
+            "title": "报价文件", "check_rule": "核验法定代表人签字及单位盖章",
+        }))
+        self.assertFalse(worker._rule_requires_visual_verification({
+            "title": "服务期限", "check_rule": "核验承诺服务期限为30日",
+        }))
+
     def test_scope_anomaly_normalises_open_dimension_without_fixed_keywords(self):
         candidates = worker._normalise_scope_anomalies(
             [["127", "无关设备与工艺", "high", "锅炉燃烧控制设备", "不属于航测服务", "建议核验来源"]],
@@ -1183,7 +1254,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.add_rule(self.app, self.project["project_id"], {"category": "objective", "title": "资质得分", "source_text": "资质得5分", "scoring": {"kind": "boolean", "max_score": 5}})
         storage.add_rule(self.app, self.project["project_id"], {"category": "subjective", "title": "技术方案", "source_text": "技术方案满分10分", "scoring": {"max_score": 10}})
         storage.confirm_rule_set(self.app, self.project["project_id"])
-        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "project-scope-coverage-v9")
+        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "project-scope-coverage-v10")
         prior = storage.create_task(self.app, self.project["project_id"], "evaluate_all", {"profile_id": None, "input_fingerprint": fingerprint})
         storage.update_task(self.app, prior["task_id"], status="success", result={"cached": True})
 

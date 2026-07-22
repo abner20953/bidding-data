@@ -1,4 +1,4 @@
-"""评标工作台独立 Blueprint。"""
+"""工作台独立 Blueprint。"""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from dashboard.evaluation_workbench.ai_gateway import test_connection
 
 
 evaluation_workbench_bp = Blueprint("evaluation_workbench", __name__)
-TASK_PROMPT_VERSION = "project-scope-coverage-v9"
+TASK_PROMPT_VERSION = "project-scope-coverage-v10"
 MODEL_CONFIGURATION_PASSWORD = "108"
 
 
@@ -77,6 +77,13 @@ def _global_rule_mutation_access_error(data: dict):
     if hmac.compare_digest(str(data.get("password", "")), MODEL_CONFIGURATION_PASSWORD):
         return None
     return jsonify({"error": "新增、修改或删除通用规则前请输入正确口令"}), 403
+
+
+def _prompt_template_mutation_access_error(data: dict):
+    """提示词允许公开查看，但每次保存或恢复默认都需单独校验口令。"""
+    if hmac.compare_digest(str(data.get("password", "")), MODEL_CONFIGURATION_PASSWORD):
+        return None
+    return jsonify({"error": "修改或恢复默认提示词前请输入正确口令"}), 403
 
 
 def _project_or_404(project_id: str):
@@ -231,7 +238,7 @@ def tasks_api(project_id):
     data = _json_body()
     task_type = str(data.get("task_type", ""))
     if task_type not in {"parse_documents", "compare_documents", "extract_rules", "review_documents", "score_objective", "score_subjective", "evaluate_all"}:
-        return jsonify({"error": "不支持的评标工作台任务"}), 400
+        return jsonify({"error": "不支持的工作台任务"}), 400
     if task_type == "compare_documents":
         documents = storage.list_documents(current_app, project_id)
         if sum(item["role"] == "bid" for item in documents) < 2:
@@ -327,22 +334,20 @@ def unlock_model_configuration_api():
 @evaluation_workbench_bp.route("/api/evaluation-workbench/prompt-templates", methods=["GET"])
 def prompt_templates_api():
     _init()
-    access_error = _model_configuration_access_error()
-    if access_error:
-        return access_error
     return jsonify({"templates": storage.list_prompt_templates(current_app)})
 
 
 @evaluation_workbench_bp.route("/api/evaluation-workbench/prompt-templates/<template_id>", methods=["PATCH", "DELETE"])
 def update_prompt_template_api(template_id):
     _init()
-    access_error = _model_configuration_access_error()
+    data = _json_body()
+    access_error = _prompt_template_mutation_access_error(data)
     if access_error:
         return access_error
     try:
         if request.method == "DELETE":
             return jsonify({"template": storage.reset_prompt_template(current_app, template_id)})
-        return jsonify({"template": storage.update_prompt_template(current_app, template_id, _json_body().get("content"))})
+        return jsonify({"template": storage.update_prompt_template(current_app, template_id, data.get("content"))})
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 

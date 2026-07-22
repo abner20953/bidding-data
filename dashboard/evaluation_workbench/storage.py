@@ -1,4 +1,4 @@
-"""评标工作台 SQLite 与文件存储。保持与现有业务模块隔离。"""
+"""工作台 SQLite 与文件存储。保持与现有业务模块隔离。"""
 
 from __future__ import annotations
 
@@ -490,7 +490,7 @@ def _model_fernet(app) -> Fernet:
     try:
         return Fernet(key)
     except (TypeError, ValueError) as exc:
-        raise ValueError("评标工作台密钥文件无效，无法读取已保存的模型 API Key") from exc
+        raise ValueError("工作台密钥文件无效，无法读取已保存的模型 API Key") from exc
 
 
 def _encrypt_model_api_key(app, api_key: str) -> str:
@@ -658,7 +658,7 @@ def store_upload(app, project_id: str, role: str, bidder_name: str, upload) -> d
     original_name = Path(upload.filename or "").name
     extension = Path(original_name).suffix.lower()
     if extension not in {".pdf", ".docx"}:
-        raise ValueError("评标工作台目前仅支持 PDF 和 DOCX 文件")
+        raise ValueError("工作台目前仅支持 PDF 和 DOCX 文件")
     if role not in {"tender", "tender_attachment", "bid"}:
         raise ValueError("不支持的文件角色")
     if role == "bid" and not bidder_name:

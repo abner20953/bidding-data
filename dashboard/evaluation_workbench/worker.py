@@ -1,4 +1,4 @@
-"""按需启动的评标工作台任务进程。"""
+"""按需启动的工作台任务进程。"""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ from dashboard.utils.comparator import CollusionDetector, ComparisonLimitError
 MAX_PARSE_PAGES = 2000
 MAX_PARSED_CHARS = 2_000_000
 MAX_DOCX_XML_BYTES = 50 * 1024 * 1024
-PROMPT_VERSION = "project-scope-coverage-v9"
+PROMPT_VERSION = "project-scope-coverage-v10"
 COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v2"
 COMPARE_AI_BATCH_SIZE = 24
 
@@ -567,7 +567,7 @@ def _rule_signature(item: dict) -> tuple[str, str, str]:
 
 
 def _dedupe_rule_candidates(items: list[dict]) -> list[dict]:
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     result = []
     for item in items:
         signature = _rule_signature(item)
@@ -576,6 +576,24 @@ def _dedupe_rule_candidates(items: list[dict]) -> list[dict]:
         seen.add(signature)
         result.append(item)
     return result
+
+
+# 这些模式描述的是“必须看图像外观才能核验”的证据形态，而不是某个项目的业务词。
+# AI 仍负责理解规则；这里仅作为保守兜底，避免把未执行 OCR 的证照、签章或凭证
+# 因文本未命中直接判成高风险不满足。
+VISUAL_EVIDENCE_PATTERNS = (
+    r"签字|签章|盖章|公章|印章|骑缝章|手写|指印",
+    r"截图|复印件|扫描件|影印件",
+    r"营业执照|许可证|合格证|资质证书|资格证书|执业证书|操控员执照|身份证",
+    r"转账凭证|缴款凭证|支付凭证|银行回单|支票|汇票|保函",
+)
+
+
+def _rule_requires_visual_verification(item: dict) -> bool:
+    if item.get("ocr_required") or item.get("check_mode") == "ocr":
+        return True
+    text = " ".join(str(item.get(key) or "") for key in ("title", "check_rule", "source_text"))
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in VISUAL_EVIDENCE_PATTERNS)
 
 
 def _rule_compilation_packet(items: list[dict], char_limit: int) -> str:
@@ -819,6 +837,9 @@ def _extract_rules(app, task: dict) -> dict:
         storage.update_task(app, task["task_id"], progress=76, message=f"规则编译未完成，已保留原始提取结果：{exc}")
     # 是否可由投标文件核验交给完整提示词与人工确认判断；不以词表硬过滤，避免误删业绩有效期等规则。
     rules = candidates
+    for item in rules:
+        if _rule_requires_visual_verification(item):
+            item["ocr_required"] = True
     excluded_rule_count = 0
     for item in rules:
         if item.get("category") not in {"objective", "subjective"}:
@@ -865,7 +886,7 @@ def _review_documents(app, task: dict) -> dict:
     review_run = storage.create_review_run(app, task["project_id"], task["task_id"], profile["profile_id"])
     rule_prompt = [{"rule_id": item["rule_id"], "category": item["category"], "title": item["title"],
                     "check_rule": item.get("check_rule") or item["title"], "source_text": item["source_text"],
-                    "ocr_required": item.get("check_mode") == "ocr"} for item in rules]
+                    "ocr_required": _rule_requires_visual_verification(item)} for item in rules]
     for index, document in enumerate(documents, start=1):
         storage.update_task(app, task["task_id"], progress=int((index - 1) * 100 / len(documents)), message=f"正在审查 {index}/{len(documents)}：{document['bidder_name'] or document['original_name']}")
         text = Path(document["parsed_path"]).read_text(encoding="utf-8", errors="ignore")
@@ -878,18 +899,7 @@ def _review_documents(app, task: dict) -> dict:
         output = parsed.get("results") if isinstance(parsed, dict) else None
         if not isinstance(output, list):
             raise ValueError("模型返回格式不符合审查要求")
-        by_id = {item["rule_id"]: item for item in rules}
-        normalized = []
-        for item in output:
-            rule_id = item.get("rule_id") if isinstance(item, dict) else None
-            if rule_id not in by_id:
-                continue
-            status = item.get("status")
-            if status not in {"satisfied", "not_satisfied", "partial", "not_found", "manual", "ocr_required"}:
-                status = "manual"
-            normalized.append(_review_result_from_model(item, rule_id, status))
-        returned_ids = {item["rule_id"] for item in normalized}
-        normalized.extend(_review_result_from_model({"reason": "模型未返回该规则的可验证结论，请人工复核。"}, rule["rule_id"], "manual") for rule in rules if rule["rule_id"] not in returned_ids)
+        normalized = _normalise_review_results(output, rules)
         storage.save_review_results(app, review_run["review_run_id"], document["document_id"], normalized)
     return {"review_run_id": review_run["review_run_id"], "document_count": len(documents), "rule_count": len(rules), "profile": profile["display_name"]}
 
@@ -912,7 +922,7 @@ def _score_documents(app, task: dict, score_type: str) -> dict:
         except json.JSONDecodeError:
             scoring = {}
         rule_payload.append({"rule_id": rule["rule_id"], "title": rule["title"], "source_text": rule["source_text"],
-                             "ocr_required": rule.get("check_mode") == "ocr", "scoring": scoring})
+                             "ocr_required": _rule_requires_visual_verification(rule), "scoring": scoring})
     for index, document in enumerate(documents, start=1):
         storage.update_task(app, task["task_id"], progress=int((index - 1) * 100 / len(documents)), message=f"正在{'客观' if score_type == 'objective' else '主观'}评分 {index}/{len(documents)}：{document['bidder_name'] or document['original_name']}")
         context = build_rule_context(document["parsed_path"], rules, char_limit)
@@ -944,7 +954,7 @@ def _score_documents(app, task: dict, score_type: str) -> dict:
 
 def _is_explicit_ocr_gap(item: dict, rule: dict) -> bool:
     """只将明确的图像识别缺口标为 OCR，避免把一般人工复核误分类。"""
-    if rule.get("check_mode") == "ocr":
+    if _rule_requires_visual_verification(rule):
         return True
     text = f"{item.get('reason') or ''} {item.get('evidence') or ''}".lower()
     return any(term in text for term in ("ocr", "扫描件", "扫描图片", "图像识别", "图片识别"))
@@ -960,14 +970,27 @@ def _normalise_review_results(output: object, rules: list[dict]) -> list[dict]:
         status = item.get("status")
         if status not in {"satisfied", "not_satisfied", "partial", "not_found", "manual", "ocr_required"}:
             status = "manual"
-        if status == "manual" and _is_explicit_ocr_gap(item, by_id[rule_id]):
+        original_status = status
+        visual_rule = _rule_requires_visual_verification(by_id[rule_id])
+        # OCR 规则在当前流程尚未真正识别图像时，不能因文本层未命中就输出高风险
+        # 不满足；模型若在理由中明确提出 OCR 缺口，也统一回落到待 OCR。
+        if visual_rule or (
+            status != "satisfied" and _is_explicit_ocr_gap(item, by_id[rule_id])
+        ):
             status = "ocr_required"
+            if original_status != "ocr_required" and visual_rule:
+                prior_reason = _clean_model_text(item.get("reason"))[:240]
+                item = {
+                    **item,
+                    "reason": "关键证据必须查看证照、签章、凭证或其他图像外观；当前未执行 OCR，需识别后再判定。"
+                    + (f" 文本层模型线索：{prior_reason}" if prior_reason else ""),
+                }
         normalized.append(_review_result_from_model(item, rule_id, status))
     returned_ids = {item["rule_id"] for item in normalized}
     normalized.extend(
         _review_result_from_model(
             {"reason": "模型未返回该规则的可验证结论，请人工复核。"}, rule["rule_id"],
-            "ocr_required" if rule.get("check_mode") == "ocr" else "manual",
+            "ocr_required" if _rule_requires_visual_verification(rule) else "manual",
         )
         for rule in rules if rule["rule_id"] not in returned_ids
     )
@@ -1001,7 +1024,7 @@ def _score_payload(rules: list[dict]) -> list[dict]:
         except json.JSONDecodeError:
             scoring = {}
         payload.append({"rule_id": rule["rule_id"], "title": rule["title"], "check_rule": rule.get("check_rule") or rule["title"], "source_text": rule["source_text"],
-                        "ocr_required": rule.get("check_mode") == "ocr", "scoring": scoring})
+                        "ocr_required": _rule_requires_visual_verification(rule), "scoring": scoring})
     return payload
 
 
@@ -1182,7 +1205,7 @@ def _combined_batch_payload(component: str, rules: list[dict]) -> list[dict]:
     if component == "review":
         return [{"rule_id": item["rule_id"], "category": item["category"], "title": item["title"],
                  "check_rule": item.get("check_rule") or item["title"], "source_text": item["source_text"],
-                 "ocr_required": item.get("check_mode") == "ocr"} for item in rules]
+                 "ocr_required": _rule_requires_visual_verification(item)} for item in rules]
     return _score_payload(rules)
 
 
@@ -1201,7 +1224,7 @@ def _full_scan_catalog(rules: list[dict]) -> list[dict]:
             "q": query[:query_limit],
             "type": rule["category"],
         }
-        if rule.get("check_mode") == "ocr":
+        if _rule_requires_visual_verification(rule):
             item["ocr"] = 1
         # 对业绩等数量/累计评分项保留极短的计分线索，避免首轮遗漏每一项材料；
         # 不在此阶段给分或做有效性裁断。
@@ -1225,7 +1248,7 @@ def _full_scan_chunk_label(chunk: dict) -> str:
 
 def _full_scan_prompt(app, document: dict, catalog: list[dict], chunk: dict, project_scope: dict, *, compact: bool) -> str:
     retry_note = (
-        "这是格式异常后的严格 JSON 重试：只输出一个 JSON 对象；matches 最多 16 条、scope_anomalies 最多 4 条，每段摘录最多 90 字；"
+        "这是格式异常后的严格 JSON 重试：只输出一个 JSON 对象；matches 最多 16 条、scope_anomalies 最多 4 条，每段摘录最多 60 字；"
         "不得使用 Markdown、注释或前后说明。\n"
         if compact else ""
     )
@@ -1800,7 +1823,7 @@ def _combined_manual_results(component: str, rules: list[dict], payload: list[di
         return [
             _review_result_from_model(
                 {"reason": reason, "risk_level": "low", "confidence": "low", "evidence_quality": "missing"},
-                rule["rule_id"], "ocr_required" if rule.get("check_mode") == "ocr" else "manual",
+                rule["rule_id"], "ocr_required" if _rule_requires_visual_verification(rule) else "manual",
             )
             for rule in rules
         ]

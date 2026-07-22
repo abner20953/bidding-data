@@ -1117,7 +1117,7 @@ except Exception as e:
 from dashboard.blueprints.shared_records import shared_records_bp, init_shared_records_db
 app.register_blueprint(shared_records_bp)
 
-# 评标工作台为独立模块；只注册路由，不在应用启动时创建任务进程或加载模型。
+# 工作台为独立模块；只注册路由，不在应用启动时创建任务进程或加载模型。
 from dashboard.blueprints.evaluation_workbench import evaluation_workbench_bp
 app.register_blueprint(evaluation_workbench_bp)
 try:
