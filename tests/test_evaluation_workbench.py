@@ -518,6 +518,71 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(kept_after_overreach, rules)
         self.assertEqual(overreach_stats["failure_count"], 1)
 
+    def test_final_rule_operations_rewrite_merge_and_drop_without_touching_scores(self):
+        task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
+        profile = storage.get_model_profile(self.app, None)
+        rules = [
+            {"category": "qualification", "title": "代理资格", "check_rule": "核验代理条件", "source_text": "代理商须满足资格条件"},
+            {"category": "compliance", "title": "制造商授权书", "check_rule": "核验制造商授权书", "source_text": "代理商须提供制造商授权书", "ocr_required": True},
+            {"category": "rejection", "title": "保证金平台状态", "check_rule": "核验平台子账号到账状态", "source_text": "投标保证金金额为五万元"},
+            {"category": "compliance", "title": "签章及在线提交", "check_rule": "核验签章并确认在线提交", "source_text": "投标文件应按要求签字盖章并在线提交"},
+            {"category": "objective", "title": "业绩评分", "check_rule": "每项3分，最高9分", "source_text": "每项3分，最高9分", "scoring": {"max_score": 9, "kind": "manual"}},
+        ]
+        rules.extend(
+            {"category": "substantive", "title": f"有效规则{index}", "check_rule": f"核验有效规则{index}", "source_text": f"应满足有效规则{index}"}
+            for index in range(6, 13)
+        )
+        response = {
+            "drops": [
+                {"rule_id": "R3", "reason": "not_file_verifiable"},
+                {"rule_id": "R5", "reason": "duplicate"},
+            ],
+            "rewrites": [
+                {"rule_id": "R4", "reason": "partial_boundary", "title": "电子签章与签字形式", "check_rule": "核验电子签章、扫描签字及涂改确认。", "ocr_required": True},
+                {"rule_id": "R5", "reason": "partial_boundary", "title": "错误评分改写", "check_rule": "不得生效", "ocr_required": False},
+            ],
+            "merges": [{
+                "rule_ids": ["R1", "R2"], "keep_rule_id": "R1", "reason": "duplicate",
+                "title": "生产或代理资格与授权材料", "check_rule": "核验代理资格条件及制造商授权书。", "ocr_required": True,
+            }],
+        }
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value=response):
+            kept, stats = worker._finalise_rule_operations(
+                self.app, task, profile, "规则提取系统提示", rules,
+            )
+
+        self.assertEqual(len(kept), 10)
+        self.assertNotIn("保证金平台状态", {item["title"] for item in kept})
+        merged = next(item for item in kept if item["title"] == "生产或代理资格与授权材料")
+        self.assertIn("代理商须满足资格条件", merged["source_text"])
+        self.assertIn("代理商须提供制造商授权书", merged["source_text"])
+        self.assertTrue(merged["ocr_required"])
+        rewritten = next(item for item in kept if item["title"] == "电子签章与签字形式")
+        self.assertNotIn("在线提交", rewritten["check_rule"])
+        score = next(item for item in kept if item["category"] == "objective")
+        self.assertEqual(score["title"], "业绩评分")
+        self.assertEqual(score["scoring"]["max_score"], 9)
+        self.assertEqual(stats, {
+            "applied": True, "dropped_count": 1, "rewritten_count": 1,
+            "merged_count": 1, "failure_count": 0,
+        })
+
+    def test_final_rule_operations_failure_keeps_all_rules(self):
+        task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
+        profile = storage.get_model_profile(self.app, None)
+        rules = [
+            {"category": "qualification", "title": f"规则{index}", "check_rule": f"核验规则{index}"}
+            for index in range(12)
+        ]
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value={"drops": "invalid"}):
+            kept, stats = worker._finalise_rule_operations(
+                self.app, task, profile, "规则提取系统提示", rules,
+            )
+        self.assertEqual(kept, rules)
+        self.assertEqual(stats["failure_count"], 1)
+        self.assertFalse(stats["applied"])
+
     def test_rule_extraction_splits_long_source_into_bounded_batches(self):
         self._add_pdf("tender.pdf", "tender", "", "用于建立解析文件")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
@@ -806,6 +871,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         compile_template = PROMPT_TEMPLATES["extract_rules_compile_user"]["content"]
         coverage_template = PROMPT_TEMPLATES["extract_rules_coverage_user"]["content"]
         quality_gate_template = PROMPT_TEMPLATES["extract_rules_quality_gate_user"]["content"]
+        finalise_template = PROMPT_TEMPLATES["extract_rules_finalise_user"]["content"]
         for value in (extraction_guidance, compile_template, coverage_template):
             self.assertIn("履约", value)
             self.assertIn("电子投标文件", value)
@@ -816,6 +882,9 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn('"drops"', quality_gate_template)
         self.assertIn("受保护规则", quality_gate_template)
         self.assertIn("勾选或取消勾选状态不是本轮提取依据", quality_gate_template)
+        self.assertIn('"rewrites"', finalise_template)
+        self.assertIn('"merges"', finalise_template)
+        self.assertIn("objective/subjective", finalise_template)
         self.assertIn("不接受联合体", extraction_validation)
         self.assertIn("平台子账号", extraction_validation)
         self.assertIn("必须为 manual", extraction_validation)

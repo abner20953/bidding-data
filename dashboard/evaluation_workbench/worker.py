@@ -1017,6 +1017,7 @@ def _compile_rule_candidates(app, task: dict, profile: dict, system_prompt: str,
 
 
 RULE_QUALITY_GATE_MIN_RULES = 2
+RULE_FINALISATION_MIN_RULES = 12
 RULE_QUALITY_GATE_REASONS = {
     "duplicate", "not_file_verifiable", "procedural", "umbrella",
     "not_scoring_rule", "unsupported_cross_reference",
@@ -1166,6 +1167,132 @@ def _final_rule_quality_gate(app, task: dict, profile: dict, system_prompt: str,
         return rules, stats
 
 
+def _finalise_rule_operations(app, task: dict, profile: dict, system_prompt: str,
+                              rules: list[dict]) -> tuple[list[dict], dict]:
+    """以可追溯操作规范化完整规则集；任何越界操作或格式异常都保留原规则。"""
+    stats = {
+        "applied": False, "dropped_count": 0, "rewritten_count": 0,
+        "merged_count": 0, "failure_count": 0,
+    }
+    if len(rules) < RULE_FINALISATION_MIN_RULES:
+        return rules, stats
+    protected = _protected_rules_for_quality_gate(app, task["project_id"])
+    prompt = storage.render_prompt_template(
+        app, "extract_rules_finalise_user",
+        candidates=_quality_gate_rule_packet(rules, include_ids=True),
+        protected_rules=_quality_gate_rule_packet(protected, include_ids=False),
+    )
+    storage.update_task(app, task["task_id"], progress=79, message="正在规范化规则边界并合并条件规则")
+    try:
+        try:
+            response = _request_task_json(
+                app, task, profile, "extract_rules_finalise", system_prompt, prompt,
+                context_mode="rule_finalise_operations",
+                max_tokens=_output_token_budget(profile, max(2_500, min(6_000, 1_200 + len(rules) * 85))),
+                thinking_mode="disabled",
+            )
+        except InvalidJsonResponse as exc:
+            response = _repair_invalid_json(
+                app, task, profile, "extract_rules_finalise_json_repair", exc, "drops",
+            )
+        if not isinstance(response, dict):
+            raise ValueError("模型返回格式不符合规则最终规范化要求")
+        operations = {key: response.get(key, []) for key in ("drops", "rewrites", "merges")}
+        if any(not isinstance(value, list) for value in operations.values()):
+            raise ValueError("模型返回格式不符合规则最终规范化要求")
+
+        id_to_index = {f"R{index + 1}": index for index in range(len(rules))}
+        working = [dict(item) for item in rules]
+        removed: set[int] = set()
+        merged_removed: set[int] = set()
+        rewritten: set[int] = set()
+        merged_groups = 0
+        allowed_drop_reasons = {"duplicate", "not_file_verifiable", "procedural", "umbrella"}
+
+        for operation in operations["rewrites"]:
+            if not isinstance(operation, dict) or operation.get("reason") not in {"partial_boundary", "umbrella"}:
+                continue
+            index = id_to_index.get(str(operation.get("rule_id") or ""))
+            if index is None or rules[index].get("category") in {"objective", "subjective"}:
+                continue
+            title = str(operation.get("title") or "").strip()
+            check_rule = str(operation.get("check_rule") or "").strip()
+            if not title or not check_rule or len(title) > 120 or len(check_rule) > 1_200:
+                continue
+            working[index]["title"] = title
+            working[index]["check_rule"] = check_rule
+            if operation.get("ocr_required") is True:
+                working[index]["ocr_required"] = True
+            rewritten.add(index)
+
+        used_merge_indexes: set[int] = set()
+        for operation in operations["merges"]:
+            if not isinstance(operation, dict) or operation.get("reason") != "duplicate":
+                continue
+            raw_ids = operation.get("rule_ids")
+            if not isinstance(raw_ids, list):
+                continue
+            indexes = []
+            for rule_id in raw_ids:
+                index = id_to_index.get(str(rule_id or ""))
+                if index is not None and index not in indexes:
+                    indexes.append(index)
+            keep_index = id_to_index.get(str(operation.get("keep_rule_id") or ""))
+            if len(indexes) < 2 or keep_index not in indexes or used_merge_indexes.intersection(indexes):
+                continue
+            if any(rules[index].get("category") in {"objective", "subjective"} for index in indexes):
+                continue
+            title = str(operation.get("title") or "").strip()
+            check_rule = str(operation.get("check_rule") or "").strip()
+            if not title or not check_rule or len(title) > 120 or len(check_rule) > 1_500:
+                continue
+            source_texts = []
+            clause_ids = []
+            for index in indexes:
+                source_text = str(rules[index].get("source_text") or "").strip()
+                if source_text and source_text not in source_texts:
+                    source_texts.append(source_text)
+                for clause_id in rules[index].get("source_clause_ids") or []:
+                    if clause_id not in clause_ids:
+                        clause_ids.append(clause_id)
+            working[keep_index]["title"] = title
+            working[keep_index]["check_rule"] = check_rule
+            working[keep_index]["source_text"] = " / ".join(source_texts)[:1_500]
+            working[keep_index]["source_clause_ids"] = clause_ids
+            if operation.get("ocr_required") is True or any(_rule_requires_visual_verification(rules[index]) for index in indexes):
+                working[keep_index]["ocr_required"] = True
+            group_removed = {index for index in indexes if index != keep_index}
+            removed.update(group_removed)
+            merged_removed.update(group_removed)
+            used_merge_indexes.update(indexes)
+            rewritten.difference_update(indexes)
+            merged_groups += 1
+
+        for operation in operations["drops"]:
+            if not isinstance(operation, dict) or operation.get("reason") not in allowed_drop_reasons:
+                continue
+            index = id_to_index.get(str(operation.get("rule_id") or ""))
+            if index is None or index in used_merge_indexes or rules[index].get("category") in {"objective", "subjective"}:
+                continue
+            removed.add(index)
+            rewritten.discard(index)
+
+        if len(removed) >= len(rules) or len(rules) - len(removed) < max(1, len(rules) // 2):
+            raise ValueError("规则最终规范化删减比例异常，已安全保留原结果")
+        result = [item for index, item in enumerate(working) if index not in removed]
+        stats.update({
+            "applied": bool(removed or rewritten or merged_groups),
+            "dropped_count": len(removed - merged_removed),
+            "rewritten_count": len(rewritten),
+            "merged_count": merged_groups,
+        })
+        return result, stats
+    except ValueError as exc:
+        stats["failure_count"] = 1
+        storage.update_task(app, task["task_id"], message=f"规则最终规范化未完成，已完整保留质量审计结果：{exc}")
+        return rules, stats
+
+
 def _extract_rules(app, task: dict) -> dict:
     documents = storage.list_documents(app, task["project_id"])
     tender = next((item for item in documents if item["role"] == "tender"), None)
@@ -1282,6 +1409,9 @@ def _extract_rules(app, task: dict) -> dict:
     rules, quality_gate = _final_rule_quality_gate(
         app, task, profile, system_prompt, rules, score_packets,
     )
+    rules, finalisation = _finalise_rule_operations(
+        app, task, profile, system_prompt, rules,
+    )
     if not rules:
         raise ValueError("模型未提取到可确认的有效规则，请检查招标文件文本或更换模型")
     storage.update_task(app, task["task_id"], progress=80, message="正在保存待确认规则")
@@ -1299,6 +1429,11 @@ def _extract_rules(app, task: dict) -> dict:
             "quality_gate_dropped_count": quality_gate["dropped_count"],
             "quality_gate_failure_count": quality_gate["failure_count"],
             "quality_gate_recovered_score_count": quality_gate["recovered_score_count"],
+            "finalisation_applied": finalisation["applied"],
+            "finalisation_dropped_count": finalisation["dropped_count"],
+            "finalisation_rewritten_count": finalisation["rewritten_count"],
+            "finalisation_merged_count": finalisation["merged_count"],
+            "finalisation_failure_count": finalisation["failure_count"],
             "preserved_rule_count": rule_set.get("preserved_rule_count", 0), "split_retry_count": split_retry_count}
 
 
