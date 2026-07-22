@@ -31,6 +31,9 @@ GLOBAL_RULE_CATEGORIES = {"qualification", "compliance", "substantive", "other"}
 _SCORE_TOTAL_PATTERN = re.compile(r"(?:总计|共计|合计|最高(?:得)?|最多(?:得)?|满分(?:为)?)\s*(\d+(?:\.\d+)?)\s*分")
 _SCORE_VALUE_PATTERN = re.compile(r"(?:得|扣)\s*(\d+(?:\.\d+)?)\s*分")
 _LEGACY_EXTRACT_RULES_USER_SHA256 = "4fe464136f54fb033ac1824271f0d942a3d7f3d13b53c04acdf498ac152ff3d2"
+# 该值是 2026-07-22 之前随系统同步到云端、但没有人工编辑过的默认模板。
+# 保留它可让本次规则质量升级实际作用于既有部署，同时绝不覆盖用户手动编辑的内容。
+_PREVIOUS_DEFAULT_EXTRACT_RULES_USER_SHA256 = "a4bb928f79c5e954c155a344ae817231ade404c684da1afd7f111bdb284ab578"
 
 
 def _validate_api_key_characters(api_key: str) -> None:
@@ -446,7 +449,10 @@ def _migrate_known_legacy_prompt_override(conn: sqlite3.Connection) -> None:
     except (TypeError, json.JSONDecodeError):
         return
     legacy = overrides.get("extract_rules_user") if isinstance(overrides, dict) else None
-    if not isinstance(legacy, str) or hashlib.sha256(legacy.encode("utf-8")).hexdigest() != _LEGACY_EXTRACT_RULES_USER_SHA256:
+    if not isinstance(legacy, str) or hashlib.sha256(legacy.encode("utf-8")).hexdigest() not in {
+        _LEGACY_EXTRACT_RULES_USER_SHA256,
+        _PREVIOUS_DEFAULT_EXTRACT_RULES_USER_SHA256,
+    }:
         return
     # 历史版本是此前同步过的原文映射模板。新版保留其业务边界，并补齐页码、
     # 评分条款 ID 与叶子评分项，避免复杂评分规则只能由后续补救阶段还原。

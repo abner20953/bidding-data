@@ -663,7 +663,13 @@ VISUAL_EVIDENCE_PATTERNS = (
 
 
 def _rule_requires_visual_verification(item: dict) -> bool:
-    if item.get("ocr_required") or item.get("check_mode") == "ocr":
+    # 提取模型已经明确给出布尔判断时，不能再因规则文字中提及“证照”“签章”等
+    # 触发词把整条规则强行升级为 OCR。混合型规则可能以文字为决定性证据，视觉
+    # 兜底只服务于旧规则或没有给出明确分类的输入。
+    explicit = item.get("ocr_required")
+    if isinstance(explicit, bool):
+        return explicit
+    if item.get("check_mode") == "ocr":
         return True
     text = " ".join(str(item.get(key) or "") for key in ("title", "check_rule", "source_text"))
     return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in VISUAL_EVIDENCE_PATTERNS)

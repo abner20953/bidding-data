@@ -1308,6 +1308,11 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             "title": "服务期限", "check_rule": "核验承诺服务期限为30日",
         }))
 
+    def test_explicit_non_ocr_rule_is_not_overridden_by_visual_keyword_fallback(self):
+        self.assertFalse(worker._rule_requires_visual_verification({
+            "title": "证照要求", "check_rule": "核验许可证名称及有效期", "ocr_required": False,
+        }))
+
     def test_scope_anomaly_normalises_open_dimension_without_fixed_keywords(self):
         candidates = worker._normalise_scope_anomalies(
             [["127", "无关设备与工艺", "high", "锅炉燃烧控制设备", "不属于航测服务", "建议核验来源"]],
