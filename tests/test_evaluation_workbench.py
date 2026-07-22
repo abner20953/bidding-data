@@ -1352,6 +1352,17 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertTrue(all(len({worker._rule_execution_strategy(rule) for rule in group}) == 1 for group in groups))
         self.assertEqual(next(group for group in groups if group[0]["rule_id"] == "section"), [rules[2]])
 
+    def test_evaluation_request_gate_promotes_then_degrades_one_level_at_a_time(self):
+        gate = worker._EvaluationRequestGate(2, max_limit=3)
+
+        for _ in range(6):
+            gate.record_success()
+        self.assertEqual(gate.limit, 3)
+        self.assertTrue(gate.reduce_after_rate_limit())
+        self.assertEqual(gate.limit, 2)
+        self.assertTrue(gate.reduce_after_rate_limit())
+        self.assertEqual(gate.limit, 1)
+
     def test_single_compound_score_rule_splits_only_explicit_additive_items_after_truncation(self):
         self._add_pdf("compound.pdf", "bid", "甲公司", "部署方案完整。运维方案完整。")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
@@ -1785,6 +1796,22 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotEqual(extracted_again["rule_id"], original["rule_id"])
         self.assertEqual(extracted_again["source_type"], "ai")
         self.assertEqual(extracted_again["enabled"], 1)
+
+    def test_reextract_defaults_visual_verification_rules_to_disabled(self):
+        storage.create_global_rule(self.app, {
+            "category": "qualification", "title": "通用许可证", "check_rule": "核验许可证图像", "ocr_required": True,
+        })
+        storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-ocr", [
+            {"category": "qualification", "title": "营业执照", "check_rule": "核验营业执照文字", "source_text": "提供营业执照。"},
+            {"category": "qualification", "title": "签字盖章", "check_rule": "核验签章图像", "source_text": "签字盖章。", "ocr_required": True},
+        ])
+
+        _, rules = storage.list_rules(self.app, self.project["project_id"])
+        enabled = {item["title"]: item["enabled"] for item in rules}
+
+        self.assertEqual(enabled["营业执照"], 1)
+        self.assertEqual(enabled["签字盖章"], 0)
+        self.assertEqual(enabled["通用许可证"], 0)
 
     def test_force_rerun_is_persisted_in_task_payload(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "已提供资质。")

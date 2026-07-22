@@ -5,8 +5,21 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 
 import requests
+
+
+_REQUEST_SESSIONS = threading.local()
+
+
+def _http_post(*args, **kwargs):
+    """按工作线程复用 HTTP 连接；评审并发时不共享 Session 可变状态。"""
+    session = getattr(_REQUEST_SESSIONS, "session", None)
+    if session is None:
+        session = requests.Session()
+        _REQUEST_SESSIONS.session = session
+    return session.post(*args, **kwargs)
 
 
 class InvalidJsonResponse(ValueError):
@@ -210,7 +223,7 @@ def request_json(profile: dict, system_prompt: str, user_prompt: str, *, usage_c
     if max_tokens is not None:
         payload["max_tokens"] = max(16, int(max_tokens))
     try:
-        response = requests.post(
+        response = _http_post(
             f"{base_url}/chat/completions",
             headers=_headers(api_key),
             json=payload,
@@ -260,7 +273,7 @@ def test_connection(profile: dict, prompt_text: str) -> str:
     if _is_minimax_m3(profile):
         payload["reasoning_split"] = True
     try:
-        response = requests.post(
+        response = _http_post(
             f"{profile['base_url'].rstrip('/')}/chat/completions",
             headers=_headers(api_key),
             json=payload,

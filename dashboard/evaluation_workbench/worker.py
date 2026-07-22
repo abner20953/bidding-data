@@ -40,9 +40,11 @@ COMPARE_AI_BATCH_SIZE = 24
 class _EvaluationRequestGate:
     """综合评审内的模型请求闸门；遇限流时自动收敛到单路。"""
 
-    def __init__(self, limit: int = 2):
+    def __init__(self, limit: int = 2, max_limit: int | None = None):
         self.limit = max(1, int(limit))
+        self.max_limit = max(self.limit, int(max_limit or self.limit))
         self.active = 0
+        self.success_count = 0
         self.condition = threading.Condition()
 
     def acquire(self) -> None:
@@ -56,11 +58,25 @@ class _EvaluationRequestGate:
             self.active = max(0, self.active - 1)
             self.condition.notify_all()
 
-    def limit_to_one(self) -> bool:
+    def record_success(self) -> bool:
+        """稳定完成若干次请求后才逐级开放一条并行位，避免小规格服务器突发放量。"""
         with self.condition:
-            if self.limit == 1:
+            self.success_count += 1
+            if self.limit < self.max_limit and self.success_count >= 6:
+                self.limit += 1
+                self.success_count = 0
+                self.condition.notify_all()
+                return True
+            return False
+
+    def reduce_after_rate_limit(self) -> bool:
+        """按 3→2→1 逐级回退；下一批任务重新从保守并行度开始。"""
+        with self.condition:
+            next_limit = 2 if self.limit > 2 else 1
+            if next_limit >= self.limit:
                 return False
-            self.limit = 1
+            self.limit = next_limit
+            self.success_count = 0
             self.condition.notify_all()
             return True
 
@@ -107,16 +123,19 @@ def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt
             if gate:
                 gate.acquire()
             try:
-                return request_json(
+                result = request_json(
                     effective_profile, system_prompt, user_prompt, usage_callback=record_usage,
                     response_metadata_callback=record_response_metadata, max_tokens=max_tokens,
                 )
+                if gate:
+                    gate.record_success()
+                return result
             except ValueError as exc:
                 # 仅综合评审的双路并行会使用该闸门。服务商限流时让后续请求
                 # 自动改为单路，并只重试当前这一小次模型调用，不重发整份文件。
                 if gate and attempt == 0 and _is_rate_limit_error(exc):
-                    if gate.limit_to_one():
-                        storage.update_task(app, task["task_id"], message="模型接口限流或暂时繁忙，已自动切换为单路继续评审")
+                    if gate.reduce_after_rate_limit():
+                        storage.update_task(app, task["task_id"], message="模型接口限流或暂时繁忙，已自动降低并行度后继续评审")
                     retry_after_rate_limit = True
                 else:
                     raise
@@ -140,12 +159,16 @@ def _system_prompt(app, template_id: str) -> str:
     base = storage.render_prompt_template(app, template_id)
     # 将长期维护的业务判断原则与可变的 JSON/任务模板分开。这样即使用户仍在使用
     # 历史任务模板，新的通用原则也可独立查看、编辑和升级，不依赖业务硬编码。
-    overlay_id = {
-        "extract_rules": "extract_rules_guidance",
-        "evaluate_all": "evaluate_all_guidance",
-    }.get(template_id)
-    if overlay_id:
-        return f"{base}\n\n【通用业务指令】\n{storage.render_prompt_template(app, overlay_id)}"
+    overlay_ids = {
+        "extract_rules": ("extract_rules_guidance",),
+        "evaluate_all": ("evaluate_all_guidance", "evaluate_all_output_contract"),
+    }.get(template_id, ())
+    if overlay_ids:
+        overlays = "\n\n".join(
+            f"【{'通用业务指令' if index == 0 else '系统与结果约束'}】\n{storage.render_prompt_template(app, overlay_id)}"
+            for index, overlay_id in enumerate(overlay_ids)
+        )
+        return f"{base}\n\n{overlays}"
     return base
 
 
@@ -1484,26 +1507,58 @@ def _rule_complexity(rule: dict) -> float:
     return complexity
 
 
-def _evaluation_rule_batches(component: str, rules: list[dict]) -> list[list[dict]]:
-    """先按证据策略归组，再按复杂度预算装箱；保持每个策略内的原始规则顺序。"""
+def _evaluation_rule_batches(component: str, rules: list[dict], scan_index: dict | None = None) -> list[list[dict]]:
+    """先按证据策略归组，再按复杂度预算装箱。
+
+    全文扫描完成后，同策略规则会优先和证据页重合度高的规则同组。每条规则仍由
+    后续上下文构造器保留自身直接页块，分组仅减少多组重复发送同一原文。
+    """
     if not rules:
         return []
     max_count = EVALUATION_BATCH_SIZES[component]
     buckets: dict[str, list[dict]] = {}
     for rule in rules:
         buckets.setdefault(_rule_execution_strategy(rule), []).append(rule)
+    chunks = scan_index.get("chunks", []) if isinstance(scan_index, dict) else []
+    chunk_map = select_rule_chunk_map(chunks, rules, per_rule=6) if chunks else {}
     groups: list[list[dict]] = []
     for strategy_rules in buckets.values():
-        current: list[dict] = []
-        current_cost = 0.0
-        for rule in strategy_rules:
-            cost = _rule_complexity(rule)
-            if current and (len(current) >= max_count or current_cost + cost > max_count):
+        if not chunk_map:
+            current: list[dict] = []
+            current_cost = 0.0
+            for rule in strategy_rules:
+                cost = _rule_complexity(rule)
+                if current and (len(current) >= max_count or current_cost + cost > max_count):
+                    groups.append(current)
+                    current, current_cost = [], 0.0
+                current.append(rule)
+                current_cost += cost
+            if current:
                 groups.append(current)
-                current, current_cost = [], 0.0
-            current.append(rule)
-            current_cost += cost
-        if current:
+            continue
+        # 以最早未分组规则为锚点；随后只在同策略、同复杂度预算内选取和已有页块
+        # 重合最多的规则。未命中页块的规则不会被丢弃，只按原始顺序作为兜底加入。
+        remaining = list(strategy_rules)
+        while remaining:
+            current = [remaining.pop(0)]
+            current_cost = _rule_complexity(current[0])
+            current_chunks = set(chunk_map.get(current[0]["rule_id"], []))
+            while remaining and len(current) < max_count:
+                options = []
+                for index, candidate in enumerate(remaining):
+                    cost = _rule_complexity(candidate)
+                    if current_cost + cost > max_count:
+                        continue
+                    candidate_chunks = set(chunk_map.get(candidate["rule_id"], []))
+                    overlap = len(current_chunks & candidate_chunks)
+                    options.append((-overlap, index, candidate, cost, candidate_chunks))
+                if not options:
+                    break
+                _, index, candidate, cost, candidate_chunks = min(options, key=lambda value: (value[0], value[1]))
+                current.append(candidate)
+                current_cost += cost
+                current_chunks.update(candidate_chunks)
+                remaining.pop(index)
             groups.append(current)
     return groups
 
@@ -1745,9 +1800,9 @@ def _project_scope_profile(app, task: dict, profile: dict, documents: list[dict]
                    for item in rules]
     scope_key = hashlib.sha256(json.dumps({
         "version": PROMPT_VERSION,
-        # 与任务统一指纹绑定，模型档案、提示词、招标附件或规则变化时均不复用。
-        "execution": task.get("payload", {}).get("input_fingerprint"),
-        # 用户明确强制重跑时，范围画像也应重新生成，而不是只跳过最终结果复用。
+        # 范围画像只依赖本阶段实际使用的资料、模型和模板。评分或输出格式提示词
+        # 的局部调整不应迫使已正确建立的招标范围画像重新消耗模型调用。
+        # 用户明确强制重跑时仍刻意绕过缓存，保留“重新完整判断”的原有语义。
         "force_run": task.get("task_id") if task.get("payload", {}).get("force_rerun") else None,
         "profile": profile.get("profile_id"), "model": profile.get("model_name"),
         "tender": tender_text, "rules": rule_packet,
@@ -1882,12 +1937,13 @@ def _scan_document_fulltext(app, task: dict, profile: dict, document: dict, rule
     catalog = _full_scan_catalog(rules)
     scan_key = hashlib.sha256(json.dumps({
         "version": PROMPT_VERSION,
-        # scan 缓存同样必须感知完整的执行输入，而不能只看模型名称和部分用户模板。
-        "execution": task.get("payload", {}).get("input_fingerprint"),
-        # 强制重跑代表用户要求重新获得模型判断，不能复用旧页块扫描结果。
+        # 全文扫描只绑定它实际使用的系统指令、扫描模板、规则目录和范围画像。
+        # 这样修改最终评分/展示提示词时可复用已完成的全文证据扫描，不减少任何页块。
+        # 强制重跑仍代表用户要求重新获得模型扫描判断，不能复用旧页块扫描结果。
         "force_run": task.get("task_id") if task.get("payload", {}).get("force_rerun") else None,
         "profile": profile.get("profile_id"), "model": profile.get("model_name"),
         "catalog": catalog, "project_scope": project_scope,
+        "system": system_prompt,
         "template": storage.prompt_template(app, "evaluate_all_full_scan_user"),
     }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
     findings: list[dict] = []
@@ -2612,7 +2668,9 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
     }
     components = (("review", review_rules, review_run), ("objective", objective_rules, objective_run), ("subjective", subjective_rules, subjective_run))
     for component, component_rules, run in components:
-        for group_index, group in enumerate(_evaluation_rule_batches(component, component_rules), start=1):
+        # 长文件已有全文扫描索引时，按重合证据页重组规则，减少不同组重复携带同一页。
+        groups = _evaluation_rule_batches(component, component_rules, scan_index=scan_index)
+        for group_index, group in enumerate(groups, start=1):
             label = f"{bidder_name}·{component} 第{group_index}组"
             progress.message(f"正在综合评审：{label}")
             results, compact_count, split_count, fallback_count, _ = _run_combined_batch(
@@ -2682,7 +2740,12 @@ def _evaluate_all(app, task: dict) -> dict:
     }
     cross_bid_units = 1 if objective_run and len(documents) >= 2 and cross_bid_price_rules else 0
     total_work_units = max(1, sum(scan_units_by_document.values()) + len(documents) * groups_per_document + cross_bid_units)
-    task["_evaluation_request_gate"] = _EvaluationRequestGate(2 if len(documents) > 1 else 1)
+    # 首次仍以两路保守启动；连续成功后才让第三家投标文件进入第三条模型通道。
+    # 对 2 核 2GB 服务器而言这主要增加网络等待并行，不常驻加载额外模型。
+    task["_evaluation_request_gate"] = _EvaluationRequestGate(
+        2 if len(documents) > 1 else 1,
+        max_limit=min(3, len(documents)),
+    )
     progress = _EvaluationProgress(app, task, total_work_units, len(documents))
 
     def run_document(document: dict) -> dict:
@@ -2701,7 +2764,7 @@ def _evaluate_all(app, task: dict) -> dict:
     if len(documents) == 1:
         document_results.append(run_document(documents[0]))
     else:
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="evaluation-bid") as executor:
+        with ThreadPoolExecutor(max_workers=min(3, len(documents)), thread_name_prefix="evaluation-bid") as executor:
             futures = [executor.submit(run_document, document) for document in documents]
             for future in as_completed(futures):
                 document_results.append(future.result())

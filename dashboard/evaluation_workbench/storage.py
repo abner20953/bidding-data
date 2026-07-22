@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet, InvalidToken
 from dashboard.evaluation_workbench.prompt_templates import (
-    PROMPT_TEMPLATE_SETTING, PROMPT_TEMPLATES, template_presentation,
+    PROMPT_TEMPLATE_SETTING, PROMPT_TEMPLATES, default_template, template_presentation,
 )
 
 
@@ -28,6 +28,7 @@ GLOBAL_RULE_CATEGORIES = {"qualification", "compliance", "substantive", "other"}
 
 _SCORE_TOTAL_PATTERN = re.compile(r"(?:总计|共计|合计|最高(?:得)?|最多(?:得)?|满分(?:为)?)\s*(\d+(?:\.\d+)?)\s*分")
 _SCORE_VALUE_PATTERN = re.compile(r"(?:得|扣)\s*(\d+(?:\.\d+)?)\s*分")
+_LEGACY_EXTRACT_RULES_USER_SHA256 = "4fe464136f54fb033ac1824271f0d942a3d7f3d13b53c04acdf498ac152ff3d2"
 
 
 def _validate_api_key_characters(api_key: str) -> None:
@@ -107,7 +108,8 @@ def task_prompt_template_fingerprint(app, task_type: str) -> str | None:
         "evaluate_all": {
             "evaluate_all", "evaluate_all_guidance", "evaluate_all_scope_profile", "evaluate_all_scope_profile_user",
             "evaluate_all_full_scan_user", "evaluate_all_review_user", "evaluate_all_objective_user",
-            "evaluate_all_subjective_user", "evaluate_all_cross_bid_price_user", "json_repair", "json_repair_user",
+            "evaluate_all_subjective_user", "evaluate_all_cross_bid_price_user", "evaluate_all_output_contract",
+            "json_repair", "json_repair_user",
         },
     }
     template_ids = templates_by_task.get(task_type)
@@ -418,6 +420,7 @@ def init_database(app) -> None:
         _ensure_column(conn, "ew_model_calls", "response_chars", "INTEGER")
         conn.execute("UPDATE ew_rules SET check_rule = title WHERE check_rule IS NULL OR check_rule = ''")
         conn.execute("UPDATE ew_rules SET source_type = CASE WHEN rule_set_id IN (SELECT rule_set_id FROM ew_rule_sets WHERE source_task_id IS NOT NULL) THEN 'ai' ELSE 'manual' END WHERE source_type IS NULL OR source_type = ''")
+        _migrate_known_legacy_prompt_override(conn)
         _seed_default_profiles(conn)
         _seed_default_model_setting(conn)
     app.extensions["evaluation_workbench_database"] = marker
@@ -427,6 +430,29 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition
     columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in columns:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _migrate_known_legacy_prompt_override(conn: sqlite3.Connection) -> None:
+    """只升级已确认的历史默认覆盖，不改写用户后来编辑过的提示词。"""
+    row = conn.execute(
+        "SELECT setting_value FROM ew_settings WHERE setting_key = ?", (PROMPT_TEMPLATE_SETTING,)
+    ).fetchone()
+    if not row:
+        return
+    try:
+        overrides = json.loads(row["setting_value"])
+    except (TypeError, json.JSONDecodeError):
+        return
+    legacy = overrides.get("extract_rules_user") if isinstance(overrides, dict) else None
+    if not isinstance(legacy, str) or hashlib.sha256(legacy.encode("utf-8")).hexdigest() != _LEGACY_EXTRACT_RULES_USER_SHA256:
+        return
+    # 历史版本是此前同步过的原文映射模板。新版保留其业务边界，并补齐页码、
+    # 评分条款 ID 与叶子评分项，避免复杂评分规则只能由后续补救阶段还原。
+    overrides["extract_rules_user"] = default_template("extract_rules_user")
+    conn.execute(
+        "UPDATE ew_settings SET setting_value = ?, updated_at = ? WHERE setting_key = ?",
+        (json.dumps(overrides, ensure_ascii=False), now_iso(), PROMPT_TEMPLATE_SETTING),
+    )
 
 
 def _seed_default_profiles(conn: sqlite3.Connection) -> None:
@@ -1541,7 +1567,7 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (str(uuid.uuid4()), rule_set["rule_set_id"], row["category"], row["title"], row["check_rule"] or row["title"],
                  row["source_text"], row["source_page"], "ocr" if row["check_mode"] == "ocr" else "auto",
-                 row["source_type"], row["source_task_id"], row["scoring_json"], 1, index, timestamp, timestamp),
+                 row["source_type"], row["source_task_id"], row["scoring_json"], 0 if row["check_mode"] == "ocr" else 1, index, timestamp, timestamp),
             )
             preserved_rule_count += 1
         for index, item in enumerate(rules):
@@ -1556,11 +1582,12 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
             signatures.add(signature)
             conn.execute(
                 """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode, source_type, source_task_id, scoring_json, enabled, sort_order, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ai', ?, ?, 1, ?, ?, ?)""",
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ai', ?, ?, ?, ?, ?, ?)""",
                 (str(uuid.uuid4()), rule_set["rule_set_id"], category, title, check_rule, str(item.get("source_text", "")).strip(),
                  item.get("source_page") if isinstance(item.get("source_page"), int) else None,
                  "ocr" if item.get("ocr_required") or item.get("check_mode") == "ocr" else "auto",
                  task_id, json.dumps(item.get("scoring"), ensure_ascii=False) if item.get("scoring") else None,
+                 0 if item.get("ocr_required") or item.get("check_mode") == "ocr" else 1,
                  preserved_rule_count + index, timestamp, timestamp),
             )
         global_rule_count = 0
@@ -1578,9 +1605,9 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
             conn.execute(
                 """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode,
                    source_type, source_task_id, scoring_json, enabled, sort_order, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'global', NULL, NULL, 1, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'global', NULL, NULL, ?, ?, ?, ?)""",
                 (str(uuid.uuid4()), rule_set["rule_set_id"], template["category"], template["title"], template["check_rule"],
-                 template["source_text"], template["check_mode"], position, timestamp, timestamp),
+                 template["source_text"], template["check_mode"], 0 if template["check_mode"] == "ocr" else 1, position, timestamp, timestamp),
             )
             global_rule_count += 1
         rule_set["global_rule_count"] = global_rule_count

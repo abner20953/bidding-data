@@ -23,7 +23,7 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
         return profile
 
     def test_connection_rejects_non_ascii_api_key_before_network_request(self):
-        with patch("dashboard.evaluation_workbench.ai_gateway.requests.post") as post:
+        with patch("dashboard.evaluation_workbench.ai_gateway._http_post") as post:
             with self.assertRaisesRegex(ValueError, "API Key 含有中文"):
                 test_connection(self._profile(_api_key="测试-key"), CONNECTION_TEST_PROMPT)
 
@@ -65,7 +65,7 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
 
     def test_connection_explains_authentication_failure_without_echoing_response(self):
         response = Mock(ok=False, status_code=401, text='{"error":"invalid api key"}')
-        with patch("dashboard.evaluation_workbench.ai_gateway.requests.post", return_value=response):
+        with patch("dashboard.evaluation_workbench.ai_gateway._http_post", return_value=response):
             with self.assertRaisesRegex(ValueError, "鉴权失败（HTTP 401）") as error:
                 test_connection(self._profile(), CONNECTION_TEST_PROMPT)
 
@@ -75,7 +75,7 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
     def test_minimax_compatible_profile_can_omit_optional_parameters(self):
         response = Mock(ok=True)
         response.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
-        with patch("dashboard.evaluation_workbench.ai_gateway.requests.post", return_value=response) as post:
+        with patch("dashboard.evaluation_workbench.ai_gateway._http_post", return_value=response) as post:
             message = test_connection(self._profile(model_name="MiniMax-M2.7"), CONNECTION_TEST_PROMPT)
 
         self.assertEqual(message, "连接成功：模型接口已响应")
@@ -89,7 +89,7 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
         profile = self._profile(
             base_url="https://api.minimaxi.com/v1", model_name="MiniMax-M3", thinking_mode="enabled"
         )
-        with patch("dashboard.evaluation_workbench.ai_gateway.requests.post", return_value=response) as post:
+        with patch("dashboard.evaluation_workbench.ai_gateway._http_post", return_value=response) as post:
             test_connection(profile, CONNECTION_TEST_PROMPT)
 
         self.assertEqual(post.call_args.kwargs["json"]["thinking"], {"type": "adaptive"})
@@ -101,7 +101,7 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
         profile = self._profile(
             base_url="https://api.minimaxi.com/v1", model_name="MiniMax-M3", thinking_mode="default"
         )
-        with patch("dashboard.evaluation_workbench.ai_gateway.requests.post", return_value=response) as post:
+        with patch("dashboard.evaluation_workbench.ai_gateway._http_post", return_value=response) as post:
             test_connection(profile, CONNECTION_TEST_PROMPT)
 
         self.assertTrue(post.call_args.kwargs["json"]["reasoning_split"])
@@ -112,7 +112,7 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
         profile = self._profile(
             base_url="https://api.minimaxi.com/v1", model_name="MiniMax-M2.7", thinking_mode="disabled"
         )
-        with patch("dashboard.evaluation_workbench.ai_gateway.requests.post", return_value=response) as post:
+        with patch("dashboard.evaluation_workbench.ai_gateway._http_post", return_value=response) as post:
             test_connection(profile, CONNECTION_TEST_PROMPT)
 
         self.assertNotIn("thinking", post.call_args.kwargs["json"])
