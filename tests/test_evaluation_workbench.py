@@ -708,6 +708,9 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn('"source_clause_ids"', extraction)
         self.assertIn('"items"', extraction)
         self.assertIn("机器可读文字、表格、元数据或后续 OCR", extraction)
+        extraction_system = PROMPT_TEMPLATES["extract_rules"]["content"]
+        self.assertIn("时间边界", extraction_system)
+        self.assertIn("不得把普通技术描述", extraction_system)
         for template_id in (
             "compare_ai_assessment_user", "review_documents_user", "score_objective_user",
             "score_subjective_user", "evaluate_all_review_user", "evaluate_all_objective_user",
