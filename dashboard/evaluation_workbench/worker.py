@@ -160,7 +160,7 @@ def _system_prompt(app, template_id: str) -> str:
     # 将长期维护的业务判断原则与可变的 JSON/任务模板分开。这样即使用户仍在使用
     # 历史任务模板，新的通用原则也可独立查看、编辑和升级，不依赖业务硬编码。
     overlay_ids = {
-        "extract_rules": ("extract_rules_guidance",),
+        "extract_rules": ("extract_rules_guidance", "extract_rules_validation_guidance"),
         "evaluate_all": ("evaluate_all_guidance", "evaluate_all_output_contract"),
     }.get(template_id, ())
     if overlay_ids:
@@ -1271,7 +1271,11 @@ def _extract_rules(app, task: dict) -> dict:
                 scoring = {"max_score": inferred, "source": "source_text_inferred"}
         if storage._valid_max_score(scoring) is not None:
             if item["category"] == "objective":
-                scoring["kind"] = "boolean" if scoring.get("kind") == "boolean" else "manual"
+                # 带有叶子评分项的客观分必然需要逐项汇总；即使模型错误标为 boolean，
+                # 也不能在综合评审中把“每类/每项计分”误按满足即满分处理。
+                score_items = scoring.get("items")
+                has_score_items = isinstance(score_items, list) and any(isinstance(value, dict) for value in score_items)
+                scoring["kind"] = "boolean" if scoring.get("kind") == "boolean" and not has_score_items else "manual"
             else:
                 scoring["kind"] = "manual"
             item["scoring"] = scoring

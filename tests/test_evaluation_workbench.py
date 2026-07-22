@@ -307,6 +307,35 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(next(item for item in rules if item["title"] == "具备有效资质")["check_rule"], "核验是否提供有效资质材料")
         self.assertEqual(next(item for item in rules if item["title"] == "技术方案评分")["check_mode"], "ocr")
 
+    def test_rule_extraction_treats_objective_rules_with_score_items_as_manual(self):
+        self._add_pdf("tender.pdf", "tender", "", "管理体系认证每提供一类得1分，最高3分。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        storage.create_task(self.app, self.project["project_id"], "extract_rules")
+        response = {"rules": [
+            {
+                "category": "objective", "title": "管理体系认证", "check_rule": "每提供一类认证得1分，最高3分",
+                "source_text": "管理体系认证每提供一类得1分，最高3分。",
+                "scoring": {"max_score": 3, "kind": "boolean", "items": [
+                    {"name": "管理体系认证", "max_score": 3, "criterion": "每提供一类得1分"},
+                ]},
+            },
+            {
+                "category": "objective", "title": "固定资质得分", "check_rule": "具备该资质得5分",
+                "source_text": "具备该资质得5分。", "scoring": {"max_score": 5, "kind": "boolean"},
+            },
+        ]}
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value=response):
+            finished = self._run_next_task()
+
+        _, rules = storage.list_rules(self.app, self.project["project_id"])
+        scoring = json.loads(next(item for item in rules if item["title"] == "管理体系认证")["scoring_json"])
+        fixed_scoring = json.loads(next(item for item in rules if item["title"] == "固定资质得分")["scoring_json"])
+        self.assertEqual(finished["status"], "success")
+        self.assertEqual(scoring["kind"], "manual")
+        self.assertEqual(fixed_scoring["kind"], "boolean")
+
     def test_rule_extraction_retries_with_compact_output_after_json_truncation(self):
         self._add_pdf("tender.pdf", "tender", "", "投标人应具备有效资质。")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
@@ -724,7 +753,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual({item["configuration_group"] for item in templates}, {"business", "workflow", "system"})
         self.assertEqual(
             [item["template_id"] for item in templates if item["configuration_group"] == "business"],
-            ["compare_ai_assessment", "extract_rules_guidance", "evaluate_all_guidance"],
+            ["compare_ai_assessment", "extract_rules_guidance", "extract_rules_validation_guidance", "evaluate_all_guidance"],
         )
         self.assertTrue(all(item["section"] and item["change_level"] for item in templates))
         extraction_template = next(item for item in templates if item["template_id"] == "extract_rules_user")
@@ -773,6 +802,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不得自行给分", PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
         self.assertIn('"page_hint":"页码或null"', PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
         extraction_guidance = PROMPT_TEMPLATES["extract_rules_guidance"]["content"]
+        extraction_validation = PROMPT_TEMPLATES["extract_rules_validation_guidance"]["content"]
         compile_template = PROMPT_TEMPLATES["extract_rules_compile_user"]["content"]
         coverage_template = PROMPT_TEMPLATES["extract_rules_coverage_user"]["content"]
         quality_gate_template = PROMPT_TEMPLATES["extract_rules_quality_gate_user"]["content"]
@@ -786,6 +816,9 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn('"drops"', quality_gate_template)
         self.assertIn("受保护规则", quality_gate_template)
         self.assertIn("勾选或取消勾选状态不是本轮提取依据", quality_gate_template)
+        self.assertIn("不接受联合体", extraction_validation)
+        self.assertIn("平台子账号", extraction_validation)
+        self.assertIn("必须为 manual", extraction_validation)
 
         compact_scan = worker._full_scan_prompt(
             self.app, {"original_name": "投标文件.pdf", "bidder_name": "投标人"},

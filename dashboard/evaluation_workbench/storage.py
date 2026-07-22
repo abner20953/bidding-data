@@ -103,7 +103,7 @@ def task_prompt_template_fingerprint(app, task_type: str) -> str | None:
     templates_by_task = {
         "compare_documents": {"compare_ai_assessment", "compare_ai_assessment_user", "json_repair", "json_repair_user"},
         "extract_rules": {
-            "extract_rules", "extract_rules_guidance", "extract_rules_user", "extract_rules_compile_user",
+            "extract_rules", "extract_rules_guidance", "extract_rules_validation_guidance", "extract_rules_user", "extract_rules_compile_user",
             "extract_rules_continue_user", "extract_rules_coverage_user", "extract_rules_quality_gate_user", "extract_rules_supplement_user",
             "json_repair", "json_repair_user",
         },
