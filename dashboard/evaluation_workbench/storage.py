@@ -23,7 +23,9 @@ from dashboard.evaluation_workbench.prompt_templates import (
 
 MAX_BID_DOCUMENTS = 10
 MAX_QUEUED_TASKS = 3
-MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+# 分块写盘，避免大文件上传时占用整份内存；生产环境可按磁盘容量通过环境变量下调。
+MAX_UPLOAD_MB = max(1, int(os.environ.get("EVALUATION_WORKBENCH_MAX_UPLOAD_MB", "500")))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 GLOBAL_RULE_CATEGORIES = {"qualification", "compliance", "substantive", "other"}
 
 _SCORE_TOTAL_PATTERN = re.compile(r"(?:总计|共计|合计|最高(?:得)?|最多(?:得)?|满分(?:为)?)\s*(\d+(?:\.\d+)?)\s*分")
@@ -709,7 +711,7 @@ def store_upload(app, project_id: str, role: str, bidder_name: str, upload) -> d
                     break
                 size_bytes += len(chunk)
                 if size_bytes > MAX_UPLOAD_BYTES:
-                    raise ValueError(f"单个文件不能超过 {MAX_UPLOAD_BYTES // (1024 * 1024)} MB")
+                    raise ValueError(f"单个文件不能超过 {MAX_UPLOAD_MB} MB")
                 digest_builder.update(chunk)
                 output.write(chunk)
         if not size_bytes:
