@@ -345,6 +345,71 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(request_json.call_count, 5)
         self.assertEqual(request_json.call_args_list[0].kwargs["max_tokens"], 6240)
 
+    def test_final_rule_quality_gate_drops_only_explicit_items_and_recovers_score_coverage(self):
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "人工保留资质", "check_rule": "核验人工保留资质",
+        })
+        storage.create_global_rule(self.app, {
+            "category": "substantive", "title": "通用承诺", "check_rule": "核验通用承诺", "enabled": True,
+        })
+        task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
+        profile = storage.get_model_profile(self.app, None)
+        rules = [
+            {"category": "qualification", "title": "响应有效期", "check_rule": "核验响应有效期"},
+            {"category": "compliance", "title": "响应有效期重复", "check_rule": "再次核验响应有效期"},
+            {"category": "substantive", "title": "成交后合同签订", "check_rule": "成交后签订合同"},
+            {"category": "objective", "title": "类似项目业绩评分", "check_rule": "每项3分，最高9分", "source_text": "业绩每有一个得3分，最高9分", "scoring": {"max_score": 9, "kind": "manual"}},
+            {"category": "qualification", "title": "营业执照", "check_rule": "核验营业执照", "ocr_required": True},
+            {"category": "subjective", "title": "技术方案", "check_rule": "按完整性评分", "scoring": {"max_score": 10, "kind": "manual"}},
+        ]
+        response = {"drops": [
+            {"rule_id": "R2", "reason": "duplicate", "duplicate_of": "R1"},
+            {"rule_id": "R3", "reason": "procedural", "duplicate_of": None},
+            {"rule_id": "R4", "reason": "duplicate", "duplicate_of": "R1"},
+            {"rule_id": "R5", "reason": "unknown_reason", "duplicate_of": None},
+        ]}
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value=response) as request_json:
+            kept, stats = worker._final_rule_quality_gate(
+                self.app, task, profile, "规则提取系统提示", rules, ["类似项目业绩每有一个得3分，最高9分"],
+            )
+
+        self.assertEqual({item["title"] for item in kept}, {"响应有效期", "类似项目业绩评分", "营业执照", "技术方案"})
+        self.assertTrue(stats["applied"])
+        self.assertEqual(stats["dropped_count"], 2)
+        self.assertEqual(stats["recovered_score_count"], 1)
+        quality_prompt = request_json.call_args.args[2]
+        self.assertIn("人工保留资质", quality_prompt)
+        self.assertIn("通用承诺", quality_prompt)
+        self.assertIn('"rule_id":"R6"', quality_prompt)
+
+    def test_final_rule_quality_gate_failure_keeps_all_compiled_rules(self):
+        task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
+        profile = storage.get_model_profile(self.app, None)
+        rules = [
+            {"category": "qualification", "title": f"规则{index}", "check_rule": f"核验规则{index}"}
+            for index in range(6)
+        ]
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=ValueError("模型接口繁忙")):
+            kept, stats = worker._final_rule_quality_gate(
+                self.app, task, profile, "规则提取系统提示", rules, [],
+            )
+
+        self.assertEqual(kept, rules)
+        self.assertFalse(stats["applied"])
+        self.assertEqual(stats["failure_count"], 1)
+        self.assertEqual(stats["dropped_count"], 0)
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value={
+            "drops": [{"rule_id": f"R{index}", "reason": "umbrella"} for index in range(1, 7)],
+        }):
+            kept_after_overreach, overreach_stats = worker._final_rule_quality_gate(
+                self.app, task, profile, "规则提取系统提示", rules, [],
+            )
+        self.assertEqual(kept_after_overreach, rules)
+        self.assertEqual(overreach_stats["failure_count"], 1)
+
     def test_rule_extraction_splits_long_source_into_bounded_batches(self):
         self._add_pdf("tender.pdf", "tender", "", "用于建立解析文件")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
@@ -380,14 +445,14 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         primary = {"rules": [{"category": "objective", "title": "报价评分", "check_rule": "按报价公式计算", "source_text": "报价得分最高25分", "scoring": {"max_score": 25, "kind": "manual"}}]}
         supplement = {"rules": [{"category": "objective", "title": "类似项目业绩评分", "check_rule": "每个同类型项目业绩计3分，最高9分", "source_text": "业绩每有一个得3分，最高9分", "scoring": {"max_score": 9, "kind": "manual"}}]}
 
-        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[primary, supplement]) as request_json:
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[primary, supplement, {"drops": []}]) as request_json:
             finished = self._run_next_task()
 
         _, rules = storage.list_rules(self.app, self.project["project_id"])
         self.assertEqual(finished["status"], "success")
         self.assertEqual(finished["result"]["score_clause_count"], 2)
         self.assertEqual(finished["result"]["scoring_supplement_count"], 1)
-        self.assertEqual(request_json.call_count, 2)
+        self.assertEqual(request_json.call_count, 3)
         self.assertEqual(next(item for item in rules if item["title"] == "类似项目业绩评分")["scoring_json"], '{"max_score": 9, "kind": "manual"}')
 
     def test_rule_extraction_checks_each_score_clause_not_only_score_rule_count(self):
@@ -407,13 +472,13 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         ]}
         supplement = {"rules": [{"category": "objective", "title": "类似项目业绩评分", "check_rule": "每个同类型项目业绩计3分，最高9分", "source_text": "业绩每有一个得3分，最高9分", "scoring": {"max_score": 9, "kind": "manual"}}]}
 
-        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[primary, supplement]) as request_json:
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[primary, supplement, {"drops": []}]) as request_json:
             finished = self._run_next_task()
 
         _, rules = storage.list_rules(self.app, self.project["project_id"])
         supplement_prompt = request_json.call_args_list[1].args[2]
         self.assertEqual(finished["result"]["uncovered_score_clause_count"], 1)
-        self.assertEqual(request_json.call_count, 2)
+        self.assertEqual(request_json.call_count, 3)
         self.assertIn("业绩每有一个得3分", supplement_prompt)
         self.assertNotIn("报价得分最高25分", supplement_prompt)
         self.assertIn("类似项目业绩评分", {item["title"] for item in rules})
@@ -584,11 +649,14 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         extraction_guidance = PROMPT_TEMPLATES["extract_rules_guidance"]["content"]
         compile_template = PROMPT_TEMPLATES["extract_rules_compile_user"]["content"]
         coverage_template = PROMPT_TEMPLATES["extract_rules_coverage_user"]["content"]
+        quality_gate_template = PROMPT_TEMPLATES["extract_rules_quality_gate_user"]["content"]
         for value in (extraction_guidance, compile_template, coverage_template):
             self.assertIn("履约", value)
             self.assertIn("电子投标文件", value)
             self.assertIn("串通、行贿、弄虚作假", value)
         self.assertIn("同一响应字段的期限、地点、标准、金额", compile_template)
+        self.assertIn('"drops"', quality_gate_template)
+        self.assertIn("受保护规则", quality_gate_template)
 
         compact_scan = worker._full_scan_prompt(
             self.app, {"original_name": "投标文件.pdf", "bidder_name": "投标人"},

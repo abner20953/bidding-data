@@ -746,6 +746,155 @@ def _compile_rule_candidates(app, task: dict, profile: dict, system_prompt: str,
     return _compile_rule_group(app, task, profile, system_prompt, candidates, char_limit)
 
 
+RULE_QUALITY_GATE_MIN_RULES = 2
+RULE_QUALITY_GATE_REASONS = {
+    "duplicate", "not_file_verifiable", "procedural", "umbrella",
+    "not_scoring_rule", "unsupported_cross_reference",
+}
+_EXPLICIT_SCORE_TEXT_PATTERN = re.compile(r"(?:满分|最高(?:得)?分|得\s*\d+(?:\.\d+)?\s*分|每.{0,20}\d+(?:\.\d+)?\s*分|扣\s*\d+(?:\.\d+)?\s*分|分值)")
+
+
+def _quality_gate_rule_packet(items: list[dict], *, include_ids: bool) -> str:
+    """构造小而完整的最终审计输入；限制单字段长度，但绝不截断规则数组。"""
+    values = []
+    for index, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            continue
+        value = {
+            "category": item.get("category"),
+            "title": str(item.get("title") or "")[:120],
+            "check_rule": str(item.get("check_rule") or item.get("title") or "")[:700],
+            "source_text": str(item.get("source_text") or "")[:260],
+            "source_page": item.get("source_page"),
+            "ocr_required": bool(item.get("ocr_required") or item.get("check_mode") == "ocr"),
+            "scoring": item.get("scoring"),
+        }
+        if include_ids:
+            value = {"rule_id": f"R{index}", **value}
+        else:
+            value.update({
+                "source_type": item.get("source_type"),
+                "enabled": bool(item.get("enabled", True)),
+            })
+        values.append(value)
+    return json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+
+
+def _protected_rules_for_quality_gate(app, project_id: str) -> list[dict]:
+    """返回不得由重新提取覆盖的用户规则，以及本轮会自动导入的通用规则。"""
+    _, current_rules = storage.list_rules(app, project_id)
+    protected = []
+    for item in current_rules:
+        if item.get("source_type") not in {"manual", "ai_locked"}:
+            continue
+        value = dict(item)
+        if item.get("scoring_json"):
+            try:
+                value["scoring"] = json.loads(item["scoring_json"])
+            except (TypeError, json.JSONDecodeError):
+                value["scoring"] = None
+        protected.append(value)
+    protected.extend(
+        {**item, "source_type": "global"}
+        for item in storage.list_global_rules(app)
+        if item.get("enabled")
+    )
+    return protected
+
+
+def _recover_dropped_scoring_rules(rules: list[dict], kept_indexes: set[int],
+                                   score_packets: list[str]) -> int:
+    """质量门控只能做减法；若减法造成明确评分条款失去覆盖，恢复最匹配的原规则。"""
+    recovered = 0
+    score_categories = {"objective", "subjective"}
+    for packet in score_packets:
+        kept_scores = [
+            item for index, item in enumerate(rules)
+            if index in kept_indexes and item.get("category") in score_categories
+        ]
+        if _score_packet_is_covered(packet, kept_scores):
+            continue
+        recover_index = next((
+            index for index, item in enumerate(rules)
+            if index not in kept_indexes and item.get("category") in score_categories
+            and _score_packet_is_covered(packet, [item])
+        ), None)
+        if recover_index is not None:
+            kept_indexes.add(recover_index)
+            recovered += 1
+    return recovered
+
+
+def _has_explicit_scoring_basis(item: dict) -> bool:
+    """识别原文明确计分的规则；只用于防止最终减法误删，不据此创建或分类规则。"""
+    if item.get("category") not in {"objective", "subjective"}:
+        return False
+    if storage._valid_max_score(item.get("scoring")) is None:
+        return False
+    return bool(_EXPLICIT_SCORE_TEXT_PATTERN.search(str(item.get("source_text") or "")))
+
+
+def _final_rule_quality_gate(app, task: dict, profile: dict, system_prompt: str,
+                             rules: list[dict], score_packets: list[str]) -> tuple[list[dict], dict]:
+    """在保存前做一次全局只减不改审计；任何模型或格式异常均安全降级为保留原规则。"""
+    stats = {"applied": False, "dropped_count": 0, "failure_count": 0, "recovered_score_count": 0}
+    if len(rules) < RULE_QUALITY_GATE_MIN_RULES:
+        return rules, stats
+    protected = _protected_rules_for_quality_gate(app, task["project_id"])
+    prompt = storage.render_prompt_template(
+        app, "extract_rules_quality_gate_user",
+        candidates=_quality_gate_rule_packet(rules, include_ids=True),
+        protected_rules=_quality_gate_rule_packet(protected, include_ids=False),
+    )
+    storage.update_task(app, task["task_id"], progress=78, message="正在对完整规则集做最终质量审计")
+    try:
+        try:
+            response = _request_task_json(
+                app, task, profile, "extract_rules_quality_gate", system_prompt, prompt,
+                context_mode="rule_quality_gate", max_tokens=_output_token_budget(
+                    profile, max(1_800, min(5_000, 900 + len(rules) * 70)),
+                ), thinking_mode="disabled",
+            )
+        except InvalidJsonResponse as exc:
+            response = _repair_invalid_json(
+                app, task, profile, "extract_rules_quality_gate_json_repair", exc, "drops",
+            )
+        drops = response.get("drops") if isinstance(response, dict) else None
+        if not isinstance(drops, list):
+            raise ValueError("模型返回格式不符合规则质量审计要求")
+        drop_indexes: set[int] = set()
+        for drop in drops:
+            if not isinstance(drop, dict) or drop.get("reason") not in RULE_QUALITY_GATE_REASONS:
+                continue
+            match = re.fullmatch(r"R([1-9]\d*)", str(drop.get("rule_id") or ""))
+            if not match:
+                continue
+            index = int(match.group(1)) - 1
+            if 0 <= index < len(rules):
+                # 原文有明确分值的评分规则，只有模型同时指出具体重复对象时才允许进入
+                # 待剔除集；其余误判继续交给评分覆盖兜底，避免清理噪声时丢分。
+                if _has_explicit_scoring_basis(rules[index]) and (
+                    drop.get("reason") != "duplicate" or not str(drop.get("duplicate_of") or "").strip()
+                ):
+                    continue
+                drop_indexes.add(index)
+        if len(drop_indexes) >= len(rules):
+            raise ValueError("规则质量审计试图剔除全部候选，已安全保留原结果")
+        kept_indexes = set(range(len(rules))) - drop_indexes
+        recovered = _recover_dropped_scoring_rules(rules, kept_indexes, score_packets)
+        result = [item for index, item in enumerate(rules) if index in kept_indexes]
+        stats.update({
+            "applied": True,
+            "dropped_count": len(rules) - len(result),
+            "recovered_score_count": recovered,
+        })
+        return result, stats
+    except ValueError as exc:
+        stats["failure_count"] = 1
+        storage.update_task(app, task["task_id"], message=f"规则最终质量审计未完成，已完整保留编译结果：{exc}")
+        return rules, stats
+
+
 def _extract_rules(app, task: dict) -> dict:
     documents = storage.list_documents(app, task["project_id"])
     tender = next((item for item in documents if item["role"] == "tender"), None)
@@ -855,6 +1004,9 @@ def _extract_rules(app, task: dict) -> dict:
             else:
                 scoring["kind"] = "manual"
             item["scoring"] = scoring
+    rules, quality_gate = _final_rule_quality_gate(
+        app, task, profile, system_prompt, rules, score_packets,
+    )
     if not rules:
         raise ValueError("模型未提取到可确认的有效规则，请检查招标文件文本或更换模型")
     storage.update_task(app, task["task_id"], progress=80, message="正在保存待确认规则")
@@ -868,6 +1020,10 @@ def _extract_rules(app, task: dict) -> dict:
             "scoring_supplement_failure_count": scoring_supplement_failures, "batch_count": len(batches),
             "semantic_compilation_used": compilation_used, "coverage_missing_rule_count": len(coverage_missing_rules),
             "semantic_compilation_failure_count": compilation_failure_count,
+            "quality_gate_applied": quality_gate["applied"],
+            "quality_gate_dropped_count": quality_gate["dropped_count"],
+            "quality_gate_failure_count": quality_gate["failure_count"],
+            "quality_gate_recovered_score_count": quality_gate["recovered_score_count"],
             "preserved_rule_count": rule_set.get("preserved_rule_count", 0), "split_retry_count": split_retry_count}
 
 
