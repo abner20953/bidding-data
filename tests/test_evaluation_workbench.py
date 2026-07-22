@@ -1,4 +1,5 @@
 import io
+import json
 import re
 import shutil
 import tempfile
@@ -15,7 +16,9 @@ from werkzeug.security import generate_password_hash
 from dashboard.blueprints.evaluation_workbench import create_worker_app, evaluation_workbench_bp
 from dashboard.evaluation_workbench import storage, worker
 from dashboard.evaluation_workbench.collusion_signals import build_cross_bid_analysis
-from dashboard.evaluation_workbench.prompt_context import _anchors, build_rule_context, select_rule_chunks, split_full_text_chunks
+from dashboard.evaluation_workbench.prompt_context import (
+    _anchors, build_rule_context, select_rule_chunk_map, select_rule_chunks, split_full_text_chunks,
+)
 from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
 
 
@@ -334,6 +337,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             worker.InvalidJsonResponse('{"rules":[', "length"),
             {"rules": left_rules}, {"missing_rules": []},
             {"rules": right_rules}, {"missing_rules": []},
+            {"rules": candidates},
         ]) as request_json:
             compiled, missing, used = worker._compile_rule_candidates(
                 self.app, task, profile, "规则编译系统提示", candidates, 40_000,
@@ -342,8 +346,30 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertTrue(used)
         self.assertEqual(missing, [])
         self.assertEqual({item["title"] for item in compiled}, {item["title"] for item in candidates})
-        self.assertEqual(request_json.call_count, 5)
+        self.assertEqual(request_json.call_count, 6)
         self.assertEqual(request_json.call_args_list[0].kwargs["max_tokens"], 6240)
+
+    def test_global_rule_compile_semantically_merges_results_from_different_groups(self):
+        task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
+        profile = storage.get_model_profile(self.app, None)
+        split_results = [
+            {"category": "qualification", "title": "营业执照要求", "check_rule": "核验有效营业执照", "source_text": "提供有效营业执照"},
+            {"category": "compliance", "title": "营业执照缺失后果", "check_rule": "未提供营业执照则无效", "source_text": "未提供则响应无效"},
+        ]
+        merged_response = {"rules": [{
+            "category": "qualification", "title": "营业执照",
+            "check_rule": "核验有效营业执照；未提供则响应无效",
+            "source_text": "提供有效营业执照，未提供则响应无效",
+        }]}
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value=merged_response) as request_json:
+            merged = worker._merge_compiled_rule_groups(
+                self.app, task, profile, "规则编译系统提示", split_results, 40_000,
+            )
+
+        self.assertEqual(len(merged), 1)
+        self.assertIn("未提供则响应无效", merged[0]["check_rule"])
+        self.assertEqual(request_json.call_count, 1)
 
     def test_final_rule_quality_gate_drops_only_explicit_items_and_recovers_score_coverage(self):
         storage.add_rule(self.app, self.project["project_id"], {
@@ -431,6 +457,32 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertTrue(all(call.kwargs["max_tokens"] <= 6000 for call in request_json.call_args_list))
         self.assertTrue(all(len(call.args[2]) < 16_000 for call in request_json.call_args_list))
 
+    def test_rule_extraction_maps_late_source_instead_of_truncating_to_front_excerpt(self):
+        self._add_pdf("tender.pdf", "tender", "", "用于建立解析文件")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        tender_document = next(item for item in storage.list_documents(self.app, self.project["project_id"]) if item["role"] == "tender")
+        late_clause = "特殊业绩计分：每提供一个同类项目业绩得3分，最高9分。"
+        Path(tender_document["parsed_path"]).write_text(("普通说明。\n" * 35_000) + late_clause, encoding="utf-8")
+        storage.create_task(self.app, self.project["project_id"], "extract_rules")
+
+        def response(_profile, _system, user_prompt, **_kwargs):
+            if late_clause in user_prompt:
+                return {"rules": [{
+                    "category": "objective", "title": "特殊业绩计分",
+                    "check_rule": "每个同类项目业绩得3分，最高9分",
+                    "source_text": late_clause, "scoring": {"kind": "manual", "max_score": 9},
+                }]}
+            return {"rules": []}
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=response) as request_json:
+            finished = self._run_next_task()
+
+        _, rules = storage.list_rules(self.app, self.project["project_id"])
+        self.assertEqual(finished["status"], "success")
+        self.assertIn("特殊业绩计分", {item["title"] for item in rules})
+        self.assertTrue(any(late_clause in call.args[2] for call in request_json.call_args_list))
+
     def test_rule_extraction_supplements_missing_score_clause_with_compact_packet(self):
         tender_text = "\n".join([
             "商务评分", "供应商业绩", "业绩每有一个得3分，最高9分。",
@@ -482,6 +534,22 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("业绩每有一个得3分", supplement_prompt)
         self.assertNotIn("报价得分最高25分", supplement_prompt)
         self.assertIn("类似项目业绩评分", {item["title"] for item in rules})
+
+    def test_adjacent_score_rows_remain_independent_coverage_clauses(self):
+        packets = worker._score_clause_packets("\n".join([
+            "商务评分标准", "业绩评分", "每提供一个同类项目业绩得3分，最高9分。",
+            "项目人员评分", "每提供一名持证人员得2分，最高6分。",
+        ]))
+        performance_rule = [{
+            "category": "objective", "title": "业绩评分",
+            "check_rule": "每个同类业绩得3分，最高9分",
+            "source_text": "每提供一个同类项目业绩得3分，最高9分。",
+        }]
+
+        self.assertEqual(len(packets), 2)
+        self.assertTrue(worker._score_packet_is_covered(packets[0], performance_rule))
+        self.assertFalse(worker._score_packet_is_covered(packets[1], performance_rule))
+        self.assertNotEqual(packets[0]["clause_id"], packets[1]["clause_id"])
 
     def test_draft_rule_can_be_disabled_before_confirmation(self):
         enabled_rule = storage.add_rule(self.app, self.project["project_id"], {"category": "qualification", "title": "保留审查项"})
@@ -637,6 +705,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         extraction = PROMPT_TEMPLATES["extract_rules_user"]["content"]
         self.assertIn('"source_page":数字或null', extraction)
+        self.assertIn('"source_clause_ids"', extraction)
+        self.assertIn('"items"', extraction)
         self.assertIn("机器可读文字、表格、元数据或后续 OCR", extraction)
         for template_id in (
             "compare_ai_assessment_user", "review_documents_user", "score_objective_user",
@@ -655,8 +725,11 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             self.assertIn("电子投标文件", value)
             self.assertIn("串通、行贿、弄虚作假", value)
         self.assertIn("同一响应字段的期限、地点、标准、金额", compile_template)
+        self.assertIn("source_clause_ids", compile_template)
+        self.assertIn("scoring.items", compile_template)
         self.assertIn('"drops"', quality_gate_template)
         self.assertIn("受保护规则", quality_gate_template)
+        self.assertIn("勾选或取消勾选状态不是本轮提取依据", quality_gate_template)
 
         compact_scan = worker._full_scan_prompt(
             self.app, {"original_name": "投标文件.pdf", "bidder_name": "投标人"},
@@ -664,6 +737,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         )
         self.assertIn("每段摘录最多 60 字", compact_scan)
         self.assertNotIn("每段摘录最多 90 字", compact_scan)
+        self.assertNotIn("matches 每个数组恰好六项、最多36条", compact_scan)
+        self.assertNotIn("scope_anomalies 每个数组恰好五项、最多8条", compact_scan)
 
     def test_task_prompt_fingerprint_ignores_unrelated_template_changes(self):
         client = self.app.test_client()
@@ -862,6 +937,40 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertTrue(selected)
         self.assertTrue(any("类似项目情况表" in item["text"] for item in chunks if item["chunk_id"] in selected))
 
+    def test_rule_chunk_map_does_not_assign_another_rules_fallback_page(self):
+        chunks = [
+            {"chunk_id": "chunk-a", "text": "类似项目业绩情况表和合同业绩。"},
+            {"chunk_id": "chunk-b", "text": "项目人员持证人员证书情况。"},
+        ]
+        rules = [
+            {"rule_id": "a", "title": "业绩评分", "check_rule": "核验类似项目合同业绩"},
+            {"rule_id": "b", "title": "人员评分", "check_rule": "核验持证项目人员"},
+        ]
+
+        mapping = select_rule_chunk_map(chunks, rules, per_rule=1)
+
+        self.assertEqual(mapping["a"], ["chunk-a"])
+        self.assertEqual(mapping["b"], ["chunk-b"])
+
+    def test_structured_score_items_participate_in_page_retrieval(self):
+        chunks = [
+            {"chunk_id": "deployment", "text": "部署实施方案包括安装调试和上线计划。"},
+            {"chunk_id": "maintenance", "text": "运维保障方案包括巡检、响应和故障恢复。"},
+        ]
+        rule = {
+            "rule_id": "solution", "category": "subjective", "title": "技术方案评分",
+            "check_rule": "按各模块分别评分", "scoring_json": json.dumps({
+                "max_score": 6, "items": [
+                    {"name": "部署实施方案", "max_score": 3, "criterion": "安装调试和上线计划"},
+                    {"name": "运维保障方案", "max_score": 3, "criterion": "巡检和故障恢复"},
+                ],
+            }, ensure_ascii=False),
+        }
+
+        mapping = select_rule_chunk_map(chunks, [rule], per_rule=2)
+
+        self.assertEqual(set(mapping["solution"]), {"deployment", "maintenance"})
+
     def test_combined_evaluation_persists_original_three_result_types(self):
         self._add_pdf("tender.pdf", "tender", "", "投标人具备资质得5分，技术方案满分10分。")
         self._add_pdf("bid.pdf", "bid", "甲公司", "本公司具备资质，技术方案完整。")
@@ -998,14 +1107,13 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         })
         storage.confirm_rule_set(self.app, self.project["project_id"])
         storage.create_task(self.app, self.project["project_id"], "evaluate_all")
-        local = {"results": [{"rule_id": rule["rule_id"], "suggested_score": None, "reason": "需横向比较"}]}
         cross = {"results": [
             {"document_id": bid_a["document_id"], "rule_id": rule["rule_id"], "quoted_price": 100,
              "suggested_score": 10, "evidence": "投标报价100万元", "calculation": "100/100×10=10", "confidence": "high"},
             {"document_id": bid_b["document_id"], "rule_id": rule["rule_id"], "quoted_price": 120,
              "suggested_score": 8.33, "evidence": "投标报价120万元", "calculation": "100/120×10=8.33", "confidence": "high"},
         ]}
-        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[local, local, cross]) as request_json:
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value=cross) as request_json:
             finished = self._run_next_task()
 
         _, results = storage.latest_score_results(self.app, self.project["project_id"], "objective")
@@ -1014,8 +1122,9 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(finished["result"]["cross_bid_price"]["result_count"], 2)
         self.assertEqual(scores["甲公司"], 10.0)
         self.assertEqual(scores["乙公司"], 8.33)
-        self.assertIn(bid_a["document_id"], request_json.call_args_list[2].args[2])
-        self.assertIn(bid_b["document_id"], request_json.call_args_list[2].args[2])
+        self.assertEqual(request_json.call_count, 1)
+        self.assertIn(bid_a["document_id"], request_json.call_args.args[2])
+        self.assertIn(bid_b["document_id"], request_json.call_args.args[2])
 
     def test_manual_objective_score_can_be_calculated_from_matched_count(self):
         payload = [{
@@ -1030,6 +1139,49 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         self.assertEqual(results[0]["suggested_score"], 6.0)
         self.assertIn("AI共识别2项", results[0]["evidence"])
+
+    def test_score_result_inherits_ocr_requirement_from_rule_payload(self):
+        payload = [{
+            "rule_id": "license", "title": "许可证评分", "check_rule": "核验许可证图片",
+            "source_text": "提供许可证得5分", "ocr_required": True,
+            "scoring": {"kind": "boolean", "max_score": 5},
+        }]
+
+        results = worker._normalise_score_results(
+            [{"rule_id": "license", "met": True, "evidence": "目录列有许可证", "confidence": "high", "needs_ocr": False}],
+            payload, "objective",
+        )
+
+        self.assertEqual(results[0]["suggested_score"], 5.0)
+        self.assertTrue(results[0]["requires_review"])
+        self.assertIsNone(results[0]["effective_score"])
+        self.assertIn("OCR", results[0]["reason"])
+
+    def test_cross_bid_price_failure_never_leaves_local_provisional_score(self):
+        bid_a = self._add_pdf("price-a.pdf", "bid", "甲公司", "投标报价：100万元。")
+        bid_b = self._add_pdf("price-b.pdf", "bid", "乙公司", "投标报价：120万元。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "最低价报价得分",
+            "check_rule": "最低评审价得10分，其他报价按最低价比例得分。",
+            "source_text": "最低评审价得10分", "scoring": {"kind": "manual", "max_score": 10},
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[
+            worker.InvalidJsonResponse("{\"results\":[", "length"),
+            worker.InvalidJsonResponse("{\"results\":[", "length"),
+        ]) as request_json:
+            finished = self._run_next_task()
+
+        _, results = storage.latest_score_results(self.app, self.project["project_id"], "objective")
+        self.assertEqual(finished["status"], "success")
+        self.assertEqual(request_json.call_count, 2)
+        self.assertEqual({item["document_id"] for item in results}, {bid_a["document_id"], bid_b["document_id"]})
+        self.assertTrue(all(item["suggested_score"] is None for item in results))
+        self.assertTrue(all("暂无法计算" in item["reason"] for item in results))
 
     def test_scope_anomaly_keeps_any_late_off_topic_content_for_final_review(self):
         chunks = [
@@ -1184,6 +1336,54 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(finished["result"]["batch_count"], 2)
         self.assertEqual(request_json.call_count, 2)
 
+    def test_evaluation_batches_separate_evidence_strategies_and_respect_complexity(self):
+        rules = [
+            {"rule_id": "point", "category": "qualification", "title": "营业执照", "check_rule": "核验营业执照"},
+            {"rule_id": "count", "category": "objective", "title": "业绩数量", "check_rule": "每个业绩得3分"},
+            {"rule_id": "section", "category": "subjective", "title": "技术方案", "check_rule": "核验实施方案各模块",
+             "scoring_json": json.dumps({"max_score": 12, "items": [
+                 {"name": f"模块{index}", "max_score": 2, "criterion": "按完整性评分"} for index in range(6)
+             ]}, ensure_ascii=False)},
+        ]
+
+        groups = worker._evaluation_rule_batches("subjective", rules)
+
+        self.assertEqual({rule["rule_id"] for group in groups for rule in group}, {"point", "count", "section"})
+        self.assertTrue(all(len({worker._rule_execution_strategy(rule) for rule in group}) == 1 for group in groups))
+        self.assertEqual(next(group for group in groups if group[0]["rule_id"] == "section"), [rules[2]])
+
+    def test_single_compound_score_rule_splits_only_explicit_additive_items_after_truncation(self):
+        self._add_pdf("compound.pdf", "bid", "甲公司", "部署方案完整。运维方案完整。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        document = next(item for item in storage.list_documents(self.app, self.project["project_id"]) if item["role"] == "bid")
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "subjective", "title": "复合方案评分", "check_rule": "部署和运维各3分",
+            "source_text": "部署方案3分，运维方案3分", "scoring": {"max_score": 6, "kind": "manual", "items": [
+                {"name": "部署方案", "max_score": 3, "criterion": "完整合理"},
+                {"name": "运维方案", "max_score": 3, "criterion": "完整合理"},
+            ]},
+        })
+        task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        profile = storage.get_model_profile(self.app, None)
+        responses = [
+            worker.InvalidJsonResponse('{"results":[', "length"),
+            {"results": [{"rule_id": rule["rule_id"], "suggested_score": 3, "evidence": "部署方案完整", "reason": "部署项得3分", "confidence": "high"}]},
+            {"results": [{"rule_id": rule["rule_id"], "suggested_score": 3, "evidence": "运维方案完整", "reason": "运维项得3分", "confidence": "high"}]},
+        ]
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=responses) as request_json:
+            results, _, split_count, _, mode = worker._run_combined_batch(
+                self.app, task, profile, document, "subjective", [rule], "综合评审系统提示", 60_000, "复合规则",
+            )
+
+        self.assertEqual(request_json.call_count, 3)
+        self.assertEqual(split_count, 1)
+        self.assertEqual(mode, "split_score_items")
+        self.assertEqual(results[0]["suggested_score"], 6.0)
+        self.assertIn("子项组1", results[0]["evidence"])
+        self.assertIn("子项组2", results[0]["evidence"])
+
     def test_combined_evaluation_retries_only_invalid_json_document_with_compact_prompt(self):
         self._add_pdf("tender.pdf", "tender", "", "投标人具备资质得5分，技术方案满分10分。")
         self._add_pdf("bid.pdf", "bid", "甲公司", "本公司具备资质，技术方案完整。")
@@ -1330,7 +1530,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.add_rule(self.app, self.project["project_id"], {"category": "objective", "title": "资质得分", "source_text": "资质得5分", "scoring": {"kind": "boolean", "max_score": 5}})
         storage.add_rule(self.app, self.project["project_id"], {"category": "subjective", "title": "技术方案", "source_text": "技术方案满分10分", "scoring": {"max_score": 10}})
         storage.confirm_rule_set(self.app, self.project["project_id"])
-        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "project-scope-coverage-v11")
+        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, worker.PROMPT_VERSION)
         prior = storage.create_task(self.app, self.project["project_id"], "evaluate_all", {"profile_id": None, "input_fingerprint": fingerprint})
         storage.update_task(self.app, prior["task_id"], status="success", result={"cached": True})
 
@@ -1535,18 +1735,20 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(scoring["max_score"], 10.0)
         self.assertEqual(scoring["source"], "manual")
 
-    def test_reextract_preserves_manual_and_human_locked_rules(self):
+    def test_reextract_preserves_edited_content_but_resets_all_selection_states(self):
         first = storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-1", [{
             "category": "qualification", "title": "营业执照", "check_rule": "核验营业执照", "source_text": "应提供营业执照。",
         }])
         _, rules = storage.list_rules(self.app, self.project["project_id"])
         ai_rule = next(item for item in rules if item["source_type"] == "ai")
-        storage.update_rule(self.app, self.project["project_id"], ai_rule["rule_id"], {
+        edited_rule = storage.update_rule(self.app, self.project["project_id"], ai_rule["rule_id"], {
             "check_rule": "核验营业执照及其有效状态",
         })
-        storage.add_rule(self.app, self.project["project_id"], {
+        storage.update_rule(self.app, self.project["project_id"], edited_rule["rule_id"], {"enabled": False})
+        manual_rule = storage.add_rule(self.app, self.project["project_id"], {
             "category": "other", "title": "人工补充承诺", "check_rule": "核验承诺函", "source_text": "人工维护规则。",
         })
+        storage.update_rule(self.app, self.project["project_id"], manual_rule["rule_id"], {"enabled": False})
 
         second = storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-2", [{
             "category": "qualification", "title": "投标人资质", "check_rule": "核验投标人资质", "source_text": "应具备资质。",
@@ -1555,8 +1757,34 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         self.assertEqual(first["version"] + 1, second["version"])
         self.assertEqual(second["preserved_rule_count"], 2)
-        self.assertEqual(next(item for item in refreshed if item["title"] == "营业执照")["source_type"], "ai_locked")
-        self.assertEqual(next(item for item in refreshed if item["title"] == "人工补充承诺")["source_type"], "manual")
+        edited = next(item for item in refreshed if item["title"] == "营业执照")
+        manual = next(item for item in refreshed if item["title"] == "人工补充承诺")
+        self.assertEqual(edited["source_type"], "ai_edited")
+        self.assertEqual(manual["source_type"], "manual")
+        self.assertEqual(edited["enabled"], 1)
+        self.assertEqual(manual["enabled"], 1)
+
+    def test_reextract_does_not_preserve_ai_rule_selection_only_changes(self):
+        storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-1", [{
+            "category": "qualification", "title": "营业执照", "check_rule": "核验营业执照", "source_text": "应提供营业执照。",
+        }])
+        _, rules = storage.list_rules(self.app, self.project["project_id"])
+        original = next(item for item in rules if item["title"] == "营业执照")
+        unchecked = storage.update_rule(
+            self.app, self.project["project_id"], original["rule_id"], {"enabled": False},
+        )
+        self.assertEqual(unchecked["source_type"], "ai")
+
+        second = storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-2", [{
+            "category": "qualification", "title": "营业执照", "check_rule": "核验营业执照", "source_text": "应提供营业执照。",
+        }])
+        _, refreshed = storage.list_rules(self.app, self.project["project_id"])
+        extracted_again = next(item for item in refreshed if item["title"] == "营业执照")
+
+        self.assertEqual(second["preserved_rule_count"], 0)
+        self.assertNotEqual(extracted_again["rule_id"], original["rule_id"])
+        self.assertEqual(extracted_again["source_type"], "ai")
+        self.assertEqual(extracted_again["enabled"], 1)
 
     def test_force_rerun_is_persisted_in_task_payload(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "已提供资质。")

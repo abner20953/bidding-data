@@ -21,7 +21,10 @@ import fitz
 from dashboard.evaluation_workbench import storage
 from dashboard.evaluation_workbench.ai_gateway import InvalidJsonResponse, request_json
 from dashboard.evaluation_workbench.collusion_signals import build_cross_bid_analysis
-from dashboard.evaluation_workbench.prompt_context import build_rule_context, select_rule_chunks, split_full_text_chunks
+from dashboard.evaluation_workbench.prompt_context import (
+    build_rule_context, select_rule_chunk_map, select_rule_chunks, split_full_text_chunks,
+)
+from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION
 from dashboard.blueprints.evaluation_workbench import create_worker_app
 from dashboard.utils.comparator import CollusionDetector, ComparisonLimitError
 
@@ -29,7 +32,7 @@ from dashboard.utils.comparator import CollusionDetector, ComparisonLimitError
 MAX_PARSE_PAGES = 2000
 MAX_PARSED_CHARS = 2_000_000
 MAX_DOCX_XML_BYTES = 50 * 1024 * 1024
-PROMPT_VERSION = "project-scope-coverage-v11"
+PROMPT_VERSION = EVALUATION_PROMPT_VERSION
 COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v2"
 COMPARE_AI_BATCH_SIZE = 24
 
@@ -64,7 +67,10 @@ class _EvaluationRequestGate:
 
 def _is_rate_limit_error(error: Exception) -> bool:
     message = str(error).lower()
-    return "http 429" in message or "rate limit" in message or "too many requests" in message or "限流" in str(error)
+    return any(term in message for term in (
+        "http 429", "http 529", "http 502", "http 503", "http 504",
+        "rate limit", "too many requests", "overloaded", "temporarily unavailable", "timeout", "timed out",
+    )) or "限流" in str(error) or "接口繁忙" in str(error)
 
 
 def _prompt_char_limit(profile: dict, default: int, ceiling: int) -> int:
@@ -110,7 +116,7 @@ def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt
                 # 自动改为单路，并只重试当前这一小次模型调用，不重发整份文件。
                 if gate and attempt == 0 and _is_rate_limit_error(exc):
                     if gate.limit_to_one():
-                        storage.update_task(app, task["task_id"], message="模型接口限流，已自动切换为单路继续评审")
+                        storage.update_task(app, task["task_id"], message="模型接口限流或暂时繁忙，已自动切换为单路继续评审")
                     retry_after_rate_limit = True
                 else:
                     raise
@@ -367,58 +373,56 @@ def _assess_compare_signals_with_ai(app, task: dict, analysis: dict) -> None:
     }
 
 
-_RULE_SECTION_MARKERS = ("评标办法", "评分标准", "资格审查", "符合性审查", "废标", "无效投标", "否决投标", "资格条件")
-_SCORE_CLAUSE_PATTERN = re.compile(r"(?:得\s*\d+(?:\.\d+)?\s*分|最高(?:得)?\s*\d+(?:\.\d+)?\s*分|满分(?:为)?\s*\d+(?:\.\d+)?\s*分)")
+_SCORE_CLAUSE_PATTERN = re.compile(
+    r"(?:得|计|为|每项|每个|每人|每处)\s*\d+(?:\.\d+)?\s*分|"
+    r"最高(?:得|为)?\s*\d+(?:\.\d+)?\s*分|满分(?:为)?\s*\d+(?:\.\d+)?\s*分|"
+    r"(?:分值|总计|合计)\s*[:：为]?\s*\d+(?:\.\d+)?\s*分?|扣\s*\d+(?:\.\d+)?\s*分"
+)
 _SCORE_COVERAGE_IGNORED_TERMS = {"项目", "评分", "标准", "要求", "供应", "服务", "能力", "部分", "内容", "提供", "文件", "采购", "投标", "技术", "商务"}
 
-
-def _rule_source_excerpt(text: str, budget: int) -> str:
-    """优先保留评标相关章节，避免长招标文件的无关前缀挤掉评分附件。"""
-    if len(text) <= budget:
-        return text
-    windows: list[tuple[int, int]] = []
-    for marker in _RULE_SECTION_MARKERS:
-        start = 0
-        while len(windows) < 12:
-            found = text.find(marker, start)
-            if found < 0:
-                break
-            windows.append((max(0, found - 1_200), min(len(text), found + 8_000)))
-            start = found + len(marker)
-    if not windows:
-        return text[:budget]
-    windows.sort()
-    merged: list[tuple[int, int]] = []
-    for start, end in windows:
-        if merged and start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-        else:
-            merged.append((start, end))
-    selected = "\n\n".join(text[start:end] for start, end in merged)
-    return selected[:budget] if selected else text[:budget]
-
-
-def _score_clause_packets(text: str, limit: int = 24) -> list[str]:
-    """从评分表行中构造短片段，作为 AI 规则提取的覆盖清单，而非本地直接判分。"""
+def _score_clause_packets(text: str, limit: int = 240) -> list[dict]:
+    """为每个明确计分行构造独立、稳定的覆盖条款，不合并相邻评分项。"""
     lines = [line.strip() for line in text.splitlines()]
-    windows: list[tuple[int, int]] = []
+    packets: list[dict] = []
     for index, line in enumerate(lines):
         if not _SCORE_CLAUSE_PATTERN.search(re.sub(r"\s+", "", line)):
             continue
-        # 评分表的项目名称通常在得分行之前；不带后续行，避免把下一条评分项误判为当前条款已覆盖。
-        start, end = max(0, index - 6), min(len(lines), index + 1)
-        if windows and start <= windows[-1][1] + 2:
-            windows[-1] = (windows[-1][0], max(windows[-1][1], end))
-        else:
-            windows.append((start, end))
-        if len(windows) >= limit:
-            break
-    packets = []
-    for start, end in windows:
-        value = "\n".join(line for line in lines[start:end] if line)[:900]
+        # 评分项目名称通常在计分行之前。遇到上一条计分行即停止回看，确保相邻表格行
+        # 分别接受覆盖审计，不会因一个标题命中而把另一项误判成已提取。
+        start = max(0, index - 6)
+        for previous in range(index - 1, start - 1, -1):
+            compact_previous = re.sub(r"\s+", "", lines[previous])
+            if _SCORE_CLAUSE_PATTERN.search(compact_previous):
+                start = previous + 1
+                break
+            if re.fullmatch(r"\[第\d+页\]", lines[previous]):
+                start = previous
+                break
+        value = "\n".join(item for item in lines[start:index + 1] if item)[:900]
         if value:
-            packets.append(value)
+            compact = re.sub(r"\s+", "", value)
+            identity_start = max(start, index - 2)
+            page_marker = next((
+                lines[position] for position in range(index, max(-1, index - 300), -1)
+                if re.fullmatch(r"\[第\d+页\]", lines[position])
+            ), "")
+            identity = f"{page_marker}\n" + "\n".join(item for item in lines[identity_start:index + 1] if item)
+            packets.append({
+                "clause_id": f"SC-{hashlib.sha1(re.sub(r'\s+', '', identity or compact).encode('utf-8')).hexdigest()[:10]}",
+                "text": value,
+                "score_line": line[:360],
+            })
+        if len(packets) >= limit:
+            break
     return packets
+
+
+def _score_packet_text(packet: object) -> str:
+    return str(packet.get("text") or "") if isinstance(packet, dict) else str(packet or "")
+
+
+def _score_packet_id(packet: object) -> str:
+    return str(packet.get("clause_id") or "") if isinstance(packet, dict) else ""
 
 
 def _score_rule_title_terms(rule: dict) -> set[str]:
@@ -434,13 +438,28 @@ def _score_rule_title_terms(rule: dict) -> set[str]:
     return terms
 
 
-def _score_packet_is_covered(packet: str, score_rules: list[dict]) -> bool:
-    """仅在评分项目名称有明确交集时视为已覆盖，不能用评分规则总数代替逐条核验。"""
-    compact_packet = re.sub(r"\s+", "", packet)
-    return any(
-        any(term in compact_packet for term in _score_rule_title_terms(rule))
-        for rule in score_rules
-    )
+def _score_packet_is_covered(packet: object, score_rules: list[dict]) -> bool:
+    """按条款 ID 或原文与计分数字的双重交集核验，避免标题短词造成误覆盖。"""
+    packet_text = _score_packet_text(packet)
+    compact_packet = re.sub(r"\s+", "", packet_text)
+    packet_id = _score_packet_id(packet)
+    packet_numbers = set(re.findall(r"\d+(?:\.\d+)?", compact_packet))
+    for rule in score_rules:
+        clause_ids = rule.get("source_clause_ids")
+        if packet_id and isinstance(clause_ids, list) and packet_id in {str(item) for item in clause_ids}:
+            return True
+        source = re.sub(r"\s+", "", str(rule.get("source_text") or ""))
+        if len(source) < 6:
+            continue
+        rule_numbers = set(re.findall(r"\d+(?:\.\d+)?", source + re.sub(r"\s+", "", str(rule.get("check_rule") or ""))))
+        source_overlap = source in compact_packet or compact_packet in source
+        if not source_overlap:
+            fragments = re.findall(r"[\u4e00-\u9fffA-Za-z0-9]{8,}", source)
+            source_overlap = any(fragment in compact_packet for fragment in fragments)
+        title_overlap = any(term in compact_packet for term in _score_rule_title_terms(rule))
+        if source_overlap and title_overlap and (not packet_numbers or bool(packet_numbers & rule_numbers)):
+            return True
+    return False
 
 
 RULE_EXTRACTION_BATCH_CHARS = 11_000
@@ -464,9 +483,13 @@ def _split_rule_extraction_text(text: str, max_chars: int) -> list[str]:
             if current:
                 chunks.append(current.strip())
                 current = ""
+            page_prefix_match = re.match(r"\[第\d+页\]\s*", part)
+            page_prefix = page_prefix_match.group(0).strip() if page_prefix_match else ""
             for start in range(0, len(part), max_chars):
                 piece = part[start:start + max_chars].strip()
                 if piece:
+                    if start and page_prefix and not piece.startswith(page_prefix):
+                        piece = f"{page_prefix}\n{piece}"
                     chunks.append(piece)
             continue
         if current and len(current) + len(part) > max_chars:
@@ -479,13 +502,23 @@ def _split_rule_extraction_text(text: str, max_chars: int) -> list[str]:
     return chunks or [value[:max_chars]]
 
 
-def _rule_extraction_prompt(app, text: str, *, compact: bool, score_packets: list[str], max_rules: int = 45) -> str:
+def _score_packet_prompt_text(score_packets: list[object]) -> str:
+    values = []
+    for index, packet in enumerate(score_packets, start=1):
+        clause_id = _score_packet_id(packet) or f"SC-{index}"
+        values.append(f"【评分条款 {clause_id}】\n{_score_packet_text(packet)}")
+    return "\n".join(values)
+
+
+def _rule_extraction_prompt(app, text: str, *, compact: bool, score_packets: list[object], max_rules: int = 45) -> str:
     limits = (
-        f"这是格式异常后的紧凑重试。最多返回 {max_rules} 条规则；title 最多 30 字，check_rule 最多 90 字，source_text 最多 120 字。"
+        f"这是格式异常后的紧凑重试。最多返回 {max_rules} 条规则；title 最多 30 字，普通规则的 check_rule 尽量控制在 180 字内，source_text 最多 120 字；"
+        "层级评分规则不得为缩短输出而省略叶子评分项、分值、公式或扣分条件。"
         if compact else
-        f"最多返回 {max_rules} 条规则；title 最多 40 字，check_rule 最多 140 字，source_text 最多 220 字。"
+        f"最多返回 {max_rules} 条规则；title 最多 40 字，普通规则的 check_rule 尽量控制在 260 字内，source_text 最多 220 字；"
+        "层级评分规则允许为完整表达叶子评分项、分值、公式和扣分条件而超过普通长度。"
     )
-    score_audit = "\n".join(f"【评分条款 {index}】\n{packet}" for index, packet in enumerate(score_packets, start=1))
+    score_audit = _score_packet_prompt_text(score_packets)
     score_requirement = (
         "本地已定位以下疑似评分条款。必须逐项核验并为每个不同的明确计分条款输出一条 objective 或 subjective 规则；"
         "不得遗漏业绩、报价、人员、资质、方案等评分项。"
@@ -495,12 +528,12 @@ def _rule_extraction_prompt(app, text: str, *, compact: bool, score_packets: lis
                                           score_audit=score_audit or "无", text=text)
 
 
-def _score_rule_supplement_prompt(app, score_packets: list[str], existing_rules: list[dict]) -> str:
+def _score_rule_supplement_prompt(app, score_packets: list[object], existing_rules: list[dict]) -> str:
     existing = [
         {"category": item.get("category"), "title": item.get("title"), "check_rule": item.get("check_rule"), "max_score": (item.get("scoring") or {}).get("max_score")}
         for item in existing_rules if item.get("category") in {"objective", "subjective"}
     ]
-    packet_text = "\n".join(f"【评分条款 {index}】\n{packet}" for index, packet in enumerate(score_packets, start=1))
+    packet_text = _score_packet_prompt_text(score_packets)
     return storage.render_prompt_template(app, "extract_rules_supplement_user",
                                           existing_rules=json.dumps(existing, ensure_ascii=False, separators=(",", ":")), packet_text=packet_text)
 
@@ -514,7 +547,23 @@ def _rule_batch_output_tokens(text: str, compact: bool = False) -> int:
 def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text: str,
                         *, document_id: str, batch_label: str, depth: int = 0) -> tuple[list[dict], int, int]:
     """提取一个小批次；截断时只二分当前批次，最小批次才紧凑重试。"""
-    packets = _score_clause_packets(text)
+    packets = _score_clause_packets(text, limit=24)
+    # 评分表密集页在 11k 字内也可能包含大量独立计分项。与其依赖模型在固定条数
+    # 上限内取舍，不如在首次调用前把这一小批次继续按页/段落二分，保证每项都能输出。
+    if len(packets) > 12 and len(text) > RULE_EXTRACTION_MIN_SPLIT_CHARS and depth < 3:
+        pieces = _split_rule_extraction_text(text, max(RULE_EXTRACTION_MIN_SPLIT_CHARS, (len(text) + 1) // 2))
+        if len(pieces) > 1:
+            rules: list[dict] = []
+            compact_retries = split_retries = 0
+            for index, piece in enumerate(pieces, start=1):
+                value, compact_count, split_count = _extract_rule_batch(
+                    app, task, profile, system_prompt, piece, document_id=document_id,
+                    batch_label=f"{batch_label}/评分密集拆分{index}", depth=depth + 1,
+                )
+                rules.extend(value)
+                compact_retries += compact_count
+                split_retries += split_count
+            return rules, compact_retries, split_retries + 1
     max_rules = 16 if depth == 0 else 10
     user_prompt = _rule_extraction_prompt(app, text, compact=False, score_packets=packets, max_rules=max_rules)
     try:
@@ -607,6 +656,7 @@ def _rule_compilation_packet(items: list[dict], char_limit: int) -> str:
             "check_rule": item.get("check_rule") or item.get("title"),
             "source_text": item.get("source_text"), "source_page": item.get("source_page"),
             "ocr_required": bool(item.get("ocr_required") or item.get("check_mode") == "ocr"),
+            "source_clause_ids": item.get("source_clause_ids") if isinstance(item.get("source_clause_ids"), list) else [],
             "scoring": item.get("scoring"),
         })
     packet = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
@@ -650,6 +700,52 @@ def _rule_compilation_output_tokens(item_count: int) -> int:
     return max(4_500, min(10_000, 1_200 + max(1, item_count) * 420))
 
 
+def _merge_compiled_rule_groups(app, task: dict, profile: dict, system_prompt: str,
+                                rules: list[dict], char_limit: int) -> list[dict]:
+    """对拆分后的规范规则做一次全局轻量语义合并；失败时完整保留子组结果。"""
+    values = _dedupe_rule_candidates(rules)
+    if len(values) <= 1:
+        return values
+    input_limit = min(char_limit, 140_000)
+    packet = _rule_compilation_packet(values, input_limit)
+    try:
+        packet_values = json.loads(packet)
+    except json.JSONDecodeError:
+        return values
+    # 不能把不完整数组送去做“全局”合并，否则尾部规则会被无提示遗漏。
+    if not isinstance(packet_values, list) or len(packet_values) != len(values):
+        return values
+    storage.update_task(app, task["task_id"], message="正在全局合并拆分后的评审规则")
+    try:
+        response = _request_task_json(
+            app, task, profile, "extract_rules_global_compile", system_prompt,
+            storage.render_prompt_template(app, "extract_rules_compile_user", candidates=packet),
+            context_mode="rule_global_semantic_compile",
+            max_tokens=_output_token_budget(profile, _rule_compilation_output_tokens(len(values))),
+            thinking_mode="disabled",
+        )
+        merged = response.get("rules") if isinstance(response, dict) else None
+        if not isinstance(merged, list):
+            raise ValueError("全局规则编译未返回有效规则")
+        merged = _dedupe_rule_candidates([item for item in merged if isinstance(item, dict)])
+        if not merged:
+            raise ValueError("全局规则编译返回空规则集")
+        # 全局合并允许减少重复规则，但明确计分条款不能因此失去覆盖。
+        for original in values:
+            if original.get("category") not in {"objective", "subjective"}:
+                continue
+            packet_like = {
+                "clause_id": next(iter(original.get("source_clause_ids") or []), ""),
+                "text": str(original.get("source_text") or original.get("check_rule") or ""),
+            }
+            if not _score_packet_is_covered(packet_like, merged):
+                merged.append(original)
+        return _dedupe_rule_candidates(merged)
+    except ValueError as exc:
+        storage.update_task(app, task["task_id"], message=f"全局规则合并未完成，已完整保留分组结果：{exc}")
+        return values
+
+
 def _compile_rule_group(app, task: dict, profile: dict, system_prompt: str,
                         candidates: list[dict], char_limit: int, *, depth: int = 0) -> tuple[list[dict], list[dict], bool]:
     """编译一个完整规则组；长度或格式异常时仅二分该组，保留每个子组的覆盖审计。"""
@@ -667,7 +763,9 @@ def _compile_rule_group(app, task: dict, profile: dict, system_prompt: str,
             compiled.extend(values)
             missing.extend(uncovered)
             used = used or group_used
-        return _dedupe_rule_candidates(compiled), _dedupe_rule_candidates(missing), used
+        return _merge_compiled_rule_groups(
+            app, task, profile, system_prompt, compiled, char_limit,
+        ), _dedupe_rule_candidates(missing), used
 
     packet = _rule_compilation_packet(candidates, input_limit)
     try:
@@ -693,7 +791,7 @@ def _compile_rule_group(app, task: dict, profile: dict, system_prompt: str,
                 left = _compile_rule_group(app, task, profile, system_prompt, candidates[:midpoint], char_limit, depth=depth + 1)
                 right = _compile_rule_group(app, task, profile, system_prompt, candidates[midpoint:], char_limit, depth=depth + 1)
                 return (
-                    _dedupe_rule_candidates(left[0] + right[0]),
+                    _merge_compiled_rule_groups(app, task, profile, system_prompt, left[0] + right[0], char_limit),
                     _dedupe_rule_candidates(left[1] + right[1]),
                     left[2] or right[2],
                 )
@@ -725,7 +823,7 @@ def _compile_rule_group(app, task: dict, profile: dict, system_prompt: str,
             left = _compile_rule_group(app, task, profile, system_prompt, candidates[:midpoint], char_limit, depth=depth + 1)
             right = _compile_rule_group(app, task, profile, system_prompt, candidates[midpoint:], char_limit, depth=depth + 1)
             return (
-                _dedupe_rule_candidates(left[0] + right[0]),
+                _merge_compiled_rule_groups(app, task, profile, system_prompt, left[0] + right[0], char_limit),
                 _dedupe_rule_candidates(left[1] + right[1]),
                 left[2] or right[2],
             )
@@ -767,6 +865,7 @@ def _quality_gate_rule_packet(items: list[dict], *, include_ids: bool) -> str:
             "source_text": str(item.get("source_text") or "")[:260],
             "source_page": item.get("source_page"),
             "ocr_required": bool(item.get("ocr_required") or item.get("check_mode") == "ocr"),
+            "source_clause_ids": item.get("source_clause_ids") if isinstance(item.get("source_clause_ids"), list) else [],
             "scoring": item.get("scoring"),
         }
         if include_ids:
@@ -785,7 +884,7 @@ def _protected_rules_for_quality_gate(app, project_id: str) -> list[dict]:
     _, current_rules = storage.list_rules(app, project_id)
     protected = []
     for item in current_rules:
-        if item.get("source_type") not in {"manual", "ai_locked"}:
+        if item.get("source_type") not in {"manual", "ai_edited"}:
             continue
         value = dict(item)
         if item.get("scoring_json"):
@@ -835,7 +934,7 @@ def _has_explicit_scoring_basis(item: dict) -> bool:
 
 
 def _final_rule_quality_gate(app, task: dict, profile: dict, system_prompt: str,
-                             rules: list[dict], score_packets: list[str]) -> tuple[list[dict], dict]:
+                             rules: list[dict], score_packets: list[object]) -> tuple[list[dict], dict]:
     """在保存前做一次全局只减不改审计；任何模型或格式异常均安全降级为保留原规则。"""
     stats = {"applied": False, "dropped_count": 0, "failure_count": 0, "recovered_score_count": 0}
     if len(rules) < RULE_QUALITY_GATE_MIN_RULES:
@@ -911,20 +1010,17 @@ def _extract_rules(app, task: dict) -> dict:
         attachment_text = Path(attachment["parsed_path"]).read_text(encoding="utf-8", errors="ignore").strip()
         if attachment_text:
             source_documents.append((f"招标附件：{attachment['original_name']}", attachment_text))
-    if len(source_documents) == 1:
-        source_parts = [f"【{source_documents[0][0]}】\n{_rule_source_excerpt(source_documents[0][1], char_limit)}"]
-    else:
-        attachment_count = len(source_documents) - 1
-        minimum_attachment_budget = min(12_000, max(2_000, char_limit // (attachment_count + 2)))
-        main_budget = max(minimum_attachment_budget, min(int(char_limit * 0.6), char_limit - attachment_count * minimum_attachment_budget))
-        attachment_budget = max(1_000, int((char_limit - main_budget) / attachment_count))
-        source_parts = [
-            f"【{label}】\n{_rule_source_excerpt(value, main_budget if index == 0 else attachment_budget)}"
-            for index, (label, value) in enumerate(source_documents)
-        ]
-    text = "\n\n".join(source_parts)[:char_limit]
-    score_packets = _score_clause_packets(text)
-    batches = _split_rule_extraction_text(text, RULE_EXTRACTION_BATCH_CHARS)
+    # 规则映射按 11k 字小批次执行，无需先把全部招标文件塞进单次上下文。这里保留
+    # 主文件和全部附件的完整可检索文本，避免固定关键词窗口在 AI 调用前丢掉后部评分表。
+    source_parts = [f"【{label}】\n{value}" for label, value in source_documents]
+    text = "\n\n".join(source_parts)
+    score_packets = _score_clause_packets(text, limit=400)
+    batches = []
+    for label, value in source_documents:
+        batches.extend(
+            f"【{label}】\n{piece}"
+            for piece in _split_rule_extraction_text(value, RULE_EXTRACTION_BATCH_CHARS)
+        )
     if not batches:
         raise ValueError("招标文件未提取到可供规则识别的正文")
     storage.update_task(app, task["task_id"], progress=15, message=f"正在分段提取评审规则（共 {len(batches)} 批）")
@@ -952,11 +1048,20 @@ def _extract_rules(app, task: dict) -> dict:
     if uncovered_score_packets:
         storage.update_task(app, task["task_id"], progress=60, message="正在核验评分条款覆盖并补充遗漏项")
         for index in range(0, len(uncovered_score_packets), 6):
-            packet_batch = uncovered_score_packets[index:index + 6]
             try:
+                current_score_rules = [
+                    item for item in raw_rules
+                    if isinstance(item, dict) and item.get("category") in {"objective", "subjective"}
+                ]
+                packet_batch = [
+                    packet for packet in uncovered_score_packets[index:index + 6]
+                    if not _score_packet_is_covered(packet, current_score_rules)
+                ]
+                if not packet_batch:
+                    continue
                 supplement = _request_task_json(
                     app, task, profile, "extract_rules_scoring_supplement", system_prompt,
-                    _score_rule_supplement_prompt(app, packet_batch, primary_score_rules), document_id=tender["document_id"],
+                    _score_rule_supplement_prompt(app, packet_batch, current_score_rules), document_id=tender["document_id"],
                     context_mode=f"score_clause_batch_{index // 6 + 1}",
                     max_tokens=_output_token_budget(profile, 3_500), thinking_mode="disabled",
                 )
@@ -1179,6 +1284,11 @@ def _score_payload(rules: list[dict]) -> list[dict]:
             scoring = json.loads(rule["scoring_json"]) if rule.get("scoring_json") else {}
         except json.JSONDecodeError:
             scoring = {}
+        if isinstance(scoring.get("items"), list):
+            scoring = {**scoring, "items": [
+                {**item, "item_id": str(item.get("item_id") or f"SI-{index}")}
+                for index, item in enumerate(scoring["items"], start=1) if isinstance(item, dict)
+            ]}
         payload.append({"rule_id": rule["rule_id"], "title": rule["title"], "check_rule": rule.get("check_rule") or rule["title"], "source_text": rule["source_text"],
                         "ocr_required": _rule_requires_visual_verification(rule), "scoring": scoring})
     return payload
@@ -1283,11 +1393,17 @@ def _normalise_score_results(output: object, rule_payload: list[dict], score_typ
         except (TypeError, ValueError):
             max_score = 0.0
         suggested = _suggested_score(item, raw, score_type, max_score)
-        results.append(_score_result_from_model(item["rule_id"], suggested, max_score, raw))
+        results.append(_score_result_from_model(
+            item["rule_id"], suggested, max_score, raw,
+            force_needs_ocr=bool(item.get("ocr_required")),
+        ))
     return results
 
 
-def _score_result_from_model(rule_id: str, suggested: float | None, max_score: float, raw: dict) -> dict:
+def _score_result_from_model(rule_id: str, suggested: float | None, max_score: float, raw: dict,
+                             *, force_needs_ocr: bool = False) -> dict:
+    if force_needs_ocr and raw.get("needs_ocr") is not True:
+        raw = {**raw, "needs_ocr": True}
     confidence = raw.get("confidence") if raw.get("confidence") in {"high", "medium", "low"} else "medium"
     needs_ocr = raw.get("needs_ocr") is True
     evidence = _score_evidence_text(raw)
@@ -1333,14 +1449,73 @@ def _rule_batches(rules: list[dict], size: int) -> list[list[dict]]:
     return [rules[index:index + size] for index in range(0, len(rules), size)]
 
 
-def _combined_batch_output_budget(component: str, rule_count: int) -> int:
-    """为思考模型留足结构化输出空间，同时避免客观分不必要地放大输出。"""
-    count = max(1, rule_count)
+def _rule_scoring(rule: dict) -> dict:
+    value = rule.get("scoring")
+    if isinstance(value, dict):
+        return value
+    try:
+        return json.loads(rule.get("scoring_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+
+
+def _rule_execution_strategy(rule: dict) -> str:
+    raw = " ".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text"))
+    if any(term in raw for term in ("公司名称", "项目名称", "前后", "一致", "无关公司", "无关项目", "全文")):
+        return "consistency"
+    if any(term in raw for term in ("业绩", "数量", "累计", "每个", "每项", "项目数", "份数", "得分")):
+        return "counting"
+    if rule.get("category") == "subjective" or any(
+        term in raw for term in ("技术方案", "实施方案", "服务方案", "组织方案", "功能", "模块", "章节")
+    ):
+        return "section"
+    return "point"
+
+
+def _rule_complexity(rule: dict) -> float:
+    """用结构复杂度而非固定条数估算一次模型输出负担，不参与业务判断。"""
+    scoring = _rule_scoring(rule)
+    items = scoring.get("items") if isinstance(scoring.get("items"), list) else []
+    text_length = len(str(rule.get("check_rule") or "")) + len(str(rule.get("source_text") or ""))
+    complexity = 1.0 + min(3.0, len(items) * 0.45) + min(2.0, max(0, text_length - 350) / 700)
+    if _rule_execution_strategy(rule) in {"counting", "section", "consistency"}:
+        complexity += 0.35
+    return complexity
+
+
+def _evaluation_rule_batches(component: str, rules: list[dict]) -> list[list[dict]]:
+    """先按证据策略归组，再按复杂度预算装箱；保持每个策略内的原始规则顺序。"""
+    if not rules:
+        return []
+    max_count = EVALUATION_BATCH_SIZES[component]
+    buckets: dict[str, list[dict]] = {}
+    for rule in rules:
+        buckets.setdefault(_rule_execution_strategy(rule), []).append(rule)
+    groups: list[list[dict]] = []
+    for strategy_rules in buckets.values():
+        current: list[dict] = []
+        current_cost = 0.0
+        for rule in strategy_rules:
+            cost = _rule_complexity(rule)
+            if current and (len(current) >= max_count or current_cost + cost > max_count):
+                groups.append(current)
+                current, current_cost = [], 0.0
+            current.append(rule)
+            current_cost += cost
+        if current:
+            groups.append(current)
+    return groups
+
+
+def _combined_batch_output_budget(component: str, rules: list[dict]) -> int:
+    """按规则数量和叶子评分复杂度共同分配输出，避免单条复合规则仍被截断。"""
+    count = max(1, len(rules))
+    item_count = sum(len((_rule_scoring(rule).get("items") or [])) for rule in rules)
     if component == "review":
-        return max(4_000, 1_600 + count * 650)
+        return max(4_000, 1_600 + count * 650 + item_count * 120)
     if component == "subjective":
-        return max(4_500, 1_800 + count * 700)
-    return max(2_000, 800 + count * 300)
+        return max(4_500, 1_800 + count * 700 + item_count * 320)
+    return max(2_000, 800 + count * 300 + item_count * 220)
 
 
 def _combined_batch_prompt(app, component: str, document: dict, payload: list[dict], text: str, *, compact: bool) -> str:
@@ -1384,13 +1559,14 @@ def _full_scan_catalog(rules: list[dict]) -> list[dict]:
             item["ocr"] = 1
         # 对业绩等数量/累计评分项保留极短的计分线索，避免首轮遗漏每一项材料；
         # 不在此阶段给分或做有效性裁断。
-        if rule["category"] == "objective":
+        if rule["category"] in {"objective", "subjective"}:
             try:
                 scoring = json.loads(rule.get("scoring_json") or "{}")
             except json.JSONDecodeError:
                 scoring = {}
             if scoring:
-                item["score_hint"] = json.dumps(scoring, ensure_ascii=False, separators=(",", ":"))[:160]
+                hint_limit = 420 if rule["category"] == "subjective" else 220
+                item["score_hint"] = json.dumps(scoring, ensure_ascii=False, separators=(",", ":"))[:hint_limit]
         catalog.append(item)
     return catalog
 
@@ -1405,16 +1581,25 @@ def _full_scan_chunk_label(chunk: dict) -> str:
 def _full_scan_prompt(app, document: dict, catalog: list[dict], chunk: dict, project_scope: dict, *, compact: bool) -> str:
     retry_note = (
         "这是格式异常后的严格 JSON 重试：只输出一个 JSON 对象；matches 最多 16 条、scope_anomalies 最多 4 条，每段摘录最多 60 字；"
+        "复合评分规则的不同叶子项可分别返回，但同一规则最多 6 条；若后文出现不同的数量限制，以本段限制为准；"
         "不得使用 Markdown、注释或前后说明。\n"
-        if compact else ""
+        if compact else
+        "本次正常扫描 matches 最多 36 条、scope_anomalies 最多 8 条；复合评分规则的不同叶子项可分别返回，"
+        "同一规则最多 8 条；若后文的通用限制与本段冲突，以本段为准。\n"
     )
-    return storage.render_prompt_template(
+    prompt = storage.render_prompt_template(
         app, "evaluate_all_full_scan_user", retry_note=retry_note,
         project_scope=json.dumps(project_scope, ensure_ascii=False, separators=(",", ":")),
         rules=json.dumps(catalog, ensure_ascii=False, separators=(",", ":")),
         document_name=document["original_name"], bidder_name=document["bidder_name"] or "未填写",
         chunk_label=_full_scan_chunk_label(chunk), text=chunk["text"],
     )
+    # 同步兼容云端尚未恢复默认的旧自定义模板，避免严格重试同时出现 16/4 与 36/8
+    # 两套上限。这里只收紧格式数量，不改任何业务判断指令。
+    if compact:
+        prompt = prompt.replace("最多36条", "最多16条").replace("最多 36 条", "最多 16 条")
+        prompt = prompt.replace("最多8条", "最多4条").replace("最多 8 条", "最多 4 条")
+    return prompt
 
 
 def _normalise_scan_findings(output: object, allowed_ids: set[str], chunk: dict) -> list[dict]:
@@ -1591,8 +1776,9 @@ def _run_full_scan_piece(app, task: dict, profile: dict, document: dict, catalog
                           project_scope: dict, system_prompt: str, depth: int = 0) -> tuple[dict, int, int, list[dict]]:
     """扫描一个连续页块；只在输出异常时拆分规则目录，绝不递归重发全文。"""
     allowed_ids = {item["id"] for item in catalog}
-    # 首轮只是候选索引而非最终结论；固定且较小的输出预算能抑制模型逐条长篇解释。
-    max_tokens = _output_token_budget(profile, min(2_800, max(1_400, 800 + len(catalog) * 28)))
+    # 首轮只是候选索引而非最终结论，但 36 条规则证据和 8 条范围候选需要足够的
+    # JSON 闭合空间；预算仍受全局 12k 上限和模型档案约束。
+    max_tokens = _output_token_budget(profile, min(4_200, max(1_800, 1_000 + len(catalog) * 45)))
 
     def findings_from(parsed: object) -> dict:
         values = parsed.get("matches") if isinstance(parsed, dict) else None
@@ -1679,6 +1865,8 @@ def _scan_document_fulltext(app, task: dict, profile: dict, document: dict, rule
                             project_scope: dict, system_prompt: str, *,
                             progress_offset: int = 0, progress_total: int = 1,
                             progress_callback=None) -> dict | None:
+    if not rules:
+        return None
     try:
         text_length = int(document.get("text_length") or 0)
     except (TypeError, ValueError):
@@ -1761,14 +1949,13 @@ def _full_scan_chunk_count(document: dict) -> int:
 
 def _scan_strategy(rules: list[dict]) -> str:
     """决定最终汇总优先携带哪类全文证据，不改变用户已确认的评审规则。"""
-    categories = {item.get("category") for item in rules}
-    raw = " ".join(f"{item.get('title', '')} {item.get('check_rule', '')}" for item in rules)
-    if "objective" in categories or any(term in raw for term in ("业绩", "数量", "累计", "每个", "项目数", "得分")):
-        return "counting"
-    if "subjective" in categories or any(term in raw for term in ("技术方案", "实施方案", "服务方案", "组织方案")):
-        return "section"
-    if any(term in raw for term in ("公司名称", "项目名称", "前后", "一致", "无关公司", "无关项目", "全文")):
-        return "consistency"
+    strategies = {_rule_execution_strategy(item) for item in rules}
+    if len(strategies) == 1:
+        return next(iter(strategies))
+    # 兼容异常调用方传入混合规则组；正常综合评审已在调用前按策略分组。
+    for value in ("counting", "section", "consistency", "point"):
+        if value in strategies:
+            return value
     return "point"
 
 
@@ -1818,7 +2005,16 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
             selected_ids.append(root_id)
     # 缺失规则补评只需要最直接的证据页；首次综合评审保持原有全文级证据覆盖，
     # 以准确性优先。这样不会再为一条漏回规则重发约 6 万字上下文。
-    per_rule = 1 if targeted else (6 if strategy in {"counting", "section"} else 4)
+    if targeted:
+        # 漏回规则通常只需重发直接证据，但复合评分/数量累计规则可能跨多个章节；
+        # 按规则结构放宽到最多 6 个页块，不能以“补评”为由只给一页而破坏完整计分。
+        max_items = max((
+            len((_rule_scoring(rule).get("items") or []))
+            for rule in rules
+        ), default=0)
+        per_rule = min(6, max(2, max_items)) if strategy in {"counting", "section"} else 2
+    else:
+        per_rule = 6 if strategy in {"counting", "section"} else 4
     for chunk_id in select_rule_chunks(scan.get("chunks", []), rules, per_rule=per_rule):
         if chunk_id not in selected_ids:
             selected_ids.append(chunk_id)
@@ -1905,13 +2101,13 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
     # 原页不会被前面规则的大段材料饿死，最终模型仍可基于真实全文片段作判断。
     rule_evidence: dict[str, list[str]] = {}
     required_ids: list[str] = []
-    fallback_ids = iter(select_rule_chunks(scan.get("chunks", []), rules, per_rule=1))
+    fallback_by_rule = select_rule_chunk_map(scan.get("chunks", []), rules, per_rule=1)
     for rule in rules:
         rule_id = str(rule.get("rule_id") or "")
         finding = best_by_rule.get(rule_id)
         chunk_id = str((finding or {}).get("chunk_id") or "").split(".", 1)[0]
         if not chunk_id:
-            chunk_id = next(fallback_ids, "")
+            chunk_id = next(iter(fallback_by_rule.get(rule_id, [])), "")
         if not chunk_id:
             continue
         if finding and finding.get("evidence"):
@@ -2001,6 +2197,69 @@ def _ordered_combined_results(rules: list[dict], values: list[dict]) -> list[dic
     return [by_id[item["rule_id"]] for item in rules if item["rule_id"] in by_id]
 
 
+def _compound_score_rule_halves(rule: dict) -> tuple[dict, dict] | None:
+    """仅在叶子项具有明确可加分值时拆单条复合评分规则。"""
+    scoring = _rule_scoring(rule)
+    items = scoring.get("items") if isinstance(scoring.get("items"), list) else []
+    if len(items) <= 1:
+        return None
+    item_scores: list[float] = []
+    for item in items:
+        try:
+            value = float(item.get("max_score")) if isinstance(item, dict) else 0.0
+        except (TypeError, ValueError):
+            return None
+        if value <= 0:
+            return None
+        item_scores.append(value)
+    try:
+        parent_max = float(scoring.get("max_score") or 0)
+    except (TypeError, ValueError):
+        return None
+    if parent_max <= 0 or abs(sum(item_scores) - parent_max) > 1e-6:
+        return None
+    midpoint = len(items) // 2
+    halves = []
+    for subset in (items[:midpoint], items[midpoint:]):
+        subset_scoring = {**scoring, "max_score": sum(float(item["max_score"]) for item in subset), "items": subset}
+        halves.append({**rule, "scoring_json": json.dumps(subset_scoring, ensure_ascii=False)})
+    return halves[0], halves[1]
+
+
+def _merge_compound_score_results(rule: dict, left: dict, right: dict) -> dict:
+    scoring = _rule_scoring(rule)
+    try:
+        max_score = float(scoring.get("max_score") or 0)
+    except (TypeError, ValueError):
+        max_score = 0.0
+    scores = (left.get("suggested_score"), right.get("suggested_score"))
+    suggested = min(max_score, sum(float(value) for value in scores)) if all(
+        isinstance(value, (int, float)) and not isinstance(value, bool) for value in scores
+    ) and max_score > 0 else None
+    confidence_order = {"low": 0, "medium": 1, "high": 2}
+    confidence = min(
+        (left.get("confidence") or "medium", right.get("confidence") or "medium"),
+        key=lambda value: confidence_order.get(value, 1),
+    )
+    evidence = "\n".join(value for value in (
+        f"【子项组1】{left.get('evidence', '')}" if left.get("evidence") else "",
+        f"【子项组2】{right.get('evidence', '')}" if right.get("evidence") else "",
+    ) if value)
+    reason = "\n".join(value for value in (
+        f"【子项组1】{left.get('reason', '')}" if left.get("reason") else "",
+        f"【子项组2】{right.get('reason', '')}" if right.get("reason") else "",
+    ) if value)
+    requires_review = bool(left.get("requires_review", True) or right.get("requires_review", True) or suggested is None)
+    return {
+        "rule_id": rule["rule_id"], "suggested_score": suggested, "final_score": None,
+        "effective_score": suggested if not requires_review else None, "max_score": max_score or None,
+        "evidence": evidence[:2000], "reason": reason[:2000], "confidence": confidence,
+        "automation_status": "needs_review" if requires_review else "ready_for_batch_confirmation",
+        "requires_review": requires_review,
+        "review_reason": "复合评分规则已按明确叶子分值分组核验，请复核汇总。" if requires_review else "",
+    }
+
+
 def _normalise_partial_combined_results(component: str, output: list[dict], rules: list[dict]) -> tuple[list[dict], list[dict]]:
     returned_ids = {item.get("rule_id") for item in output if isinstance(item, dict)}
     present_rules = [item for item in rules if item["rule_id"] in returned_ids]
@@ -2012,15 +2271,18 @@ def _normalise_partial_combined_results(component: str, output: list[dict], rule
 def _run_combined_batch(app, task: dict, profile: dict, document: dict, component: str, rules: list[dict],
                         system_prompt: str, char_limit: int, label: str, depth: int = 0,
                         scan_index: dict | None = None, allow_missing_retry: bool = True,
-                        targeted_retry: bool = False) -> tuple[list[dict], int, int, int, str]:
+                        targeted_retry: bool = False, allow_item_split: bool = True) -> tuple[list[dict], int, int, int, str]:
     """运行一个可独立保存的综合评审规则组；异常时仅拆分当前组。"""
     payload = _combined_batch_payload(component, rules)
     strategy = _scan_strategy(rules)
     context_limit = min(char_limit, EVALUATION_BATCH_CONTEXT_CHARS,
                         EVALUATION_STRATEGY_CONTEXT_CHARS.get(strategy, EVALUATION_BATCH_CONTEXT_CHARS))
     if targeted_retry:
-        # 仅补评一小组漏回规则：给足直接证据，但不再携带完整全文汇总包。
-        context_limit = min(context_limit, 14_000 if component == "review" else 18_000)
+        # 仅补评漏回规则，不携带无关全文；复合评分和数量累计仍保留跨章节证据容量。
+        retry_cap = 18_000 if component == "review" else (
+            42_000 if any(_rule_execution_strategy(rule) in {"counting", "section"} for rule in rules) else 24_000
+        )
+        context_limit = min(context_limit, retry_cap)
     if scan_index:
         context = _full_scan_review_context(scan_index, rules, context_limit, targeted=targeted_retry)
     else:
@@ -2070,7 +2332,7 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
             app, task, profile, f"evaluate_all_{component}_batch", system_prompt,
             _combined_batch_prompt(app, component, document, payload, context["text"], compact=False),
             document_id=document["document_id"], context_mode=f"{label}:{context['mode']}",
-            max_tokens=_output_token_budget(profile, _combined_batch_output_budget(component, len(rules))), thinking_mode=thinking_mode,
+            max_tokens=_output_token_budget(profile, _combined_batch_output_budget(component, rules)), thinking_mode=thinking_mode,
         )
         return finish(parsed, 0, context["mode"])
     except InvalidJsonResponse as exc:
@@ -2092,6 +2354,25 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
             raise
         format_error = exc
 
+    # 单条复合评分规则也可能因逐叶子项证据过长而截断。仅当每个叶子项都有明确、
+    # 可加的分值时，才安全拆成两个子项组并按父项满分汇总；其他评分口径不擅自拆算。
+    compound_halves = _compound_score_rule_halves(rules[0]) if (
+        allow_item_split and len(rules) == 1 and component in {"objective", "subjective"}
+    ) else None
+    if isinstance(format_error, InvalidJsonResponse) and format_error.finish_reason.lower() in {"length", "max_tokens"} and compound_halves:
+        storage.update_task(app, task["task_id"], message=f"{label} 单条复合评分输出达到上限，正在按明确叶子评分项拆分")
+        left = _run_combined_batch(
+            app, task, profile, document, component, [compound_halves[0]], system_prompt, char_limit,
+            f"{label}/子项组1", depth + 1, scan_index, allow_missing_retry, targeted_retry, False,
+        )
+        right = _run_combined_batch(
+            app, task, profile, document, component, [compound_halves[1]], system_prompt, char_limit,
+            f"{label}/子项组2", depth + 1, scan_index, allow_missing_retry, targeted_retry, False,
+        )
+        if left[0] and right[0]:
+            merged = _merge_compound_score_results(rules[0], left[0][0], right[0][0])
+            return [merged], left[1] + right[1], left[2] + right[2] + 1, left[3] + right[3], "split_score_items"
+
     # 截断响应不能可靠补尾；直接拆小规则组，避免把同一大上下文完整重发一遍。
     if isinstance(format_error, InvalidJsonResponse) and format_error.finish_reason.lower() in {"length", "max_tokens"} and len(rules) > 1 and depth < 3:
         storage.update_task(app, task["task_id"], message=f"{label} 输出达到上限，正在仅拆分该规则组")
@@ -2110,7 +2391,7 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
                 app, task, profile, f"evaluate_all_{component}_compact_retry", system_prompt,
                 _combined_batch_prompt(app, component, document, payload, context["text"], compact=True),
                 document_id=document["document_id"], context_mode=f"{label}_compact:{context['mode']}",
-                max_tokens=_output_token_budget(profile, _combined_batch_output_budget(component, len(rules))), thinking_mode="disabled",
+                max_tokens=_output_token_budget(profile, _combined_batch_output_budget(component, rules)), thinking_mode="disabled",
             )
             return finish(parsed, 1, context["mode"])
         except ValueError as retry_exc:
@@ -2122,6 +2403,19 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
                 left = _run_combined_batch(app, task, profile, document, component, rules[:midpoint], system_prompt, char_limit, f"{label}/拆分1", depth + 1, scan_index, allow_missing_retry)
                 right = _run_combined_batch(app, task, profile, document, component, rules[midpoint:], system_prompt, char_limit, f"{label}/拆分2", depth + 1, scan_index, allow_missing_retry)
                 return left[0] + right[0], left[1] + right[1] + 1, left[2] + right[2] + 1, left[3] + right[3], "split"
+            if compound_halves:
+                storage.update_task(app, task["task_id"], message=f"{label} 严格重试仍异常，正在按明确叶子评分项拆分")
+                left = _run_combined_batch(
+                    app, task, profile, document, component, [compound_halves[0]], system_prompt, char_limit,
+                    f"{label}/子项组1", depth + 1, scan_index, allow_missing_retry, targeted_retry, False,
+                )
+                right = _run_combined_batch(
+                    app, task, profile, document, component, [compound_halves[1]], system_prompt, char_limit,
+                    f"{label}/子项组2", depth + 1, scan_index, allow_missing_retry, targeted_retry, False,
+                )
+                if left[0] and right[0]:
+                    merged = _merge_compound_score_results(rules[0], left[0][0], right[0][0])
+                    return [merged], left[1] + right[1] + 1, left[2] + right[2] + 1, left[3] + right[3], "split_score_items"
             reason = "模型连续两次返回格式异常，本规则未获得可靠 AI 结论；已保留任务并转为人工核验。"
             storage.update_task(app, task["task_id"], message=f"{label} 格式重试失败，已标记人工核验并继续")
             return _combined_manual_results(component, rules, payload, reason), 1, 0, len(rules), "manual_fallback"
@@ -2162,6 +2456,20 @@ def _run_cross_bid_price_scoring(app, task: dict, profile: dict, documents: list
     )
     expected = {(document["document_id"], rule["rule_id"]) for document in documents for rule in rules}
 
+    def save_unavailable(keys: set[tuple[str, str]], reason: str) -> None:
+        for document_id, rule_id in keys:
+            rule_payload = rules_by_id[rule_id]
+            try:
+                max_score = float(rule_payload.get("scoring", {}).get("max_score") or 0)
+            except (TypeError, ValueError):
+                max_score = 0.0
+            result = _score_result_from_model(
+                rule_id, None, max_score,
+                {"reason": reason, "confidence": "low", "needs_ocr": bool(rule_payload.get("ocr_required"))},
+                force_needs_ocr=bool(rule_payload.get("ocr_required")),
+            )
+            storage.save_score_results(app, score_run_id, document_id, [result])
+
     def request(phase: str) -> dict:
         return _request_task_json(
             app, task, profile, phase, _system_prompt(app, "evaluate_all"), prompt,
@@ -2188,17 +2496,19 @@ def _run_cross_bid_price_scoring(app, task: dict, profile: dict, documents: list
                     raise
                 return None
 
+    rules_by_id = {rule["rule_id"]: item for rule, item in zip(rules, payload)}
+    documents_by_id = {document["document_id"]: document for document in documents}
     parsed = request_with_repair("evaluate_all_cross_bid_price")
     if not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list):
         retry_count += 1
         parsed = request_with_repair("evaluate_all_cross_bid_price_retry")
     if not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list):
-        # 格式故障不能让已经完成的数十个审查结果整体失败；保留单文件阶段结果并明确统计缺失。
+        # 比较型价格规则不能使用单文件暂定分兜底；明确保存“暂无法计算”，同时不让
+        # 已完成的其他审查结果整体失败。
+        save_unavailable(expected, "跨投标人价格比较未返回可靠结果，当前暂无法计算建议分，请人工核对全部报价后复核。")
         return {"rule_count": len(rules), "result_count": 0, "retry_count": retry_count,
                 "missing_count": len(expected), "format_failure": True}
 
-    rules_by_id = {rule["rule_id"]: item for rule, item in zip(rules, payload)}
-    documents_by_id = {document["document_id"]: document for document in documents}
     received: set[tuple[str, str]] = set()
     for raw in parsed["results"]:
         if not isinstance(raw, dict):
@@ -2212,11 +2522,17 @@ def _run_cross_bid_price_scoring(app, task: dict, profile: dict, documents: list
         except (TypeError, ValueError):
             max_score = 0.0
         suggested = _suggested_score(rule_payload, raw, "objective", max_score)
-        result = _score_result_from_model(key[1], suggested, max_score, raw)
+        result = _score_result_from_model(
+            key[1], suggested, max_score, raw,
+            force_needs_ocr=bool(rule_payload.get("ocr_required")),
+        )
         storage.save_score_results(app, score_run_id, documents_by_id[key[0]]["document_id"], [result])
         received.add(key)
+    missing = expected - received
+    if missing:
+        save_unavailable(missing, "跨投标人价格比较未返回本投标人的可靠结果，当前暂无法计算建议分，请人工复核报价口径和公式。")
     return {"rule_count": len(rules), "result_count": len(received), "retry_count": retry_count,
-            "missing_count": len(expected - received)}
+            "missing_count": len(missing)}
 
 
 class _EvaluationProgress:
@@ -2295,7 +2611,7 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
     }
     components = (("review", review_rules, review_run), ("objective", objective_rules, objective_run), ("subjective", subjective_rules, subjective_run))
     for component, component_rules, run in components:
-        for group_index, group in enumerate(_rule_batches(component_rules, EVALUATION_BATCH_SIZES[component]), start=1):
+        for group_index, group in enumerate(_evaluation_rule_batches(component, component_rules), start=1):
             label = f"{bidder_name}·{component} 第{group_index}组"
             progress.message(f"正在综合评审：{label}")
             results, compact_count, split_count, fallback_count, _ = _run_combined_batch(
@@ -2324,6 +2640,10 @@ def _evaluate_all(app, task: dict) -> dict:
     objective_rules = [item for item in all_rules if item["enabled"] and item["category"] == "objective"]
     subjective_rules = [item for item in all_rules if item["enabled"] and item["category"] == "subjective"]
     cross_bid_price_rules = _cross_bid_price_rules(objective_rules)
+    cross_bid_price_rule_ids = {item["rule_id"] for item in cross_bid_price_rules}
+    # 最低价、基准价等比较型规则不能在单份文件阶段独立计分。单文件阶段完全跳过，
+    # 最终统一比较成功后再写入结果，失败时写入明确的“暂无法计算”。
+    local_objective_rules = [item for item in objective_rules if item["rule_id"] not in cross_bid_price_rule_ids]
     if not (review_rules or objective_rules or subjective_rules):
         raise ValueError("综合评审需要至少一条已确认的审查或评分规则")
     all_documents = storage.list_documents(app, task["project_id"])
@@ -2351,10 +2671,14 @@ def _evaluate_all(app, task: dict) -> dict:
     batch_count = 0
     full_scan_document_count = full_scan_batch_count = full_scan_failed_chunk_count = 0
     groups_per_document = sum(
-        len(_rule_batches(component_rules, EVALUATION_BATCH_SIZES[component]))
-        for component, component_rules in (("review", review_rules), ("objective", objective_rules), ("subjective", subjective_rules))
+        len(_evaluation_rule_batches(component, component_rules))
+        for component, component_rules in (("review", review_rules), ("objective", local_objective_rules), ("subjective", subjective_rules))
     )
-    scan_units_by_document = {item["document_id"]: _full_scan_chunk_count(item) for item in documents}
+    has_local_rules = bool(review_rules or local_objective_rules or subjective_rules)
+    scan_units_by_document = {
+        item["document_id"]: _full_scan_chunk_count(item) if has_local_rules else 0
+        for item in documents
+    }
     cross_bid_units = 1 if objective_run and len(documents) >= 2 and cross_bid_price_rules else 0
     total_work_units = max(1, sum(scan_units_by_document.values()) + len(documents) * groups_per_document + cross_bid_units)
     task["_evaluation_request_gate"] = _EvaluationRequestGate(2 if len(documents) > 1 else 1)
@@ -2363,7 +2687,7 @@ def _evaluate_all(app, task: dict) -> dict:
     def run_document(document: dict) -> dict:
         return _evaluate_document(
             app, task, document, rule_set=rule_set, profile=profile, char_limit=char_limit,
-            expected_rule_ids=expected_rule_ids, review_rules=review_rules, objective_rules=objective_rules,
+            expected_rule_ids=expected_rule_ids, review_rules=review_rules, objective_rules=local_objective_rules,
             subjective_rules=subjective_rules, review_run=review_run, objective_run=objective_run,
             subjective_run=subjective_run, project_scope=project_scope, system_prompt=system_prompt,
             scan_units=scan_units_by_document[document["document_id"]], groups_per_document=groups_per_document,

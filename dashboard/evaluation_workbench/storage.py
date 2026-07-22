@@ -1480,23 +1480,25 @@ def update_rule(app, project_id: str, rule_id: str, payload: dict) -> dict:
             if rule["category"] == "objective":
                 current["kind"] = "boolean" if scoring.get("kind") == "boolean" else "manual"
             scoring_json = json.dumps(current, ensure_ascii=False)
-        # AI 规则一旦被人工修改其检查语义、评分口径或启用选择，后续重新提取不得
-        # 覆盖该人工维护结果；否则取消勾选的规则会在重新提取后被悄然重新启用。
-        locked = rule.get("source_type") == "ai" and (check_rule is not None or scoring_json is not None or enabled is not None)
+        # 规则内容/评分口径的人工修改属于长期维护内容；启用勾选仅属于当前规则集，
+        # 重新提取时必须重新选择，不能因为一次勾选操作把 AI 规则固化到下一版本。
+        content_locked = rule.get("source_type") in {"ai", "ai_locked"} and (
+            check_rule is not None or scoring_json is not None
+        )
         if check_rule is not None:
             conn.execute(
-                "UPDATE ew_rules SET check_rule = ?, source_type = CASE WHEN ? THEN 'ai_locked' ELSE source_type END, updated_at = ? WHERE rule_id = ?",
-                (check_rule, 1 if locked else 0, now_iso(), rule_id),
+                "UPDATE ew_rules SET check_rule = ?, source_type = CASE WHEN ? THEN 'ai_edited' ELSE source_type END, updated_at = ? WHERE rule_id = ?",
+                (check_rule, 1 if content_locked else 0, now_iso(), rule_id),
             )
         if scoring_json is not None:
             conn.execute(
-                "UPDATE ew_rules SET scoring_json = ?, source_type = CASE WHEN ? THEN 'ai_locked' ELSE source_type END, updated_at = ? WHERE rule_id = ?",
-                (scoring_json, 1 if locked else 0, now_iso(), rule_id),
+                "UPDATE ew_rules SET scoring_json = ?, source_type = CASE WHEN ? THEN 'ai_edited' ELSE source_type END, updated_at = ? WHERE rule_id = ?",
+                (scoring_json, 1 if content_locked else 0, now_iso(), rule_id),
             )
         if enabled is not None:
             conn.execute(
-                "UPDATE ew_rules SET enabled = ?, source_type = CASE WHEN ? THEN 'ai_locked' ELSE source_type END, updated_at = ? WHERE rule_id = ?",
-                (enabled, 1 if locked else 0, now_iso(), rule_id),
+                "UPDATE ew_rules SET enabled = ?, updated_at = ? WHERE rule_id = ?",
+                (enabled, now_iso(), rule_id),
             )
         conn.execute("UPDATE ew_rule_sets SET updated_at = ? WHERE rule_set_id = ?", (now_iso(), rule_set["rule_set_id"]))
         updated = conn.execute("SELECT * FROM ew_rules WHERE rule_id = ?", (rule_id,)).fetchone()
@@ -1505,15 +1507,17 @@ def update_rule(app, project_id: str, rule_id: str, payload: dict) -> dict:
 
 def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: list[dict]) -> dict:
     with connection(app) as conn:
-        # 新一轮 AI 提取仅刷新 AI 来源规则。人工补充及人工锁定的 AI 规则是用户
-        # 已确认的业务输入，必须随新草稿迁移，避免“重新提取”变成静默删除。
+        # 新一轮 AI 提取刷新普通 AI 规则。人工补充及人工修改过内容/评分口径的
+        # AI 规则继续迁移，但上一版本的启用勾选一律不迁移，新草稿统一重新启用。
+        # 历史 ai_locked 无法区分“只改勾选”与“改过内容”，不再迁移；今后内容修改
+        # 使用 ai_edited 明确记录，彻底切断重新提取与上一次勾选状态的关系。
         current = conn.execute(
             "SELECT * FROM ew_rule_sets WHERE project_id = ? ORDER BY version DESC LIMIT 1", (project_id,)
         ).fetchone()
         preserved = []
         if current:
             preserved = conn.execute(
-                "SELECT * FROM ew_rules WHERE rule_set_id = ? AND source_type IN ('manual', 'ai_locked') ORDER BY sort_order, created_at",
+                "SELECT * FROM ew_rules WHERE rule_set_id = ? AND source_type IN ('manual', 'ai_edited') ORDER BY sort_order, created_at",
                 (current["rule_set_id"],),
             ).fetchall()
         prior = conn.execute("SELECT MAX(version) FROM ew_rule_sets WHERE project_id = ?", (project_id,)).fetchone()[0] or 0
@@ -1537,7 +1541,7 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (str(uuid.uuid4()), rule_set["rule_set_id"], row["category"], row["title"], row["check_rule"] or row["title"],
                  row["source_text"], row["source_page"], "ocr" if row["check_mode"] == "ocr" else "auto",
-                 row["source_type"], row["source_task_id"], row["scoring_json"], row["enabled"], index, timestamp, timestamp),
+                 row["source_type"], row["source_task_id"], row["scoring_json"], 1, index, timestamp, timestamp),
             )
             preserved_rule_count += 1
         for index, item in enumerate(rules):

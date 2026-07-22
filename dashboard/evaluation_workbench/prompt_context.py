@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -43,7 +44,17 @@ def _pages_from_text(text: str) -> dict[int, str]:
 
 
 def _anchors(rule: dict) -> list[str]:
-    raw = f"{rule.get('title', '')} {rule.get('check_rule', '')} {rule.get('source_text', '')}"
+    scoring = rule.get("scoring")
+    if not isinstance(scoring, dict):
+        try:
+            scoring = json.loads(rule.get("scoring_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            scoring = {}
+    item_text = " ".join(
+        f"{item.get('name', '')} {item.get('criterion', '')}"
+        for item in (scoring.get("items") or []) if isinstance(item, dict)
+    )
+    raw = f"{rule.get('title', '')} {rule.get('check_rule', '')} {rule.get('source_text', '')} {item_text}"
     priority: list[str] = []
     for triggers, terms in DOMAIN_TERM_GROUPS:
         if any(trigger in raw for trigger in triggers):
@@ -138,10 +149,13 @@ def split_full_text_chunks(path: str | Path, target_chars: int = 11_000, overlap
     return chunks
 
 
-def select_rule_chunks(chunks: list[dict], rules: list[dict], per_rule: int = 4) -> list[str]:
-    """为全文扫描后的二次复核补充确定性候选块，不作为首轮过滤器。"""
-    selected: list[str] = []
+def select_rule_chunk_map(chunks: list[dict], rules: list[dict], per_rule: int = 4) -> dict[str, list[str]]:
+    """按规则返回确定性候选块，防止扁平列表在缺失补评时发生规则错配。"""
+    selected: dict[str, list[str]] = {}
     for rule in rules:
+        rule_id = str(rule.get("rule_id") or "")
+        if not rule_id:
+            continue
         anchors = _anchors(rule)
         scored: list[tuple[int, int, str]] = []
         for index, chunk in enumerate(chunks):
@@ -150,8 +164,21 @@ def select_rule_chunks(chunks: list[dict], rules: list[dict], per_rule: int = 4)
             if score:
                 scored.append((score, index, str(chunk.get("chunk_id"))))
         scored.sort(key=lambda item: (-item[0], item[1]))
+        rule_chunks: list[str] = []
         for _, _, chunk_id in scored[:per_rule]:
-            if chunk_id and chunk_id not in selected:
+            if chunk_id and chunk_id not in rule_chunks:
+                rule_chunks.append(chunk_id)
+        selected[rule_id] = rule_chunks
+    return selected
+
+
+def select_rule_chunks(chunks: list[dict], rules: list[dict], per_rule: int = 4) -> list[str]:
+    """兼容原调用方：按规则顺序扁平化候选块，并保持全局去重。"""
+    selected: list[str] = []
+    chunk_map = select_rule_chunk_map(chunks, rules, per_rule=per_rule)
+    for rule in rules:
+        for chunk_id in chunk_map.get(str(rule.get("rule_id") or ""), []):
+            if chunk_id not in selected:
                 selected.append(chunk_id)
     return selected
 

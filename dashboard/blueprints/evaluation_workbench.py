@@ -14,10 +14,11 @@ from werkzeug.security import check_password_hash
 
 from dashboard.evaluation_workbench import storage
 from dashboard.evaluation_workbench.ai_gateway import test_connection
+from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION
 
 
 evaluation_workbench_bp = Blueprint("evaluation_workbench", __name__)
-TASK_PROMPT_VERSION = "project-scope-coverage-v11"
+TASK_PROMPT_VERSION = EVALUATION_PROMPT_VERSION
 MODEL_CONFIGURATION_PASSWORD = "108"
 
 
