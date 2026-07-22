@@ -1167,33 +1167,32 @@ def _final_rule_quality_gate(app, task: dict, profile: dict, system_prompt: str,
         return rules, stats
 
 
-def _finalise_rule_operations(app, task: dict, profile: dict, system_prompt: str,
-                              rules: list[dict]) -> tuple[list[dict], dict]:
+def _finalise_rule_operations_pass(app, task: dict, profile: dict, system_prompt: str,
+                                   rules: list[dict], *, focus_key: str, focus: str) -> tuple[list[dict], dict]:
     """以可追溯操作规范化完整规则集；任何越界操作或格式异常都保留原规则。"""
     stats = {
         "applied": False, "dropped_count": 0, "rewritten_count": 0,
         "merged_count": 0, "failure_count": 0,
     }
-    if len(rules) < RULE_FINALISATION_MIN_RULES:
-        return rules, stats
     protected = _protected_rules_for_quality_gate(app, task["project_id"])
     prompt = storage.render_prompt_template(
         app, "extract_rules_finalise_user",
+        focus=focus,
         candidates=_quality_gate_rule_packet(rules, include_ids=True),
         protected_rules=_quality_gate_rule_packet(protected, include_ids=False),
     )
-    storage.update_task(app, task["task_id"], progress=79, message="正在规范化规则边界并合并条件规则")
+    storage.update_task(app, task["task_id"], progress=79, message=f"正在执行规则最终规范化：{focus_key}")
     try:
         try:
             response = _request_task_json(
-                app, task, profile, "extract_rules_finalise", system_prompt, prompt,
-                context_mode="rule_finalise_operations",
+                app, task, profile, f"extract_rules_finalise_{focus_key}", system_prompt, prompt,
+                context_mode=f"rule_finalise_{focus_key}",
                 max_tokens=_output_token_budget(profile, max(2_500, min(6_000, 1_200 + len(rules) * 85))),
                 thinking_mode="disabled",
             )
         except InvalidJsonResponse as exc:
             response = _repair_invalid_json(
-                app, task, profile, "extract_rules_finalise_json_repair", exc, "drops",
+                app, task, profile, f"extract_rules_finalise_{focus_key}_json_repair", exc, "drops",
             )
         if not isinstance(response, dict):
             raise ValueError("模型返回格式不符合规则最终规范化要求")
@@ -1291,6 +1290,36 @@ def _finalise_rule_operations(app, task: dict, profile: dict, system_prompt: str
         stats["failure_count"] = 1
         storage.update_task(app, task["task_id"], message=f"规则最终规范化未完成，已完整保留质量审计结果：{exc}")
         return rules, stats
+
+
+def _finalise_rule_operations(app, task: dict, profile: dict, system_prompt: str,
+                              rules: list[dict]) -> tuple[list[dict], dict]:
+    """分两轮完成边界清理与语义归并，降低长列表多目标审计的漏判率。"""
+    stats = {
+        "applied": False, "dropped_count": 0, "rewritten_count": 0,
+        "merged_count": 0, "failure_count": 0,
+    }
+    if len(rules) < RULE_FINALISATION_MIN_RULES:
+        return rules, stats
+    passes = (
+        (
+            "文件边界",
+            "只处理当前电子投标文件无法直接核验的内容：整条均为外部平台/官网/原件状态、评审流程、未来履约事实时 drops；规则主体有效但混入上述越界内容时 rewrites。merges 必须为空，不处理重复或上位规则。",
+        ),
+        (
+            "重复归并",
+            "只处理重复、条件模板和已被具体子规则覆盖的上位规则：同一底层事实 merges，纯重复或上位汇总 drops。不得删除独立事实；rewrites 仅用于去掉上位兜底措辞并保留其中尚未被承接的具体事实。",
+        ),
+    )
+    result = rules
+    for focus_key, focus in passes:
+        result, pass_stats = _finalise_rule_operations_pass(
+            app, task, profile, system_prompt, result, focus_key=focus_key, focus=focus,
+        )
+        stats["applied"] = stats["applied"] or pass_stats["applied"]
+        for key in ("dropped_count", "rewritten_count", "merged_count", "failure_count"):
+            stats[key] += pass_stats[key]
+    return result, stats
 
 
 def _extract_rules(app, task: dict) -> dict:

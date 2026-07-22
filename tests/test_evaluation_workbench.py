@@ -532,7 +532,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             {"category": "substantive", "title": f"有效规则{index}", "check_rule": f"核验有效规则{index}", "source_text": f"应满足有效规则{index}"}
             for index in range(6, 13)
         )
-        response = {
+        boundary_response = {
             "drops": [
                 {"rule_id": "R3", "reason": "not_file_verifiable"},
                 {"rule_id": "R5", "reason": "duplicate"},
@@ -541,13 +541,17 @@ class EvaluationWorkbenchTests(unittest.TestCase):
                 {"rule_id": "R4", "reason": "partial_boundary", "title": "电子签章与签字形式", "check_rule": "核验电子签章、扫描签字及涂改确认。", "ocr_required": True},
                 {"rule_id": "R5", "reason": "partial_boundary", "title": "错误评分改写", "check_rule": "不得生效", "ocr_required": False},
             ],
+            "merges": [],
+        }
+        merge_response = {
+            "drops": [], "rewrites": [],
             "merges": [{
                 "rule_ids": ["R1", "R2"], "keep_rule_id": "R1", "reason": "duplicate",
                 "title": "生产或代理资格与授权材料", "check_rule": "核验代理资格条件及制造商授权书。", "ocr_required": True,
             }],
         }
 
-        with patch("dashboard.evaluation_workbench.worker.request_json", return_value=response):
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[boundary_response, merge_response]) as request_json:
             kept, stats = worker._finalise_rule_operations(
                 self.app, task, profile, "规则提取系统提示", rules,
             )
@@ -567,6 +571,9 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             "applied": True, "dropped_count": 1, "rewritten_count": 1,
             "merged_count": 1, "failure_count": 0,
         })
+        self.assertEqual(request_json.call_count, 2)
+        self.assertIn("文件无法直接核验", request_json.call_args_list[0].args[2])
+        self.assertIn("重复、条件模板", request_json.call_args_list[1].args[2])
 
     def test_final_rule_operations_failure_keeps_all_rules(self):
         task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
@@ -580,7 +587,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
                 self.app, task, profile, "规则提取系统提示", rules,
             )
         self.assertEqual(kept, rules)
-        self.assertEqual(stats["failure_count"], 1)
+        self.assertEqual(stats["failure_count"], 2)
         self.assertFalse(stats["applied"])
 
     def test_rule_extraction_splits_long_source_into_bounded_batches(self):
