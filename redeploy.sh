@@ -21,7 +21,8 @@ fi
 
 # 3. 重新构建镜像
 echo "🔨 正在重新构建 Docker 镜像..."
-docker build -f Dockerfile.tencent -t bidding-app .
+# 优先复用当前镜像已有层，避免清理构建缓存后每次重新下载 PyTorch 等大依赖。
+docker build --cache-from bidding-app -f Dockerfile.tencent -t bidding-app .
 if [ $? -ne 0 ]; then
     echo "❌ 镜像构建失败！"
     exit 1
