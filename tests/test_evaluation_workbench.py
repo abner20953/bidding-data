@@ -600,6 +600,20 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             "check_rule": "核验投标文件文字中列明的证书编号、有效期和适用范围。",
         }))
 
+    def test_score_clause_packets_capture_parenthesised_score_table_rows(self):
+        text = """[第51页]
+投标设备产品整体技术性能指标的响应程度（12 分）
+投标设备产品的运营可靠性（8分）
+技术支持资料
+（7 分） 根据优良情况酌情打分。
+普通履约期限为30日。
+"""
+        packets = worker._score_clause_packets(text)
+        self.assertEqual(len(packets), 3)
+        self.assertTrue(any("12 分" in packet["score_line"] for packet in packets))
+        self.assertTrue(any("8分" in packet["score_line"] for packet in packets))
+        self.assertTrue(any("7 分" in packet["score_line"] for packet in packets))
+
     def test_rule_extraction_splits_long_source_into_bounded_batches(self):
         self._add_pdf("tender.pdf", "tender", "", "用于建立解析文件")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
