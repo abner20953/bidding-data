@@ -581,6 +581,14 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             self.assertIn("恰好返回一次", PROMPT_TEMPLATES[template_id]["content"], template_id)
         self.assertIn("不得自行给分", PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
         self.assertIn('"page_hint":"页码或null"', PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
+        extraction_guidance = PROMPT_TEMPLATES["extract_rules_guidance"]["content"]
+        compile_template = PROMPT_TEMPLATES["extract_rules_compile_user"]["content"]
+        coverage_template = PROMPT_TEMPLATES["extract_rules_coverage_user"]["content"]
+        for value in (extraction_guidance, compile_template, coverage_template):
+            self.assertIn("履约", value)
+            self.assertIn("电子投标文件", value)
+            self.assertIn("串通、行贿、弄虚作假", value)
+        self.assertIn("同一响应字段的期限、地点、标准、金额", compile_template)
 
         compact_scan = worker._full_scan_prompt(
             self.app, {"original_name": "投标文件.pdf", "bidder_name": "投标人"},
@@ -1254,7 +1262,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.add_rule(self.app, self.project["project_id"], {"category": "objective", "title": "资质得分", "source_text": "资质得5分", "scoring": {"kind": "boolean", "max_score": 5}})
         storage.add_rule(self.app, self.project["project_id"], {"category": "subjective", "title": "技术方案", "source_text": "技术方案满分10分", "scoring": {"max_score": 10}})
         storage.confirm_rule_set(self.app, self.project["project_id"])
-        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "project-scope-coverage-v10")
+        fingerprint = storage.task_input_fingerprint(self.app, self.project["project_id"], "evaluate_all", None, "project-scope-coverage-v11")
         prior = storage.create_task(self.app, self.project["project_id"], "evaluate_all", {"profile_id": None, "input_fingerprint": fingerprint})
         storage.update_task(self.app, prior["task_id"], status="success", result={"cached": True})
 
