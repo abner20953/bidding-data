@@ -450,6 +450,7 @@ _SCORE_CLAUSE_PATTERN = re.compile(
     r"|[（(]\s*\d+(?:\.\d+)?\s*分\s*[）)]"
 )
 _SCORE_COVERAGE_IGNORED_TERMS = {"项目", "评分", "标准", "要求", "供应", "服务", "能力", "部分", "内容", "提供", "文件", "采购", "投标", "技术", "商务"}
+_QUALIFICATION_CLAUSE_ID_PATTERN = re.compile(r"(?m)^\s*(1\.[1-9])(?:\s|$)")
 
 def _score_clause_packets(text: str, limit: int = 240) -> list[dict]:
     """为每个明确计分行构造独立、稳定的覆盖条款，不合并相邻评分项。"""
@@ -531,6 +532,53 @@ def _score_packet_is_covered(packet: object, score_rules: list[dict]) -> bool:
         if source_overlap and title_overlap and (not packet_numbers or bool(packet_numbers & rule_numbers)):
             return True
     return False
+
+
+def _qualification_clause_packets(text: str, limit: int = 24) -> list[dict]:
+    """从正式资格证明材料表中构造逐项核验包，补上评分覆盖之外的资格覆盖口径。
+
+    仅依据表格的通用结构（1.x 编号与“证明材料”），不依赖业绩、社保或财务等业务词。
+    PDF 将表格跨页拆开时，同一连续区域会一并保留，避免遗漏后一页的具体条件。
+    """
+    pages = [value.strip() for value in _PARSED_PAGE_MARKER.split(text) if value.strip()]
+    selected: list[str] = []
+    for page in pages:
+        clause_ids = _QUALIFICATION_CLAUSE_ID_PATTERN.findall(page)
+        if "证明材料" in page and len(set(clause_ids)) >= 2:
+            selected.append(page)
+    if not selected:
+        return []
+    source = "\n\n".join(selected)
+    matches = list(_QUALIFICATION_CLAUSE_ID_PATTERN.finditer(source))
+    packets: list[dict] = []
+    for index, match in enumerate(matches):
+        clause_id = match.group(1)
+        start = max(0, match.start() - 180)
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(source)
+        value = source[start:end].strip()
+        if not value:
+            continue
+        # 使用完整条件而非条款号生成稳定 ID，避免不同文件同为 1.1 时误作同一条款。
+        digest = re.sub(r"\s+", "", value)
+        packets.append({
+            "clause_id": f"QF-{hashlib.sha1(digest.encode('utf-8')).hexdigest()[:10]}",
+            "label": clause_id,
+            "text": value[:2_400],
+        })
+        if len(packets) >= limit:
+            break
+    return packets
+
+
+def _qualification_packet_prompt_text(packets: list[object]) -> str:
+    values = []
+    for index, packet in enumerate(packets, start=1):
+        if not isinstance(packet, dict):
+            continue
+        clause_id = str(packet.get("clause_id") or f"QF-{index}")
+        label = str(packet.get("label") or "资格条款")
+        values.append(f"【资格条款 {clause_id} / {label}】\n{packet.get('text') or ''}")
+    return "\n\n".join(values)
 
 
 RULE_EXTRACTION_BATCH_CHARS = 11_000
@@ -649,6 +697,22 @@ def _score_rule_supplement_prompt(app, score_packets: list[object], existing_rul
     packet_text = _score_packet_prompt_text(score_packets)
     return storage.render_prompt_template(app, "extract_rules_supplement_user",
                                           existing_rules=json.dumps(existing, ensure_ascii=False, separators=(",", ":")), packet_text=packet_text)
+
+
+def _qualification_rule_supplement_prompt(app, qualification_packets: list[object], existing_rules: list[dict]) -> str:
+    """将正式资格表的缺漏核验交给小上下文补充调用，避免重发整份采购文件。"""
+    existing = [
+        {
+            "category": item.get("category"), "title": item.get("title"),
+            "check_rule": item.get("check_rule"), "source_text": item.get("source_text"),
+        }
+        for item in existing_rules if item.get("category") == "qualification"
+    ]
+    return storage.render_prompt_template(
+        app, "extract_rules_qualification_supplement_user",
+        existing_rules=json.dumps(existing, ensure_ascii=False, separators=(",", ":")),
+        packet_text=_qualification_packet_prompt_text(qualification_packets),
+    )
 
 
 def _scoring_reconciliation_packet(score_packets: list[object], char_limit: int) -> str | None:
@@ -1551,6 +1615,7 @@ def _extract_rules(app, task: dict) -> dict:
     source_parts = [f"【{label}】\n{value}" for label, value in source_documents]
     text = "\n\n".join(source_parts)
     score_packets = _score_clause_packets(text, limit=400)
+    qualification_packets = _qualification_clause_packets(text)
     review_anchor_catalog = _initial_review_anchor_catalog(main_text)
     batches = []
     for label, value in source_documents:
@@ -1606,6 +1671,35 @@ def _extract_rules(app, task: dict) -> dict:
                 # 主规则已提取成功时，单个评分补充批次异常不应丢弃已得到的规则集。
                 scoring_supplement_failures += 1
                 storage.update_task(app, task["task_id"], message=f"部分评分条款补充未完成：{exc}")
+    qualification_supplement_count = 0
+    qualification_supplement_failures = 0
+    if qualification_packets:
+        storage.update_task(app, task["task_id"], progress=63, message="正在核验正式资格条款覆盖并补充遗漏项")
+        try:
+            qualification_rules = [
+                item for item in raw_rules if isinstance(item, dict) and item.get("category") == "qualification"
+            ]
+            try:
+                supplement = _request_task_json(
+                    app, task, profile, "extract_rules_qualification_supplement", system_prompt,
+                    _qualification_rule_supplement_prompt(app, qualification_packets, qualification_rules),
+                    document_id=tender["document_id"], context_mode="qualification_clause_coverage",
+                    max_tokens=_output_token_budget(profile, max(3_500, min(6_000, 900 + len(qualification_packets) * 700))),
+                    thinking_mode="disabled",
+                )
+            except InvalidJsonResponse as exc:
+                supplement = _repair_invalid_json(
+                    app, task, profile, "extract_rules_qualification_supplement_json_repair", exc, "rules",
+                    document_id=tender["document_id"],
+                )
+            supplement_rules = supplement.get("rules") if isinstance(supplement, dict) else None
+            if isinstance(supplement_rules, list):
+                raw_rules.extend(item for item in supplement_rules if isinstance(item, dict))
+                qualification_supplement_count = len(supplement_rules)
+        except ValueError as exc:
+            # 正式资格覆盖是增强路径；异常时保留已映射规则，并在任务结果中透明记录。
+            qualification_supplement_failures = 1
+            storage.update_task(app, task["task_id"], message=f"部分资格条款补充未完成：{exc}")
     mapped_candidates = [
         item for item in raw_rules if isinstance(item, dict) and str(item.get("title", "")).strip()
         and item.get("category") in {"qualification", "compliance", "substantive", "rejection", "objective", "subjective"}
@@ -1669,6 +1763,8 @@ def _extract_rules(app, task: dict) -> dict:
             "compact_retry_count": compact_retry_count, "score_clause_count": len(score_packets),
             "uncovered_score_clause_count": len(uncovered_score_packets), "scoring_supplement_count": scoring_supplement_count,
             "scoring_supplement_failure_count": scoring_supplement_failures, "batch_count": len(batches),
+            "qualification_clause_count": len(qualification_packets), "qualification_supplement_count": qualification_supplement_count,
+            "qualification_supplement_failure_count": qualification_supplement_failures,
             "semantic_compilation_used": compilation_used, "coverage_missing_rule_count": len(coverage_missing_rules),
             "semantic_compilation_failure_count": compilation_failure_count,
             "scoring_reconciliation_applied": scoring_reconciliation["applied"],

@@ -107,6 +107,7 @@ def task_prompt_template_fingerprint(app, task_type: str) -> str | None:
             "extract_rules_continue_user", "extract_rules_coverage_user", "extract_rules_quality_gate_user",
             "extract_rules_finalise_user", "extract_rules_finalise_boundary_focus",
             "extract_rules_finalise_merge_focus", "extract_rules_supplement_user",
+            "extract_rules_qualification_supplement_user",
             "extract_rules_scoring_reconcile_user",
             "json_repair", "json_repair_user",
         },

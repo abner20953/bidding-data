@@ -674,6 +674,27 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         }
         self.assertFalse(worker._score_packet_is_covered(target, [unrelated_rule]))
 
+    def test_qualification_clause_packets_keep_formal_material_requirements(self):
+        text = """[第11页]
+依法设立
+1.1 的证明材料
+供应商应提供营业执照、基本账户信息、近6个月任意一次纳税凭证及社保凭证；依法免税或免缴的提供证明。
+财务要求
+1.3 证明材料
+供应商应提供年度财务审计报告；新成立企业可提供银行资信证明。
+业绩要求
+1.4 证明材料
+供应商应提供近年类似服务业绩，至少一项，并附合同关键页。
+"""
+        packets = worker._qualification_clause_packets(text)
+        self.assertEqual([packet["label"] for packet in packets], ["1.1", "1.3", "1.4"])
+        self.assertIn("纳税凭证及社保凭证", packets[0]["text"])
+        self.assertIn("财务审计报告", packets[1]["text"])
+        self.assertIn("至少一项", packets[2]["text"])
+        prompt = worker._qualification_rule_supplement_prompt(self.app, packets, [])
+        self.assertIn(packets[0]["clause_id"], prompt)
+        self.assertIn("资格业绩门槛与同一业绩的加分条款必须同时保留", prompt)
+
     def test_scoring_reconciliation_preserves_all_clauses_and_corrects_discretionary_category(self):
         packets = worker._score_clause_packets("\n".join([
             "商务部分（9分）", "同类业绩：每提供一个得3分，最高6分。", "管理体系证书：每项1分，最高1分。",
@@ -1029,6 +1050,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         extraction_guidance = PROMPT_TEMPLATES["extract_rules_guidance"]["content"]
         self.assertIn("正式评审依据门槛", extraction_guidance)
         self.assertIn("不得把普通技术描述", extraction_guidance)
+        self.assertIn("资格业绩的最低数量", extraction_guidance)
         extraction_composed = worker._system_prompt(self.app, "extract_rules")
         self.assertIn("正式评审依据门槛", extraction_composed)
         self.assertIn("未来或外部事项", extraction_composed)
