@@ -31,6 +31,10 @@ class InvalidJsonResponse(ValueError):
         super().__init__(_invalid_json_error(content, finish_reason))
 
 
+class ModelResponseEnvelopeError(ValueError):
+    """接口 HTTP 成功但未返回 OpenAI-compatible 正文；通常可短暂重试。"""
+
+
 def _load_json_candidate(value: str) -> object:
     """解析模型常见的轻微 JSON 瑕疵，不猜测缺失的业务内容。"""
     attempts = [value]
@@ -248,6 +252,29 @@ def _raise_http_error(response, *, operation: str) -> None:
     raise ValueError(f"{operation}（HTTP {response.status_code}）：{response.text[:500]}")
 
 
+def _response_choice(body: object) -> tuple[dict, object]:
+    """读取兼容接口的正文；不持久化异常响应，避免泄露模型或业务正文。"""
+    if not isinstance(body, dict):
+        raise ModelResponseEnvelopeError("模型接口响应格式异常，未返回 JSON 对象")
+    try:
+        choice = body["choices"][0]
+        content = choice["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        # MiniMax 等兼容接口在瞬时繁忙时可能返回 HTTP 200 的错误/空包，
+        # 不应被误判为业务 JSON 异常；调用层会仅重试该最小工作分组。
+        error = body.get("error")
+        detail = ""
+        if isinstance(error, dict):
+            detail = str(error.get("message") or error.get("type") or "").strip()
+        elif isinstance(error, str):
+            detail = error.strip()
+        suffix = f"：{detail[:160]}" if detail else ""
+        raise ModelResponseEnvelopeError(f"模型接口响应不完整，缺少 choices/message/content{suffix}") from exc
+    if not isinstance(choice, dict):
+        raise ModelResponseEnvelopeError("模型接口响应不完整，choices 条目格式异常")
+    return choice, content
+
+
 def request_json(profile: dict, system_prompt: str, user_prompt: str, *, usage_callback=None,
                  response_metadata_callback=None, max_tokens: int | None = None) -> dict:
     api_key = _api_key_for(profile)
@@ -281,15 +308,14 @@ def request_json(profile: dict, system_prompt: str, user_prompt: str, *, usage_c
         raise ValueError(f"模型连接失败：{exc}") from exc
     if not response.ok:
         _raise_http_error(response, operation="模型请求失败")
-    body = response.json()
-    if usage_callback:
-        usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
-        usage_callback(usage)
     try:
-        choice = body["choices"][0]
-        content = choice["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise ValueError("模型响应缺少 choices/message/content") from exc
+        body = response.json()
+    except (requests.JSONDecodeError, ValueError) as exc:
+        raise ModelResponseEnvelopeError("模型接口响应不是有效 JSON") from exc
+    if usage_callback:
+        usage = body.get("usage") if isinstance(body, dict) and isinstance(body.get("usage"), dict) else {}
+        usage_callback(usage)
+    choice, content = _response_choice(body)
     if response_metadata_callback:
         # 只记录长度与结束原因，绝不保存模型正文、提示词或思考内容。
         response_metadata_callback({

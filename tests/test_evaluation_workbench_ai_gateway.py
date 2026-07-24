@@ -1,7 +1,9 @@
 import unittest
 from unittest.mock import Mock, patch
 
-from dashboard.evaluation_workbench.ai_gateway import _decode_json_content, _recover_complete_json_array, test_connection
+from dashboard.evaluation_workbench.ai_gateway import (
+    ModelResponseEnvelopeError, _decode_json_content, _recover_complete_json_array, request_json, test_connection,
+)
 
 
 CONNECTION_TEST_PROMPT = '请仅返回 JSON 对象：{"message":"连接成功"}'
@@ -28,6 +30,17 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
                 test_connection(self._profile(_api_key="测试-key"), CONNECTION_TEST_PROMPT)
 
         post.assert_not_called()
+
+    def test_request_json_marks_http_success_without_choice_content_as_retriable_envelope_error(self):
+        response = Mock(ok=True)
+        response.json.return_value = {"error": {"message": "temporary upstream failure"}}
+
+        with patch("dashboard.evaluation_workbench.ai_gateway._http_post", return_value=response):
+            with self.assertRaises(ModelResponseEnvelopeError) as error:
+                request_json(self._profile(), "system", "user")
+
+        self.assertIn("choices/message/content", str(error.exception))
+        self.assertIn("temporary upstream failure", str(error.exception))
 
     def test_json_decoder_ignores_minimax_thinking_block_before_json(self):
         content = '<think>先分析规则与招标文件的对应关系。</think>\n\n```json\n{"rules": []}\n```'

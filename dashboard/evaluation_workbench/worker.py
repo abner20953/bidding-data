@@ -19,7 +19,9 @@ from xml.etree import ElementTree
 import fitz
 
 from dashboard.evaluation_workbench import storage
-from dashboard.evaluation_workbench.ai_gateway import InvalidJsonResponse, _recover_complete_json_array, request_json
+from dashboard.evaluation_workbench.ai_gateway import (
+    InvalidJsonResponse, ModelResponseEnvelopeError, _recover_complete_json_array, request_json,
+)
 from dashboard.evaluation_workbench.collusion_signals import build_cross_bid_analysis
 from dashboard.evaluation_workbench.prompt_context import (
     build_rule_context, select_rule_chunk_map, select_rule_chunks, split_full_text_chunks,
@@ -135,9 +137,17 @@ def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt
             except ValueError as exc:
                 # 规则提取和综合评审共用该闸门。服务商限流时让后续请求
                 # 自动改为单路，并只重试当前这一小次模型调用，不重发整份文件。
-                if gate and attempt == 0 and _is_rate_limit_error(exc):
-                    if gate.reduce_after_rate_limit():
-                        storage.update_task(app, task["task_id"], message="模型接口限流或暂时繁忙，已自动降低并行度后继续")
+                # HTTP 成功但缺少 choices/message/content 同样属于服务商瞬时空包，
+                # 不能把已完成的全文扫描和其他投标人结果一并判为失败。
+                should_retry = attempt == 0 and (
+                    _is_rate_limit_error(exc) or isinstance(exc, ModelResponseEnvelopeError)
+                )
+                if should_retry:
+                    if gate and gate.reduce_after_rate_limit():
+                        message = "模型接口返回不完整响应，已自动降低并行度后重试当前分组" if isinstance(exc, ModelResponseEnvelopeError) else "模型接口限流或暂时繁忙，已自动降低并行度后继续"
+                        storage.update_task(app, task["task_id"], message=message)
+                    elif isinstance(exc, ModelResponseEnvelopeError):
+                        storage.update_task(app, task["task_id"], message="模型接口返回不完整响应，正在重试当前分组")
                     retry_after_rate_limit = True
                 else:
                     raise
