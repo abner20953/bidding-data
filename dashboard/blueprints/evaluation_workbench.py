@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import os
 import hmac
+import re
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from flask import Blueprint, current_app, jsonify, render_template, request, session
@@ -20,6 +22,140 @@ from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VE
 evaluation_workbench_bp = Blueprint("evaluation_workbench", __name__)
 TASK_PROMPT_VERSION = EVALUATION_PROMPT_VERSION
 MODEL_CONFIGURATION_PASSWORD = "108"
+
+
+_REPORT_ROLE_LABELS = {"tender": "主招标文件", "tender_attachment": "招标附件", "bid": "投标文件"}
+_REPORT_PARSE_STATUS_LABELS = {"pending": "待解析", "queued": "排队中", "running": "解析中", "success": "解析完成", "error": "解析失败"}
+_REPORT_RULE_SET_STATUS_LABELS = {"draft": "待确认", "confirmed": "已确认", "superseded": "已替换"}
+_REPORT_CATEGORY_LABELS = {
+    "qualification": "资格性", "compliance": "符合性", "substantive": "实质性/废标项",
+    "rejection": "实质性/废标项", "other": "其他规则", "objective": "客观分", "subjective": "主观分",
+}
+_REPORT_STATUS_LABELS = {
+    "satisfied": "满足", "not_satisfied": "不满足", "partial": "部分满足",
+    "not_found": "未找到证据", "manual": "需人工判断", "ocr_required": "需 OCR 后判定",
+}
+_REPORT_RISK_LABELS = {"high": "高风险", "medium": "中风险", "low": "低风险"}
+_REPORT_CONFIDENCE_LABELS = {"high": "高", "medium": "中", "low": "低"}
+_REPORT_EVIDENCE_LABELS = {"sufficient": "充分", "limited": "有限", "missing": "缺失"}
+_REPORT_AI_DECISION_LABELS = {
+    "pending_human_review": "待 AI 复核", "no_signal_detected": "未发现线索",
+    "confirmed_clue": "AI 确认线索", "suspected_clue": "AI 疑似线索",
+    "excluded": "AI 倾向排除", "unassessable": "AI 证据不足",
+}
+
+
+def _report_label(labels: dict, value: object, default: str = "-") -> str:
+    value = str(value or "").strip()
+    return labels.get(value, value or default)
+
+
+def _report_compact_text(value: object, limit: int = 240) -> str:
+    """压缩打印报告中的长文本，不改变网页端原始结果。"""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return text if len(text) <= limit else f"{text[:limit - 1].rstrip()}…"
+
+
+def _report_result_explanation(value: object, rule: dict) -> str:
+    """与网页端保持一致：结果区不重复显示已经单列的检查规则。"""
+    text = str(value or "").strip()
+    candidates = sorted(
+        (str(rule.get(key) or "").strip() for key in ("check_rule", "title")),
+        key=len,
+        reverse=True,
+    )
+    for candidate in candidates:
+        if len(candidate) >= 6:
+            text = text.replace(candidate, "")
+    text = re.sub(r"(?:本|该)?规则(?:要求|规定|需|是)?[：:，,；;\s]*", "", text)
+    return re.sub(r"^[，。；:：\s]+|[，；:：\s]+$", "", text).strip()
+
+
+def _report_generated_time(value: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return str(value or "-")
+
+
+def _report_presentation(documents: list[dict], rule_set: dict | None, rules: list[dict],
+                         compare_task: dict | None, compare_pairs: list[dict], reviews: list[dict],
+                         objective_scores: list[dict], subjective_scores: list[dict]) -> dict:
+    """生成仅用于打印的中文摘要视图，所有判断仍直接来自已保存结果。"""
+    displayed_documents = [{
+        **item,
+        "role_label": _report_label(_REPORT_ROLE_LABELS, item.get("role")),
+        "parse_status_label": _report_label(_REPORT_PARSE_STATUS_LABELS, item.get("parse_status")),
+    } for item in documents]
+    displayed_rules = [{
+        **item,
+        "category_label": _report_label(_REPORT_CATEGORY_LABELS, item.get("category")),
+        "source_text_brief": _report_compact_text(item.get("source_text"), 160),
+    } for item in rules]
+
+    def present_result(item: dict, *, score: bool = False) -> dict:
+        value = dict(item)
+        value["title_brief"] = _report_compact_text(value.get("title") or value.get("check_rule"), 72)
+        value["evidence_brief"] = _report_compact_text(_report_result_explanation(value.get("evidence"), value), 200)
+        value["reason_brief"] = _report_compact_text(_report_result_explanation(value.get("reason"), value), 200)
+        value["confidence_label"] = _report_label(_REPORT_CONFIDENCE_LABELS, value.get("confidence"))
+        if score:
+            value["suggested_score_label"] = value.get("suggested_score")
+            if value["suggested_score_label"] is None:
+                value["suggested_score_label"] = "需 OCR 后评分" if value.get("check_mode") == "ocr" else "-"
+        else:
+            value["status_label"] = _report_label(_REPORT_STATUS_LABELS, value.get("status"))
+            value["risk_label"] = _report_label(_REPORT_RISK_LABELS, value.get("risk_level"))
+            value["evidence_quality_label"] = _report_label(_REPORT_EVIDENCE_LABELS, value.get("evidence_quality"))
+        return value
+
+    cross_analysis = ((compare_task or {}).get("result") or {}).get("cross_bid_analysis")
+    compare_summary_rows: list[dict] = []
+    compare_signal_rows: list[dict] = []
+    if isinstance(cross_analysis, dict):
+        for item in cross_analysis.get("pair_summaries") or []:
+            assessment = item.get("ai_assessment") if isinstance(item.get("ai_assessment"), dict) else {}
+            compare_summary_rows.append({
+                "bidder_a": item.get("bidder_a") or "文件 A", "bidder_b": item.get("bidder_b") or "文件 B",
+                "dimensions": "、".join(item.get("dimension_labels") or []) or "未发现",
+                "signal_count": item.get("signal_count") or 0,
+                "priority_label": _report_label({"high": "高", "medium": "中", "normal": "常规", "none": "无"}, item.get("review_priority")),
+                "decision_label": _report_label(_REPORT_AI_DECISION_LABELS, assessment.get("decision") or item.get("assessment_result")),
+            })
+        for item in cross_analysis.get("signals") or []:
+            assessment = item.get("ai_assessment") if isinstance(item.get("ai_assessment"), dict) else {}
+            compare_signal_rows.append({
+                "bidder_a": item.get("bidder_a") or "文件 A", "bidder_b": item.get("bidder_b") or "文件 B",
+                "dimension_label": item.get("dimension_label") or "-",
+                "basis": _report_compact_text(item.get("basis"), 180),
+                "decision_label": _report_label(_REPORT_AI_DECISION_LABELS, assessment.get("decision"), "待 AI 判定"),
+                "risk_label": _report_label(_REPORT_RISK_LABELS, assessment.get("risk_level")),
+                "confidence_label": _report_label(_REPORT_CONFIDENCE_LABELS, assessment.get("confidence")),
+                "reason": _report_compact_text(assessment.get("reason"), 160),
+            })
+    compare_pair_rows = []
+    for item in compare_pairs:
+        summary = item.get("result", {}).get("summary", {}) if isinstance(item.get("result"), dict) else {}
+        compare_pair_rows.append({
+            "bidder_a": item.get("bidder_a") or item.get("filename_a") or "文件 A",
+            "bidder_b": item.get("bidder_b") or item.get("filename_b") or "文件 B",
+            "exact": summary.get("exact") or 0, "fuzzy": summary.get("fuzzy") or 0,
+            "shared_error": summary.get("shared_error") or 0, "entity": summary.get("entity") or 0,
+            "ratio_a": summary.get("matched_ratio_a") or 0, "ratio_b": summary.get("matched_ratio_b") or 0,
+        })
+    return {
+        "documents": displayed_documents,
+        "rule_set_status_label": _report_label(_REPORT_RULE_SET_STATUS_LABELS, (rule_set or {}).get("status")),
+        "rules": displayed_rules,
+        "reviews": [present_result(item) for item in reviews],
+        "objective_scores": [present_result(item, score=True) for item in objective_scores],
+        "subjective_scores": [present_result(item, score=True) for item in subjective_scores],
+        "cross_analysis": cross_analysis if isinstance(cross_analysis, dict) else None,
+        "compare_summary_rows": compare_summary_rows,
+        "compare_signal_rows": compare_signal_rows,
+        "compare_pair_rows": compare_pair_rows,
+    }
 
 
 def create_worker_app():
@@ -559,9 +695,11 @@ def evaluation_report_view(project_id):
     review_run, reviews = storage.latest_review_results(current_app, project_id)
     _, objective_scores = storage.latest_score_results(current_app, project_id, "objective")
     _, subjective_scores = storage.latest_score_results(current_app, project_id, "subjective")
+    presentation = _report_presentation(
+        storage.list_documents(current_app, project_id), rule_set, rules, compare_task, compare_pairs,
+        reviews, objective_scores, subjective_scores,
+    )
     return render_template(
-        "evaluation_workbench/report.html", project=project, rule_set=rule_set, rules=rules,
-        documents=storage.list_documents(current_app, project_id), review_run=review_run, reviews=reviews,
-        objective_scores=objective_scores, subjective_scores=subjective_scores,
-        compare_task=compare_task, compare_pairs=compare_pairs, generated_at=storage.now_iso(),
+        "evaluation_workbench/report.html", project=project, rule_set=rule_set, review_run=review_run,
+        generated_at=_report_generated_time(storage.now_iso()), **presentation,
     )
