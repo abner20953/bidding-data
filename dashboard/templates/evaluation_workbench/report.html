@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
     <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{{ project.name }} - 评标辅助汇总报告</title>
+    <title>{{ project.display_name or project.name }} - 评标辅助汇总报告</title>
     <style>
         body { font-family: "Microsoft YaHei", sans-serif; color: #1f2937; max-width: 1100px; margin: 32px auto; line-height: 1.55; }
         h1 { margin-bottom: 4px; } .muted { color: #6b7280; } table { width: 100%; border-collapse: collapse; margin: 14px 0 28px; font-size: 13px; } th, td { border: 1px solid #cbd5e1; padding: 7px; text-align: left; vertical-align: top; } th { background: #f1f5f9; } .notice { padding: 10px 12px; background: #fff7ed; border-left: 4px solid #f97316; } @media print { body { margin: 12mm; max-width: none; } .no-print { display: none; } }
@@ -11,7 +11,7 @@
 <body>
     <button class="no-print" onclick="window.print()">打印</button>
     <h1>评标辅助汇总报告</h1>
-    <p class="muted">项目：{{ project.name }}{% if project.project_number %} · 编号：{{ project.project_number }}{% endif %}{% if project.section_name %} · 标段：{{ project.section_name }}{% endif %}</p>
+    <p class="muted">项目：{{ project.display_name or project.name }}{% if project.project_number %} · 编号：{{ project.project_number }}{% endif %}</p>
     <p class="muted">生成时间：{{ generated_at }}</p>
     <p class="notice">本报告为电子文件辅助审查和评分留痕，不替代评标委员会的人工判断、最终打分或废标认定。</p>
     <h2>文件清单</h2>

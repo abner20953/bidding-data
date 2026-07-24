@@ -79,6 +79,13 @@ def _report_generated_time(value: str) -> str:
         return str(value or "-")
 
 
+def _project_display_name(project: dict) -> str:
+    """同名项目在报告标题中优先带上标段/包号，避免浏览器标签混淆。"""
+    name = str(project.get("name") or "未命名项目").strip()
+    section = str(project.get("section_name") or "").strip()
+    return f"{name} · {section}" if section else name
+
+
 def _report_presentation(documents: list[dict], rule_set: dict | None, rules: list[dict],
                          compare_task: dict | None, compare_pairs: list[dict], reviews: list[dict],
                          objective_scores: list[dict], subjective_scores: list[dict]) -> dict:
@@ -699,7 +706,8 @@ def evaluation_report_view(project_id):
         storage.list_documents(current_app, project_id), rule_set, rules, compare_task, compare_pairs,
         reviews, objective_scores, subjective_scores,
     )
+    report_project = {**project, "display_name": _project_display_name(project)}
     return render_template(
-        "evaluation_workbench/report.html", project=project, rule_set=rule_set, review_run=review_run,
+        "evaluation_workbench/report.html", project=report_project, rule_set=rule_set, review_run=review_run,
         generated_at=_report_generated_time(storage.now_iso()), **presentation,
     )
