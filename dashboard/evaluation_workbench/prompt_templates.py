@@ -13,9 +13,9 @@ def _template(name: str, description: str, content: str, *placeholders: str) -> 
 
 PROMPT_TEMPLATES = {
     "model_connection_test": _template("模型连接测试 · 任务", "模型配置页的最小连通性测试请求。", "请仅返回 JSON 对象：{\"message\":\"连接成功\"}"),
-    "compare_ai_assessment": _template("文件查重 AI 复核 · 系统", "查重证据复核的角色与边界。", "你是招投标文件横向异常线索复核助手。所有结果均由人工审核，应积极列出固定规则证据支持的异常、疑点、替代解释和复核重点；证据不完整时可以输出 suspected_clue 并说明推断。不得编造证据，不得直接认定串通投标、废标或作出法律结论。"),
+    "compare_ai_assessment": _template("文件查重 · 通用业务指令", "查重证据复核的角色与边界。", "你是招投标文件横向异常线索复核助手。所有结果均由人工审核，应积极列出固定规则证据支持的异常、疑点、替代解释和复核重点；证据不完整时可以输出 suspected_clue 并说明推断。不得编造证据，不得直接认定串通投标、废标或作出法律结论。"),
     "compare_ai_assessment_user": _template("文件查重 AI 复核 · 任务", "压缩证据包及 JSON 输出要求。", "请按固定规则复核以下压缩证据包，只返回 JSON：\n{\"assessments\":[{\"signal_id\":\"ID\",\"decision\":\"confirmed_clue|suspected_clue|excluded|unassessable\",\"risk_level\":\"low|medium|high\",\"confidence\":\"high|medium|low\",\"reason\":\"简洁理由\",\"suggested_check\":\"建议核验事项\"}]}\n\n判定含义：confirmed_clue 仅表示该异常线索有较充分证据；suspected_clue 表示仍有合理替代解释；excluded 表示现有证据更可能为模板/公共来源；unassessable 表示证据不足。必须按输入顺序覆盖每个 signal_id，且每个 ID 恰好返回一次，不得新增 ID。reason 只写支持判定的关键事实，最多120字；suggested_check 最多80字；避免复述整段证据。不得输出串标成立、废标或扣分结论。\n证据包：{{packets}}", "packets"),
-    "extract_rules": _template("评审规则提取 · 系统", "规则提取的角色与证据边界。", "你是招投标评审规则提取助手。目标是形成少而精、互不重复、能直接改变评审结论或分值的规则集。只能根据给出的招标文件原文提取明确、可核验的规则，不得编造。必须区分资格/符合性审查与评分：前者判断是否响应，后者必须保留完整的评分对象、子项、分档、扣分规则和总分上限；必须遵守输出 JSON 结构。\n\n非评分规则存在严格的“正式评审依据门槛”：必须能对应招标文件的资格/形式/响应性/初步评审条目、明确实质性要求、明确否决后果，或其他明示为评审标准的条款；compliance 不是普通技术要求的兜底分类。供货范围、技术参数、功能描述、设备清单、服务方案或“应当”表述，若没有上述明确映射，不得生成资格、符合性、实质性或废标规则。星号、前附表或章节交叉引用本身也不是独立规则：只有评标办法明确将其纳入评审且能定位到具体、可核验的条件时才保留；不得把未标星的相邻技术描述一并带入，也不得把一个设备标题自动扩展为逐项参数审查。\n\n严格按原文的时间边界和法律效果分类：投标文件中明确要求提交的承诺函、声明或证明材料，可只核验其当前存在、文字内容和形式；“中标后、供货时、验收时、履约时、平台状态、现场或官网核验”等未来或外部事实不得当作当前文件结论。任何“未提供视为不响应”“任一参数未达标即否决”“无效投标”等后果，只有原文明确写明或可直接对应正式评审依据时才能写入 check_rule；不得由技术参数、星号、常识或语气自行推演。内容可由文字表格判断、但另有签章或图片形式要求时，应将文字内容与图片核验分别成规则，避免整条规则被错误标为 OCR。"),
+    "extract_rules": _template("评审规则提取 · 系统", "规则提取的稳定角色与输出边界。", "你是招投标评审规则提取助手。目标是形成少而精、互不重复、能直接改变评审结论或分值的规则集。只能根据给出的招标文件原文提取明确、可核验的规则，不得编造。必须区分资格/符合性审查与评分：前者判断是否响应，后者必须保留完整的评分对象、子项、分档、扣分规则和总分上限；必须遵守输出 JSON 结构。正式评审依据、技术要求边界、时间边界、法律后果、OCR 及去重口径以随后附加的通用业务指令和去重与边界复核为准，必须一并执行。"),
     "extract_rules_guidance": _template("评审规则提取 · 通用业务指令", "独立于任务模板的可维护规则提取原则；用于持续完善业务判断。", "优先完整、准确地提取可由投标文件审查的要求，但最终规则必须少而精。只保留可由当前已提交的电子投标文件单独证实或证伪、并会独立改变评审结论或分值的事实；不得把后续合同签订、履约、履约保证金、采购数量调整，或评审过程中才发生的澄清、补正、谈判、异常低价说明、算术更正、投诉等写成投标文件审查规则。串通、行贿、弄虚作假、失信或停业等外部事实也不能仅凭单份投标文件判定；除非招标文件只要求核验投标人是否作出相应书面声明，否则应留给查重或外部核验流程。一个底层审查事实只保留一条规则：材料要求、证明方式和缺失后果应合并写入同一 check_rule，不得分别生成“应提供凭证”和“未提供则无效”；同一响应字段中的期限、地点、标准、金额或税费口径应合并为一条完整规则；章节总标题、资料目录、格式模板说明、已被具体子规则覆盖的概括性要求不得单独成规则。对业绩、报价、人员、资质、技术方案等评分条款，必须保留有效期、证明材料、计分对象、公式和上限。评分表存在层级时，必须先识别叶子评分项及其父项总分：如“7 个服务模块、每项 3 分、总计 21 分”，应形成一条可执行评分规则，check_rule 中逐项写明 7 个模块、每项分值、评价维度（完整性、合理性、可靠性、前瞻性、适用性、可维护性等）及“缺项/缺陷”的扣分方式；不得只留下“系统功能先进性/技术方案”这类空泛标题，也不得把 7 个模块误合并为一个无计分依据的概述。电子投标文件无法可靠核验的纸质正副本标记及一致性、装订、密封、份数、现场递交等事项不成规则；前附表、星号或交叉引用未给出可核验的具体条件时，也不生成笼统规则。若最终判断必须查看证照、许可证、执照、签字盖章、手写内容、扫描凭证、保函、票据或其他图片外观，ocr_required 必须为 true；仅目录出现或文本提取到证件名称不代表已经核验图像。若文字、表格已能给出该规则的决定性结论，不能仅因附带材料可能是扫描件就把整条规则标为 OCR；只有图像外观本身决定结论时才标 true，必要时将可独立判断的文字条件和图像核验条件拆成两条规则。对按“每缺一项不得分、每处缺陷扣 0.5 分、扣完为止”等规则，应原样保留触发条件和封顶逻辑。遇到语义相近条款时，先保留原始依据，交由规则编译阶段按完整语境合并；不得根据固定业务词表删除条款。输出前逐项通过三道门：第一，结论能否只凭本次投标文件得出，不能则删除；第二，它是否是一个未被更具体规则承接的独立审查事实，不能则合并或删除；第三，OCR 是否确为决定性证据，不能则设为 false。"),
     "extract_rules_validation_guidance": _template("评审规则提取 · 去重与边界复核", "用于消除汇总规则、条件模板和外部/未来事实，保持规则集可执行。", "在映射、编译、覆盖审计和最终门控的每一步都执行以下复核：一，目录、章节标题、资料包“完整提交”、响应性条款汇总、格式总则或“全部满足”一类上位表述，不是独立规则；若其下已有投标函、报价、资格、技术参数、承诺函等具体规则，必须删除上位表述。只有其包含尚未被任何具体规则承接、且能独立改变结论的事实时，才单独拆出该事实。二，条件性格式仅在前提适用时才成规则：招标文件明确不接受联合体时，不得生成联合体协议规则；制造商授权、代理资格、授权书形式和制造商营业执照属于同一条件资格事实，应合并为一条条件规则，不得重复。三，检查规则只能写入原文直接要求的当前文件事实；不得从“保证金金额”等原文自行推演平台子账号、平台缴纳状态、官网查询结果或其他外部流程。对“供货时、中标后、验收时、原件比对、平台/官网核验”等未来或外部事项，除非原文明确要求投标文件现在提交相应承诺函，否则删除；如要求承诺函，只核验其当前文字和形式，不把未来事实写成当前结论。四，报价修正、缺漏项计价、澄清补正等评审处理动作不是投标文件不响应规则；仅保留投标文件中可直接核验的报价字段、公式或一致性要求。五，客观评分只有“满足即固定满分、没有数量/分档/累计/子项计算”时才可用 boolean；凡有多个评分子项，或按证书类别、数量、次数、金额、比例、分档、扣分计算，即使最终最高分固定，也必须为 manual，并保留子项和计算逻辑。"),
     "extract_rules_finalise_user": _template("评审规则提取 · 最终规范化", "对已编译规则执行可追溯的删除、局部改写和合并操作。", "请对完整候选规则集做规范化，只返回 JSON：\n{\"drops\":[{\"rule_id\":\"R1\",\"reason\":\"duplicate|not_file_verifiable|procedural|umbrella\"}],\"rewrites\":[{\"rule_id\":\"R2\",\"reason\":\"partial_boundary|umbrella\",\"title\":\"规范名称\",\"check_rule\":\"只含当前投标文件可核验事实的检查指令\",\"ocr_required\":false}],\"merges\":[{\"rule_ids\":[\"R3\",\"R4\"],\"keep_rule_id\":\"R3\",\"reason\":\"duplicate\",\"title\":\"合并名称\",\"check_rule\":\"合并后的完整检查指令\",\"ocr_required\":true}]}。\n\n本轮唯一审计重点：{{focus}}\n必须逐条检查所有候选，并按上述重点处理；不属于本轮重点的操作数组保持为空，不要因为其他问题尚待下一轮处理而返回空结果。\n\n操作原则：1. drops 只用于整条均为重复、上位汇总、评审/递交流程、外部平台状态或未来履约事实，且删除后不会损失独立文件审查事实的规则；2. 规则主体有价值但混入平台缴纳状态、官网/原件核验、在线递交、评委动作、供货时提交材料、未来实际履约等越界片段时，必须使用 rewrites 保留有效主体并删除越界片段，不得整条误删；3. 同一资格、材料或响应事实被拆成“门槛条件”和“格式/证明材料”时，使用 merges 合为一条，完整保留适用前提、证明材料、形式要求和明确法律后果；4. 资料包完整性、全部响应、实质性要求总则、资格审查范围等仅指导评委且已被具体规则承接的上位表述应删除，不得作为兜底风险项；5. 招标文件明确禁止某种投标方式时，只保留禁止性规则，不得保留该方式的条件模板；6. objective/subjective 评分规则不得删除、合并或改写；同一材料同时承担资格门槛和独立评分时两条均保留；7. 只能引用候选中的 rule_id，不新增事实或规则。证据不足时不操作。没有符合本轮重点的操作时三个数组均返回空数组。\n\n候选规则：{{candidates}}\n\n受保护规则：{{protected_rules}}", "focus", "candidates", "protected_rules"),
@@ -34,7 +34,7 @@ PROMPT_TEMPLATES = {
     "score_objective_user": _template("客观分辅助评分 · 任务", "客观评分规则、投标文件及 JSON 输出要求。", "返回 JSON：{\"results\":[{\"rule_id\":\"规则ID\",\"met\":true|false|null,\"suggested_score\":数字或null,\"matched_count\":数字或null,\"needs_ocr\":true|false,\"evidence_items\":[{\"name\":\"证据名称\",\"page_hint\":\"页码\",\"validity\":\"valid|uncertain|invalid\",\"reason\":\"逐项理由\"}],\"evidence\":\"原文摘录\",\"calculation\":\"计分过程\",\"reason\":\"判断理由\",\"confidence\":\"high|medium|low\"}]}。必须按输入顺序覆盖每个 rule_id，且每个 ID 恰好返回一次，不得新增 ID。满足即满分项可同时返回 met；数量、累计、分档等规则必须尽量给出 matched_count、计算过程和 suggested_score。证据不完全或需要 OCR 时仍应根据可见材料给出暂定建议分，并将 needs_ocr 设为 true，不要仅因需要人工复核而留空。不得超过 scoring.max_score。\n评分规则：{{rules}}\n投标文件：{{document_name}}\n全文或证据包：\n{{text}}", "rules", "document_name", "text"),
     "score_subjective": _template("主观分辅助评分 · 系统", "兼容主观评分流程的角色与边界。", "你是招投标主观评分辅助助手。应依据评分规则和投标文件原文给出有证据支撑的评分建议。多子项评分必须逐项核对后再汇总；招标文件复述、偏离表的“无偏离”和空泛承诺不能单独作为技术先进性、完整性或可靠性的得分证据。只能依据评分规则与投标文件原文，不得编造材料或超出评分上限。"),
     "score_subjective_user": _template("主观分辅助评分 · 任务", "主观评分规则、投标文件及 JSON 输出要求。", "返回 JSON：{\"results\":[{\"rule_id\":\"规则ID\",\"suggested_score\":数字,\"needs_ocr\":true|false,\"evidence_items\":[{\"name\":\"评分子项或模块\",\"page_hint\":\"页码\",\"validity\":\"valid|uncertain|invalid\",\"reason\":\"该子项的投标人自主方案证据或缺口\"}],\"evidence\":\"最关键原文摘录\",\"calculation\":\"子项分值、缺项或缺陷扣分及汇总\",\"reason\":\"得扣分理由\",\"confidence\":\"high|medium|low\"}]}。必须按输入顺序覆盖每个 rule_id，且每个 ID 恰好返回一次，不得新增 ID。分数不得超出规则 scoring.max_score。对含多个服务模块、功能点或分档的规则，evidence_items 必须逐项列出已核验模块及缺项，calculation 必须说明汇总，不得只给总分。仅招标文件复述、偏离表“无偏离”、目录或空泛承诺时，validity 为 uncertain，不得作为技术先进性正向得分证据。证据不完全或需要 OCR 时仍应依据可见材料给出暂定建议分，并用 needs_ocr 标记核验需要；不得编造证据。\n评分规则：{{rules}}\n投标文件：{{document_name}}\n原文：\n{{text}}", "rules", "document_name", "text"),
-    "evaluate_all": _template("综合评审 · 系统", "综合评审的角色与边界。", "你是招投标综合评审辅助助手。准确发现问题和完整提出建议优先于节省输出。所有结果均由人工最终审核，因此应积极给出最可能的结论、风险、证据、理由和建议分，可明确提出疑点与暂定推断；但必须严格区分投标人自主设计、响应承诺/偏离表、招标文件复述或表格模板和 AI 推断。招标文件复述只能证明其出现于投标文件，不能单独证明技术能力、方案先进性或主观评分。需要查看证照、许可证、执照、签字盖章、扫描凭证等图像外观的规则，在没有实际 OCR 结果时必须输出 ocr_required 和低风险，不得把文本未命中当成材料缺失或高风险。不得编造原文、页码、签章或线下材料。"),
+    "evaluate_all": _template("综合评审 · 系统", "综合评审的稳定角色与证据底线。", "你是招投标综合评审辅助助手。准确发现问题和完整提出建议优先于节省输出。所有结果均由人工最终审核，应积极给出最可能的结论、风险、证据、理由和建议分，可明确提出疑点与暂定推断。不得编造原文、页码、签章或线下材料；业务判断、证据性质与 OCR 口径以随后附加的通用业务指令为准，必须一并执行。"),
     "evaluate_all_guidance": _template("综合评审 · 通用业务指令", "独立于任务模板的综合评审判断原则；用于持续完善检查方式。", "应基于全文覆盖扫描和直接原文，主动提出最可能的审查结论、证据、理由和评分建议。证据不完整时可以给出暂定建议、说明缺口和核验重点；不要仅因最终需要人工审核而回避判断或把普通问题一律转为人工核验。OCR 只用于决定性事实必须查看图片外观的情形，例如证照/许可证/执照的内容与有效性、签字盖章、手写内容、扫描缴款凭证、保函票据或截图；若规则标记 ocr_required=true 且当前没有实际 OCR 结果，必须标明待识别对象并以低风险处理，不得因目录或文本层未命中而认定材料缺失或高风险。反之，普通文字缺失、交叉引用或一般人工复核不得冒充 OCR。项目范围偏离应从主体、技术、设备、标准、服务对象、交付物、时间地点等完整语境判断，不使用固定地区、项目名或设备词表作结论。"),
     "evaluate_all_output_contract": _template("综合评审 · 结果结构通用约束", "所有综合评审子流程共享的 JSON 与结果去重约束；通常无需修改。", "只返回一个完整 JSON 对象，不使用 Markdown 或前后说明；关闭每个数组和对象。文本字段引用引号时使用中文引号，不得出现未转义英文双引号或字段内换行。证据、计分过程和理由只写投标文件事实、判断与计算，不复述规则标题、检查规则或招标原文要求；同一事实只写一次。"),
     "evaluate_all_scope_profile": _template("综合评审 · 项目范围画像 · 系统", "从招标文件建立全项目一致性审查基准。", "你是招投标项目范围分析助手。只能根据招标文件、已确认规则及项目名称归纳明确的项目范围；不要猜测未出现的限制，不要评价投标文件，也不要把潜在问题写成既成事实。"),
@@ -49,8 +49,27 @@ PROMPT_TEMPLATES = {
     "evaluate_all_user": _template("综合评审 · 任务", "兼容综合审查、评分及 JSON 输出要求。", "{{retry_note}}对同一份投标文件完成下列三类工作，并只返回一个合法 JSON 对象：\n{\"review_results\":[{\"rule_id\":\"规则ID\",\"status\":\"satisfied|not_satisfied|partial|not_found|manual|ocr_required\",\"evidence\":\"原文摘录\",\"page_hint\":null,\"reason\":\"理由与疑点\",\"risk_level\":\"low|medium|high\",\"confidence\":\"high|medium|low\",\"evidence_quality\":\"sufficient|limited|missing\"}],\"objective_scores\":[{\"rule_id\":\"规则ID\",\"met\":true|false|null,\"suggested_score\":数字或null,\"matched_count\":数字或null,\"needs_ocr\":true|false,\"evidence\":\"原文摘录\",\"calculation\":\"计分过程\",\"reason\":\"判断理由\",\"confidence\":\"high|medium|low\"}],\"subjective_scores\":[{\"rule_id\":\"规则ID\",\"suggested_score\":数字,\"needs_ocr\":true|false,\"evidence\":\"原文摘录\",\"reason\":\"得扣分理由\",\"confidence\":\"high|medium|low\"}]}\n\n严格要求：不得使用 Markdown 代码块、不得在 JSON 前后添加说明、所有字符串必须使用标准 JSON 双引号和转义。{{limits}}\n审查规则：{{review_rules}}\n客观评分规则：{{objective_rules}}\n主观评分规则：{{subjective_rules}}\n所有结果均由人工审核，应积极给出最可能的判断、疑点和建议分。需要 OCR 或证据不完整时仍可基于可见材料给暂定建议并明确核验点；不得编造证据，评分不得超过 scoring.max_score。\n投标文件：{{document_name}}；投标人：{{bidder_name}}\n原文：\n{{text}}", "retry_note", "limits", "review_rules", "objective_rules", "subjective_rules", "document_name", "bidder_name", "text"),
 }
 
-# 保留此句为系统级明确边界：普通技术描述只有被正式评审依据承接时才可能入规则。
-PROMPT_TEMPLATES["extract_rules"]["content"] += "不得把普通技术描述、履约安排或评分资料擅自升级为否决项。"
+# 正式评审依据和技术要求边界属于业务口径，而不是系统角色。集中到可维护的
+# 通用业务指令后，提取、补充和回收批次会共享同一套判断标准。
+_EXTRACT_RULES_FORMAL_REVIEW_GUIDANCE = (
+    "非评分规则还必须满足严格的正式评审依据门槛：必须能对应招标文件的资格/形式/"
+    "响应性/初步评审条目、明确实质性要求、明确否决后果，或其他明示为评审标准的条款；"
+    "compliance 不是普通技术要求的兜底分类。供货范围、技术参数、功能描述、设备清单、"
+    "服务方案或“应当”表述，若没有上述明确映射，不得生成资格、符合性、实质性或废标规则。"
+    "星号、前附表或章节交叉引用本身也不是独立规则：只有评标办法明确将其纳入评审且能定位到"
+    "具体、可核验的条件时才保留；不得把未标星的相邻技术描述一并带入，也不得把一个设备标题"
+    "自动扩展为逐项参数审查。不得把普通技术描述、履约安排或评分资料擅自升级为否决项。"
+    "任何“未提供视为不响应”“任一参数未达标即否决”“无效投标”等后果，只有原文明确写明"
+    "或可直接对应正式评审依据时才能写入 check_rule；不得由技术参数、星号、常识或语气自行推演。"
+)
+PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += "\n\n" + _EXTRACT_RULES_FORMAL_REVIEW_GUIDANCE
+
+# 证据性质是综合评审的业务判断口径，供全文扫描、规则审查和评分子流程共同使用。
+_EVALUATE_ALL_EVIDENCE_GUIDANCE = (
+    "必须严格区分投标人自主设计、响应承诺/偏离表、招标文件复述或表格模板和 AI 推断。"
+    "招标文件复述只能证明其出现于投标文件，不能单独证明技术能力、方案先进性或主观评分。"
+)
+PROMPT_TEMPLATES["evaluate_all_guidance"]["content"] += "\n\n" + _EVALUATE_ALL_EVIDENCE_GUIDANCE
 
 
 # 仅控制提示词配置界面的归类、排序和风险提示，不参与模型调用。业务原则集中
@@ -65,15 +84,6 @@ PROMPT_TEMPLATE_PRESENTATION = {
     # 按流程修改：同时包含业务要求和结构化输出约定，修改时应保留字段与占位符。
     "compare_ai_assessment_user": ("workflow", "文件查重", 110, "careful"),
     "extract_rules_user": ("workflow", "评审规则", 120, "careful"),
-    "extract_rules_continue_user": ("workflow", "评审规则", 120.5, "careful"),
-    "extract_rules_compile_user": ("workflow", "评审规则", 121, "careful"),
-    "extract_rules_coverage_user": ("workflow", "评审规则", 122, "careful"),
-    "extract_rules_quality_gate_user": ("workflow", "评审规则", 123, "careful"),
-    "extract_rules_finalise_user": ("workflow", "评审规则", 123.5, "careful"),
-    "extract_rules_finalise_boundary_focus": ("workflow", "评审规则", 123.6, "careful"),
-    "extract_rules_finalise_merge_focus": ("workflow", "评审规则", 123.7, "careful"),
-    "extract_rules_supplement_user": ("workflow", "评审规则", 124, "careful"),
-    "extract_rules_scoring_reconcile_user": ("workflow", "评审规则", 124.5, "careful"),
     "evaluate_all_scope_profile_user": ("workflow", "综合评审", 130, "careful"),
     "evaluate_all_full_scan_user": ("workflow", "综合评审", 131, "careful"),
     "evaluate_all_review_user": ("workflow", "综合评审", 132, "careful"),
@@ -96,6 +106,16 @@ PROMPT_TEMPLATE_PRESENTATION = {
     "score_subjective": ("system", "兼容流程", 244, "advanced"),
     "score_subjective_user": ("system", "兼容流程", 245, "advanced"),
     "evaluate_all_user": ("system", "兼容流程", 246, "advanced"),
+    # 规则提取的分批回收、编译、覆盖审计与最终门控；包含严格 JSON 协议，默认收起。
+    "extract_rules_continue_user": ("system", "评审规则内部处理", 250, "advanced"),
+    "extract_rules_compile_user": ("system", "评审规则内部处理", 251, "advanced"),
+    "extract_rules_coverage_user": ("system", "评审规则内部处理", 252, "advanced"),
+    "extract_rules_quality_gate_user": ("system", "评审规则内部处理", 253, "advanced"),
+    "extract_rules_finalise_user": ("system", "评审规则内部处理", 254, "advanced"),
+    "extract_rules_finalise_boundary_focus": ("system", "评审规则内部处理", 255, "advanced"),
+    "extract_rules_finalise_merge_focus": ("system", "评审规则内部处理", 256, "advanced"),
+    "extract_rules_supplement_user": ("system", "评审规则内部处理", 257, "advanced"),
+    "extract_rules_scoring_reconcile_user": ("system", "评审规则内部处理", 258, "advanced"),
 }
 
 

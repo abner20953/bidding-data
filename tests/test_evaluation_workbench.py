@@ -655,6 +655,25 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertTrue(any("8分" in packet["score_line"] for packet in packets))
         self.assertTrue(any("7 分" in packet["score_line"] for packet in packets))
 
+    def test_score_clause_packet_keeps_certificate_context_across_page_break(self):
+        text = """管理体系认证证书：每提供一类得1分，最高1分。
+（2）取得 CCID 信息系统服务交付能力等级证书、取得 CCRC 信息安全服务资质认证证书。
+提供以上证书复印件。
+46
+[第50页]
+每提供一类得1分，最高2分。
+"""
+        packets = worker._score_clause_packets(text)
+        target = next(packet for packet in packets if "最高2分" in packet["score_line"])
+        self.assertIn("CCID 信息系统服务交付能力等级证书", target["text"])
+        self.assertIn("CCRC 信息安全服务资质认证证书", target["text"])
+        unrelated_rule = {
+            "title": "类似业绩分类计分",
+            "source_text": "每提供一类得1分，最高2分。",
+            "check_rule": "核验类似业绩，每提供一类得1分，最高2分。",
+        }
+        self.assertFalse(worker._score_packet_is_covered(target, [unrelated_rule]))
+
     def test_scoring_reconciliation_preserves_all_clauses_and_corrects_discretionary_category(self):
         packets = worker._score_clause_packets("\n".join([
             "商务部分（9分）", "同类业绩：每提供一个得3分，最高6分。", "管理体系证书：每项1分，最高1分。",
@@ -968,6 +987,11 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertTrue(all(item["section"] and item["change_level"] for item in templates))
         extraction_template = next(item for item in templates if item["template_id"] == "extract_rules_user")
         self.assertIn("不得逐条复述招标原文", extraction_template["content"])
+        internal_template = next(item for item in templates if item["template_id"] == "extract_rules_compile_user")
+        self.assertEqual(internal_template["configuration_group"], "system")
+        self.assertEqual(internal_template["section"], "评审规则内部处理")
+        compare_guidance = next(item for item in templates if item["template_id"] == "compare_ai_assessment")
+        self.assertEqual(compare_guidance["name"], "文件查重 · 通用业务指令")
         original = next(item for item in templates if item["template_id"] == "evaluate_all")
         before_fingerprint = storage.prompt_template_fingerprint(self.app)
         locked = client.patch("/api/evaluation-workbench/prompt-templates/evaluate_all", json={"content": "请严格逐项核验，并用简洁中文说明证据和理由。"})
@@ -1001,8 +1025,15 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn('"items"', extraction)
         self.assertIn("机器可读文字、表格、元数据或后续 OCR", extraction)
         extraction_system = PROMPT_TEMPLATES["extract_rules"]["content"]
-        self.assertIn("时间边界", extraction_system)
-        self.assertIn("不得把普通技术描述", extraction_system)
+        self.assertIn("随后附加的通用业务指令", extraction_system)
+        extraction_guidance = PROMPT_TEMPLATES["extract_rules_guidance"]["content"]
+        self.assertIn("正式评审依据门槛", extraction_guidance)
+        self.assertIn("不得把普通技术描述", extraction_guidance)
+        extraction_composed = worker._system_prompt(self.app, "extract_rules")
+        self.assertIn("正式评审依据门槛", extraction_composed)
+        self.assertIn("未来或外部事项", extraction_composed)
+        evaluation_composed = worker._system_prompt(self.app, "evaluate_all")
+        self.assertIn("招标文件复述只能证明", evaluation_composed)
         for template_id in (
             "compare_ai_assessment_user", "review_documents_user", "score_objective_user",
             "score_subjective_user", "evaluate_all_review_user", "evaluate_all_objective_user",
@@ -1011,7 +1042,6 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             self.assertIn("恰好返回一次", PROMPT_TEMPLATES[template_id]["content"], template_id)
         self.assertIn("不得自行给分", PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
         self.assertIn('"page_hint":"页码或null"', PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
-        extraction_guidance = PROMPT_TEMPLATES["extract_rules_guidance"]["content"]
         extraction_validation = PROMPT_TEMPLATES["extract_rules_validation_guidance"]["content"]
         compile_template = PROMPT_TEMPLATES["extract_rules_compile_user"]["content"]
         coverage_template = PROMPT_TEMPLATES["extract_rules_coverage_user"]["content"]

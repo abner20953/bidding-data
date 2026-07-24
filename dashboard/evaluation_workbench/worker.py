@@ -458,26 +458,25 @@ def _score_clause_packets(text: str, limit: int = 240) -> list[dict]:
     for index, line in enumerate(lines):
         if not _SCORE_CLAUSE_PATTERN.search(re.sub(r"\s+", "", line)):
             continue
-        # 评分项目名称通常在计分行之前。遇到上一条计分行即停止回看，确保相邻表格行
-        # 分别接受覆盖审计，不会因一个标题命中而把另一项误判成已提取。
-        start = max(0, index - 6)
+        # 评分表经 PDF 文本抽取后，项目名称、证明材料和计分行可能被分页符和大量空行
+        # 分开。不能把分页符当作新评分项边界；最近一条明确计分行才是可靠边界。
+        # 仍限制回看窗口，避免把整张长表误并为一个条款。
+        start = max(0, index - 48)
         for previous in range(index - 1, start - 1, -1):
             compact_previous = re.sub(r"\s+", "", lines[previous])
             if _SCORE_CLAUSE_PATTERN.search(compact_previous):
                 start = previous + 1
                 break
-            if re.fullmatch(r"\[第\d+页\]", lines[previous]):
-                start = previous
-                break
         value = "\n".join(item for item in lines[start:index + 1] if item)[:900]
         if value:
             compact = re.sub(r"\s+", "", value)
-            identity_start = max(start, index - 2)
             page_marker = next((
                 lines[position] for position in range(index, max(-1, index - 300), -1)
                 if re.fullmatch(r"\[第\d+页\]", lines[position])
             ), "")
-            identity = f"{page_marker}\n" + "\n".join(item for item in lines[identity_start:index + 1] if item)
+            # 使用完整条款而非仅末两行生成 ID；否则“每提供一类得 1 分”这类通用
+            # 计分行在跨页时会失去证书/业绩/人员等区分信息，进而误判为已覆盖。
+            identity = f"{page_marker}\n{value}"
             identity_digest_source = re.sub(r"\s+", "", identity or compact)
             packets.append({
                 "clause_id": f"SC-{hashlib.sha1(identity_digest_source.encode('utf-8')).hexdigest()[:10]}",
