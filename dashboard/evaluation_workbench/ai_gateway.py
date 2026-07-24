@@ -32,7 +32,12 @@ class InvalidJsonResponse(ValueError):
 
 
 class ModelResponseEnvelopeError(ValueError):
-    """接口 HTTP 成功但未返回 OpenAI-compatible 正文；通常可短暂重试。"""
+    """接口 HTTP 成功但未返回 OpenAI-compatible 正文。"""
+
+    def __init__(self, message: str, *, retryable: bool = True, provider_code: object = None):
+        self.retryable = bool(retryable)
+        self.provider_code = str(provider_code or "")
+        super().__init__(message)
 
 
 def _load_json_candidate(value: str) -> object:
@@ -252,10 +257,52 @@ def _raise_http_error(response, *, operation: str) -> None:
     raise ValueError(f"{operation}（HTTP {response.status_code}）：{response.text[:500]}")
 
 
-def _response_choice(body: object) -> tuple[dict, object]:
+def _minimax_response_error(body: dict) -> ModelResponseEnvelopeError | InvalidJsonResponse | None:
+    """识别 MiniMax HTTP 200 业务错误；将输出触顶交给调用方的拆分恢复流程。"""
+    base_resp = body.get("base_resp")
+    if not isinstance(base_resp, dict):
+        return None
+    code = base_resp.get("status_code")
+    try:
+        numeric_code = int(code)
+    except (TypeError, ValueError):
+        return None
+    if numeric_code == 0:
+        return None
+    if numeric_code == 1039:
+        return InvalidJsonResponse("", "length")
+    # 这些是服务端繁忙、超时、频率限制或下游短暂错误；其余错误不能靠重试修复。
+    retryable = numeric_code in {1000, 1001, 1002, 1024, 1033}
+    detail = str(base_resp.get("status_msg") or "").strip()
+    label = f"（服务商代码 {numeric_code}）"
+    if detail:
+        label += f"：{detail[:160]}"
+    return ModelResponseEnvelopeError(f"模型接口业务错误{label}", retryable=retryable, provider_code=numeric_code)
+
+
+def _response_reached_output_limit(body: dict, requested_output_tokens: int | None) -> bool:
+    """兼容接口有时仅返回 usage 而省略 choices；命中上限时按截断处理。"""
+    if not requested_output_tokens:
+        return False
+    usage = body.get("usage")
+    if not isinstance(usage, dict):
+        return False
+    value = usage.get("completion_tokens", usage.get("output_tokens"))
+    try:
+        return int(value) >= max(1, int(requested_output_tokens) - 2)
+    except (TypeError, ValueError):
+        return False
+
+
+def _response_choice(body: object, *, requested_output_tokens: int | None = None) -> tuple[dict, object]:
     """读取兼容接口的正文；不持久化异常响应，避免泄露模型或业务正文。"""
     if not isinstance(body, dict):
         raise ModelResponseEnvelopeError("模型接口响应格式异常，未返回 JSON 对象")
+    minimax_error = _minimax_response_error(body)
+    if minimax_error:
+        raise minimax_error
+    if body.get("input_sensitive") is True or body.get("output_sensitive") is True:
+        raise ModelResponseEnvelopeError("模型接口因内容安全限制未返回可用正文", retryable=False)
     try:
         choice = body["choices"][0]
         content = choice["message"]["content"]
@@ -268,11 +315,52 @@ def _response_choice(body: object) -> tuple[dict, object]:
             detail = str(error.get("message") or error.get("type") or "").strip()
         elif isinstance(error, str):
             detail = error.strip()
+        if _response_reached_output_limit(body, requested_output_tokens):
+            # M3 adaptive thinking 可能先耗尽全部生成预算，未留下最终 JSON；不能把它
+            # 当作网络空包原样重试，应走既有的规则拆分/紧凑恢复路径。
+            raise InvalidJsonResponse("", "length") from exc
         suffix = f"：{detail[:160]}" if detail else ""
-        raise ModelResponseEnvelopeError(f"模型接口响应不完整，缺少 choices/message/content{suffix}") from exc
+        permanent_terms = ("invalid", "authentication", "api key", "balance", "insufficient", "参数", "鉴权", "余额")
+        retryable = not detail or not any(term in detail.lower() for term in permanent_terms)
+        raise ModelResponseEnvelopeError(
+            f"模型接口响应不完整，缺少 choices/message/content{suffix}", retryable=retryable,
+        ) from exc
     if not isinstance(choice, dict):
         raise ModelResponseEnvelopeError("模型接口响应不完整，choices 条目格式异常")
     return choice, content
+
+
+def _requested_output_tokens(profile: dict, max_tokens: int | None, *, reserve_for_adaptive_thinking: bool = True) -> int | None:
+    if max_tokens is None:
+        return None
+    limit = max(16, int(max_tokens))
+    if _is_minimax_m3(profile) and reserve_for_adaptive_thinking and profile.get("thinking_mode") != "disabled":
+        # 业务 JSON 本身通常只需数千 token；M3 adaptive 还会从同一生成预算中消耗
+        # 推理 token。给出 16K~24K 的上限以避免“只完成思考、没有最终正文”，但不
+        # 采用官方 128K 建议值，防止小规格工作台出现不受控的单次成本。
+        limit = max(16_000, min(24_000, limit * 3))
+    return limit
+
+
+def _record_response_metadata(callback, body: object, requested_output_tokens: int | None) -> None:
+    if not callback:
+        return
+    choice = None
+    if isinstance(body, dict):
+        choices = body.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            choice = choices[0]
+    content = (choice.get("message") or {}).get("content") if isinstance(choice, dict) else None
+    finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else None
+    if not finish_reason and isinstance(body, dict):
+        base_resp = body.get("base_resp")
+        if (isinstance(base_resp, dict) and str(base_resp.get("status_code")) == "1039") or _response_reached_output_limit(body, requested_output_tokens):
+            finish_reason = "length"
+    callback({
+        "requested_max_tokens": requested_output_tokens,
+        "finish_reason": finish_reason,
+        "response_chars": len(content) if isinstance(content, str) else 0,
+    })
 
 
 def request_json(profile: dict, system_prompt: str, user_prompt: str, *, usage_callback=None,
@@ -295,8 +383,11 @@ def request_json(profile: dict, system_prompt: str, user_prompt: str, *, usage_c
     if _is_minimax_m3(profile):
         # MiniMax M3 将思考内容置于独立字段，content 仅保留最终结构化结论。
         payload["reasoning_split"] = True
-    if max_tokens is not None:
-        payload["max_tokens"] = max(16, int(max_tokens))
+    requested_output_tokens = _requested_output_tokens(profile, max_tokens)
+    if requested_output_tokens is not None:
+        # MiniMax M3 已将 max_tokens 标为废弃参数；使用新字段并为 adaptive thinking
+        # 预留预算，其他 OpenAI-compatible 模型保持原字段以兼容既有配置。
+        payload["max_completion_tokens" if _is_minimax_m3(profile) else "max_tokens"] = requested_output_tokens
     try:
         response = _http_post(
             f"{base_url}/chat/completions",
@@ -315,14 +406,9 @@ def request_json(profile: dict, system_prompt: str, user_prompt: str, *, usage_c
     if usage_callback:
         usage = body.get("usage") if isinstance(body, dict) and isinstance(body.get("usage"), dict) else {}
         usage_callback(usage)
-    choice, content = _response_choice(body)
-    if response_metadata_callback:
-        # 只记录长度与结束原因，绝不保存模型正文、提示词或思考内容。
-        response_metadata_callback({
-            "requested_max_tokens": payload.get("max_tokens"),
-            "finish_reason": choice.get("finish_reason"),
-            "response_chars": len(content) if isinstance(content, str) else 0,
-        })
+    # 无论 choices 是否缺失，都记录长度、结束原因和请求上限；绝不保存正文。
+    _record_response_metadata(response_metadata_callback, body, requested_output_tokens)
+    choice, content = _response_choice(body, requested_output_tokens=requested_output_tokens)
     try:
         result = _decode_json_content(content)
     except (json.JSONDecodeError, ValueError, TypeError) as exc:
@@ -337,8 +423,13 @@ def test_connection(profile: dict, prompt_text: str) -> str:
         "model": profile["model_name"],
         "messages": [{"role": "user", "content": prompt_text}],
         "temperature": 0,
-        "max_tokens": 16,
     }
+    if _is_minimax_m3(profile):
+        # M3 adaptive thinking 与最终短回答共用生成预算；16 token 不足以完成一次真实
+        # 兼容性验证。该测试仍保持很小，不影响常规评审成本。
+        payload["max_completion_tokens"] = 1024
+    else:
+        payload["max_tokens"] = 16
     if profile.get("json_mode"):
         payload["response_format"] = {"type": "json_object"}
     thinking = _thinking_payload(profile)

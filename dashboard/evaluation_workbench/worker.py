@@ -110,22 +110,24 @@ def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt
                        *, document_id: str | None = None, context_mode: str = "full_prefix",
                        max_tokens: int | None = None, thinking_mode: str | None = None) -> dict:
     """调用模型并只记录用量元数据，不记录正文或提示词。"""
-    usage: dict = {}
-    response_metadata: dict = {"requested_max_tokens": max_tokens}
-
-    def record_usage(value: dict) -> None:
-        usage.update(value if isinstance(value, dict) else {})
-
-    def record_response_metadata(value: dict) -> None:
-        response_metadata.update(value if isinstance(value, dict) else {})
-
     gate = task.get("_evaluation_request_gate")
-    try:
-        effective_profile = {**profile, "thinking_mode": thinking_mode} if thinking_mode else profile
-        for attempt in range(3):
-            retry_after_rate_limit = False
-            if gate:
-                gate.acquire()
+    effective_profile = {**profile, "thinking_mode": thinking_mode} if thinking_mode else profile
+    for attempt in range(3):
+        # 每一次真实请求单独落一行用量。此前重试会覆盖上一轮 usage，导致 token
+        # 统计偏低，也难以区分服务暂时繁忙与模型输出触顶。
+        usage: dict = {}
+        response_metadata: dict = {"requested_max_tokens": max_tokens}
+
+        def record_usage(value: dict) -> None:
+            usage.update(value if isinstance(value, dict) else {})
+
+        def record_response_metadata(value: dict) -> None:
+            response_metadata.update(value if isinstance(value, dict) else {})
+
+        retry_after_failure = False
+        if gate:
+            gate.acquire()
+        try:
             try:
                 result = request_json(
                     effective_profile, system_prompt, user_prompt, usage_callback=record_usage,
@@ -137,38 +139,39 @@ def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt
             except ValueError as exc:
                 # 规则提取和综合评审共用该闸门。服务商限流时让后续请求
                 # 自动改为单路，并只重试当前这一小次模型调用，不重发整份文件。
-                # HTTP 成功但缺少 choices/message/content 同样属于服务商瞬时空包，
-                # 不能把已完成的全文扫描和其他投标人结果一并判为失败。
                 incomplete_envelope = isinstance(exc, ModelResponseEnvelopeError)
-                # 限流沿用一次重试；空响应不消耗可用正文且常呈短暂连续波动，
-                # 因此允许额外一次退避重试，仍只针对当前最小分组。
-                retry_limit = 2 if incomplete_envelope else 1
+                envelope_retryable = incomplete_envelope and exc.retryable
+                rate_limited = _is_rate_limit_error(exc)
+                # 只有明确的暂时性服务故障才退避重试。M3 因输出预算耗尽时会转化为
+                # InvalidJsonResponse(length)，交由上层拆分规则组，不能原样重发。
+                retry_limit = 2 if envelope_retryable else 1
                 should_retry = attempt < retry_limit and (
-                    _is_rate_limit_error(exc) or incomplete_envelope
+                    rate_limited or envelope_retryable
                 )
                 if should_retry:
-                    if gate and gate.reduce_after_rate_limit():
-                        message = "模型接口返回不完整响应，已自动降低并行度后重试当前分组" if incomplete_envelope else "模型接口限流或暂时繁忙，已自动降低并行度后继续"
+                    # 仅限流/超时才降低并发。响应结构异常、业务错误包与并行度无必然关系。
+                    if rate_limited and gate and gate.reduce_after_rate_limit():
+                        message = "模型接口限流或暂时繁忙，已自动降低并行度后继续"
                         storage.update_task(app, task["task_id"], message=message)
-                    elif incomplete_envelope:
+                    elif envelope_retryable:
                         storage.update_task(app, task["task_id"], message=f"模型接口返回不完整响应，正在第 {attempt + 1}/{retry_limit} 次重试当前分组")
-                    retry_after_rate_limit = True
+                    retry_after_failure = True
                 else:
                     raise
             finally:
-                if gate:
-                    gate.release()
-            if retry_after_rate_limit:
-                # 必须先释放并发位；否则失败请求在退避期间会无谓阻塞另一家投标人的收尾。
-                time.sleep(2 * (attempt + 1))
-                continue
-    finally:
-        # 部分兼容接口不返回 usage；仍保留发送字符数与截断元数据以便统计和优化。
-        storage.record_model_call(
-            app, task["task_id"], task["project_id"], phase, profile.get("profile_id"),
-            document_id=document_id, input_chars=len(system_prompt) + len(user_prompt),
-            context_mode=context_mode, usage=usage, response_metadata=response_metadata,
-        )
+                # 部分兼容接口不返回 usage；仍保留发送字符数与截断元数据以便统计和优化。
+                storage.record_model_call(
+                    app, task["task_id"], task["project_id"], phase, profile.get("profile_id"),
+                    document_id=document_id, input_chars=len(system_prompt) + len(user_prompt),
+                    context_mode=context_mode, usage=usage, response_metadata=response_metadata,
+                )
+        finally:
+            if gate:
+                gate.release()
+        if retry_after_failure:
+            # 必须先释放并发位；否则失败请求在退避期间会无谓阻塞另一家投标人的收尾。
+            time.sleep(2 * (attempt + 1))
+            continue
 
 
 def _system_prompt(app, template_id: str) -> str:
@@ -955,7 +958,9 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
             raise ValueError("模型返回格式不符合规则提取要求")
         return [item for item in rules if isinstance(item, dict)], 1, 0
     except ValueError as exc:
-        if not _is_invalid_json_model_response(exc):
+        # 暂时性 HTTP 200 错误包在网关已完成局部退避后，仍可走紧凑/拆分恢复；
+        # 鉴权、余额、参数等不可重试错误仍会立即清晰报出。
+        if not _is_model_format_error(exc):
             raise
         if len(text) > RULE_EXTRACTION_MIN_SPLIT_CHARS and depth < 3:
             pieces = _split_rule_extraction_text(text, max(RULE_EXTRACTION_MIN_SPLIT_CHARS, (len(text) + 1) // 2))
@@ -2087,7 +2092,11 @@ def _is_invalid_json_model_response(exc: ValueError) -> bool:
 
 def _is_model_format_error(exc: ValueError) -> bool:
     message = str(exc)
-    return _is_invalid_json_model_response(exc) or message.startswith("模型返回格式不符合综合评审要求")
+    return (
+        _is_invalid_json_model_response(exc)
+        or message.startswith("模型返回格式不符合综合评审要求")
+        or (isinstance(exc, ModelResponseEnvelopeError) and exc.retryable)
+    )
 
 
 EVALUATION_BATCH_SIZES = {"review": 8, "objective": 8, "subjective": 6}

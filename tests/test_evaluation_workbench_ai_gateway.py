@@ -2,7 +2,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 from dashboard.evaluation_workbench.ai_gateway import (
-    ModelResponseEnvelopeError, _decode_json_content, _recover_complete_json_array, request_json, test_connection,
+    InvalidJsonResponse, ModelResponseEnvelopeError, _decode_json_content, _recover_complete_json_array,
+    request_json, test_connection,
 )
 
 
@@ -41,6 +42,51 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
 
         self.assertIn("choices/message/content", str(error.exception))
         self.assertIn("temporary upstream failure", str(error.exception))
+
+    def test_request_json_treats_usage_at_output_limit_without_choices_as_length(self):
+        response = Mock(ok=True)
+        response.json.return_value = {"choices": [], "usage": {"completion_tokens": 5120}}
+        metadata = {}
+        profile = self._profile(
+            base_url="https://api.minimaxi.com/v1", model_name="MiniMax-M3", thinking_mode="disabled",
+        )
+
+        with patch("dashboard.evaluation_workbench.ai_gateway._http_post", return_value=response) as post:
+            with self.assertRaises(InvalidJsonResponse) as error:
+                request_json(profile, "system", "user", max_tokens=5120, response_metadata_callback=metadata.update)
+
+        self.assertEqual(error.exception.finish_reason, "length")
+        self.assertEqual(post.call_args.kwargs["json"]["max_completion_tokens"], 5120)
+        self.assertNotIn("max_tokens", post.call_args.kwargs["json"])
+        self.assertEqual(metadata["requested_max_tokens"], 5120)
+        self.assertEqual(metadata["response_chars"], 0)
+
+    def test_request_json_treats_minimax_token_limit_business_code_as_length(self):
+        response = Mock(ok=True)
+        response.json.return_value = {"base_resp": {"status_code": 1039, "status_msg": "token limit"}}
+        profile = self._profile(
+            base_url="https://api.minimaxi.com/v1", model_name="MiniMax-M3", thinking_mode="disabled",
+        )
+
+        with patch("dashboard.evaluation_workbench.ai_gateway._http_post", return_value=response):
+            with self.assertRaises(InvalidJsonResponse) as error:
+                request_json(profile, "system", "user", max_tokens=5120)
+
+        self.assertEqual(error.exception.finish_reason, "length")
+
+    def test_minimax_m3_adaptive_reserves_completion_budget_for_reasoning(self):
+        response = Mock(ok=True)
+        response.json.return_value = {"choices": [{"message": {"content": '{"results":[]}'}}]}
+        profile = self._profile(
+            base_url="https://api.minimaxi.com/v1", model_name="MiniMax-M3", thinking_mode="adaptive",
+        )
+
+        with patch("dashboard.evaluation_workbench.ai_gateway._http_post", return_value=response) as post:
+            result = request_json(profile, "system", "user", max_tokens=5440)
+
+        self.assertEqual(result, {"results": []})
+        self.assertEqual(post.call_args.kwargs["json"]["max_completion_tokens"], 16320)
+        self.assertNotIn("max_tokens", post.call_args.kwargs["json"])
 
     def test_json_decoder_ignores_minimax_thinking_block_before_json(self):
         content = '<think>先分析规则与招标文件的对应关系。</think>\n\n```json\n{"rules": []}\n```'

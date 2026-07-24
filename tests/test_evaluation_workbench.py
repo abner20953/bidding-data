@@ -121,6 +121,25 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(request_json.call_count, 3)
         self.assertEqual(sleep.call_args_list[0].args, (2,))
         self.assertEqual(sleep.call_args_list[1].args, (4,))
+        self.assertEqual(storage.project_token_usage(self.app, self.project["project_id"])["call_count"], 3)
+
+    def test_non_retryable_model_envelope_does_not_repeat_or_reduce_concurrency(self):
+        task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
+        gate = worker._EvaluationRequestGate(limit=2, max_limit=2)
+        task["_evaluation_request_gate"] = gate
+        profile = {"profile_id": "profile-1", "display_name": "测试模型"}
+
+        with patch(
+            "dashboard.evaluation_workbench.worker.request_json",
+            side_effect=worker.ModelResponseEnvelopeError("模型接口业务错误（服务商代码 1004）", retryable=False),
+        ) as request_json, patch("dashboard.evaluation_workbench.worker.time.sleep") as sleep:
+            with self.assertRaises(worker.ModelResponseEnvelopeError):
+                worker._request_task_json(self.app, task, profile, "test_phase", "system", "user", max_tokens=32)
+
+        self.assertEqual(request_json.call_count, 1)
+        sleep.assert_not_called()
+        self.assertEqual(gate.limit, 2)
+        self.assertEqual(storage.project_token_usage(self.app, self.project["project_id"])["call_count"], 1)
 
     def test_full_scan_checkpoint_is_reusable_by_chunk_hash(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案：稳定运行。")
