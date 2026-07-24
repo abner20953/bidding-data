@@ -468,6 +468,93 @@ _SCORE_CLAUSE_PATTERN = re.compile(
 )
 _SCORE_COVERAGE_IGNORED_TERMS = {"项目", "评分", "标准", "要求", "供应", "服务", "能力", "部分", "内容", "提供", "文件", "采购", "投标", "技术", "商务"}
 _QUALIFICATION_CLAUSE_ID_PATTERN = re.compile(r"(?m)^\s*(1\.[1-9])(?:\s|$)")
+_PACKAGE_MARKER_PATTERN = re.compile(r"(?:采购\s*包|标\s*包|包)\s*([0-9０-９一二三四五六七八九十]+)|第\s*([0-9０-９一二三四五六七八九十]+)\s*包")
+_PACKAGE_HEADING_PATTERN = re.compile(r"^\s*(?:采购\s*包|标\s*包|第\s*)\s*([0-9０-９一二三四五六七八九十]+)\s*(?:包)?\s*[：:]")
+_CHINESE_PACKAGE_NUMBERS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+
+
+def _normalise_package_number(value: object) -> int | None:
+    """识别常见包号写法；未明确填写包号时保持全项目提取。"""
+    text = str(value or "").strip().translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+    if not text:
+        return None
+    match = _PACKAGE_MARKER_PATTERN.search(text)
+    raw = (match.group(1) or match.group(2)) if match else ""
+    if not raw:
+        return None
+    if raw.isdigit():
+        return max(1, int(raw))
+    if raw in _CHINESE_PACKAGE_NUMBERS:
+        return _CHINESE_PACKAGE_NUMBERS[raw]
+    if len(raw) == 2 and raw.startswith("十") and raw[1] in _CHINESE_PACKAGE_NUMBERS:
+        return 10 + _CHINESE_PACKAGE_NUMBERS[raw[1]]
+    if len(raw) == 2 and raw.endswith("十") and raw[0] in _CHINESE_PACKAGE_NUMBERS:
+        return _CHINESE_PACKAGE_NUMBERS[raw[0]] * 10
+    return None
+
+
+def _package_numbers_in_text(value: object) -> set[int]:
+    text = str(value or "").translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+    values = set()
+    for match in _PACKAGE_MARKER_PATTERN.finditer(text):
+        number = _normalise_package_number(match.group(0))
+        if number is not None:
+            values.add(number)
+    return values
+
+
+def _score_packet_package_numbers(lines: list[str], index: int) -> set[int]:
+    """以最近的评分表包标题标记计分行，避免相同公式在不同包之间误判覆盖。"""
+    # 评分表标题通常在同页或前一页；向上限定窗口，不能把数十页前的包号带入。
+    for position in range(index, max(-1, index - 220), -1):
+        heading = _PACKAGE_HEADING_PATTERN.match(lines[position])
+        if heading:
+            number = _normalise_package_number(heading.group(0))
+            return {number} if number is not None else set()
+    return set()
+
+
+def _filter_score_packets_for_package(packets: list[dict], package_number: int | None) -> list[dict]:
+    """只过滤能被本地明确归属到其他包的评分条款；归属不明时宁可保留给模型判断。"""
+    if package_number is None:
+        return packets
+    return [
+        packet for packet in packets
+        if not packet.get("package_numbers") or package_number in set(packet.get("package_numbers") or [])
+    ]
+
+
+def _filter_rules_for_package(rules: list[dict], package_number: int | None) -> list[dict]:
+    """防止模型把其他包的明确专属规则写入当前项目；通用或归属不明规则不误删。"""
+    if package_number is None:
+        return rules
+    values = []
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        text = "\n".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text"))
+        mentioned = _package_numbers_in_text(text)
+        if mentioned and package_number not in mentioned:
+            continue
+        values.append(rule)
+    return values
+
+
+def _project_package_scope_instruction(app, project: dict) -> tuple[int | None, str]:
+    section_name = str(project.get("section_name") or "").strip()
+    package_number = _normalise_package_number(section_name)
+    if package_number is None:
+        scope = "当前项目未填写可识别的包号/标段号；请提取招标文件中全部适用的规则。"
+    else:
+        scope = f"当前项目仅对应采购包{package_number}；必须排除其他采购包的专属规则。"
+    instruction = storage.render_prompt_template(
+        app, "extract_rules_package_scope",
+        project_name=str(project.get("name") or "未命名项目"),
+        project_number=str(project.get("project_number") or "未填写"),
+        section_name=section_name or "未填写",
+        package_scope=scope,
+    )
+    return package_number, instruction
 
 def _score_clause_packets(text: str, limit: int = 240) -> list[dict]:
     """为每个明确计分行构造独立、稳定的覆盖条款，不合并相邻评分项。"""
@@ -500,6 +587,7 @@ def _score_clause_packets(text: str, limit: int = 240) -> list[dict]:
                 "clause_id": f"SC-{hashlib.sha1(identity_digest_source.encode('utf-8')).hexdigest()[:10]}",
                 "text": value,
                 "score_line": line[:360],
+                "package_numbers": sorted(_score_packet_package_numbers(lines, index)),
             })
         if len(packets) >= limit:
             break
@@ -642,7 +730,9 @@ def _score_packet_prompt_text(score_packets: list[object]) -> str:
     values = []
     for index, packet in enumerate(score_packets, start=1):
         clause_id = _score_packet_id(packet) or f"SC-{index}"
-        values.append(f"【评分条款 {clause_id}】\n{_score_packet_text(packet)}")
+        package_numbers = packet.get("package_numbers") if isinstance(packet, dict) else None
+        package_label = f"；适用采购包：{','.join(str(value) for value in package_numbers)}" if package_numbers else ""
+        values.append(f"【评分条款 {clause_id}{package_label}】\n{_score_packet_text(packet)}")
     return "\n".join(values)
 
 
@@ -1614,6 +1704,10 @@ def _finalise_rule_operations(app, task: dict, profile: dict, system_prompt: str
 
 
 def _extract_rules(app, task: dict) -> dict:
+    project = storage.get_project(app, task["project_id"])
+    if not project:
+        raise ValueError("评标项目不存在")
+    package_number, package_scope_instruction = _project_package_scope_instruction(app, project)
     documents = storage.list_documents(app, task["project_id"])
     tender = next((item for item in documents if item["role"] == "tender"), None)
     if not tender or tender.get("parse_status") != "success" or not tender.get("parsed_path"):
@@ -1633,7 +1727,10 @@ def _extract_rules(app, task: dict) -> dict:
     # 主文件和全部附件的完整可检索文本，避免固定关键词窗口在 AI 调用前丢掉后部评分表。
     source_parts = [f"【{label}】\n{value}" for label, value in source_documents]
     text = "\n\n".join(source_parts)
-    score_packets = _score_clause_packets(text, limit=400)
+    all_score_packets = _score_clause_packets(text, limit=400)
+    # 多包文件的评分公式往往相同；只把当前包或本地无法安全归属的条款送入覆盖审计，
+    # 不能让包1公式“覆盖”包3评分项。未填写包号时保持原有全文件行为。
+    score_packets = _filter_score_packets_for_package(all_score_packets, package_number)
     qualification_packets = _qualification_clause_packets(text)
     review_anchor_catalog = _initial_review_anchor_catalog(main_text)
     batches = []
@@ -1645,7 +1742,7 @@ def _extract_rules(app, task: dict) -> dict:
     if not batches:
         raise ValueError("招标文件未提取到可供规则识别的正文")
     storage.update_task(app, task["task_id"], progress=15, message=f"正在分段提取评审规则（共 {len(batches)} 批）")
-    system_prompt = _system_prompt(app, "extract_rules")
+    system_prompt = f"{_system_prompt(app, 'extract_rules')}\n\n【当前项目分包范围】\n{package_scope_instruction}"
     # 规则映射和顶层规则组编译共用同一限流闸门：默认两路，连续成功后可升至三路，
     # 接口繁忙时自动回落。只限制远端请求，不额外增加本地解析并行度。
     # 这只限制远端请求，并不创建常驻线程或后台进程。
@@ -1654,7 +1751,7 @@ def _extract_rules(app, task: dict) -> dict:
         app, task, profile, system_prompt, batches, document_id=tender["document_id"],
         review_anchor_catalog=review_anchor_catalog,
     )
-    raw_rules = _dedupe_rule_candidates(raw_rules)
+    raw_rules = _filter_rules_for_package(_dedupe_rule_candidates(raw_rules), package_number)
     primary_score_rules = [item for item in raw_rules if isinstance(item, dict) and item.get("category") in {"objective", "subjective"}]
     uncovered_score_packets = [
         packet for packet in score_packets
@@ -1684,8 +1781,11 @@ def _extract_rules(app, task: dict) -> dict:
                 )
                 supplement_rules = supplement.get("rules") if isinstance(supplement, dict) else None
                 if isinstance(supplement_rules, list):
-                    raw_rules.extend(item for item in supplement_rules if isinstance(item, dict))
-                    scoring_supplement_count += len(supplement_rules)
+                    kept_supplement_rules = _filter_rules_for_package(
+                        [item for item in supplement_rules if isinstance(item, dict)], package_number,
+                    )
+                    raw_rules.extend(kept_supplement_rules)
+                    scoring_supplement_count += len(kept_supplement_rules)
             except ValueError as exc:
                 # 主规则已提取成功时，单个评分补充批次异常不应丢弃已得到的规则集。
                 scoring_supplement_failures += 1
@@ -1713,8 +1813,11 @@ def _extract_rules(app, task: dict) -> dict:
                 )
             supplement_rules = supplement.get("rules") if isinstance(supplement, dict) else None
             if isinstance(supplement_rules, list):
-                raw_rules.extend(item for item in supplement_rules if isinstance(item, dict))
-                qualification_supplement_count = len(supplement_rules)
+                kept_supplement_rules = _filter_rules_for_package(
+                    [item for item in supplement_rules if isinstance(item, dict)], package_number,
+                )
+                raw_rules.extend(kept_supplement_rules)
+                qualification_supplement_count = len(kept_supplement_rules)
         except ValueError as exc:
             # 正式资格覆盖是增强路径；异常时保留已映射规则，并在任务结果中透明记录。
             qualification_supplement_failures = 1
@@ -1723,6 +1826,7 @@ def _extract_rules(app, task: dict) -> dict:
         item for item in raw_rules if isinstance(item, dict) and str(item.get("title", "")).strip()
         and item.get("category") in {"qualification", "compliance", "substantive", "rejection", "objective", "subjective"}
     ]
+    mapped_candidates = _filter_rules_for_package(mapped_candidates, package_number)
     compilation_failure_count = 0
     try:
         candidates, coverage_missing_rules, compilation_used = _compile_rule_candidates(
@@ -1736,7 +1840,7 @@ def _extract_rules(app, task: dict) -> dict:
         compilation_failure_count = 1
         storage.update_task(app, task["task_id"], progress=76, message=f"规则编译未完成，已保留原始提取结果：{exc}")
     # 是否可由投标文件核验交给完整提示词与人工确认判断；不以词表硬过滤，避免误删业绩有效期等规则。
-    rules = candidates
+    rules = _filter_rules_for_package(candidates, package_number)
     for item in rules:
         if _rule_requires_visual_verification(item):
             item["ocr_required"] = True
@@ -1762,12 +1866,14 @@ def _extract_rules(app, task: dict) -> dict:
     rules, scoring_reconciliation = _reconcile_scoring_rules(
         app, task, profile, system_prompt, rules, score_packets,
     )
+    rules = _filter_rules_for_package(rules, package_number)
     rules, quality_gate = _final_rule_quality_gate(
         app, task, profile, system_prompt, rules, score_packets,
     )
     rules, finalisation = _finalise_rule_operations(
         app, task, profile, system_prompt, rules,
     )
+    rules = _filter_rules_for_package(rules, package_number)
     for item in rules:
         if _rule_requires_visual_verification(item):
             item["ocr_required"] = True
@@ -1780,6 +1886,7 @@ def _extract_rules(app, task: dict) -> dict:
             "ai_rule_count": len(rules), "global_rule_count": global_rule_count,
             "excluded_rule_count": excluded_rule_count, "profile": profile["display_name"],
             "compact_retry_count": compact_retry_count, "score_clause_count": len(score_packets),
+            "all_score_clause_count": len(all_score_packets), "package_scope": package_number,
             "uncovered_score_clause_count": len(uncovered_score_packets), "scoring_supplement_count": scoring_supplement_count,
             "scoring_supplement_failure_count": scoring_supplement_failures, "batch_count": len(batches),
             "qualification_clause_count": len(qualification_packets), "qualification_supplement_count": qualification_supplement_count,

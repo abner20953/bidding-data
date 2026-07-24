@@ -734,6 +734,56 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         }
         self.assertFalse(worker._score_packet_is_covered(target, [unrelated_rule]))
 
+    def test_package_scope_filters_score_packets_using_nearest_package_heading(self):
+        text = """[第35页]
+采购包1：
+报价得分最高20分。
+视觉方案得分最高10分。
+[第36页]
+采购包2：
+报价得分最高20分。
+现场服务方案得分最高10分。
+[第37页]
+采购包3：
+报价得分最高20分。
+音乐制作方案得分最高15分。
+"""
+        packets = worker._score_clause_packets(text)
+        package_three_packets = worker._filter_score_packets_for_package(packets, 3)
+
+        self.assertEqual(len(packets), 6)
+        self.assertEqual(len(package_three_packets), 2)
+        self.assertTrue(all(packet["package_numbers"] == [3] for packet in package_three_packets))
+        self.assertTrue(any("音乐制作方案" in packet["text"] for packet in package_three_packets))
+        self.assertTrue(all("视觉方案" not in packet["text"] for packet in package_three_packets))
+
+    def test_package_scope_filters_only_explicit_other_package_rules(self):
+        rules = [
+            {"title": "包1报价评分", "check_rule": "采购包1报价最高20分", "source_text": "采购包1：报价得分最高20分。"},
+            {"title": "包3音乐评分", "check_rule": "采购包3音乐制作方案最高15分", "source_text": "采购包3：音乐制作方案得分最高15分。"},
+            {"title": "通用资格", "check_rule": "包1、包2、包3均须提供营业执照", "source_text": "各采购包均适用。"},
+            {"title": "未标注范围的资格", "check_rule": "提供依法设立证明材料", "source_text": "供应商应提供营业执照。"},
+        ]
+
+        kept = worker._filter_rules_for_package(rules, 3)
+
+        self.assertEqual([item["title"] for item in kept], ["包3音乐评分", "通用资格", "未标注范围的资格"])
+        self.assertEqual(worker._filter_rules_for_package(rules, None), rules)
+
+    def test_project_package_scope_uses_section_name_not_project_number(self):
+        package_number, instruction = worker._project_package_scope_instruction(self.app, {
+            "name": "开幕式", "project_number": "1", "section_name": "包3",
+        })
+        no_package_number, no_package_instruction = worker._project_package_scope_instruction(self.app, {
+            "name": "普通项目", "project_number": "包3", "section_name": "",
+        })
+
+        self.assertEqual(package_number, 3)
+        self.assertIn("当前项目仅对应采购包3", instruction)
+        self.assertIn("分包/标段：包3", instruction)
+        self.assertIsNone(no_package_number)
+        self.assertIn("未填写可识别的包号", no_package_instruction)
+
     def test_qualification_clause_packets_keep_formal_material_requirements(self):
         text = """[第11页]
 依法设立
@@ -1063,7 +1113,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual({item["configuration_group"] for item in templates}, {"business", "workflow", "system"})
         self.assertEqual(
             [item["template_id"] for item in templates if item["configuration_group"] == "business"],
-            ["compare_ai_assessment", "extract_rules_guidance", "extract_rules_validation_guidance", "evaluate_all_guidance"],
+            ["compare_ai_assessment", "extract_rules_guidance", "extract_rules_package_scope", "extract_rules_validation_guidance", "evaluate_all_guidance"],
         )
         self.assertTrue(all(item["section"] and item["change_level"] for item in templates))
         extraction_template = next(item for item in templates if item["template_id"] == "extract_rules_user")
