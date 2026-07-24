@@ -122,7 +122,7 @@ def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt
     gate = task.get("_evaluation_request_gate")
     try:
         effective_profile = {**profile, "thinking_mode": thinking_mode} if thinking_mode else profile
-        for attempt in range(2):
+        for attempt in range(3):
             retry_after_rate_limit = False
             if gate:
                 gate.acquire()
@@ -139,15 +139,19 @@ def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt
                 # 自动改为单路，并只重试当前这一小次模型调用，不重发整份文件。
                 # HTTP 成功但缺少 choices/message/content 同样属于服务商瞬时空包，
                 # 不能把已完成的全文扫描和其他投标人结果一并判为失败。
-                should_retry = attempt == 0 and (
-                    _is_rate_limit_error(exc) or isinstance(exc, ModelResponseEnvelopeError)
+                incomplete_envelope = isinstance(exc, ModelResponseEnvelopeError)
+                # 限流沿用一次重试；空响应不消耗可用正文且常呈短暂连续波动，
+                # 因此允许额外一次退避重试，仍只针对当前最小分组。
+                retry_limit = 2 if incomplete_envelope else 1
+                should_retry = attempt < retry_limit and (
+                    _is_rate_limit_error(exc) or incomplete_envelope
                 )
                 if should_retry:
                     if gate and gate.reduce_after_rate_limit():
-                        message = "模型接口返回不完整响应，已自动降低并行度后重试当前分组" if isinstance(exc, ModelResponseEnvelopeError) else "模型接口限流或暂时繁忙，已自动降低并行度后继续"
+                        message = "模型接口返回不完整响应，已自动降低并行度后重试当前分组" if incomplete_envelope else "模型接口限流或暂时繁忙，已自动降低并行度后继续"
                         storage.update_task(app, task["task_id"], message=message)
-                    elif isinstance(exc, ModelResponseEnvelopeError):
-                        storage.update_task(app, task["task_id"], message="模型接口返回不完整响应，正在重试当前分组")
+                    elif incomplete_envelope:
+                        storage.update_task(app, task["task_id"], message=f"模型接口返回不完整响应，正在第 {attempt + 1}/{retry_limit} 次重试当前分组")
                     retry_after_rate_limit = True
                 else:
                     raise
@@ -156,7 +160,7 @@ def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt
                     gate.release()
             if retry_after_rate_limit:
                 # 必须先释放并发位；否则失败请求在退避期间会无谓阻塞另一家投标人的收尾。
-                time.sleep(2)
+                time.sleep(2 * (attempt + 1))
                 continue
     finally:
         # 部分兼容接口不返回 usage；仍保留发送字符数与截断元数据以便统计和优化。

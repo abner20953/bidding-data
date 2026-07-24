@@ -17,6 +17,8 @@ __pycache__
 
 # Application Data (Large files not needed for build)
 file/
+data/
+dashboard/static/uploads/
 results/
 dashboard/uploads/
 dashboard/visitor_logs.db

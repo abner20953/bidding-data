@@ -100,6 +100,28 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         refreshed = storage.get_task(self.app, task["task_id"])
         self.assertIn("重试当前分组", refreshed["message"])
 
+    def test_incomplete_model_envelope_allows_second_backoff_retry(self):
+        task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
+        profile = {"profile_id": "profile-1", "display_name": "测试模型"}
+        task["_evaluation_request_gate"] = worker._EvaluationRequestGate(limit=1, max_limit=1)
+
+        with patch(
+            "dashboard.evaluation_workbench.worker.request_json",
+            side_effect=[
+                worker.ModelResponseEnvelopeError("模型接口响应不完整"),
+                worker.ModelResponseEnvelopeError("模型接口响应不完整"),
+                {"rules": []},
+            ],
+        ) as request_json, patch("dashboard.evaluation_workbench.worker.time.sleep") as sleep:
+            result = worker._request_task_json(
+                self.app, task, profile, "test_phase", "system", "user", max_tokens=32,
+            )
+
+        self.assertEqual(result, {"rules": []})
+        self.assertEqual(request_json.call_count, 3)
+        self.assertEqual(sleep.call_args_list[0].args, (2,))
+        self.assertEqual(sleep.call_args_list[1].args, (4,))
+
     def test_full_scan_checkpoint_is_reusable_by_chunk_hash(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案：稳定运行。")
         findings = [{"rule_id": "rule-1", "chunk_id": "chunk_1", "evidence": "技术方案", "page_hint": "1"}]
