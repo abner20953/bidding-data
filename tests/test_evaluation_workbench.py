@@ -267,6 +267,47 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertLessEqual(len(packet["evidence"][0]["text_a"]), 280)
         self.assertNotIn("投标文件全文", str(packet))
 
+    def test_compare_ai_recovers_complete_assessments_then_retries_only_missing_signals(self):
+        task = storage.create_task(self.app, self.project["project_id"], "compare_documents")
+        signals = [
+            {"signal_id": f"signal-{index}", "bidder_a": "甲", "bidder_b": "乙", "dimension_label": "正文雷同", "basis": f"线索{index}", "evidence": []}
+            for index in range(1, 4)
+        ]
+        partial = '{"assessments":[{"signal_id":"signal-1","decision":"excluded","risk_level":"low","confidence":"high","reason":"公共模板","suggested_check":"无需额外核验"},'
+        completed = {"assessments": [
+            {"signal_id": "signal-2", "decision": "suspected_clue", "risk_level": "medium", "confidence": "medium", "reason": "存在相似表述", "suggested_check": "核验来源"},
+            {"signal_id": "signal-3", "decision": "excluded", "risk_level": "low", "confidence": "high", "reason": "通用内容", "suggested_check": "无需额外核验"},
+        ]}
+        analysis = {"signals": signals, "pair_summaries": []}
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[
+            worker.InvalidJsonResponse(partial, "length"), completed,
+        ]) as request_json:
+            worker._assess_compare_signals_with_ai(self.app, task, analysis)
+
+        self.assertEqual(analysis["ai_assessment"]["status"], "success")
+        self.assertEqual(analysis["ai_assessment"]["assessed_count"], 3)
+        self.assertEqual(request_json.call_count, 2)
+        self.assertIn('"signal-1"', request_json.call_args_list[0].args[2])
+        self.assertNotIn('"signal-1"', request_json.call_args_list[1].args[2])
+        self.assertTrue(all(item["ai_assessment"]["reason"] != "AI 未返回该线索的可用判定。" for item in signals))
+
+    def test_compare_ai_retries_single_missing_signal_once_then_uses_fallback(self):
+        task = storage.create_task(self.app, self.project["project_id"], "compare_documents")
+        signal = {"signal_id": "signal-1", "bidder_a": "甲", "bidder_b": "乙", "dimension_label": "正文雷同", "basis": "线索", "evidence": []}
+        analysis = {"signals": [signal], "pair_summaries": []}
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[
+            worker.InvalidJsonResponse('{"assessments":[', "length"),
+            worker.InvalidJsonResponse('{"assessments":[', "length"),
+        ]) as request_json:
+            worker._assess_compare_signals_with_ai(self.app, task, analysis)
+
+        self.assertEqual(request_json.call_count, 2)
+        self.assertEqual(analysis["ai_assessment"]["status"], "partial")
+        self.assertEqual(analysis["ai_assessment"]["assessed_count"], 0)
+        self.assertEqual(signal["ai_assessment"]["reason"], "AI 未返回该线索的可用判定。")
+
     def test_compare_signal_disposition_is_persisted_separately(self):
         task = storage.create_task(self.app, self.project["project_id"], "compare_documents")
         storage.initialize_compare_signal_reviews(self.app, task["task_id"], [{"signal_id": "signal-1"}])
@@ -614,6 +655,56 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertTrue(any("8分" in packet["score_line"] for packet in packets))
         self.assertTrue(any("7 分" in packet["score_line"] for packet in packets))
 
+    def test_scoring_reconciliation_preserves_all_clauses_and_corrects_discretionary_category(self):
+        packets = worker._score_clause_packets("\n".join([
+            "商务部分（9分）", "同类业绩：每提供一个得3分，最高6分。", "管理体系证书：每项1分，最高1分。",
+            "技术部分（46分）", "设备选型（5分）：按优劣横向比较、酌情评分。", "技术方案（41分）：按完整性和合理性评分。",
+            "投标报价（45分）：按报价公式计算。", "总分（100分）。",
+        ]))
+        current_rules = [
+            {"category": "objective", "title": "同类业绩", "check_rule": "每项3分，最高6分", "source_text": "每提供一个得3分，最高6分", "scoring": {"max_score": 6, "kind": "manual"}},
+            {"category": "objective", "title": "设备选型", "check_rule": "按横向比较评分", "source_text": "设备选型（5分）", "scoring": {"max_score": 5, "kind": "manual"}},
+            {"category": "subjective", "title": "技术方案", "check_rule": "按完整性评分", "source_text": "技术方案（41分）", "scoring": {"max_score": 41, "kind": "manual"}},
+        ]
+        clause_ids = [packet["clause_id"] for packet in packets]
+        reconciled = {
+            "rules": [
+                {"category": "objective", "title": "同类业绩", "check_rule": "每提供一个得3分，最高6分。", "source_text": "同类业绩：每提供一个得3分，最高6分。", "source_clause_ids": clause_ids[:2], "scoring": {"max_score": 6, "kind": "manual"}},
+                {"category": "objective", "title": "管理体系证书", "check_rule": "每项1分，最高1分。", "source_text": "管理体系证书：每项1分，最高1分。", "source_clause_ids": [clause_ids[2]], "scoring": {"max_score": 1, "kind": "manual"}},
+                {"category": "subjective", "title": "设备选型", "check_rule": "按优劣横向比较、酌情评分，满分5分。", "source_text": "设备选型（5分）：按优劣横向比较、酌情评分。", "source_clause_ids": clause_ids[3:5], "scoring": {"max_score": 5, "kind": "manual"}},
+                {"category": "subjective", "title": "技术方案", "check_rule": "按完整性和合理性评分，满分41分。", "source_text": "技术方案（41分）：按完整性和合理性评分。", "source_clause_ids": [clause_ids[5]], "scoring": {"max_score": 41, "kind": "manual"}},
+                {"category": "objective", "title": "投标报价", "check_rule": "按报价公式计算，满分45分。", "source_text": "投标报价（45分）：按报价公式计算。", "source_clause_ids": clause_ids[6:], "scoring": {"max_score": 45, "kind": "manual"}},
+            ],
+        }
+        task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
+        profile = storage.get_model_profile(self.app, None)
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value=reconciled) as request_json:
+            rules, stats = worker._reconcile_scoring_rules(
+                self.app, task, profile, "规则提取系统提示", current_rules, packets,
+            )
+
+        self.assertTrue(stats["applied"])
+        self.assertEqual(stats["failure_count"], 0)
+        self.assertEqual(next(item for item in rules if item["title"] == "设备选型")["category"], "subjective")
+        self.assertTrue(all(worker._score_packet_is_covered(packet, rules) for packet in packets))
+        self.assertIn("完整评分条款", request_json.call_args.args[2])
+
+    def test_scoring_reconciliation_keeps_original_rules_when_model_omits_clause_mapping(self):
+        packets = worker._score_clause_packets("业绩：每提供一个得3分，最高6分。\n报价：最高得45分。")
+        original = [{"category": "objective", "title": "业绩评分", "check_rule": "每个业绩3分，最高6分", "source_text": "每提供一个得3分，最高6分", "scoring": {"max_score": 6, "kind": "manual"}}]
+        task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
+        profile = storage.get_model_profile(self.app, None)
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value={"rules": original}):
+            rules, stats = worker._reconcile_scoring_rules(
+                self.app, task, profile, "规则提取系统提示", original, packets,
+            )
+
+        self.assertEqual(rules, original)
+        self.assertFalse(stats["applied"])
+        self.assertEqual(stats["failure_count"], 1)
+
     def test_rule_extraction_splits_long_source_into_bounded_batches(self):
         self._add_pdf("tender.pdf", "tender", "", "用于建立解析文件")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
@@ -675,14 +766,14 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         primary = {"rules": [{"category": "objective", "title": "报价评分", "check_rule": "按报价公式计算", "source_text": "报价得分最高25分", "scoring": {"max_score": 25, "kind": "manual"}}]}
         supplement = {"rules": [{"category": "objective", "title": "类似项目业绩评分", "check_rule": "每个同类型项目业绩计3分，最高9分", "source_text": "业绩每有一个得3分，最高9分", "scoring": {"max_score": 9, "kind": "manual"}}]}
 
-        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[primary, supplement, {"drops": []}]) as request_json:
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[primary, supplement, {"rules": []}, {"drops": []}]) as request_json:
             finished = self._run_next_task()
 
         _, rules = storage.list_rules(self.app, self.project["project_id"])
         self.assertEqual(finished["status"], "success")
         self.assertEqual(finished["result"]["score_clause_count"], 2)
         self.assertEqual(finished["result"]["scoring_supplement_count"], 1)
-        self.assertEqual(request_json.call_count, 3)
+        self.assertEqual(request_json.call_count, 4)
         self.assertEqual(next(item for item in rules if item["title"] == "类似项目业绩评分")["scoring_json"], '{"max_score": 9, "kind": "manual"}')
 
     def test_rule_extraction_checks_each_score_clause_not_only_score_rule_count(self):
@@ -702,13 +793,13 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         ]}
         supplement = {"rules": [{"category": "objective", "title": "类似项目业绩评分", "check_rule": "每个同类型项目业绩计3分，最高9分", "source_text": "业绩每有一个得3分，最高9分", "scoring": {"max_score": 9, "kind": "manual"}}]}
 
-        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[primary, supplement, {"drops": []}]) as request_json:
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[primary, supplement, {"rules": []}, {"drops": []}]) as request_json:
             finished = self._run_next_task()
 
         _, rules = storage.list_rules(self.app, self.project["project_id"])
         supplement_prompt = request_json.call_args_list[1].args[2]
         self.assertEqual(finished["result"]["uncovered_score_clause_count"], 1)
-        self.assertEqual(request_json.call_count, 3)
+        self.assertEqual(request_json.call_count, 4)
         self.assertIn("业绩每有一个得3分", supplement_prompt)
         self.assertNotIn("报价得分最高25分", supplement_prompt)
         self.assertIn("类似项目业绩评分", {item["title"] for item in rules})
@@ -825,6 +916,29 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         deleted = client.delete(f"/api/evaluation-workbench/model-profiles/{profile['profile_id']}")
         self.assertEqual(deleted.status_code, 200)
         self.assertNotEqual(storage.get_model_profile(self.app, None)["profile_id"], profile["profile_id"])
+
+    def test_model_profile_can_be_disabled_and_default_is_reassigned(self):
+        profile = storage.create_model_profile(self.app, {
+            "display_name": "待禁用默认模型", "base_url": "https://example.test/v1", "model_name": "disable-test", "api_key": "test-key",
+        })
+        client = self.app.test_client()
+        self._unlock_model_configuration(client)
+        self.assertEqual(client.post(f"/api/evaluation-workbench/model-profiles/{profile['profile_id']}/default").status_code, 200)
+
+        response = client.patch(
+            f"/api/evaluation-workbench/model-profiles/{profile['profile_id']}",
+            json={"enabled": False},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["profile"]["enabled"], 0)
+        profiles = storage.list_model_profiles(self.app)
+        disabled = next(item for item in profiles if item["profile_id"] == profile["profile_id"])
+        self.assertEqual(disabled["enabled"], 0)
+        self.assertFalse(disabled["is_default"])
+        self.assertNotEqual(storage.get_model_profile(self.app, None)["profile_id"], profile["profile_id"])
+        with self.assertRaisesRegex(ValueError, "未找到已启用的模型档案"):
+            storage.get_model_profile(self.app, profile["profile_id"])
 
     def test_model_configuration_management_requires_password(self):
         client = self.app.test_client()

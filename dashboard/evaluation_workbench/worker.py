@@ -34,11 +34,13 @@ MAX_PARSED_CHARS = 2_000_000
 MAX_DOCX_XML_BYTES = 50 * 1024 * 1024
 PROMPT_VERSION = EVALUATION_PROMPT_VERSION
 COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v2"
-COMPARE_AI_BATCH_SIZE = 24
+# 单条线索的证据包虽小，但查重往往同时命中多种维度；以较小批次起步，并在
+# 截断时继续局部拆分，避免某一批过长导致整批线索都只能降级为人工核验。
+COMPARE_AI_BATCH_SIZE = 8
 
 
 class _EvaluationRequestGate:
-    """综合评审内的模型请求闸门；遇限流时自动收敛到单路。"""
+    """规则提取/综合评审的模型请求闸门；稳定时升至三路，限流时逐级回退。"""
 
     def __init__(self, limit: int = 2, max_limit: int | None = None):
         self.limit = max(1, int(limit))
@@ -131,11 +133,11 @@ def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt
                     gate.record_success()
                 return result
             except ValueError as exc:
-                # 仅综合评审的双路并行会使用该闸门。服务商限流时让后续请求
+                # 规则提取和综合评审共用该闸门。服务商限流时让后续请求
                 # 自动改为单路，并只重试当前这一小次模型调用，不重发整份文件。
                 if gate and attempt == 0 and _is_rate_limit_error(exc):
                     if gate.reduce_after_rate_limit():
-                        storage.update_task(app, task["task_id"], message="模型接口限流或暂时繁忙，已自动降低并行度后继续评审")
+                        storage.update_task(app, task["task_id"], message="模型接口限流或暂时繁忙，已自动降低并行度后继续")
                     retry_after_rate_limit = True
                 else:
                     raise
@@ -342,37 +344,82 @@ def _assess_compare_signals_with_ai(app, task: dict, analysis: dict) -> None:
         analysis["ai_assessment"] = {"status": "unavailable", "reason": f"AI 判定未执行：{exc}", "prompt_version": COMPARE_AI_PROMPT_VERSION}
         return
     by_id = {item["signal_id"]: item for item in signals}
-    completed, failures = 0, []
+    completed_ids, failures = set(), []
     system_prompt = _system_prompt(app, "compare_ai_assessment")
-    for start in range(0, len(signals), COMPARE_AI_BATCH_SIZE):
-        batch = signals[start:start + COMPARE_AI_BATCH_SIZE]
+
+    def apply_assessments(values: object, batch: list[dict]) -> None:
+        """只接收当前批次内、字段完整的结论，模型漏回的 ID 留给局部重试。"""
+        allowed_ids = {item["signal_id"] for item in batch}
+        for value in values if isinstance(values, list) else []:
+            if not isinstance(value, dict) or value.get("signal_id") not in allowed_ids:
+                continue
+            decision = value.get("decision")
+            if decision not in {"confirmed_clue", "suspected_clue", "excluded", "unassessable"}:
+                decision = "unassessable"
+            signal = by_id[value["signal_id"]]
+            signal["ai_assessment"] = {
+                "decision": decision,
+                "risk_level": value.get("risk_level") if value.get("risk_level") in {"low", "medium", "high"} else "medium",
+                "confidence": value.get("confidence") if value.get("confidence") in {"high", "medium", "low"} else "medium",
+                "reason": str(value.get("reason", ""))[:1000],
+                "suggested_check": str(value.get("suggested_check", ""))[:700],
+            }
+            completed_ids.add(value["signal_id"])
+
+    def assess_batch(batch: list[dict], *, depth: int = 0, leaf_retry: bool = False,
+                     retried_missing_group: bool = False) -> bool:
+        """截断时先回收完整对象，再仅对剩余 ID 二分；绝不重发成功线索。"""
+        if not batch:
+            return True
         packets = [_compare_evidence_packet(item) for item in batch]
         user_prompt = storage.render_prompt_template(app, "compare_ai_assessment_user", packets=json.dumps(packets, ensure_ascii=False, separators=(",", ":")))
         try:
             parsed = _request_task_json(app, task, profile, "compare_ai_assessment", system_prompt, user_prompt,
                                         context_mode="evidence_batch",
-                                        max_tokens=_output_token_budget(profile, 700 + len(batch) * 120))
-            values = parsed.get("assessments") if isinstance(parsed, dict) else []
-            for value in values if isinstance(values, list) else []:
-                if not isinstance(value, dict) or value.get("signal_id") not in by_id:
-                    continue
-                decision = value.get("decision")
-                if decision not in {"confirmed_clue", "suspected_clue", "excluded", "unassessable"}:
-                    decision = "unassessable"
-                signal = by_id[value["signal_id"]]
-                signal["ai_assessment"] = {
-                    "decision": decision,
-                    "risk_level": value.get("risk_level") if value.get("risk_level") in {"low", "medium", "high"} else "medium",
-                    "confidence": value.get("confidence") if value.get("confidence") in {"high", "medium", "low"} else "medium",
-                    "reason": str(value.get("reason", ""))[:1000],
-                    "suggested_check": str(value.get("suggested_check", ""))[:700],
-                }
-                completed += 1
+                                        # 每条需要五个结构字段和判断理由；按较充足预算起步，
+                                        # 再由局部拆批兜底，避免过低上限本身制造截断。
+                                        max_tokens=_output_token_budget(profile, 900 + len(batch) * 240))
+            apply_assessments(parsed.get("assessments") if isinstance(parsed, dict) else [], batch)
+        except InvalidJsonResponse as exc:
+            # 长度截断时不可能可靠补齐最后半条，但数组中已经闭合的对象仍完全可用。
+            recovered = _recover_complete_json_array(exc.raw_content, "assessments")
+            apply_assessments(recovered.get("assessments") if recovered else [], batch)
+            if exc.finish_reason.lower() not in {"length", "max_tokens"}:
+                try:
+                    repaired = _repair_invalid_json(
+                        app, task, profile, "compare_ai_assessment_json_repair", exc, "assessments",
+                    )
+                    apply_assessments(repaired.get("assessments") if isinstance(repaired, dict) else [], batch)
+                except ValueError:
+                    pass
         except Exception as exc:  # 保留确定性查重结果，不能因 AI 暂不可用而丢失证据。
             message = str(exc)[:180]
             failures.append(message)
             if "鉴权失败" in message or "尚未配置 API Key" in message or "HTTP 4" in message:
-                break
+                return False
+            return True
+        missing = [item for item in batch if item["signal_id"] not in completed_ids]
+        if not missing:
+            return True
+        # 本批已回收部分结论时，先把“仅缺失 ID”作为一个更小批次再试一次；它通常
+        # 已足以避开输出上限，不必马上拆到单条，兼顾速度和结论上下文。
+        if len(missing) < len(batch) and not retried_missing_group:
+            storage.update_task(app, task["task_id"], message=f"已回收部分查重结论，正在仅重试 {len(missing)} 条遗漏线索")
+            return assess_batch(missing, depth=depth + 1, retried_missing_group=True)
+        if len(missing) == 1:
+            if not leaf_retry:
+                storage.update_task(app, task["task_id"], message="部分查重线索未返回，正在仅重试该线索")
+                return assess_batch(missing, depth=depth + 1, leaf_retry=True)
+            failures.append("模型未返回单条查重线索的有效 JSON")
+            return True
+        # 模型漏回或输出截断都只影响当前小组；二分后已获得结论的线索不会被重发。
+        midpoint = len(missing) // 2
+        storage.update_task(app, task["task_id"], message=f"查重 AI 输出不完整，正在仅拆分 {len(missing)} 条未返回线索重试")
+        return assess_batch(missing[:midpoint], depth=depth + 1) and assess_batch(missing[midpoint:], depth=depth + 1)
+
+    for start in range(0, len(signals), COMPARE_AI_BATCH_SIZE):
+        if not assess_batch(signals[start:start + COMPARE_AI_BATCH_SIZE]):
+            break
     for signal in signals:
         signal.setdefault("ai_assessment", {"decision": "unassessable", "risk_level": "medium", "confidence": "low", "reason": "AI 未返回该线索的可用判定。", "suggested_check": "请结合原始文件人工核验。"})
     for summary in analysis.get("pair_summaries", []):
@@ -390,7 +437,7 @@ def _assess_compare_signals_with_ai(app, task: dict, analysis: dict) -> None:
         elif decisions:
             summary["assessment_result"] = "unassessable"
     analysis["ai_assessment"] = {
-        "status": "partial" if failures else "success", "assessed_count": completed, "signal_count": len(signals),
+        "status": "partial" if failures else "success", "assessed_count": len(completed_ids), "signal_count": len(signals),
         "failure_count": len(failures), "reason": "；".join(failures), "profile": profile["display_name"],
         "prompt_version": COMPARE_AI_PROMPT_VERSION, "input_mode": "fixed_rule_evidence_packets_only",
     }
@@ -563,6 +610,102 @@ def _score_rule_supplement_prompt(app, score_packets: list[object], existing_rul
                                           existing_rules=json.dumps(existing, ensure_ascii=False, separators=(",", ":")), packet_text=packet_text)
 
 
+def _scoring_reconciliation_packet(score_packets: list[object], char_limit: int) -> str | None:
+    """以完整条款为单位压缩评分表，不能把半条 JSON 送给结构复核。"""
+    values, size = [], 2
+    for index, packet in enumerate(score_packets, start=1):
+        value = {
+            "clause_id": _score_packet_id(packet) or f"SC-{index}",
+            # 评分行及其最近上下文优先，保留父项标题、计分对象和分值。
+            "text": _score_packet_text(packet)[:900],
+        }
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        if values and size + len(encoded) + 1 > char_limit:
+            return None
+        values.append(value)
+        size += len(encoded) + 1
+    return json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+
+
+def _normalise_reconciled_scoring_rules(value: object, score_packets: list[object]) -> list[dict] | None:
+    """仅接受可完整覆盖原评分条款的结构复核结果，异常时仍使用上一阶段结果。"""
+    if not isinstance(value, list) or not value:
+        return None
+    known_clause_ids = {_score_packet_id(packet) for packet in score_packets if _score_packet_id(packet)}
+    rules = _dedupe_rule_candidates([item for item in value if isinstance(item, dict)])
+    if not rules:
+        return None
+    for rule in rules:
+        if rule.get("category") not in {"objective", "subjective"}:
+            return None
+        if not str(rule.get("title") or "").strip() or not str(rule.get("check_rule") or "").strip():
+            return None
+        scoring = rule.get("scoring") if isinstance(rule.get("scoring"), dict) else {}
+        if storage._valid_max_score(scoring) is None:
+            return None
+        scoring = dict(scoring)
+        scoring["kind"] = "manual" if rule["category"] == "subjective" else (
+            "boolean" if scoring.get("kind") == "boolean" and not scoring.get("items") else "manual"
+        )
+        rule["scoring"] = scoring
+        clause_ids = rule.get("source_clause_ids")
+        if not isinstance(clause_ids, list) or not clause_ids:
+            return None
+        if any(str(clause_id) not in known_clause_ids for clause_id in clause_ids):
+            return None
+    # 不以“分数相加恰好 100”代替结构完整性；各项目总分可能不是 100。
+    # 每个原始评分条款均须明确映射，防止模型为删重而静默丢掉叶子项。
+    if any(not _score_packet_is_covered(packet, rules) for packet in score_packets):
+        return None
+    return rules
+
+
+def _reconcile_scoring_rules(app, task: dict, profile: dict, system_prompt: str,
+                             rules: list[dict], score_packets: list[object]) -> tuple[list[dict], dict]:
+    """对评分表做一次独立结构复核，修正类别/归属而不触碰非评分规则。"""
+    stats = {"applied": False, "failure_count": 0}
+    scoring_rules = [item for item in rules if item.get("category") in {"objective", "subjective"}]
+    if not score_packets or not scoring_rules:
+        return rules, stats
+    input_limit = min(_prompt_char_limit(profile, 90_000, 140_000), 140_000)
+    packets = _scoring_reconciliation_packet(score_packets, input_limit)
+    score_rules_packet = _rule_compilation_packet(scoring_rules, input_limit)
+    try:
+        if packets is None:
+            raise ValueError("评分条款过长，未执行结构复核")
+        parsed_score_rules = json.loads(score_rules_packet)
+        if not isinstance(parsed_score_rules, list) or len(parsed_score_rules) != len(scoring_rules):
+            raise ValueError("当前评分规则过长，未执行结构复核")
+        storage.update_task(app, task["task_id"], progress=76, message="正在复核评分表的分部、类别与重复项")
+        try:
+            response = _request_task_json(
+                app, task, profile, "extract_rules_scoring_reconcile", system_prompt,
+                storage.render_prompt_template(
+                    app, "extract_rules_scoring_reconcile_user", score_packets=packets,
+                    score_rules=score_rules_packet,
+                ),
+                context_mode="rule_scoring_structure_reconcile",
+                max_tokens=_output_token_budget(profile, max(4_500, min(10_000, 1_200 + len(scoring_rules) * 460))),
+                thinking_mode="disabled",
+            )
+        except InvalidJsonResponse as exc:
+            response = _repair_invalid_json(
+                app, task, profile, "extract_rules_scoring_reconcile_json_repair", exc, "rules",
+            )
+        reconciled = _normalise_reconciled_scoring_rules(
+            response.get("rules") if isinstance(response, dict) else None, score_packets,
+        )
+        if reconciled is None:
+            raise ValueError("评分结构复核未返回完整、可追溯的评分规则")
+        non_scoring_rules = [item for item in rules if item.get("category") not in {"objective", "subjective"}]
+        stats["applied"] = True
+        return _dedupe_rule_candidates(non_scoring_rules + reconciled), stats
+    except ValueError as exc:
+        stats["failure_count"] = 1
+        storage.update_task(app, task["task_id"], message=f"评分结构复核未完成，已保留原评分规则：{exc}")
+        return rules, stats
+
+
 def _rule_recovery_continue_prompt(app, text: str, recovered_rules: list[dict]) -> str:
     """仅把已完整解析的必要字段交给续提，避免截断正文或重复输出放大上下文。"""
     recovered = [
@@ -715,12 +858,14 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
 
 
 def _extract_rule_batches(app, task: dict, profile: dict, system_prompt: str, batches: list[str], *, document_id: str) -> tuple[list[dict], int, int]:
-    """在两个受闸门保护的工作位中完成互不依赖的原文映射，按原文顺序汇总结果。"""
+    """在受闸门保护的至多三路工作位中映射原文，按原文顺序汇总结果。"""
     if not batches:
         return [], 0, 0
     total = len(batches)
     results: list[tuple[list[dict], int, int] | None] = [None] * total
-    workers = min(2, total)
+    # 初始闸门仍是两路；第三个工作位只在任务已启用动态闸门时才会创建并获得请求许可。
+    gate = task.get("_evaluation_request_gate")
+    workers = min(3 if gate and gate.max_limit >= 3 else 2, total)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_index = {
             executor.submit(
@@ -737,7 +882,7 @@ def _extract_rule_batches(app, task: dict, profile: dict, system_prompt: str, ba
             progress = 15 + int(completed * 45 / total)
             storage.update_task(
                 app, task["task_id"], progress=progress,
-                message=f"正在分段提取评审规则（已完成 {completed}/{total} 批，受控双并发）",
+                message=f"正在分段提取评审规则（已完成 {completed}/{total} 批，动态至多三路并发）",
             )
     raw_rules: list[dict] = []
     compact_retries = split_retries = 0
@@ -916,13 +1061,13 @@ def _compile_rule_group(app, task: dict, profile: dict, system_prompt: str,
     groups = _split_rule_compilation_groups(candidates, input_limit)
     if len(groups) > 1:
         compiled, missing, used = [], [], False
-        # 原始映射完成后，多个大规则组之间互不依赖。只在顶层受控双并发，子组内
+        # 原始映射完成后，多个大规则组之间互不依赖。只在顶层动态至多三路，子组内
         # 保持串行，最终仍由全局合并统一消重和保留评分覆盖，避免嵌套并发打满接口。
         parallel_groups = depth == 0 and task.get("_evaluation_request_gate") is not None
         if parallel_groups:
-            storage.update_task(app, task["task_id"], message=f"正在分组编译评审规则（{len(groups)} 组，受控双并发）")
+            storage.update_task(app, task["task_id"], message=f"正在分组编译评审规则（{len(groups)} 组，动态至多三路并发）")
             group_results: list[tuple[list[dict], list[dict], bool] | None] = [None] * len(groups)
-            with ThreadPoolExecutor(max_workers=min(2, len(groups))) as executor:
+            with ThreadPoolExecutor(max_workers=min(3, len(groups))) as executor:
                 future_to_index = {
                     executor.submit(
                         _compile_rule_group, app, task, profile, system_prompt, group, char_limit, depth=depth + 1,
@@ -1360,9 +1505,10 @@ def _extract_rules(app, task: dict) -> dict:
         raise ValueError("招标文件未提取到可供规则识别的正文")
     storage.update_task(app, task["task_id"], progress=15, message=f"正在分段提取评审规则（共 {len(batches)} 批）")
     system_prompt = _system_prompt(app, "extract_rules")
-    # 规则映射和顶层规则组编译共用同一限流闸门：默认至多两路，接口繁忙时自动回落单路。
+    # 规则映射和顶层规则组编译共用同一限流闸门：默认两路，连续成功后可升至三路，
+    # 接口繁忙时自动回落。只限制远端请求，不额外增加本地解析并行度。
     # 这只限制远端请求，并不创建常驻线程或后台进程。
-    task["_evaluation_request_gate"] = _EvaluationRequestGate(limit=2, max_limit=2)
+    task["_evaluation_request_gate"] = _EvaluationRequestGate(limit=2, max_limit=min(3, len(batches)))
     raw_rules, compact_retry_count, split_retry_count = _extract_rule_batches(
         app, task, profile, system_prompt, batches, document_id=tender["document_id"],
     )
@@ -1442,6 +1588,9 @@ def _extract_rules(app, task: dict) -> dict:
             else:
                 scoring["kind"] = "manual"
             item["scoring"] = scoring
+    rules, scoring_reconciliation = _reconcile_scoring_rules(
+        app, task, profile, system_prompt, rules, score_packets,
+    )
     rules, quality_gate = _final_rule_quality_gate(
         app, task, profile, system_prompt, rules, score_packets,
     )
@@ -1464,6 +1613,8 @@ def _extract_rules(app, task: dict) -> dict:
             "scoring_supplement_failure_count": scoring_supplement_failures, "batch_count": len(batches),
             "semantic_compilation_used": compilation_used, "coverage_missing_rule_count": len(coverage_missing_rules),
             "semantic_compilation_failure_count": compilation_failure_count,
+            "scoring_reconciliation_applied": scoring_reconciliation["applied"],
+            "scoring_reconciliation_failure_count": scoring_reconciliation["failure_count"],
             "quality_gate_applied": quality_gate["applied"],
             "quality_gate_dropped_count": quality_gate["dropped_count"],
             "quality_gate_failure_count": quality_gate["failure_count"],
@@ -3079,7 +3230,7 @@ def _evaluate_all(app, task: dict) -> dict:
         )
 
     # 只有投标人之间的文件审查并行；单份文件仍保持页块、规则组的先后顺序。
-    # 模型请求由闸门限制为两路，触发服务商限流后会自动降为一路重试。
+    # 模型请求默认两路、稳定后动态至多三路，触发服务商限流后会自动逐级降路重试。
     document_results: list[dict] = []
     if len(documents) == 1:
         document_results.append(run_document(documents[0]))

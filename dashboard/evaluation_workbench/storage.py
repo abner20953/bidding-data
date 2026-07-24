@@ -107,6 +107,7 @@ def task_prompt_template_fingerprint(app, task_type: str) -> str | None:
             "extract_rules_continue_user", "extract_rules_coverage_user", "extract_rules_quality_gate_user",
             "extract_rules_finalise_user", "extract_rules_finalise_boundary_focus",
             "extract_rules_finalise_merge_focus", "extract_rules_supplement_user",
+            "extract_rules_scoring_reconcile_user",
             "json_repair", "json_repair_user",
         },
         "review_documents": {"review_documents", "review_documents_user", "json_repair", "json_repair_user"},
@@ -1265,6 +1266,9 @@ def _model_profile_values(app, payload: dict, *, existing: dict | None = None) -
     if not existing and not raw_api_key and not api_key_env:
         raise ValueError("请填写 API Key，或指定已配置的 API Key 环境变量名")
     profile_id, timestamp = (existing["profile_id"] if existing else str(uuid.uuid4())), now_iso()
+    enabled = payload.get("enabled", existing.get("enabled", 1) if existing else 1)
+    if not isinstance(enabled, bool) and enabled not in {0, 1}:
+        raise ValueError("模型启用状态格式不正确")
     values = {
         "profile_id": profile_id,
         "display_name": str(payload["display_name"]).strip(),
@@ -1277,7 +1281,7 @@ def _model_profile_values(app, payload: dict, *, existing: dict | None = None) -
         "timeout_seconds": min(1800, max(30, int(payload.get("timeout_seconds") or 600))),
         "json_mode": 1 if payload.get("json_mode", True) else 0,
         "thinking_mode": payload.get("thinking_mode") if payload.get("thinking_mode") in {"default", "enabled", "adaptive", "disabled"} else "default",
-        "enabled": 1,
+        "enabled": 1 if enabled else 0,
         "created_at": existing["created_at"] if existing else timestamp,
         "updated_at": timestamp,
     }
@@ -1308,6 +1312,17 @@ def update_model_profile(app, profile_id: str, payload: dict) -> dict:
         merged["api_key"] = payload["api_key"]
     values = _model_profile_values(app, merged, existing=current)
     with connection(app) as conn:
+        if not values["enabled"]:
+            active_rows = conn.execute(
+                "SELECT payload_json FROM ew_tasks WHERE status IN ('queued', 'running')"
+            ).fetchall()
+            for active in active_rows:
+                try:
+                    active_payload = json.loads(active["payload_json"] or "{}")
+                except json.JSONDecodeError:
+                    active_payload = {}
+                if active_payload.get("profile_id") == profile_id:
+                    raise ValueError("该模型正在被排队或运行中的任务使用，暂不能禁用")
         conn.execute(
             """UPDATE ew_model_profiles SET display_name=:display_name, protocol=:protocol, base_url=:base_url,
                model_name=:model_name, api_key_env=:api_key_env, api_key_encrypted=:api_key_encrypted,
@@ -1315,6 +1330,26 @@ def update_model_profile(app, profile_id: str, payload: dict) -> dict:
                thinking_mode=:thinking_mode, enabled=:enabled, updated_at=:updated_at WHERE profile_id=:profile_id""",
             values,
         )
+        if not values["enabled"]:
+            default_row = conn.execute(
+                "SELECT setting_value FROM ew_settings WHERE setting_key = 'default_model_profile_id'"
+            ).fetchone()
+            if default_row and default_row["setting_value"] == profile_id:
+                candidates = conn.execute(
+                    "SELECT profile_id, api_key_env, api_key_encrypted FROM ew_model_profiles "
+                    "WHERE profile_id != ? AND enabled = 1 ORDER BY created_at",
+                    (profile_id,),
+                ).fetchall()
+                replacement = next((candidate for candidate in candidates if candidate["api_key_encrypted"] or (
+                    candidate["api_key_env"] and os.environ.get(candidate["api_key_env"], "").strip()
+                )), None)
+                if replacement:
+                    conn.execute(
+                        "UPDATE ew_settings SET setting_value = ?, updated_at = ? WHERE setting_key = 'default_model_profile_id'",
+                        (replacement["profile_id"], now_iso()),
+                    )
+                else:
+                    conn.execute("DELETE FROM ew_settings WHERE setting_key = 'default_model_profile_id'")
     return _public_model_profile(values)
 
 
