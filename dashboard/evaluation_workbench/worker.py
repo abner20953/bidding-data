@@ -582,7 +582,47 @@ def _score_packet_prompt_text(score_packets: list[object]) -> str:
     return "\n".join(values)
 
 
-def _rule_extraction_prompt(app, text: str, *, compact: bool, score_packets: list[object], max_rules: int = 45) -> str:
+INITIAL_REVIEW_ANCHOR_TERMS = (
+    "评标办法前附表", "形式评审", "资格评审", "响应性评审", "初步评审",
+    "实质性要求", "否决投标", "评审标准",
+)
+_PARSED_PAGE_MARKER = re.compile(r"(?=\[第\d+页\]\s*)")
+
+
+def _initial_review_anchor_catalog(text: str, max_chars: int = 6_500) -> str:
+    """从招标原文中提取一次性的初步评审依据目录，供所有分段规则映射共用。
+
+    这不是基于业务词的规则过滤器，只是把通常位于第三章、而与技术需求页相隔很远的
+    评审依据一并交给模型，避免模型把“应当/参数/★”本身误当成独立符合性结论。
+    """
+    pages = [value.strip() for value in _PARSED_PAGE_MARKER.split(text) if value.strip()]
+    if not pages:
+        return "未定位到初步评审目录；非评分规则必须在当前原文中自行找到明确评审或否决依据。"
+
+    selected_indexes: set[int] = set()
+    for index, page in enumerate(pages):
+        if not any(term in page for term in INITIAL_REVIEW_ANCHOR_TERMS):
+            continue
+        selected_indexes.add(index)
+
+    values: list[str] = []
+    size = 0
+    for index in sorted(selected_indexes):
+        value = pages[index]
+        if not value:
+            continue
+        # 保留整页而非按关键词截句，表格相邻行和“★条款”交叉引用才不会断裂。
+        if values and size + len(value) + 2 > max_chars:
+            continue
+        values.append(value)
+        size += len(value) + 2
+    if not values:
+        return "未定位到初步评审目录；非评分规则必须在当前原文中自行找到明确评审或否决依据。"
+    return "\n\n".join(values)
+
+
+def _rule_extraction_prompt(app, text: str, *, compact: bool, score_packets: list[object],
+                            review_anchor_catalog: str, max_rules: int = 45) -> str:
     limits = (
         f"这是格式异常后的紧凑重试。最多返回 {max_rules} 条规则；title 最多 30 字，普通规则的 check_rule 尽量控制在 180 字内，source_text 最多 120 字；"
         "层级评分规则不得为缩短输出而省略叶子评分项、分值、公式或扣分条件。"
@@ -596,8 +636,10 @@ def _rule_extraction_prompt(app, text: str, *, compact: bool, score_packets: lis
         "不得遗漏业绩、报价、人员、资质、方案等评分项。"
         if score_audit else "未定位到明确评分条款时，不要臆造评分规则。"
     )
-    return storage.render_prompt_template(app, "extract_rules_user", limits=limits, score_requirement=score_requirement,
-                                          score_audit=score_audit or "无", text=text)
+    return storage.render_prompt_template(
+        app, "extract_rules_user", limits=limits, score_requirement=score_requirement,
+        score_audit=score_audit or "无", review_anchor_catalog=review_anchor_catalog, text=text,
+    )
 
 
 def _score_rule_supplement_prompt(app, score_packets: list[object], existing_rules: list[dict]) -> str:
@@ -706,7 +748,7 @@ def _reconcile_scoring_rules(app, task: dict, profile: dict, system_prompt: str,
         return rules, stats
 
 
-def _rule_recovery_continue_prompt(app, text: str, recovered_rules: list[dict]) -> str:
+def _rule_recovery_continue_prompt(app, text: str, recovered_rules: list[dict], review_anchor_catalog: str) -> str:
     """仅把已完整解析的必要字段交给续提，避免截断正文或重复输出放大上下文。"""
     recovered = [
         {
@@ -719,7 +761,8 @@ def _rule_recovery_continue_prompt(app, text: str, recovered_rules: list[dict]) 
     ]
     return storage.render_prompt_template(
         app, "extract_rules_continue_user",
-        existing_rules=json.dumps(recovered, ensure_ascii=False, separators=(",", ":")), text=text,
+        existing_rules=json.dumps(recovered, ensure_ascii=False, separators=(",", ":")),
+        review_anchor_catalog=review_anchor_catalog, text=text,
     )
 
 
@@ -730,7 +773,8 @@ def _rule_batch_output_tokens(text: str, compact: bool = False) -> int:
 
 
 def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text: str,
-                        *, document_id: str, batch_label: str, depth: int = 0) -> tuple[list[dict], int, int]:
+                        *, document_id: str, batch_label: str, review_anchor_catalog: str = "",
+                        depth: int = 0) -> tuple[list[dict], int, int]:
     """提取一个小批次；截断时只二分当前批次，最小批次才紧凑重试。"""
     packets = _score_clause_packets(text, limit=24)
     # 评分表密集页在 11k 字内也可能包含大量独立计分项。与其依赖模型在固定条数
@@ -743,14 +787,17 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
             for index, piece in enumerate(pieces, start=1):
                 value, compact_count, split_count = _extract_rule_batch(
                     app, task, profile, system_prompt, piece, document_id=document_id,
-                    batch_label=f"{batch_label}/评分密集拆分{index}", depth=depth + 1,
+                    batch_label=f"{batch_label}/评分密集拆分{index}", review_anchor_catalog=review_anchor_catalog,
+                    depth=depth + 1,
                 )
                 rules.extend(value)
                 compact_retries += compact_count
                 split_retries += split_count
             return rules, compact_retries, split_retries + 1
     max_rules = 16 if depth == 0 else 10
-    user_prompt = _rule_extraction_prompt(app, text, compact=False, score_packets=packets, max_rules=max_rules)
+    user_prompt = _rule_extraction_prompt(
+        app, text, compact=False, score_packets=packets, review_anchor_catalog=review_anchor_catalog, max_rules=max_rules,
+    )
     try:
         parsed = _request_task_json(
             app, task, profile, "extract_rules_batch", system_prompt, user_prompt,
@@ -774,7 +821,7 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
             try:
                 continued = _request_task_json(
                     app, task, profile, "extract_rules_local_recovery_continue", system_prompt,
-                    _rule_recovery_continue_prompt(app, text, recovered_rules), document_id=document_id,
+                    _rule_recovery_continue_prompt(app, text, recovered_rules, review_anchor_catalog), document_id=document_id,
                     context_mode=f"{batch_label}_local_json_continue",
                     max_tokens=_output_token_budget(profile, _rule_batch_output_tokens(text, compact=True)),
                     thinking_mode="disabled",
@@ -809,14 +856,18 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
                 for index, piece in enumerate(pieces, start=1):
                     value, compact_count, split_count = _extract_rule_batch(
                         app, task, profile, system_prompt, piece, document_id=document_id,
-                        batch_label=f"{batch_label}/拆分{index}", depth=depth + 1,
+                        batch_label=f"{batch_label}/拆分{index}", review_anchor_catalog=review_anchor_catalog,
+                        depth=depth + 1,
                     )
                     rules.extend(value)
                     compact_retries += compact_count
                     split_retries += split_count
                 return rules, compact_retries, split_retries + 1
         storage.update_task(app, task["task_id"], message=f"{batch_label} 格式异常，正在以紧凑 JSON 重试")
-        retry_prompt = _rule_extraction_prompt(app, text, compact=True, score_packets=packets, max_rules=max(8, max_rules))
+        retry_prompt = _rule_extraction_prompt(
+            app, text, compact=True, score_packets=packets, review_anchor_catalog=review_anchor_catalog,
+            max_rules=max(8, max_rules),
+        )
         parsed = _request_task_json(
             app, task, profile, "extract_rules_compact_retry", system_prompt, retry_prompt,
             document_id=document_id, context_mode=f"{batch_label}_compact_retry",
@@ -838,14 +889,18 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
                 for index, piece in enumerate(pieces, start=1):
                     value, compact_count, split_count = _extract_rule_batch(
                         app, task, profile, system_prompt, piece, document_id=document_id,
-                        batch_label=f"{batch_label}/拆分{index}", depth=depth + 1,
+                        batch_label=f"{batch_label}/拆分{index}", review_anchor_catalog=review_anchor_catalog,
+                        depth=depth + 1,
                     )
                     rules.extend(value)
                     compact_retries += compact_count
                     split_retries += split_count
                 return rules, compact_retries, split_retries + 1
         storage.update_task(app, task["task_id"], message=f"{batch_label} 格式异常，正在以紧凑 JSON 重试")
-        retry_prompt = _rule_extraction_prompt(app, text, compact=True, score_packets=packets, max_rules=max(8, max_rules))
+        retry_prompt = _rule_extraction_prompt(
+            app, text, compact=True, score_packets=packets, review_anchor_catalog=review_anchor_catalog,
+            max_rules=max(8, max_rules),
+        )
         parsed = _request_task_json(
             app, task, profile, "extract_rules_compact_retry", system_prompt, retry_prompt,
             document_id=document_id, context_mode=f"{batch_label}_compact_retry",
@@ -857,7 +912,8 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
         return [item for item in rules if isinstance(item, dict)], 1, 0
 
 
-def _extract_rule_batches(app, task: dict, profile: dict, system_prompt: str, batches: list[str], *, document_id: str) -> tuple[list[dict], int, int]:
+def _extract_rule_batches(app, task: dict, profile: dict, system_prompt: str, batches: list[str], *,
+                          document_id: str, review_anchor_catalog: str = "") -> tuple[list[dict], int, int]:
     """在受闸门保护的至多三路工作位中映射原文，按原文顺序汇总结果。"""
     if not batches:
         return [], 0, 0
@@ -871,6 +927,7 @@ def _extract_rule_batches(app, task: dict, profile: dict, system_prompt: str, ba
             executor.submit(
                 _extract_rule_batch, app, task, profile, system_prompt, batch,
                 document_id=document_id, batch_label=f"rule_batch_{index + 1}_of_{total}",
+                review_anchor_catalog=review_anchor_catalog,
             ): index
             for index, batch in enumerate(batches)
         }
@@ -1495,6 +1552,7 @@ def _extract_rules(app, task: dict) -> dict:
     source_parts = [f"【{label}】\n{value}" for label, value in source_documents]
     text = "\n\n".join(source_parts)
     score_packets = _score_clause_packets(text, limit=400)
+    review_anchor_catalog = _initial_review_anchor_catalog(main_text)
     batches = []
     for label, value in source_documents:
         batches.extend(
@@ -1511,6 +1569,7 @@ def _extract_rules(app, task: dict) -> dict:
     task["_evaluation_request_gate"] = _EvaluationRequestGate(limit=2, max_limit=min(3, len(batches)))
     raw_rules, compact_retry_count, split_retry_count = _extract_rule_batches(
         app, task, profile, system_prompt, batches, document_id=tender["document_id"],
+        review_anchor_catalog=review_anchor_catalog,
     )
     raw_rules = _dedupe_rule_candidates(raw_rules)
     primary_score_rules = [item for item in raw_rules if isinstance(item, dict) and item.get("category") in {"objective", "subjective"}]
