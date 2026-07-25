@@ -87,6 +87,22 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
         self.assertEqual(result, {"results": []})
         self.assertEqual(post.call_args.kwargs["json"]["max_completion_tokens"], 16320)
         self.assertNotIn("max_tokens", post.call_args.kwargs["json"])
+        self.assertNotIn("response_format", post.call_args.kwargs["json"])
+
+    def test_request_json_does_not_locally_complete_a_length_truncated_response(self):
+        response = Mock(ok=True)
+        response.json.return_value = {
+            "choices": [{"finish_reason": "length", "message": {"content": '{"results":[{"rule_id":"R1"'} }],
+        }
+        metadata = {}
+
+        with patch("dashboard.evaluation_workbench.ai_gateway._http_post", return_value=response):
+            with self.assertRaises(InvalidJsonResponse) as error:
+                request_json(self._profile(), "system", "user", response_metadata_callback=metadata.update)
+
+        self.assertEqual(error.exception.finish_reason, "length")
+        self.assertEqual(metadata["parse_status"], "invalid_json")
+        self.assertNotIn("local_json_repaired", metadata)
 
     def test_json_decoder_ignores_minimax_thinking_block_before_json(self):
         content = '<think>先分析规则与招标文件的对应关系。</think>\n\n```json\n{"rules": []}\n```'
@@ -115,6 +131,15 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
 
         self.assertEqual(decoded, {"evidence": "编号\\A-01"})
 
+    def test_json_decoder_repairs_common_missing_comma_locally(self):
+        diagnostics = {}
+
+        decoded = _decode_json_content('{"results":[{"rule_id":"R1" "reason":"缺少逗号"}]}', diagnostics=diagnostics)
+
+        self.assertEqual(decoded, {"results": [{"rule_id": "R1", "reason": "缺少逗号"}]})
+        self.assertTrue(diagnostics["local_json_repaired"])
+        self.assertEqual(diagnostics["parse_status"], "local_repaired")
+
     def test_json_decoder_accepts_text_content_blocks_and_double_encoded_object(self):
         blocked = _decode_json_content([{"type": "text", "text": '{"results":[]}'}])
         encoded = _decode_json_content('"{\\"results\\":[]}"')
@@ -139,20 +164,28 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
         self.assertNotIn("invalid api key", str(error.exception))
         self.assertIn("重新创建并完整复制", str(error.exception))
 
+    def test_connection_requires_a_real_structured_json_response(self):
+        response = Mock(ok=True)
+        response.json.return_value = {"choices": [{"message": {"content": "连接成功"}}]}
+
+        with patch("dashboard.evaluation_workbench.ai_gateway._http_post", return_value=response):
+            with self.assertRaisesRegex(ValueError, "有效的结构化 JSON"):
+                test_connection(self._profile(), CONNECTION_TEST_PROMPT)
+
     def test_minimax_compatible_profile_can_omit_optional_parameters(self):
         response = Mock(ok=True)
-        response.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        response.json.return_value = {"choices": [{"message": {"content": '{"message":"ok"}'}}]}
         with patch("dashboard.evaluation_workbench.ai_gateway._http_post", return_value=response) as post:
             message = test_connection(self._profile(model_name="MiniMax-M2.7"), CONNECTION_TEST_PROMPT)
 
-        self.assertEqual(message, "连接成功：模型接口已响应")
+        self.assertEqual(message, "连接成功：模型接口已响应，结构化 JSON 测试通过")
         self.assertEqual(post.call_args.kwargs["json"]["model"], "MiniMax-M2.7")
         self.assertNotIn("response_format", post.call_args.kwargs["json"])
         self.assertNotIn("thinking", post.call_args.kwargs["json"])
 
     def test_minimax_m3_maps_legacy_enabled_thinking_to_adaptive(self):
         response = Mock(ok=True)
-        response.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        response.json.return_value = {"choices": [{"message": {"content": '{"message":"ok"}'}}]}
         profile = self._profile(
             base_url="https://api.minimaxi.com/v1", model_name="MiniMax-M3", thinking_mode="enabled"
         )
@@ -164,7 +197,7 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
 
     def test_minimax_m3_separates_reasoning_when_thinking_uses_default_mode(self):
         response = Mock(ok=True)
-        response.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        response.json.return_value = {"choices": [{"message": {"content": '{"message":"ok"}'}}]}
         profile = self._profile(
             base_url="https://api.minimaxi.com/v1", model_name="MiniMax-M3", thinking_mode="default"
         )
@@ -175,7 +208,7 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
 
     def test_minimax_m2_omits_unsupported_disabled_thinking_parameter(self):
         response = Mock(ok=True)
-        response.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        response.json.return_value = {"choices": [{"message": {"content": '{"message":"ok"}'}}]}
         profile = self._profile(
             base_url="https://api.minimaxi.com/v1", model_name="MiniMax-M2.7", thinking_mode="disabled"
         )

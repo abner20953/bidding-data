@@ -115,9 +115,10 @@ def task_prompt_template_fingerprint(app, task_type: str) -> str | None:
         "score_objective": {"score_objective", "score_objective_user", "json_repair", "json_repair_user"},
         "score_subjective": {"score_subjective", "score_subjective_user", "json_repair", "json_repair_user"},
         "evaluate_all": {
-            "evaluate_all", "evaluate_all_guidance", "evaluate_all_scope_profile", "evaluate_all_scope_profile_user",
+            "evaluate_all", "evaluate_all_guidance", "evaluate_all_highlights", "evaluate_all_scope_profile", "evaluate_all_scope_profile_user",
             "evaluate_all_full_scan_user", "evaluate_all_review_user", "evaluate_all_objective_user",
-            "evaluate_all_subjective_user", "evaluate_all_cross_bid_price_user", "evaluate_all_output_contract",
+            "evaluate_all_subjective_user", "evaluate_all_cross_bid_price_user", "evaluate_all_highlights_user",
+            "evaluate_all_output_contract",
             "json_repair", "json_repair_user",
         },
     }
@@ -255,6 +256,9 @@ def init_database(app) -> None:
                 requested_max_tokens INTEGER,
                 finish_reason TEXT,
                 response_chars INTEGER,
+                parse_status TEXT,
+                parse_error_kind TEXT,
+                local_json_repaired INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_ew_model_calls_project ON ew_model_calls(project_id, created_at);
@@ -427,6 +431,9 @@ def init_database(app) -> None:
         _ensure_column(conn, "ew_model_calls", "requested_max_tokens", "INTEGER")
         _ensure_column(conn, "ew_model_calls", "finish_reason", "TEXT")
         _ensure_column(conn, "ew_model_calls", "response_chars", "INTEGER")
+        _ensure_column(conn, "ew_model_calls", "parse_status", "TEXT")
+        _ensure_column(conn, "ew_model_calls", "parse_error_kind", "TEXT")
+        _ensure_column(conn, "ew_model_calls", "local_json_repaired", "INTEGER NOT NULL DEFAULT 0")
         conn.execute("UPDATE ew_rules SET check_rule = title WHERE check_rule IS NULL OR check_rule = ''")
         conn.execute("UPDATE ew_rules SET source_type = CASE WHEN rule_set_id IN (SELECT rule_set_id FROM ew_rule_sets WHERE source_task_id IS NOT NULL) THEN 'ai' ELSE 'manual' END WHERE source_type IS NULL OR source_type = ''")
         _migrate_known_legacy_prompt_override(conn)
@@ -983,14 +990,18 @@ def record_model_call(app, task_id: str, project_id: str, phase: str, profile_id
         conn.execute(
             """INSERT INTO ew_model_calls(call_id, task_id, project_id, document_id, phase, profile_id,
                context_mode, input_chars, prompt_tokens, completion_tokens, total_tokens, cache_hit_tokens,
-               requested_max_tokens, finish_reason, response_chars, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               requested_max_tokens, finish_reason, response_chars, parse_status, parse_error_kind,
+               local_json_repaired, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (str(uuid.uuid4()), task_id, project_id, document_id, phase, profile_id, context_mode,
              max(0, int(input_chars)), prompt_tokens, completion_tokens, total_tokens,
              number("prompt_cache_hit_tokens", "cache_hit_tokens", "cached_tokens"),
              _safe_positive_int(response_metadata.get("requested_max_tokens")),
              str(response_metadata.get("finish_reason") or "")[:64] or None,
-             _safe_positive_int(response_metadata.get("response_chars")), now_iso()),
+             _safe_positive_int(response_metadata.get("response_chars")),
+             str(response_metadata.get("parse_status") or "")[:32] or None,
+             str(response_metadata.get("parse_error_kind") or "")[:96] or None,
+             1 if response_metadata.get("local_json_repaired") else 0, now_iso()),
         )
 
 
@@ -1750,6 +1761,11 @@ def latest_review_results(app, project_id: str) -> tuple[dict | None, list[dict]
     if isinstance(partial, dict) and isinstance(partial.get("completed_documents"), list):
         value["completed_document_ids"] = [
             item["document_id"] for item in partial["completed_documents"]
+            if isinstance(item, dict) and item.get("document_id")
+        ]
+    if isinstance(partial, dict) and isinstance(partial.get("highlights"), list):
+        value["highlights"] = [
+            item for item in partial["highlights"]
             if isinstance(item, dict) and item.get("document_id")
         ]
     return value, results

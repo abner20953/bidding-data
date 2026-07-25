@@ -1471,6 +1471,77 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(request_json.call_args_list[2].args[0]["thinking_mode"], "disabled")
         self.assertEqual(request_json.call_args_list[3].args[0]["thinking_mode"], "adaptive")
 
+    def test_evaluation_highlights_downgrade_unqualified_critical_and_deduplicate(self):
+        candidates = [{"document_id": "bid-a", "bidder_name": "甲公司", "candidates": []}]
+        allowed = {
+            ("bid-a", "qualified"): {"_critical_eligible": True},
+            ("bid-a", "unqualified"): {"_critical_eligible": False},
+        }
+
+        values = worker._normalise_evaluation_highlights({"summaries": [{
+            "document_id": "bid-a", "headline": "存在应优先复核事项",
+            "highlights": [
+                {"rule_id": "qualified", "level": "critical", "keyword": "**明确否决**", "conclusion": "缺少有效资质", "basis": "证据充分"},
+                {"rule_id": "unqualified", "level": "critical", "keyword": "待核验", "conclusion": "材料存在疑点", "basis": "仍需人工确认"},
+                {"rule_id": "qualified", "level": "high", "keyword": "重复", "conclusion": "不应重复显示", "basis": "-"},
+            ],
+        }]}, candidates, allowed)
+
+        self.assertEqual(len(values), 1)
+        self.assertEqual(len(values[0]["highlights"]), 2)
+        self.assertEqual(values[0]["highlights"][0]["level"], "critical")
+        self.assertEqual(values[0]["highlights"][0]["keyword"], "明确否决")
+        self.assertEqual(values[0]["highlights"][1]["level"], "high")
+
+    def test_latest_review_results_exposes_saved_important_highlights(self):
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "资质材料。")
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "有效资质", "check_rule": "缺失资质将导致投标无效",
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        review_run = storage.create_review_run(self.app, self.project["project_id"], task["task_id"], None)
+        storage.save_review_results(self.app, review_run["review_run_id"], document["document_id"], [{
+            "rule_id": rule["rule_id"], "status": "not_satisfied", "risk_level": "high",
+            "confidence": "high", "evidence_quality": "sufficient", "evidence": "未见有效资质",
+        }])
+        storage.update_task(self.app, task["task_id"], status="success", result={"highlights": [{
+            "document_id": document["document_id"], "bidder_name": "甲公司", "overall_level": "critical",
+            "highlights": [{"rule_id": rule["rule_id"], "level": "critical", "keyword": "明确否决", "conclusion": "未见有效资质", "basis": "证据充分"}],
+        }]})
+
+        review_run, rows = storage.latest_review_results(self.app, self.project["project_id"])
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(review_run["highlights"][0]["bidder_name"], "甲公司")
+        self.assertEqual(review_run["highlights"][0]["highlights"][0]["keyword"], "明确否决")
+
+    def test_highlight_failure_does_not_fail_completed_evaluation(self):
+        self._add_pdf("tender.pdf", "tender", "", "投标人未提供有效资质的，作无效投标处理。")
+        self._add_pdf("bid.pdf", "bid", "甲公司", "未附有效资质材料。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "有效资质", "check_rule": "未提供有效资质的，作无效投标处理。",
+            "source_text": "投标人须提供有效资质。",
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[
+            {"project_identity": "测试项目", "scope_summary": "资质审查", "service_targets": [], "core_tasks": [],
+             "technical_topics": [], "equipment_or_materials": [], "deliverables": [], "standards_or_rules": [], "regions": [], "keywords": ["资质"]},
+            {"results": [{"rule_id": rule["rule_id"], "status": "not_satisfied", "evidence": "未附有效资质材料",
+                          "reason": "未见证明文件", "risk_level": "high", "confidence": "high", "evidence_quality": "sufficient"}]},
+            RuntimeError("important-summary unavailable"),
+        ]):
+            finished = self._run_next_task()
+
+        _, reviews = storage.latest_review_results(self.app, self.project["project_id"])
+        self.assertEqual(finished["status"], "success")
+        self.assertEqual(finished["result"]["highlight_failure_count"], 1)
+        self.assertEqual(len(reviews), 1)
+
     def test_combined_evaluation_runs_two_bidders_with_bounded_parallelism(self):
         self._add_pdf("bid-a.pdf", "bid", "甲公司", "甲公司具备有效资质。")
         self._add_pdf("bid-b.pdf", "bid", "乙公司", "乙公司具备有效资质。")
@@ -1545,6 +1616,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
                 {"results": [{"rule_id": rule["rule_id"], "suggested_score": 3, "matched_count": 1,
                               "evidence_items": [{"name": "项目一", "page_hint": "1", "validity": "valid", "reason": "同类型"}],
                               "calculation": "1项×3分=3分", "reason": "建议得3分", "confidence": "high"}]},
+                {"summaries": []},
             ],
         ) as request_json:
             finished = self._run_next_task()
@@ -1553,7 +1625,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(finished["status"], "success")
         self.assertEqual(finished["result"]["full_scan_document_count"], 1)
         self.assertEqual(finished["result"]["full_scan_batch_count"], 1)
-        self.assertEqual(request_json.call_count, 2)
+        self.assertEqual(request_json.call_count, 3)
         self.assertIn("全文证据扫描", request_json.call_args_list[0].args[2])
         self.assertEqual(results[0]["suggested_score"], 3.0)
         self.assertIn("AI共识别1项", results[0]["evidence"])

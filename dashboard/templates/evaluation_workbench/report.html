@@ -5,7 +5,7 @@
     <title>{{ project.display_name or project.name }} - 评标辅助汇总报告</title>
     <style>
         body { font-family: "Microsoft YaHei", sans-serif; color: #1f2937; max-width: 1100px; margin: 32px auto; line-height: 1.55; }
-        h1 { margin-bottom: 4px; } .muted { color: #6b7280; } table { width: 100%; border-collapse: collapse; margin: 14px 0 28px; font-size: 13px; } th, td { border: 1px solid #cbd5e1; padding: 7px; text-align: left; vertical-align: top; } th { background: #f1f5f9; } .notice { padding: 10px 12px; background: #fff7ed; border-left: 4px solid #f97316; } @media print { body { margin: 12mm; max-width: none; } .no-print { display: none; } }
+        h1 { margin-bottom: 4px; } .muted { color: #6b7280; } table { width: 100%; border-collapse: collapse; margin: 14px 0 28px; font-size: 13px; } th, td { border: 1px solid #cbd5e1; padding: 7px; text-align: left; vertical-align: top; } th { background: #f1f5f9; } .notice { padding: 10px 12px; background: #fff7ed; border-left: 4px solid #f97316; } .highlight-group { margin: 10px 0 18px; padding: 10px 12px; border-left: 4px solid #b91c1c; background: #fef2f2; } .highlight-group ul { margin: 6px 0 0; } .highlight-group strong { color: #111827; } @media print { body { margin: 12mm; max-width: none; } .no-print { display: none; } }
     </style>
 </head>
 <body>
@@ -28,6 +28,10 @@
     <p class="muted">{% if rule_set %}版本 {{ rule_set.version }} · {{ rule_set_status_label }} · 已启用 {{ rules | selectattr('enabled') | list | length }}/{{ rules | length }} 条{% else %}尚未建立规则集{% endif %}</p>
     <table><tr><th>分类</th><th>规则名称</th><th>招标原文依据</th></tr>{% for item in rules %}<tr><td>{{ item.category_label }}</td><td>{{ item.title }}{% if item.check_mode == 'ocr' %}<br><span class="muted">需 OCR 识别</span>{% endif %}</td><td>{{ item.source_text_brief or '-' }}</td></tr>{% endfor %}</table>
     <h2>综合评审结果</h2>
+    {% if review_run and review_run.highlights %}
+    <h3>重要结论提炼</h3>
+    {% for summary in review_run.highlights %}{% if summary.highlights %}<section class="highlight-group"><strong>{{ summary.bidder_name }}</strong>{% if summary.headline %}<div>{{ summary.headline }}</div>{% endif %}<ul>{% for item in summary.highlights %}<li><strong>{{ item.keyword }}</strong>：{{ item.conclusion }}{% if item.basis %}<br><span class="muted">{{ item.basis }}</span>{% endif %}</li>{% endfor %}</ul></section>{% endif %}{% endfor %}
+    {% endif %}
     <table><tr><th>投标人</th><th>审查项</th><th>AI 建议</th><th>风险</th><th>证据与理由</th></tr>{% for item in reviews %}<tr><td>{{ item.bidder_name or item.original_name }}</td><td>{{ item.title_brief }}</td><td>{{ item.status_label }}<br><span class="muted">置信度：{{ item.confidence_label }}；证据：{{ item.evidence_quality_label }}</span></td><td>{{ item.risk_label }}</td><td>{{ item.evidence_brief or '-' }}{% if item.reason_brief %}<br><span class="muted">{{ item.reason_brief }}</span>{% endif %}</td></tr>{% endfor %}</table>
     <h2>客观分</h2>
     <table><tr><th>投标人</th><th>评分项</th><th>AI 建议得分</th><th>满分</th><th>置信度</th><th>证据与理由</th></tr>{% for item in objective_scores %}<tr><td>{{ item.bidder_name or item.original_name }}</td><td>{{ item.title_brief }}</td><td>{{ item.suggested_score_label }}</td><td>{{ item.max_score or '-' }}</td><td>{{ item.confidence_label }}</td><td>{{ item.evidence_brief or '-' }}{% if item.reason_brief %}<br><span class="muted">{{ item.reason_brief }}</span>{% endif %}</td></tr>{% endfor %}</table>

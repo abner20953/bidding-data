@@ -9,6 +9,11 @@ import threading
 
 import requests
 
+try:
+    from json_repair import repair_json
+except ImportError:  # 部署升级中的短暂兼容；正式镜像由 requirements.txt 安装依赖。
+    repair_json = None
+
 
 _REQUEST_SESSIONS = threading.local()
 
@@ -40,7 +45,8 @@ class ModelResponseEnvelopeError(ValueError):
         super().__init__(message)
 
 
-def _load_json_candidate(value: str) -> object:
+def _load_json_candidate(value: str, *, allow_structural_repair: bool = True,
+                         diagnostics: dict | None = None) -> object:
     """解析模型常见的轻微 JSON 瑕疵，不猜测缺失的业务内容。"""
     attempts = [value]
     # 部分模型会输出未转义的换行/制表符，strict=False 可安全接受这类控制字符。
@@ -62,9 +68,24 @@ def _load_json_candidate(value: str) -> object:
     if repaired != value:
         attempts.append(repaired)
         try:
-            return json.loads(repaired, strict=False)
+            parsed = json.loads(repaired, strict=False)
+            if diagnostics is not None:
+                diagnostics["local_json_repaired"] = True
+            return parsed
         except json.JSONDecodeError:
             pass
+    # MiniMax 等兼容模型常在自然语言证据中的引号、逗号或闭合括号上出错。先做本地
+    # 语法修复，随后仍由各业务阶段按 rule_id、枚举值和分数边界严格校验；长度截断
+    # 响应绝不在这里补尾，仍交给原有的回收/拆分流程。
+    if allow_structural_repair and repair_json is not None:
+        try:
+            parsed = repair_json(value, return_objects=True, skip_json_loads=True)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            if diagnostics is not None:
+                diagnostics["local_json_repaired"] = True
+            return parsed
     # 保留最早的严格 JSON 异常，调用方只记录安全诊断，不持久化正文。
     return json.loads(attempts[0])
 
@@ -159,7 +180,15 @@ def _recover_complete_json_array(content: object, expected_field: str) -> dict |
     return {expected_field: recovered} if recovered else None
 
 
-def _decode_json_content(content) -> dict:
+def _json_error_kind(error: Exception) -> str:
+    if isinstance(error, json.JSONDecodeError):
+        value = re.sub(r"[^a-z0-9]+", "_", error.msg.lower()).strip("_")
+        return f"json_{value[:56] or 'syntax'}"
+    return "json_invalid"
+
+
+def _decode_json_content(content, *, allow_structural_repair: bool = True,
+                         diagnostics: dict | None = None) -> dict:
     if isinstance(content, dict):
         return content
     if isinstance(content, list):
@@ -171,24 +200,37 @@ def _decode_json_content(content) -> dict:
     if not isinstance(content, str):
         raise ValueError("模型响应正文为空")
     value = _normalise_json_response_text(content)
+    # 若正文前带有自然语言说明，不能让宽松修复器把说明误当 JSON 字段；先从完整
+    # 对象候选中修复。真正以 JSON 开头的响应才允许直接做结构化本地修复。
+    can_repair_whole_value = value.lstrip().startswith(("{", "[", '"'))
     try:
-        parsed = _load_json_candidate(value)
+        parsed = _load_json_candidate(
+            value,
+            allow_structural_repair=allow_structural_repair and can_repair_whole_value,
+            diagnostics=diagnostics,
+        )
     except json.JSONDecodeError as original_error:
         # 少量兼容接口仍可能在 JSON 前后附带简短说明；只尝试结构完整的对象，
         # 不以“第一个 { 到最后一个 }”的贪婪方式吞入说明文字。
         for candidate in _balanced_object_candidates(value):
             try:
-                parsed = _load_json_candidate(candidate)
+                parsed = _load_json_candidate(candidate, allow_structural_repair=allow_structural_repair, diagnostics=diagnostics)
                 break
             except json.JSONDecodeError:
                 continue
         else:
+            if diagnostics is not None:
+                diagnostics.update({"parse_status": "invalid_json", "parse_error_kind": _json_error_kind(original_error)})
             raise original_error
     # 某些兼容接口会把 JSON 对象再次序列化成字符串。
     if isinstance(parsed, str):
-        parsed = _load_json_candidate(parsed)
+        parsed = _load_json_candidate(parsed, allow_structural_repair=allow_structural_repair, diagnostics=diagnostics)
     if not isinstance(parsed, dict):
+        if diagnostics is not None:
+            diagnostics.update({"parse_status": "invalid_json", "parse_error_kind": "json_top_level_not_object"})
         raise ValueError("模型返回的 JSON 顶层必须是对象")
+    if diagnostics is not None:
+        diagnostics.setdefault("parse_status", "local_repaired" if diagnostics.get("local_json_repaired") else "strict_json")
     return parsed
 
 
@@ -228,9 +270,13 @@ def _thinking_payload(profile: dict) -> dict | None:
     return None
 
 
+def _is_minimax_profile(profile: dict) -> bool:
+    return "api.minimaxi.com" in str(profile.get("base_url") or "").lower()
+
+
 def _is_minimax_m3(profile: dict) -> bool:
     return (
-        "api.minimaxi.com" in str(profile.get("base_url") or "").lower()
+        _is_minimax_profile(profile)
         and str(profile.get("model_name") or "").lower() == "minimax-m3"
     )
 
@@ -375,7 +421,10 @@ def request_json(profile: dict, system_prompt: str, user_prompt: str, *, usage_c
         ],
         "temperature": 0.1,
     }
-    if profile.get("json_mode"):
+    # MiniMax 公开文档没有将 json_object 列为 M2/M3 的受支持结构化输出方式。
+    # 继续发送该参数会制造“已开启 JSON 模式”的错觉，实际仍只能依赖提示词；
+    # 后续工具调用协议会单独接管 MiniMax 的严格结构化输出。
+    if profile.get("json_mode") and not _is_minimax_profile(profile):
         payload["response_format"] = {"type": "json_object"}
     thinking = _thinking_payload(profile)
     if thinking:
@@ -408,11 +457,25 @@ def request_json(profile: dict, system_prompt: str, user_prompt: str, *, usage_c
         usage_callback(usage)
     # 无论 choices 是否缺失，都记录长度、结束原因和请求上限；绝不保存正文。
     _record_response_metadata(response_metadata_callback, body, requested_output_tokens)
-    choice, content = _response_choice(body, requested_output_tokens=requested_output_tokens)
     try:
-        result = _decode_json_content(content)
+        choice, content = _response_choice(body, requested_output_tokens=requested_output_tokens)
+    except ModelResponseEnvelopeError as exc:
+        if response_metadata_callback:
+            response_metadata_callback({"parse_status": "envelope_error", "parse_error_kind": "missing_choice_content"})
+        raise exc
+    diagnostics: dict = {}
+    try:
+        result = _decode_json_content(
+            content,
+            allow_structural_repair=str(choice.get("finish_reason") or "").lower() not in {"length", "max_tokens"},
+            diagnostics=diagnostics,
+        )
     except (json.JSONDecodeError, ValueError, TypeError) as exc:
+        if response_metadata_callback:
+            response_metadata_callback(diagnostics or {"parse_status": "invalid_json", "parse_error_kind": _json_error_kind(exc)})
         raise InvalidJsonResponse(content, choice.get("finish_reason")) from exc
+    if response_metadata_callback:
+        response_metadata_callback(diagnostics)
     return result
 
 
@@ -430,7 +493,7 @@ def test_connection(profile: dict, prompt_text: str) -> str:
         payload["max_completion_tokens"] = 1024
     else:
         payload["max_tokens"] = 16
-    if profile.get("json_mode"):
+    if profile.get("json_mode") and not _is_minimax_profile(profile):
         payload["response_format"] = {"type": "json_object"}
     thinking = _thinking_payload(profile)
     if thinking:
@@ -449,8 +512,11 @@ def test_connection(profile: dict, prompt_text: str) -> str:
     if not response.ok:
         _raise_http_error(response, operation="模型测试失败")
     try:
-        if not response.json().get("choices"):
-            raise ValueError
-    except (ValueError, requests.JSONDecodeError) as exc:
-        raise ValueError("模型测试未返回有效 choices 数据") from exc
-    return "连接成功：模型接口已响应"
+        body = response.json()
+        choice, content = _response_choice(body, requested_output_tokens=None)
+        value = _decode_json_content(content, allow_structural_repair=False)
+        if not isinstance(value.get("message"), str) or not value["message"].strip():
+            raise ValueError("缺少 message 字段")
+    except (ValueError, requests.JSONDecodeError, TypeError) as exc:
+        raise ValueError("模型测试未返回有效的结构化 JSON 数据") from exc
+    return "连接成功：模型接口已响应，结构化 JSON 测试通过"

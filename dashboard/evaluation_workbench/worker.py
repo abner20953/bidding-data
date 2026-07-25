@@ -42,7 +42,7 @@ COMPARE_AI_BATCH_SIZE = 8
 
 
 class _EvaluationRequestGate:
-    """规则提取/综合评审的模型请求闸门；稳定时升至三路，限流时逐级回退。"""
+    """规则提取/综合评审的模型请求闸门；稳定时按档案上限升档，限流时逐级回退。"""
 
     def __init__(self, limit: int = 2, max_limit: int | None = None):
         self.limit = max(1, int(limit))
@@ -91,6 +91,17 @@ def _is_rate_limit_error(error: Exception) -> bool:
         "http 429", "http 529", "http 502", "http 503", "http 504",
         "rate limit", "too many requests", "overloaded", "temporarily unavailable", "timeout", "timed out",
     )) or "限流" in str(error) or "接口繁忙" in str(error)
+
+
+def _is_minimax_profile(profile: dict) -> bool:
+    """MiniMax 的令牌计划按并发突发计量，统一保守地最多两路请求。"""
+    return "api.minimaxi.com" in str(profile.get("base_url") or "").lower()
+
+
+def _profile_parallel_limit(profile: dict, available: int) -> int:
+    """只限制同一任务的远端请求数，不额外常驻线程或模型。"""
+    ceiling = 2 if _is_minimax_profile(profile) else 3
+    return max(1, min(ceiling, max(1, int(available))))
 
 
 def _prompt_char_limit(profile: dict, default: int, ceiling: int) -> int:
@@ -986,7 +997,7 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
         if isinstance(recovered_rules, list) and recovered_rules:
             storage.update_task(
                 app, task["task_id"],
-                message=f"{batch_label} 格式异常，已在本地回收 {len(recovered_rules)} 条完整规则，正在补充遗漏项",
+                message=f"{batch_label} 正在规范化模型返回，已在本地回收 {len(recovered_rules)} 条完整规则，正在补充遗漏项",
             )
             try:
                 continued = _request_task_json(
@@ -1033,7 +1044,7 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
                     compact_retries += compact_count
                     split_retries += split_count
                 return rules, compact_retries, split_retries + 1
-        storage.update_task(app, task["task_id"], message=f"{batch_label} 格式异常，正在以紧凑 JSON 重试")
+        storage.update_task(app, task["task_id"], message=f"{batch_label} 正在按更紧凑结构继续处理")
         retry_prompt = _rule_extraction_prompt(
             app, text, compact=True, score_packets=packets, review_anchor_catalog=review_anchor_catalog,
             max_rules=max(8, max_rules),
@@ -1068,7 +1079,7 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
                     compact_retries += compact_count
                     split_retries += split_count
                 return rules, compact_retries, split_retries + 1
-        storage.update_task(app, task["task_id"], message=f"{batch_label} 格式异常，正在以紧凑 JSON 重试")
+        storage.update_task(app, task["task_id"], message=f"{batch_label} 正在按更紧凑结构继续处理")
         retry_prompt = _rule_extraction_prompt(
             app, text, compact=True, score_packets=packets, review_anchor_catalog=review_anchor_catalog,
             max_rules=max(8, max_rules),
@@ -1091,9 +1102,9 @@ def _extract_rule_batches(app, task: dict, profile: dict, system_prompt: str, ba
         return [], 0, 0
     total = len(batches)
     results: list[tuple[list[dict], int, int] | None] = [None] * total
-    # 初始闸门仍是两路；第三个工作位只在任务已启用动态闸门时才会创建并获得请求许可。
+    # 初始闸门仍是两路；工作位数量始终不超过当前模型档案允许的远端并发数。
     gate = task.get("_evaluation_request_gate")
-    workers = min(3 if gate and gate.max_limit >= 3 else 2, total)
+    workers = min(gate.max_limit if gate else 2, total)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_index = {
             executor.submit(
@@ -1111,7 +1122,7 @@ def _extract_rule_batches(app, task: dict, profile: dict, system_prompt: str, ba
             progress = 15 + int(completed * 45 / total)
             storage.update_task(
                 app, task["task_id"], progress=progress,
-                message=f"正在分段提取评审规则（已完成 {completed}/{total} 批，动态至多三路并发）",
+                message=f"正在分段提取评审规则（已完成 {completed}/{total} 批，按模型档案动态并发）",
             )
     raw_rules: list[dict] = []
     compact_retries = split_retries = 0
@@ -1294,9 +1305,10 @@ def _compile_rule_group(app, task: dict, profile: dict, system_prompt: str,
         # 保持串行，最终仍由全局合并统一消重和保留评分覆盖，避免嵌套并发打满接口。
         parallel_groups = depth == 0 and task.get("_evaluation_request_gate") is not None
         if parallel_groups:
-            storage.update_task(app, task["task_id"], message=f"正在分组编译评审规则（{len(groups)} 组，动态至多三路并发）")
+            storage.update_task(app, task["task_id"], message=f"正在分组编译评审规则（{len(groups)} 组，按模型档案动态并发）")
             group_results: list[tuple[list[dict], list[dict], bool] | None] = [None] * len(groups)
-            with ThreadPoolExecutor(max_workers=min(3, len(groups))) as executor:
+            gate = task.get("_evaluation_request_gate")
+            with ThreadPoolExecutor(max_workers=min(gate.max_limit if gate else 2, len(groups))) as executor:
                 future_to_index = {
                     executor.submit(
                         _compile_rule_group, app, task, profile, system_prompt, group, char_limit, depth=depth + 1,
@@ -1743,10 +1755,13 @@ def _extract_rules(app, task: dict) -> dict:
         raise ValueError("招标文件未提取到可供规则识别的正文")
     storage.update_task(app, task["task_id"], progress=15, message=f"正在分段提取评审规则（共 {len(batches)} 批）")
     system_prompt = f"{_system_prompt(app, 'extract_rules')}\n\n【当前项目分包范围】\n{package_scope_instruction}"
-    # 规则映射和顶层规则组编译共用同一限流闸门：默认两路，连续成功后可升至三路，
+    # 规则映射和顶层规则组编译共用同一限流闸门：默认两路，连续成功后按模型档案升档，
     # 接口繁忙时自动回落。只限制远端请求，不额外增加本地解析并行度。
     # 这只限制远端请求，并不创建常驻线程或后台进程。
-    task["_evaluation_request_gate"] = _EvaluationRequestGate(limit=2, max_limit=min(3, len(batches)))
+    task["_evaluation_request_gate"] = _EvaluationRequestGate(
+        limit=min(2, _profile_parallel_limit(profile, len(batches))),
+        max_limit=_profile_parallel_limit(profile, len(batches)),
+    )
     raw_rules, compact_retry_count, split_retry_count = _extract_rule_batches(
         app, task, profile, system_prompt, batches, document_id=tender["document_id"],
         review_anchor_catalog=review_anchor_catalog,
@@ -2620,7 +2635,7 @@ def _run_full_scan_piece(app, task: dict, profile: dict, document: dict, catalog
     except InvalidJsonResponse as exc:
         format_error = exc
         if exc.finish_reason.lower() not in {"length", "max_tokens"}:
-            storage.update_task(app, task["task_id"], message=f"{document['bidder_name'] or document['original_name']} {_full_scan_chunk_label(chunk)} 扫描 JSON 异常，正在仅修复响应")
+            storage.update_task(app, task["task_id"], message=f"{document['bidder_name'] or document['original_name']} {_full_scan_chunk_label(chunk)} 扫描结果正在规范化")
             try:
                 repaired = _repair_invalid_json(
                     app, task, profile, "evaluate_all_full_scan_json_repair", exc, "matches",
@@ -2647,7 +2662,7 @@ def _run_full_scan_piece(app, task: dict, profile: dict, document: dict, catalog
             "scope_anomalies": left[0]["scope_anomalies"] + right[0]["scope_anomalies"],
         }, left[1] + right[1], left[2] + right[2] + 1, left[3] + right[3]
 
-    storage.update_task(app, task["task_id"], message=f"{document['bidder_name'] or document['original_name']} {_full_scan_chunk_label(chunk)} 全文扫描格式异常，正在严格重试")
+    storage.update_task(app, task["task_id"], message=f"{document['bidder_name'] or document['original_name']} {_full_scan_chunk_label(chunk)} 全文扫描正在按紧凑结构继续")
     try:
         parsed = _request_task_json(
             app, task, profile, "evaluate_all_full_scan_compact_retry", system_prompt,
@@ -3150,7 +3165,7 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
     except InvalidJsonResponse as exc:
         format_error = exc
         if exc.finish_reason.lower() not in {"length", "max_tokens"}:
-            storage.update_task(app, task["task_id"], message=f"{label} 返回 JSON 语法异常，正在仅修复响应")
+            storage.update_task(app, task["task_id"], message=f"{label} 模型结果正在规范化")
             try:
                 repaired = _repair_invalid_json(
                     app, task, profile, f"evaluate_all_{component}_json_repair", exc, "results",
@@ -3197,7 +3212,7 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
 
     if format_error is not None:
         # 非截断且无法做响应级修复时，保留一次禁用思考的紧凑重试作为兼容兜底。
-        storage.update_task(app, task["task_id"], message=f"{label} 返回格式异常，正在严格 JSON 重试")
+        storage.update_task(app, task["task_id"], message=f"{label} 模型结果正在按紧凑结构继续")
         try:
             parsed = _request_task_json(
                 app, task, profile, f"evaluate_all_{component}_compact_retry", system_prompt,
@@ -3298,7 +3313,7 @@ def _run_cross_bid_price_scoring(app, task: dict, profile: dict, documents: list
             return request(phase)
         except InvalidJsonResponse as exc:
             retry_count += 1
-            storage.update_task(app, task["task_id"], message="跨投标人价格评分返回格式异常，正在仅修复响应")
+            storage.update_task(app, task["task_id"], message="跨投标人价格评分结果正在规范化")
             try:
                 return _repair_invalid_json(
                     app, task, profile, f"{phase}_json_repair", exc, "results",
@@ -3445,6 +3460,159 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
     return values
 
 
+def _evaluation_highlight_candidates(app, project_id: str) -> tuple[list[dict], dict[tuple[str, str], dict]]:
+    """只向收尾提炼发送已有的重要候选，不重发全文或普通满足项。"""
+    _, review_results = storage.latest_review_results(app, project_id)
+    _, objective_results = storage.latest_score_results(app, project_id, "objective")
+    _, subjective_results = storage.latest_score_results(app, project_id, "subjective")
+    grouped: dict[str, dict] = {}
+    allowed: dict[tuple[str, str], dict] = {}
+    review_rank = {"not_satisfied": 4, "partial": 3, "not_found": 2}
+    category_rank = {"rejection": 4, "substantive": 4, "qualification": 3, "compliance": 3, "other": 1}
+    risk_rank = {"high": 3, "medium": 2, "low": 1}
+    for item in review_results:
+        if item.get("status") not in review_rank or item.get("risk_level") not in {"high", "medium"}:
+            continue
+        document_id = str(item.get("document_id") or "")
+        rule_id = str(item.get("rule_id") or "")
+        if not document_id or not rule_id:
+            continue
+        candidate = {
+            "type": "review", "rule_id": rule_id, "category": item.get("category"),
+            "title": item.get("title"), "check_rule": item.get("check_rule"),
+            "status": item.get("status"), "risk_level": item.get("risk_level"),
+            "confidence": item.get("confidence"), "evidence_quality": item.get("evidence_quality"),
+            "evidence": str(item.get("evidence") or "")[:360],
+            "reason": str(item.get("reason") or "")[:260],
+        }
+        candidate["_rank"] = (
+            review_rank.get(str(item.get("status")), 0),
+            category_rank.get(str(item.get("category")), 0),
+            risk_rank.get(str(item.get("risk_level")), 0),
+        )
+        candidate["_critical_eligible"] = (
+            item.get("status") == "not_satisfied"
+            and item.get("risk_level") == "high"
+            and item.get("confidence") == "high"
+            and item.get("evidence_quality") == "sufficient"
+            and item.get("category") in {"qualification", "compliance", "substantive", "rejection"}
+            and bool(re.search(r"投标无效|否决|不通过|废标|无效投标", str(item.get("check_rule") or "")))
+        )
+        group = grouped.setdefault(document_id, {
+            "document_id": document_id,
+            "bidder_name": item.get("bidder_name") or item.get("original_name") or "未命名投标人",
+            "candidates": [],
+        })
+        group["candidates"].append(candidate)
+        allowed[(document_id, rule_id)] = candidate
+    for item in [*objective_results, *subjective_results]:
+        try:
+            suggested_score = float(item.get("suggested_score"))
+            max_score = float(item.get("max_score"))
+        except (TypeError, ValueError):
+            continue
+        if max_score <= 0 or suggested_score / max_score > 0.5:
+            continue
+        document_id = str(item.get("document_id") or "")
+        rule_id = str(item.get("rule_id") or "")
+        if not document_id or not rule_id:
+            continue
+        candidate = {
+            "type": "score", "rule_id": rule_id, "title": item.get("title"),
+            "check_rule": item.get("check_rule"), "suggested_score": suggested_score,
+            "max_score": max_score, "confidence": item.get("confidence"),
+            "evidence": str(item.get("evidence") or "")[:300],
+            "reason": str(item.get("reason") or "")[:220],
+            "_rank": (1, 0, 0), "_critical_eligible": False,
+        }
+        group = grouped.setdefault(document_id, {
+            "document_id": document_id,
+            "bidder_name": item.get("bidder_name") or item.get("original_name") or "未命名投标人",
+            "candidates": [],
+        })
+        group["candidates"].append(candidate)
+        allowed[(document_id, rule_id)] = candidate
+    values = []
+    for group in grouped.values():
+        ordered = sorted(group["candidates"], key=lambda item: item["_rank"], reverse=True)[:12]
+        values.append({
+            "document_id": group["document_id"], "bidder_name": group["bidder_name"],
+            "candidates": [
+                {key: value for key, value in item.items() if not key.startswith("_")}
+                for item in ordered
+            ],
+        })
+    return values, allowed
+
+
+def _normalise_evaluation_highlights(parsed: dict, candidates: list[dict],
+                                     allowed: dict[tuple[str, str], dict]) -> list[dict]:
+    bidder_names = {item["document_id"]: item["bidder_name"] for item in candidates}
+    severity_rank = {"critical": 3, "high": 2, "attention": 1}
+    values = []
+    seen_documents: set[str] = set()
+    raw_summaries = parsed.get("summaries") if isinstance(parsed, dict) else None
+    for summary in raw_summaries if isinstance(raw_summaries, list) else []:
+        if not isinstance(summary, dict):
+            continue
+        document_id = str(summary.get("document_id") or "")
+        if document_id not in bidder_names or document_id in seen_documents:
+            continue
+        seen_documents.add(document_id)
+        highlights = []
+        seen_rule_ids: set[str] = set()
+        raw_highlights = summary.get("highlights")
+        for item in raw_highlights if isinstance(raw_highlights, list) else []:
+            if not isinstance(item, dict) or len(highlights) >= 5:
+                continue
+            rule_id = str(item.get("rule_id") or "")
+            candidate = allowed.get((document_id, rule_id))
+            if not candidate or rule_id in seen_rule_ids:
+                continue
+            seen_rule_ids.add(rule_id)
+            level = str(item.get("level") or "attention")
+            if level not in severity_rank:
+                level = "attention"
+            if level == "critical" and not candidate.get("_critical_eligible"):
+                level = "high"
+            keyword = re.sub(r"[*_`#]+", "", str(item.get("keyword") or "")).strip()[:16]
+            conclusion = re.sub(r"\s+", " ", str(item.get("conclusion") or "")).strip()[:80]
+            basis = re.sub(r"\s+", " ", str(item.get("basis") or "")).strip()[:140]
+            if not keyword or not conclusion:
+                continue
+            highlights.append({
+                "rule_id": rule_id, "level": level, "keyword": keyword,
+                "conclusion": conclusion, "basis": basis,
+            })
+        highlights.sort(key=lambda item: severity_rank[item["level"]], reverse=True)
+        overall_level = highlights[0]["level"] if highlights else "none"
+        headline = re.sub(r"\s+", " ", str(summary.get("headline") or "")).strip()[:100]
+        values.append({
+            "document_id": document_id, "bidder_name": bidder_names[document_id],
+            "overall_level": overall_level, "headline": headline,
+            "highlights": highlights,
+        })
+    return values
+
+
+def _summarise_evaluation_highlights(app, task: dict, profile: dict) -> list[dict]:
+    candidates, allowed = _evaluation_highlight_candidates(app, task["project_id"])
+    if not candidates:
+        return []
+    storage.update_task(app, task["task_id"], message="正在提炼极其重要的评审结论")
+    prompt = storage.render_prompt_template(
+        app, "evaluate_all_highlights_user",
+        candidates=json.dumps(candidates, ensure_ascii=False, separators=(",", ":")),
+    )
+    parsed = _request_task_json(
+        app, task, profile, "evaluate_all_highlights", _system_prompt(app, "evaluate_all_highlights"),
+        prompt, context_mode="result_highlights_only",
+        max_tokens=_output_token_budget(profile, min(4_000, 1_400 + len(candidates) * 500)),
+        thinking_mode="disabled",
+    )
+    return _normalise_evaluation_highlights(parsed, candidates, allowed)
+
+
 def _evaluate_all(app, task: dict) -> dict:
     """综合评审按规则小组运行并立即落库，避免单次混合 JSON 过大。"""
     rule_set, all_rules = storage.list_rules(app, task["project_id"])
@@ -3495,11 +3663,12 @@ def _evaluate_all(app, task: dict) -> dict:
     }
     cross_bid_units = 1 if objective_run and len(documents) >= 2 and cross_bid_price_rules else 0
     total_work_units = max(1, sum(scan_units_by_document.values()) + len(documents) * groups_per_document + cross_bid_units)
-    # 首次仍以两路保守启动；连续成功后才让第三家投标文件进入第三条模型通道。
+    # 首次仍以两路保守启动；连续成功后再按模型档案增加并行位。
     # 对 2 核 2GB 服务器而言这主要增加网络等待并行，不常驻加载额外模型。
+    parallel_limit = _profile_parallel_limit(profile, len(documents))
     task["_evaluation_request_gate"] = _EvaluationRequestGate(
-        2 if len(documents) > 1 else 1,
-        max_limit=min(3, len(documents)),
+        min(2 if len(documents) > 1 else 1, parallel_limit),
+        max_limit=parallel_limit,
     )
     progress = _EvaluationProgress(app, task, total_work_units, len(documents))
 
@@ -3514,12 +3683,12 @@ def _evaluate_all(app, task: dict) -> dict:
         )
 
     # 只有投标人之间的文件审查并行；单份文件仍保持页块、规则组的先后顺序。
-    # 模型请求默认两路、稳定后动态至多三路，触发服务商限流后会自动逐级降路重试。
+    # 模型请求默认两路、稳定后按档案动态升档，触发服务商限流后会自动逐级降路重试。
     document_results: list[dict] = []
     if len(documents) == 1:
         document_results.append(run_document(documents[0]))
     else:
-        with ThreadPoolExecutor(max_workers=min(3, len(documents)), thread_name_prefix="evaluation-bid") as executor:
+        with ThreadPoolExecutor(max_workers=parallel_limit, thread_name_prefix="evaluation-bid") as executor:
             futures = [executor.submit(run_document, document) for document in documents]
             for future in as_completed(futures):
                 document_results.append(future.result())
@@ -3539,6 +3708,14 @@ def _evaluate_all(app, task: dict) -> dict:
             app, task, profile, documents, cross_bid_price_rules, objective_run["score_run_id"],
         )
         progress.advance("已完成全部投标人的报价比较与价格评分")
+    highlight_failure_count = 0
+    try:
+        highlights = _summarise_evaluation_highlights(app, task, profile)
+    except Exception as exc:
+        # 重要结论只是既有结果的展示层，不得因为该附加调用异常而丢失已落库的评审和评分结果。
+        highlights = []
+        highlight_failure_count = 1
+        storage.update_task(app, task["task_id"], message=f"重要结论提炼未完成，原始评审结果已完整保留：{exc}")
     recovery = storage.task_recovery_summary(app, task["task_id"])
     return {"review_run_id": review_run["review_run_id"] if review_run else None, "objective_run_id": objective_run["score_run_id"] if objective_run else None,
             "subjective_run_id": subjective_run["score_run_id"] if subjective_run else None, "document_count": len(documents),
@@ -3555,6 +3732,7 @@ def _evaluate_all(app, task: dict) -> dict:
             "batch_count": batch_count, "full_scan_document_count": full_scan_document_count,
             "full_scan_batch_count": full_scan_batch_count, "full_scan_failed_chunk_count": full_scan_failed_chunk_count,
             "cross_bid_price": cross_bid_price,
+            "highlights": highlights, "highlight_failure_count": highlight_failure_count,
             "prompt_version": PROMPT_VERSION}
 
 
