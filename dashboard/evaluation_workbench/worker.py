@@ -478,7 +478,10 @@ _SCORE_CLAUSE_PATTERN = re.compile(
     r"|[（(]\s*\d+(?:\.\d+)?\s*分\s*[）)]"
 )
 _SCORE_COVERAGE_IGNORED_TERMS = {"项目", "评分", "标准", "要求", "供应", "服务", "能力", "部分", "内容", "提供", "文件", "采购", "投标", "技术", "商务"}
-_QUALIFICATION_CLAUSE_ID_PATTERN = re.compile(r"(?m)^\s*(1\.[1-9])(?:\s|$)")
+_QUALIFICATION_SOURCE_PATTERN = re.compile(
+    r"(?:投标人|供应商|申请人|响应人|竞标人)(?:的)?(?:资格(?:条件|要求)|应具备的资格条件)|"
+    r"资格(?:性)?审查(?:标准|要求|办法|表)|资格评审(?:标准|要求|办法|表)"
+)
 _PACKAGE_MARKER_PATTERN = re.compile(r"(?:采购\s*包|标\s*包|包)\s*([0-9０-９一二三四五六七八九十]+)|第\s*([0-9０-９一二三四五六七八九十]+)\s*包")
 _PACKAGE_HEADING_PATTERN = re.compile(r"^\s*(?:采购\s*包|标\s*包|第\s*)\s*([0-9０-９一二三四五六七八九十]+)\s*(?:包)?\s*[：:]")
 _CHINESE_PACKAGE_NUMBERS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
@@ -651,38 +654,50 @@ def _score_packet_is_covered(packet: object, score_rules: list[dict]) -> bool:
 
 
 def _qualification_clause_packets(text: str, limit: int = 24) -> list[dict]:
-    """从正式资格证明材料表中构造逐项核验包，补上评分覆盖之外的资格覆盖口径。
+    """从正式资格章节/评审表构造小型覆盖包，补上主提取遗漏的资格口径。
 
-    仅依据表格的通用结构（1.x 编号与“证明材料”），不依赖业绩、社保或财务等业务词。
-    PDF 将表格跨页拆开时，同一连续区域会一并保留，避免遗漏后一页的具体条件。
+    定位只依赖资格章节的通用标题，不假设条款必须使用 ``1.x`` 编号，也不使用
+    业绩、社保、财务或证书等业务关键词。每个命中页最多携带后两页作为跨页上下文；
+    相邻的非资格段落由补充提示词排除。
     """
     pages = [value.strip() for value in _PARSED_PAGE_MARKER.split(text) if value.strip()]
-    selected: list[str] = []
-    for page in pages:
-        clause_ids = _QUALIFICATION_CLAUSE_ID_PATTERN.findall(page)
-        if "证明材料" in page and len(set(clause_ids)) >= 2:
-            selected.append(page)
-    if not selected:
+    anchor_indexes = [
+        index for index, page in enumerate(pages)
+        if _QUALIFICATION_SOURCE_PATTERN.search(re.sub(r"\s+", "", page))
+    ]
+    if not anchor_indexes:
         return []
-    source = "\n\n".join(selected)
-    matches = list(_QUALIFICATION_CLAUSE_ID_PATTERN.finditer(source))
+
+    # 先保留所有正式锚点页，再按距离补充跨页上下文。这样即使文件多次出现资格章节，
+    # limit 也不会先被第一页后面的普通内容耗尽，导致后部资格评审表永远进不了提示词。
+    prioritised_indexes: list[int] = []
+    seen_indexes: set[int] = set()
+    for offset in range(3):
+        for anchor_index in anchor_indexes:
+            page_index = anchor_index + offset
+            if page_index >= len(pages) or page_index in seen_indexes:
+                continue
+            prioritised_indexes.append(page_index)
+            seen_indexes.add(page_index)
+    selected_indexes = sorted(prioritised_indexes[:limit])
+
     packets: list[dict] = []
-    for index, match in enumerate(matches):
-        clause_id = match.group(1)
-        start = max(0, match.start() - 180)
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(source)
-        value = source[start:end].strip()
-        if not value:
-            continue
-        # 使用完整条件而非条款号生成稳定 ID，避免不同文件同为 1.1 时误作同一条款。
-        digest = re.sub(r"\s+", "", value)
-        packets.append({
-            "clause_id": f"QF-{hashlib.sha1(digest.encode('utf-8')).hexdigest()[:10]}",
-            "label": clause_id,
-            "text": value[:2_400],
-        })
-        if len(packets) >= limit:
-            break
+    for page_index in sorted(selected_indexes):
+        page = pages[page_index]
+        marker_match = re.match(r"\[第(\d+)页\]\s*", page)
+        page_number = marker_match.group(1) if marker_match else str(page_index + 1)
+        pieces = _split_rule_extraction_text(page, 2_400)
+        for piece_index, value in enumerate(pieces, start=1):
+            if not value:
+                continue
+            digest = re.sub(r"\s+", "", value)
+            packets.append({
+                "clause_id": f"QF-{hashlib.sha1(digest.encode('utf-8')).hexdigest()[:10]}",
+                "label": f"第{page_number}页·{piece_index}/{len(pieces)}",
+                "text": value,
+            })
+            if len(packets) >= limit:
+                return packets
     return packets
 
 

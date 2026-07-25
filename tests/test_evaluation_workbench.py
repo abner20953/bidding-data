@@ -786,24 +786,62 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
     def test_qualification_clause_packets_keep_formal_material_requirements(self):
         text = """[第11页]
+三、供应商资格要求
 依法设立
-1.1 的证明材料
+3.1 的证明材料
 供应商应提供营业执照、基本账户信息、近6个月任意一次纳税凭证及社保凭证；依法免税或免缴的提供证明。
 财务要求
-1.3 证明材料
+3.2 证明材料
 供应商应提供年度财务审计报告；新成立企业可提供银行资信证明。
+[第12页]
 业绩要求
-1.4 证明材料
+3.3 证明材料
 供应商应提供近年类似服务业绩，至少一项，并附合同关键页。
+[第13页]
+四、采购文件获取
+获取时间和地点另行通知。
 """
         packets = worker._qualification_clause_packets(text)
-        self.assertEqual([packet["label"] for packet in packets], ["1.1", "1.3", "1.4"])
-        self.assertIn("纳税凭证及社保凭证", packets[0]["text"])
-        self.assertIn("财务审计报告", packets[1]["text"])
-        self.assertIn("至少一项", packets[2]["text"])
+        combined = "\n".join(packet["text"] for packet in packets)
+        self.assertTrue(packets)
+        self.assertIn("纳税凭证及社保凭证", combined)
+        self.assertIn("财务审计报告", combined)
+        self.assertIn("至少一项", combined)
+        self.assertTrue(all(packet["label"].startswith("第") for packet in packets))
         prompt = worker._qualification_rule_supplement_prompt(self.app, packets, [])
         self.assertIn(packets[0]["clause_id"], prompt)
         self.assertIn("资格业绩门槛与同一业绩的加分条款必须同时保留", prompt)
+        self.assertIn("相邻非资格内容", prompt)
+
+    def test_qualification_clause_packets_ignore_unrelated_numbered_material_section(self):
+        text = """[第31页]
+五、施工组织设计
+5.1 技术路线
+投标人应说明系统架构和实施计划。
+5.2 证明材料
+投标人可附产品彩页和检测材料。
+"""
+
+        self.assertEqual(worker._qualification_clause_packets(text), [])
+
+    def test_qualification_clause_packet_limit_keeps_late_formal_anchor(self):
+        text = """[第1页]
+一、投标人资格要求
+1.1 提供主体资格证明。
+[第2页]
+第一处相邻说明。
+[第3页]
+第二处相邻说明。
+[第10页]
+资格评审标准
+核验项目负责人资格。
+"""
+
+        packets = worker._qualification_clause_packets(text, limit=2)
+        combined = "\n".join(packet["text"] for packet in packets)
+        self.assertEqual(len(packets), 2)
+        self.assertIn("提供主体资格证明", combined)
+        self.assertIn("核验项目负责人资格", combined)
 
     def test_scoring_reconciliation_preserves_all_clauses_and_corrects_discretionary_category(self):
         packets = worker._score_clause_packets("\n".join([
@@ -1172,8 +1210,14 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             "evaluate_all_subjective_user",
         ):
             self.assertIn("恰好返回一次", PROMPT_TEMPLATES[template_id]["content"], template_id)
-        self.assertIn("不得自行给分", PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
-        self.assertIn('"page_hint":"页码或null"', PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
+        review_template = PROMPT_TEMPLATES["evaluate_all_review_user"]["content"]
+        self.assertIn("不得自行给分", review_template)
+        self.assertIn('"page_hint":"页码或null"', review_template)
+        self.assertIn("正向义务", review_template)
+        self.assertIn("未找到直接证据时应返回 not_found", review_template)
+        qualification_template = PROMPT_TEMPLATES["extract_rules_qualification_supplement_user"]["content"]
+        self.assertIn("正式资格候选区段", qualification_template)
+        self.assertIn("相邻非资格内容", qualification_template)
         extraction_validation = PROMPT_TEMPLATES["extract_rules_validation_guidance"]["content"]
         compile_template = PROMPT_TEMPLATES["extract_rules_compile_user"]["content"]
         coverage_template = PROMPT_TEMPLATES["extract_rules_coverage_user"]["content"]
