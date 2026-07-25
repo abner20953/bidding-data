@@ -20,3 +20,9 @@ manual.html
 test_env/
 data/
 .env
+# 临时补丁/调试脚本（一次性工具，不入版本库）
+tmp/
+scratch/
+patch_*.py
+reinit_face_db.py
+restore_and_patch.py
