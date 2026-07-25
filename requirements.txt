@@ -1,5 +1,5 @@
 requests
-json-repair==0.58.3
+json-repair==0.44.0
 beautifulsoup4
 pandas
 numpy==1.26.4
