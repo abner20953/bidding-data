@@ -34,6 +34,10 @@ _LEGACY_EXTRACT_RULES_USER_SHA256 = "4fe464136f54fb033ac1824271f0d942a3d7f3d13b5
 # 该值是 2026-07-22 之前随系统同步到云端、但没有人工编辑过的默认模板。
 # 保留它可让本次规则质量升级实际作用于既有部署，同时绝不覆盖用户手动编辑的内容。
 _PREVIOUS_DEFAULT_EXTRACT_RULES_USER_SHA256 = "a4bb928f79c5e954c155a344ae817231ade404c684da1afd7f111bdb284ab578"
+# 2026-07-27 v16 部署时的默认模板。云端将默认内容保存成了 override；只有哈希
+# 完全一致时才升级，任何人工编辑（哪怕一个字符）都会被保留。
+_V16_DEFAULT_EXTRACT_RULES_USER_SHA256 = "faca26909a0098c11c32ee238dbaa167e52c8bc85a767922abbdb87f9027cd29"
+_V16_DEFAULT_EXTRACT_RULES_CONTINUE_SHA256 = "922d2d7c6e8df3fa6851cd214d7e36d8949e5c02d194f9ad95850a78be5ba5d1"
 
 
 def _validate_api_key_characters(api_key: str) -> None:
@@ -472,15 +476,28 @@ def _migrate_known_legacy_prompt_override(conn: sqlite3.Connection) -> None:
         overrides = json.loads(row["setting_value"])
     except (TypeError, json.JSONDecodeError):
         return
-    legacy = overrides.get("extract_rules_user") if isinstance(overrides, dict) else None
-    if not isinstance(legacy, str) or hashlib.sha256(legacy.encode("utf-8")).hexdigest() not in {
-        _LEGACY_EXTRACT_RULES_USER_SHA256,
-        _PREVIOUS_DEFAULT_EXTRACT_RULES_USER_SHA256,
-    }:
+    if not isinstance(overrides, dict):
         return
-    # 历史版本是此前同步过的原文映射模板。新版保留其业务边界，并补齐页码、
-    # 评分条款 ID 与叶子评分项，避免复杂评分规则只能由后续补救阶段还原。
-    overrides["extract_rules_user"] = default_template("extract_rules_user")
+    known_defaults = {
+        "extract_rules_user": {
+            _LEGACY_EXTRACT_RULES_USER_SHA256,
+            _PREVIOUS_DEFAULT_EXTRACT_RULES_USER_SHA256,
+            _V16_DEFAULT_EXTRACT_RULES_USER_SHA256,
+        },
+        "extract_rules_continue_user": {_V16_DEFAULT_EXTRACT_RULES_CONTINUE_SHA256},
+    }
+    changed = False
+    for template_id, known_hashes in known_defaults.items():
+        current = overrides.get(template_id)
+        if not isinstance(current, str):
+            continue
+        if hashlib.sha256(current.encode("utf-8")).hexdigest() not in known_hashes:
+            continue
+        overrides[template_id] = default_template(template_id)
+        changed = True
+    if not changed:
+        return
+    # 仅升级已知历史默认值；用户真正编辑过的提示词哈希不同，会原样保留。
     conn.execute(
         "UPDATE ew_settings SET setting_value = ?, updated_at = ? WHERE setting_key = ?",
         (json.dumps(overrides, ensure_ascii=False), now_iso(), PROMPT_TEMPLATE_SETTING),
@@ -841,7 +858,7 @@ def task_input_fingerprint(app, project_id: str, task_type: str, profile_id: str
         "rule_set": (rule_set or {}).get("rule_set_id") if uses_rules else None,
         "rule_set_updated_at": (rule_set or {}).get("updated_at") if uses_rules else None,
         "profile": (profile.get("profile_id"), profile.get("model_name"), profile.get("base_url"), profile.get("updated_at"), profile.get("json_mode"), profile.get("thinking_mode")),
-        "comparison_version": "cross-bid-signals-v2" if task_type == "compare_documents" else None,
+        "comparison_version": "cross-bid-signals-v3" if task_type == "compare_documents" else None,
         "prompt_templates": task_prompt_template_fingerprint(app, task_type),
     }
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()

@@ -313,10 +313,16 @@ class EvaluationWorkbenchTests(unittest.TestCase):
                 {"type": "shared_error", "text_a": "保证期为为三年", "text_b": "保证期为为三年", "page_a": 4, "page_b": 5, "error_kind": "重复字"},
                 {"type": "entity", "text_a": "13800138000", "text_b": "13800138000", "page_a": 6, "page_b": 7},
             ],
-            "metadata": {"auxiliary": {"matches": [
-                {"field": "author", "label": "作者/创建者", "value": "Same Author", "strength": "reference", "also_in_tender": False},
-                {"field": "creator", "label": "创建软件", "value": "Common Tool", "strength": "weak", "also_in_tender": True},
-            ]}},
+            "metadata": {
+                "auxiliary": {"matches": [
+                    {"field": "author", "label": "作者/创建者", "value": "Same Author", "strength": "reference", "also_in_tender": False},
+                    {"field": "creator", "label": "创建软件", "value": "Common Tool", "strength": "weak", "also_in_tender": True},
+                ]},
+                "text_stats": {
+                    "file_a": {"scan_ratio": 0.45},
+                    "file_b": {"scan_ratio": 0.60},
+                },
+            },
         }
 
         analysis = build_cross_bid_analysis("task-1", [(left, right, result)], tender_loaded=True)
@@ -332,7 +338,9 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         contact = next(item for item in analysis["signals"] if item["dimension"] == "contact")
         self.assertEqual(contact["evidence"][0]["text_a"], "13800138000")
         metadata = next(item for item in analysis["signals"] if item["dimension"] == "metadata")
-        self.assertEqual(len(metadata["evidence"]), 1)
+        self.assertEqual(len(metadata["evidence"]), 2)
+        self.assertIn("45.0%", metadata["evidence"][1]["value"])
+        self.assertIn("正文查重覆盖有限", metadata["basis"])
 
     def test_cross_bid_analysis_separates_common_name_email_and_address(self):
         left = {"document_id": "a", "bidder_name": "甲公司", "original_name": "a.pdf"}
@@ -1230,14 +1238,23 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         extraction_system = PROMPT_TEMPLATES["extract_rules"]["content"]
         self.assertIn("随后附加的通用业务指令", extraction_system)
         extraction_guidance = PROMPT_TEMPLATES["extract_rules_guidance"]["content"]
+        extraction_user = PROMPT_TEMPLATES["extract_rules_user"]["content"]
+        extraction_continue = PROMPT_TEMPLATES["extract_rules_continue_user"]["content"]
         self.assertIn("正式评审依据门槛", extraction_guidance)
         self.assertIn("不得把普通技术描述", extraction_guidance)
         self.assertIn("资格业绩的最低数量", extraction_guidance)
+        self.assertIn("技术/服务要求逐项响应覆盖", extraction_guidance)
+        self.assertIn("通常每个采购包控制为1至3条规则", extraction_guidance)
+        self.assertIn("subjective|other", extraction_user)
+        self.assertIn("category=other", extraction_user)
+        self.assertIn("subjective|other", extraction_continue)
         extraction_composed = worker._system_prompt(self.app, "extract_rules")
         self.assertIn("正式评审依据门槛", extraction_composed)
         self.assertIn("未来或外部事项", extraction_composed)
         evaluation_composed = worker._system_prompt(self.app, "evaluate_all")
         self.assertIn("招标文件复述只能证明", evaluation_composed)
+        self.assertIn("概括性方案、目录、偏离表“无偏离”", evaluation_composed)
+        self.assertIn("模板提示文字", evaluation_composed)
         for template_id in (
             "compare_ai_assessment_user", "review_documents_user", "score_objective_user",
             "score_subjective_user", "evaluate_all_review_user", "evaluate_all_objective_user",
@@ -1264,9 +1281,12 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("同一响应字段的期限、地点、标准、金额", compile_template)
         self.assertIn("source_clause_ids", compile_template)
         self.assertIn("scoring.items", compile_template)
+        self.assertIn("逐项响应覆盖候选", compile_template)
+        self.assertIn("category=other 的逐项响应覆盖规则", coverage_template)
         self.assertIn('"drops"', quality_gate_template)
         self.assertIn("受保护规则", quality_gate_template)
         self.assertIn("勾选或取消勾选状态不是本轮提取依据", quality_gate_template)
+        self.assertIn("具有独立人工复核价值", quality_gate_template)
         self.assertIn('"rewrites"', finalise_template)
         self.assertIn('"merges"', finalise_template)
         self.assertIn("objective/subjective", finalise_template)

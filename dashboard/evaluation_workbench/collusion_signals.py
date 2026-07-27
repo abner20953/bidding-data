@@ -10,7 +10,7 @@ import re
 import uuid
 
 
-ANALYSIS_VERSION = "cross-bid-signals-v2"
+ANALYSIS_VERSION = "cross-bid-signals-v3"
 DECISION_BOUNDARY = (
     "本结果仅表示投标文件之间存在需要复核的横向异常线索，不构成串通投标认定、"
     "法定情形认定、废标依据或自动扣分依据。最终结论须由评标委员会结合原件、"
@@ -154,11 +154,35 @@ def analyze_pair(task_id: str, left: dict, right: dict, result: dict, *, tender_
     metadata_matches = [item for item in auxiliary.get("matches") or [] if not item.get("also_in_tender")]
     if metadata_matches:
         strong = any(item.get("strength") == "reference" for item in metadata_matches)
+        text_stats = (result.get("metadata") or {}).get("text_stats") or {}
+        file_a_stats = text_stats.get("file_a") or {}
+        file_b_stats = text_stats.get("file_b") or {}
+        scan_ratio_a = file_a_stats.get("scan_ratio")
+        scan_ratio_b = file_b_stats.get("scan_ratio")
+        scan_evidence = []
+        scan_note = ""
+        if isinstance(scan_ratio_a, (int, float)) and isinstance(scan_ratio_b, (int, float)):
+            scan_evidence.append({
+                "field": "疑似扫描页比例",
+                "value": f"{left.get('bidder_name') or '文件A'} {scan_ratio_a:.1%} / "
+                         f"{right.get('bidder_name') or '文件B'} {scan_ratio_b:.1%}",
+                "strength": "coverage",
+            })
+            if scan_ratio_a >= 0.25 or scan_ratio_b >= 0.25:
+                scan_note = "；部分页面可读文字较少，正文查重覆盖有限"
         signals.append(_signal(
             task_id, left, right, "metadata", "C2" if strong else "C1",
-            f"发现 {len(metadata_matches)} 项相同文档属性；该维度仅作为辅助排查，不参与相似度分数。",
-            [{"field": item.get("label") or item.get("field"), "value": _clip(item.get("value"), 100), "strength": item.get("strength")} for item in metadata_matches],
-            ["相同办公软件、默认作者、批量转换工具或文件模板均可能产生相同属性。"],
+            f"发现 {len(metadata_matches)} 项相同文档属性{scan_note}；"
+            "该维度仅作为辅助排查，不参与相似度分数。",
+            [
+                {"field": item.get("label") or item.get("field"),
+                 "value": _clip(item.get("value"), 100), "strength": item.get("strength")}
+                for item in metadata_matches
+            ] + scan_evidence,
+            [
+                "相同办公软件、默认作者、批量转换工具或文件模板均可能产生相同属性。",
+                "扫描页比例只反映文本比对覆盖程度，不能单独证明文件存在异常关系。",
+            ],
         ))
     return signals
 
