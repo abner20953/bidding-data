@@ -653,7 +653,7 @@ def navigation_index_full():
 @app.route('/api/tools/download')
 def download_tools():
     # 保留此路由用于首页按钮 (只下载 Beyond Compare)
-    filename = "Beyond-Compare-Pro-5.0.4.30422-x64.7z"
+    filename = "Beyond-Compare-Pro-4.4.7.28397-x64.7z"
     directory = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     
     file_path = os.path.join(directory, filename)
@@ -665,9 +665,9 @@ def download_tools():
 # --- 工具箱相关路由 ---
 
 ALLOWED_TOOLS = {
-    'Beyond-Compare-Pro-5.0.4.30422-x64.7z',
-    'WPS2016单文件极简版.7z',
-    'WPS2023专业增强版-v12.1.0.23542-激活优化版.exe',
+    'Beyond-Compare-Pro-4.4.7.28397-x64.7z',
+    'WPS2016单文件极简版.exe',
+    'WPS2023专业增强版-v12.1.0.26899-激活优化版.exe',
     'WPS2019专业增强版_v11.8.2.10972_中石油定制版.exe'
 }
 
