@@ -15,7 +15,7 @@ from flask import Blueprint, current_app, jsonify, render_template, request, ses
 from werkzeug.security import check_password_hash
 
 from dashboard.evaluation_workbench import storage
-from dashboard.evaluation_workbench.ai_gateway import test_connection
+from dashboard.evaluation_workbench.ai_gateway import model_capabilities, test_connection
 from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION
 
 
@@ -538,7 +538,8 @@ def model_profiles_api():
             return jsonify({"profile": storage.create_model_profile(current_app, _json_body())}), 201
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
-    return jsonify({"profiles": storage.list_model_profiles(current_app)})
+    profiles = storage.list_model_profiles(current_app)
+    return jsonify({"profiles": [{**profile, "capabilities": model_capabilities(profile)} for profile in profiles]})
 
 
 @evaluation_workbench_bp.route("/api/evaluation-workbench/model-profiles/<profile_id>", methods=["PATCH", "DELETE"])

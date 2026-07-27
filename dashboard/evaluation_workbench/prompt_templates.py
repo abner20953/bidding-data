@@ -80,6 +80,14 @@ _EXTRACT_RULES_QUALIFICATION_COVERAGE_GUIDANCE = (
 )
 PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += "\n\n" + _EXTRACT_RULES_QUALIFICATION_COVERAGE_GUIDANCE
 
+# 规则执行元数据不改变已有字段或人工勾选口径。它让后续综合评审按证据类型和
+# 规则结构路由，而不是从标题关键词猜测；旧版自定义模板未输出时仍由代码回退。
+_EXTRACT_RULE_EXECUTION_METADATA_GUIDANCE = """
+
+每条 AI 规则还应尽量补充 execution_strategy、evidence_requirements、applicability 三个字段；它们只描述后续取证方式，不得改变规则本身。execution_strategy 只能是 point（单点材料）、counting（需要逐项累计/去重）、section（需要通读完整章节或方案）、consistency（需要全文前后/范围一致性核验）、cross_bid（必须横向比较多家投标文件）、visual（关键结论仅靠图片外观）或 external（需外部核验）。evidence_requirements 是 text、visual、cross_bid、external 的数组：文字和图片都可分别支持同一规则时同时写 text、visual；不要把“可能附有证照”误写为仅 visual。applicability 形如 {"scope":"all|package|conditional|unknown","package_ids":[数字]}，包别无法从原文可靠判断时写 unknown。新增字段缺失时系统会兼容旧规则，但不得因节省篇幅省略评分、资格或否决条款的既有内容。
+""".strip()
+PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += "\n\n" + _EXTRACT_RULE_EXECUTION_METADATA_GUIDANCE
+
 # 证据性质是综合评审的业务判断口径，供全文扫描、规则审查和评分子流程共同使用。
 _EVALUATE_ALL_EVIDENCE_GUIDANCE = (
     "必须严格区分投标人自主设计、响应承诺/偏离表、招标文件复述或表格模板和 AI 推断。"

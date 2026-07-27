@@ -275,6 +275,17 @@ def init_database(app) -> None:
                 UNIQUE(document_id, scan_key, chunk_id, chunk_hash)
             );
             CREATE INDEX IF NOT EXISTS idx_ew_scan_cache_document ON ew_evaluation_scan_cache(document_id, scan_key);
+            CREATE TABLE IF NOT EXISTS ew_document_evidence_manifests (
+                manifest_id TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL REFERENCES ew_documents(document_id) ON DELETE CASCADE,
+                document_sha256 TEXT NOT NULL,
+                parser_version TEXT NOT NULL,
+                manifest_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(document_id, document_sha256, parser_version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_ew_evidence_manifest_document ON ew_document_evidence_manifests(document_id, updated_at);
             CREATE TABLE IF NOT EXISTS ew_project_scope_cache (
                 scope_cache_id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL REFERENCES ew_projects(project_id) ON DELETE CASCADE,
@@ -344,6 +355,7 @@ def init_database(app) -> None:
                 source_page INTEGER,
                 check_mode TEXT NOT NULL DEFAULT 'auto',
                 scoring_json TEXT,
+                execution_meta_json TEXT,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 sort_order INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
@@ -428,6 +440,7 @@ def init_database(app) -> None:
         _ensure_column(conn, "ew_rules", "source_type", "TEXT")
         _ensure_column(conn, "ew_rules", "source_task_id", "TEXT")
         _ensure_column(conn, "ew_rules", "check_rule", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "ew_rules", "execution_meta_json", "TEXT")
         _ensure_column(conn, "ew_model_calls", "requested_max_tokens", "INTEGER")
         _ensure_column(conn, "ew_model_calls", "finish_reason", "TEXT")
         _ensure_column(conn, "ew_model_calls", "response_chars", "INTEGER")
@@ -981,6 +994,19 @@ def record_model_call(app, task_id: str, project_id: str, phase: str, profile_id
                 return max(0, int(value))
         return None
 
+    def nested_number(*paths: tuple[str, ...]) -> int | None:
+        """兼容服务商把缓存命中量放在 usage 的嵌套统计字段中。"""
+        for path in paths:
+            value: object = usage
+            for key in path:
+                if not isinstance(value, dict):
+                    value = None
+                    break
+                value = value.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return max(0, int(value))
+        return None
+
     prompt_tokens = number("prompt_tokens", "input_tokens")
     completion_tokens = number("completion_tokens", "output_tokens")
     total_tokens = number("total_tokens")
@@ -995,7 +1021,11 @@ def record_model_call(app, task_id: str, project_id: str, phase: str, profile_id
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (str(uuid.uuid4()), task_id, project_id, document_id, phase, profile_id, context_mode,
              max(0, int(input_chars)), prompt_tokens, completion_tokens, total_tokens,
-             number("prompt_cache_hit_tokens", "cache_hit_tokens", "cached_tokens"),
+             number("prompt_cache_hit_tokens", "cache_hit_tokens", "cached_tokens") or nested_number(
+                 ("prompt_tokens_details", "cached_tokens"),
+                 ("usage", "prompt_tokens_details", "cached_tokens"),
+                 ("cache_read_input_tokens",),
+             ),
              _safe_positive_int(response_metadata.get("requested_max_tokens")),
              str(response_metadata.get("finish_reason") or "")[:64] or None,
              _safe_positive_int(response_metadata.get("response_chars")),
@@ -1035,6 +1065,39 @@ def save_evaluation_scan_checkpoint(app, project_id: str, document_id: str, scan
                findings_json=excluded.findings_json, updated_at=excluded.updated_at""",
             (str(uuid.uuid4()), project_id, document_id, scan_key, chunk_id, chunk_hash,
               json.dumps(findings, ensure_ascii=False), timestamp, timestamp),
+        )
+
+
+def get_document_evidence_manifest(app, document_id: str, document_sha256: str, parser_version: str) -> list[dict] | None:
+    """读取轻量页块清单；不存正文，正文始终从已有解析文件按需读取。"""
+    with connection(app) as conn:
+        row = conn.execute(
+            """SELECT manifest_json FROM ew_document_evidence_manifests
+               WHERE document_id=? AND document_sha256=? AND parser_version=?""",
+            (document_id, document_sha256, parser_version),
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        value = json.loads(row["manifest_json"])
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, list) else None
+
+
+def save_document_evidence_manifest(app, document_id: str, document_sha256: str, parser_version: str,
+                                    manifest: list[dict]) -> None:
+    """保存页块边界和摘要哈希，为后续规则关联与缓存校验提供稳定基础。"""
+    timestamp = now_iso()
+    with connection(app) as conn:
+        conn.execute(
+            """INSERT INTO ew_document_evidence_manifests
+               (manifest_id, document_id, document_sha256, parser_version, manifest_json, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(document_id, document_sha256, parser_version) DO UPDATE SET
+               manifest_json=excluded.manifest_json, updated_at=excluded.updated_at""",
+            (str(uuid.uuid4()), document_id, document_sha256, parser_version,
+             json.dumps(manifest, ensure_ascii=False, separators=(",", ":")), timestamp, timestamp),
         )
 
 
@@ -1411,13 +1474,69 @@ def current_rule_set(app, project_id: str, create: bool = False) -> dict | None:
     return rule_set
 
 
+_RULE_EXECUTION_STRATEGIES = {"point", "counting", "section", "consistency", "cross_bid", "visual", "external"}
+_RULE_EVIDENCE_TYPES = {"text", "visual", "cross_bid", "external"}
+
+
+def rule_execution_meta(rule: dict) -> dict:
+    """读取可向后兼容的规则执行元数据；旧规则安全回退为空元数据。"""
+    raw = rule.get("execution_meta_json")
+    try:
+        value = json.loads(raw or "{}") if isinstance(raw, str) else (raw or {})
+    except json.JSONDecodeError:
+        value = {}
+    if not isinstance(value, dict):
+        value = {}
+    strategy = str(value.get("execution_strategy") or "").strip()
+    requirements = value.get("evidence_requirements")
+    if not isinstance(requirements, list):
+        requirements = []
+    requirements = [str(item) for item in requirements if str(item) in _RULE_EVIDENCE_TYPES]
+    applicability = value.get("applicability")
+    if not isinstance(applicability, dict):
+        applicability = {}
+    return {
+        "execution_strategy": strategy if strategy in _RULE_EXECUTION_STRATEGIES else "",
+        "evidence_requirements": list(dict.fromkeys(requirements)),
+        "applicability": applicability,
+    }
+
+
+def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str | None:
+    base = rule_execution_meta(fallback or {})
+    strategy = str(payload.get("execution_strategy", base["execution_strategy"]) or "").strip()
+    requirements = payload.get("evidence_requirements", base["evidence_requirements"])
+    if not isinstance(requirements, list):
+        requirements = base["evidence_requirements"]
+    normalized = [str(item) for item in requirements if str(item) in _RULE_EVIDENCE_TYPES]
+    if payload.get("ocr_required") or payload.get("check_mode") == "ocr":
+        if "visual" not in normalized:
+            normalized.append("visual")
+    applicability = payload.get("applicability", base["applicability"])
+    if not isinstance(applicability, dict):
+        applicability = {}
+    value = {
+        "execution_strategy": strategy if strategy in _RULE_EXECUTION_STRATEGIES else "",
+        "evidence_requirements": normalized,
+        "applicability": applicability,
+    }
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _rule_public_value(row: dict) -> dict:
+    value = dict(row)
+    meta = rule_execution_meta(value)
+    value.update(meta)
+    return value
+
+
 def list_rules(app, project_id: str) -> tuple[dict | None, list[dict]]:
     rule_set = current_rule_set(app, project_id)
     if not rule_set:
         return None, []
     with connection(app) as conn:
         rows = conn.execute("SELECT * FROM ew_rules WHERE rule_set_id = ? ORDER BY category, sort_order, created_at", (rule_set["rule_set_id"],)).fetchall()
-    return rule_set, [dict(row) for row in rows]
+    return rule_set, [_rule_public_value(dict(row)) for row in rows]
 
 
 def add_rule(app, project_id: str, payload: dict) -> dict:
@@ -1439,14 +1558,15 @@ def add_rule(app, project_id: str, payload: dict) -> dict:
         "check_mode": "ocr" if payload.get("ocr_required") or payload.get("check_mode") == "ocr" else "auto",
         "source_type": "manual", "source_task_id": None,
         "scoring_json": json.dumps(payload.get("scoring"), ensure_ascii=False) if payload.get("scoring") else None,
+        "execution_meta_json": _execution_meta_json(payload),
         "enabled": 1, "sort_order": int(payload.get("sort_order") or 0), "created_at": timestamp, "updated_at": timestamp,
     }
     with connection(app) as conn:
         conn.execute(
             """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode,
-            source_type, source_task_id, scoring_json, enabled, sort_order, created_at, updated_at)
+            source_type, source_task_id, scoring_json, execution_meta_json, enabled, sort_order, created_at, updated_at)
             VALUES (:rule_id, :rule_set_id, :category, :title, :check_rule, :source_text, :source_page, :check_mode,
-            :source_type, :source_task_id, :scoring_json, :enabled, :sort_order, :created_at, :updated_at)""", rule,
+            :source_type, :source_task_id, :scoring_json, :execution_meta_json, :enabled, :sort_order, :created_at, :updated_at)""", rule,
         )
         conn.execute("UPDATE ew_rule_sets SET updated_at = ? WHERE rule_set_id = ?", (timestamp, rule_set["rule_set_id"]))
     return rule
@@ -1462,9 +1582,9 @@ def _clone_rule_set_as_draft(app, project_id: str, source_rule_set: dict) -> dic
         for row in rows:
             conn.execute(
                 """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode,
-                   source_type, source_task_id, scoring_json, enabled, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   source_type, source_task_id, scoring_json, execution_meta_json, enabled, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (str(uuid.uuid4()), draft["rule_set_id"], row["category"], row["title"], row["check_rule"] or row["title"], row["source_text"], row["source_page"],
-                 "ocr" if row["check_mode"] == "ocr" else "auto", row["source_type"] or "manual", row["source_task_id"], row["scoring_json"], row["enabled"], row["sort_order"], timestamp, timestamp),
+                 "ocr" if row["check_mode"] == "ocr" else "auto", row["source_type"] or "manual", row["source_task_id"], row["scoring_json"], row["execution_meta_json"], row["enabled"], row["sort_order"], timestamp, timestamp),
             )
     return draft
 
@@ -1583,9 +1703,14 @@ def update_rule(app, project_id: str, rule_id: str, payload: dict) -> dict:
                 "UPDATE ew_rules SET enabled = ?, updated_at = ? WHERE rule_id = ?",
                 (enabled, now_iso(), rule_id),
             )
+        if any(key in payload for key in ("execution_strategy", "evidence_requirements", "applicability", "ocr_required", "check_mode")):
+            conn.execute(
+                "UPDATE ew_rules SET execution_meta_json = ?, updated_at = ? WHERE rule_id = ?",
+                (_execution_meta_json(payload, fallback=rule), now_iso(), rule_id),
+            )
         conn.execute("UPDATE ew_rule_sets SET updated_at = ? WHERE rule_set_id = ?", (now_iso(), rule_set["rule_set_id"]))
         updated = conn.execute("SELECT * FROM ew_rules WHERE rule_id = ?", (rule_id,)).fetchone()
-    return dict(updated)
+    return _rule_public_value(dict(updated))
 
 
 def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: list[dict]) -> dict:
@@ -1620,11 +1745,11 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
             signatures.add(signature)
             conn.execute(
                 """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode,
-                   source_type, source_task_id, scoring_json, enabled, sort_order, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   source_type, source_task_id, scoring_json, execution_meta_json, enabled, sort_order, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (str(uuid.uuid4()), rule_set["rule_set_id"], row["category"], row["title"], row["check_rule"] or row["title"],
                  row["source_text"], row["source_page"], "ocr" if row["check_mode"] == "ocr" else "auto",
-                 row["source_type"], row["source_task_id"], row["scoring_json"], 0 if row["check_mode"] == "ocr" else 1, index, timestamp, timestamp),
+                 row["source_type"], row["source_task_id"], row["scoring_json"], row["execution_meta_json"], 0 if row["check_mode"] == "ocr" else 1, index, timestamp, timestamp),
             )
             preserved_rule_count += 1
         for index, item in enumerate(rules):
@@ -1638,12 +1763,12 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
                 continue
             signatures.add(signature)
             conn.execute(
-                """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode, source_type, source_task_id, scoring_json, enabled, sort_order, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ai', ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode, source_type, source_task_id, scoring_json, execution_meta_json, enabled, sort_order, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ai', ?, ?, ?, ?, ?, ?, ?)""",
                 (str(uuid.uuid4()), rule_set["rule_set_id"], category, title, check_rule, str(item.get("source_text", "")).strip(),
                  item.get("source_page") if isinstance(item.get("source_page"), int) else None,
                  "ocr" if item.get("ocr_required") or item.get("check_mode") == "ocr" else "auto",
-                 task_id, json.dumps(item.get("scoring"), ensure_ascii=False) if item.get("scoring") else None,
+                 task_id, json.dumps(item.get("scoring"), ensure_ascii=False) if item.get("scoring") else None, _execution_meta_json(item),
                  0 if item.get("ocr_required") or item.get("check_mode") == "ocr" else 1,
                  preserved_rule_count + index, timestamp, timestamp),
             )

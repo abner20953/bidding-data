@@ -172,6 +172,45 @@ def select_rule_chunk_map(chunks: list[dict], rules: list[dict], per_rule: int =
     return selected
 
 
+def select_rule_chunk_evidence_map(chunks: list[dict], rules: list[dict], per_rule: int = 4) -> dict[str, list[dict]]:
+    """返回本地召回页块及命中位置，供二次审查围绕真正命中处截取原文。
+
+    ``select_rule_chunk_map`` 为了兼容旧调用方只返回页块 ID。综合评审若首轮
+    AI 没有给出摘录，会回退到本地召回；旧实现此时不知道命中在页块的哪个位置，
+    长页块会总是从开头截断，造成“已召回但未送达模型”的隐性漏证据。
+    本函数仅增加瞬时的字符串定位结果，不创建常驻索引或引入额外依赖。
+    """
+    selected: dict[str, list[dict]] = {}
+    for rule in rules:
+        rule_id = str(rule.get("rule_id") or "")
+        if not rule_id:
+            continue
+        anchors = _anchors(rule)
+        scored: list[tuple[int, int, str, int, str]] = []
+        for index, chunk in enumerate(chunks):
+            text = str(chunk.get("text") or "")
+            matched = [term for term in anchors if term and term in text]
+            if not matched:
+                continue
+            matched.sort(key=lambda term: (-len(term), text.find(term), term))
+            anchor = matched[0]
+            offset = text.find(anchor)
+            score = sum(min(3, text.count(term)) * max(2, len(term)) ** 2 for term in matched)
+            scored.append((score, index, str(chunk.get("chunk_id") or ""), max(0, offset), anchor))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        values: list[dict] = []
+        seen: set[str] = set()
+        for _, _, chunk_id, offset, anchor in scored:
+            if not chunk_id or chunk_id in seen:
+                continue
+            seen.add(chunk_id)
+            values.append({"chunk_id": chunk_id, "offset": offset, "anchor": anchor})
+            if len(values) >= per_rule:
+                break
+        selected[rule_id] = values
+    return selected
+
+
 def select_rule_chunks(chunks: list[dict], rules: list[dict], per_rule: int = 4) -> list[str]:
     """兼容原调用方：按规则顺序扁平化候选块，并保持全局去重。"""
     selected: list[str] = []

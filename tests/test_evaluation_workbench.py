@@ -17,7 +17,8 @@ from dashboard.blueprints.evaluation_workbench import create_worker_app, evaluat
 from dashboard.evaluation_workbench import storage, worker
 from dashboard.evaluation_workbench.collusion_signals import build_cross_bid_analysis
 from dashboard.evaluation_workbench.prompt_context import (
-    _anchors, build_rule_context, select_rule_chunk_map, select_rule_chunks, split_full_text_chunks,
+    _anchors, build_rule_context, select_rule_chunk_evidence_map, select_rule_chunk_map, select_rule_chunks,
+    split_full_text_chunks,
 )
 from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
 
@@ -162,6 +163,39 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         self.assertEqual(
             storage.get_project_scope_checkpoint(self.app, self.project["project_id"], "scope-v1"), scope,
+        )
+
+    def test_scope_excerpt_prioritises_business_sections_not_only_fixed_positions(self):
+        text = "\n\n".join([
+            "[第1页]\n前言说明。" * 80,
+            "[第2页]\n一般条款。" * 80,
+            "[第3页]\n采购范围：井下工业视频系统扩容，包含摄像机、传输网络和平台适配。" * 20,
+            "[第4页]\n其他条款。" * 80,
+        ])
+
+        excerpt = worker._scope_excerpt(text, 1_500)
+
+        self.assertIn("井下工业视频系统扩容", excerpt)
+
+    def test_nested_provider_cache_usage_is_aggregated(self):
+        task = storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        storage.record_model_call(
+            self.app, task["task_id"], self.project["project_id"], "test", None,
+            usage={"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110,
+                   "prompt_tokens_details": {"cached_tokens": 80}},
+        )
+
+        usage = storage.project_token_usage(self.app, self.project["project_id"])
+        self.assertEqual(usage["cache_hit_tokens"], 80)
+
+    def test_document_evidence_manifest_is_reusable_without_storing_document_text(self):
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案：稳定运行。")
+        manifest = [{"chunk_id": "chunk_1", "start_page": 1, "end_page": 1, "chars": 12, "text_hash": "abc"}]
+
+        storage.save_document_evidence_manifest(self.app, document["document_id"], document["sha256"], "v1", manifest)
+
+        self.assertEqual(
+            storage.get_document_evidence_manifest(self.app, document["document_id"], document["sha256"], "v1"), manifest,
         )
 
     def test_task_recovery_summary_separates_json_repair_and_compact_retry(self):
@@ -1460,6 +1494,31 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         self.assertEqual(mapping["a"], ["chunk-a"])
         self.assertEqual(mapping["b"], ["chunk-b"])
+
+    def test_rule_chunk_evidence_map_keeps_anchor_offset_for_long_chunk(self):
+        chunks = [{"chunk_id": "chunk-a", "text": "无关前言" * 600 + "\n关键证据：类似项目合同业绩。"}]
+        rule = {"rule_id": "a", "title": "业绩评分", "check_rule": "核验类似项目合同业绩"}
+
+        mapping = select_rule_chunk_evidence_map(chunks, [rule], per_rule=1)
+
+        self.assertEqual(mapping["a"][0]["chunk_id"], "chunk-a")
+        self.assertGreater(mapping["a"][0]["offset"], 1000)
+        self.assertIn("类似项目", mapping["a"][0]["anchor"])
+
+    def test_rule_execution_metadata_is_persisted_and_overrides_legacy_keyword_routing(self):
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "综合材料", "check_rule": "核验材料完整性",
+            "execution_strategy": "section", "evidence_requirements": ["text", "visual"],
+            "applicability": {"scope": "package", "package_ids": [2]},
+        })
+        _, rules = storage.list_rules(self.app, self.project["project_id"])
+        saved = next(item for item in rules if item["rule_id"] == rule["rule_id"])
+
+        self.assertEqual(saved["execution_strategy"], "section")
+        self.assertEqual(saved["evidence_requirements"], ["text", "visual"])
+        self.assertEqual(saved["applicability"]["package_ids"], [2])
+        self.assertEqual(worker._rule_execution_strategy(saved), "section")
+        self.assertFalse(worker._rule_requires_visual_verification(saved))
 
     def test_structured_score_items_participate_in_page_retrieval(self):
         chunks = [

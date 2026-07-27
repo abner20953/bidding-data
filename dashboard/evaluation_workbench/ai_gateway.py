@@ -281,6 +281,47 @@ def _is_minimax_m3(profile: dict) -> bool:
     )
 
 
+def model_capabilities(profile: dict) -> dict:
+    """返回可展示、可路由的模型能力，不把服务商差异散落在业务流程里。
+
+    这是保守能力声明：未知模型只获得提示词约束的 JSON，不会被误当成支持严格
+    Schema 或视觉输入。后续连接测试可在此基础上补充主动探测结果。
+    """
+    model_name = str(profile.get("model_name") or "").lower()
+    base_url = str(profile.get("base_url") or "").lower()
+    minimax = "api.minimaxi.com" in base_url
+    m3 = minimax and model_name == "minimax-m3"
+    deepseek = "api.deepseek.com" in base_url or model_name.startswith("deepseek-")
+    if deepseek:
+        return {
+            "structured_output": "json_object",
+            "strict_tool_schema": True,
+            "vision": False,
+            "thinking_modes": ["enabled", "disabled"],
+            "parallel_limit": 3,
+            "prompt_cache": "prefix",
+        }
+    if minimax:
+        return {
+            # M2/M3 在当前 OpenAI-compatible 路径不声明 json_object/schema；保留
+            # 本地 JSON 恢复兜底，而不是让界面产生“严格 JSON 已开启”的错觉。
+            "structured_output": "prompt_constrained",
+            "strict_tool_schema": False,
+            "vision": m3,
+            "thinking_modes": ["adaptive", "disabled"] if m3 else ["default"],
+            "parallel_limit": 2,
+            "prompt_cache": "prefix",
+        }
+    return {
+        "structured_output": "prompt_constrained",
+        "strict_tool_schema": False,
+        "vision": False,
+        "thinking_modes": ["default", "enabled", "disabled"],
+        "parallel_limit": 1,
+        "prompt_cache": "unknown",
+    }
+
+
 def _invalid_json_error(content, finish_reason) -> str:
     """返回不含模型正文的诊断，便于排查而不留存招标文件或模型原文。"""
     details = []

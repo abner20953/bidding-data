@@ -20,11 +20,12 @@ import fitz
 
 from dashboard.evaluation_workbench import storage
 from dashboard.evaluation_workbench.ai_gateway import (
-    InvalidJsonResponse, ModelResponseEnvelopeError, _recover_complete_json_array, request_json,
+    InvalidJsonResponse, ModelResponseEnvelopeError, _recover_complete_json_array, model_capabilities, request_json,
 )
 from dashboard.evaluation_workbench.collusion_signals import build_cross_bid_analysis
 from dashboard.evaluation_workbench.prompt_context import (
-    build_rule_context, select_rule_chunk_map, select_rule_chunks, split_full_text_chunks,
+    build_rule_context, select_rule_chunk_evidence_map, select_rule_chunk_map, select_rule_chunks,
+    split_full_text_chunks,
 )
 from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION
 from dashboard.blueprints.evaluation_workbench import create_worker_app
@@ -100,7 +101,7 @@ def _is_minimax_profile(profile: dict) -> bool:
 
 def _profile_parallel_limit(profile: dict, available: int) -> int:
     """只限制同一任务的远端请求数，不额外常驻线程或模型。"""
-    ceiling = 2 if _is_minimax_profile(profile) else 3
+    ceiling = int(model_capabilities(profile).get("parallel_limit") or 1)
     return max(1, min(ceiling, max(1, int(available))))
 
 
@@ -1193,6 +1194,19 @@ def _rule_requires_visual_verification(item: dict) -> bool:
     # 提取模型已经明确给出布尔判断时，不能再因规则文字中提及“证照”“签章”等
     # 触发词把整条规则强行升级为 OCR。混合型规则可能以文字为决定性证据，视觉
     # 兜底只服务于旧规则或没有给出明确分类的输入。
+    requirements = item.get("evidence_requirements")
+    if not isinstance(requirements, list):
+        try:
+            requirements = json.loads(item.get("execution_meta_json") or "{}").get("evidence_requirements", [])
+        except (TypeError, json.JSONDecodeError):
+            requirements = []
+    requirements = {str(value) for value in requirements if value}
+    # 新规则可以同时声明文本和图片证据。此时文本层仍应正常给出建议，图片仅作为
+    # 单独待核验点；只有视觉是唯一决定性来源时才把整条回落为“需 OCR”。
+    if "visual" in requirements and "text" not in requirements:
+        return True
+    if "text" in requirements:
+        return False
     explicit = item.get("ocr_required")
     if explicit is True:
         return True
@@ -1217,6 +1231,9 @@ def _rule_compilation_packet(items: list[dict], char_limit: int) -> str:
             "check_rule": item.get("check_rule") or item.get("title"),
             "source_text": item.get("source_text"), "source_page": item.get("source_page"),
             "ocr_required": bool(item.get("ocr_required") or item.get("check_mode") == "ocr"),
+            "execution_strategy": item.get("execution_strategy"),
+            "evidence_requirements": item.get("evidence_requirements"),
+            "applicability": item.get("applicability"),
             "source_clause_ids": item.get("source_clause_ids") if isinstance(item.get("source_clause_ids"), list) else [],
             "scoring": item.get("scoring"),
         })
@@ -2095,7 +2112,8 @@ def _score_payload(rules: list[dict]) -> list[dict]:
                 for index, item in enumerate(scoring["items"], start=1) if isinstance(item, dict)
             ]}
         payload.append({"rule_id": rule["rule_id"], "title": rule["title"], "check_rule": rule.get("check_rule") or rule["title"], "source_text": rule["source_text"],
-                        "ocr_required": _rule_requires_visual_verification(rule), "scoring": scoring})
+                        "ocr_required": _rule_requires_visual_verification(rule), "execution_strategy": _rule_execution_strategy(rule),
+                        "evidence_requirements": rule.get("evidence_requirements") or [], "scoring": scoring})
     return payload
 
 
@@ -2244,6 +2262,7 @@ FULL_SCAN_CHUNK_CHARS = 11_000
 # 首轮只建立候选证据索引：每个页块携带一次完整的精简规则目录。正常情况下
 # 不再形成“页块 × 规则批次”的矩阵；若模型确实输出超长，才仅拆规则目录一次。
 FULL_SCAN_CATALOG_RULE_CHARS = 220
+EVIDENCE_MANIFEST_VERSION = "page-chunks-v1"
 # 二次复核上下文上限。全文首轮已覆盖所有页面，此处只装入候选证据和重点原文。
 EVALUATION_BATCH_CONTEXT_CHARS = 64_000
 EVALUATION_STRATEGY_CONTEXT_CHARS = {
@@ -2252,6 +2271,34 @@ EVALUATION_STRATEGY_CONTEXT_CHARS = {
     "counting": 64_000,
     "section": 64_000,
 }
+
+
+def _document_evidence_chunks(app, document: dict) -> list[dict]:
+    """建立可复用的轻量证据索引骨架，并按需返回当前任务所需的原文页块。
+
+    清单只保存页码边界、哈希和长度，既可在规则或提示词变化后校验页面一致性，
+    又不会把解析正文重复写进 SQLite；未运行任务时不会占用内存。
+    """
+    path = str(document.get("parsed_path") or "")
+    if not path:
+        return []
+    chunks = split_full_text_chunks(path, FULL_SCAN_CHUNK_CHARS, overlap_pages=1)
+    manifest = [
+        {
+            "chunk_id": chunk.get("chunk_id"), "start_page": chunk.get("start_page"),
+            "end_page": chunk.get("end_page"), "chars": len(str(chunk.get("text") or "")),
+            "text_hash": hashlib.sha256(str(chunk.get("text") or "").encode("utf-8")).hexdigest(),
+        }
+        for chunk in chunks
+    ]
+    document_hash = str(document.get("sha256") or "")
+    if document_hash:
+        cached = storage.get_document_evidence_manifest(app, document["document_id"], document_hash, EVIDENCE_MANIFEST_VERSION)
+        if cached != manifest:
+            storage.save_document_evidence_manifest(
+                app, document["document_id"], document_hash, EVIDENCE_MANIFEST_VERSION, manifest,
+            )
+    return chunks
 
 
 def _rule_batches(rules: list[dict], size: int) -> list[list[dict]]:
@@ -2269,6 +2316,10 @@ def _rule_scoring(rule: dict) -> dict:
 
 
 def _rule_execution_strategy(rule: dict) -> str:
+    explicit = str(rule.get("execution_strategy") or "").strip()
+    if explicit in {"point", "counting", "section", "consistency", "cross_bid", "visual", "external"}:
+        # visual/external 的最终文本审查仍按点状路由；它们的证据要求由独立字段控制。
+        return "point" if explicit in {"visual", "external", "cross_bid"} else explicit
     raw = " ".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text"))
     if any(term in raw for term in ("公司名称", "项目名称", "前后", "一致", "无关公司", "无关项目", "全文")):
         return "consistency"
@@ -2305,7 +2356,17 @@ def _evaluation_rule_batches(component: str, rules: list[dict], scan_index: dict
     for rule in rules:
         buckets.setdefault(_rule_execution_strategy(rule), []).append(rule)
     chunks = scan_index.get("chunks", []) if isinstance(scan_index, dict) else []
-    chunk_map = select_rule_chunk_map(chunks, rules, per_rule=6) if chunks else {}
+    ledger = scan_index.get("evidence_ledger", {}) if isinstance(scan_index, dict) else {}
+    if isinstance(ledger, dict) and ledger:
+        chunk_map = {
+            rule["rule_id"]: [
+                str(item.get("chunk_id") or "") for item in ledger.get(str(rule.get("rule_id") or ""), {}).get("candidates", [])
+                if str(item.get("chunk_id") or "")
+            ][:6]
+            for rule in rules
+        }
+    else:
+        chunk_map = select_rule_chunk_map(chunks, rules, per_rule=6) if chunks else {}
     groups: list[list[dict]] = []
     for strategy_rules in buckets.values():
         if not chunk_map:
@@ -2377,7 +2438,9 @@ def _combined_batch_payload(component: str, rules: list[dict]) -> list[dict]:
     if component == "review":
         return [{"rule_id": item["rule_id"], "category": item["category"], "title": item["title"],
                  "check_rule": item.get("check_rule") or item["title"], "source_text": item["source_text"],
-                 "ocr_required": _rule_requires_visual_verification(item)} for item in rules]
+                 "ocr_required": _rule_requires_visual_verification(item),
+                 "execution_strategy": _rule_execution_strategy(item),
+                 "evidence_requirements": item.get("evidence_requirements") or []} for item in rules]
     return _score_payload(rules)
 
 
@@ -2395,6 +2458,8 @@ def _full_scan_catalog(rules: list[dict]) -> list[dict]:
             "rule_id": rule["rule_id"],
             "q": query[:query_limit],
             "type": rule["category"],
+            "strategy": _rule_execution_strategy(rule),
+            "evidence_requirements": rule.get("evidence_requirements") or [],
         }
         if _rule_requires_visual_verification(rule):
             item["ocr"] = 1
@@ -2527,9 +2592,53 @@ SCOPE_PROFILE_FIELDS = (
     "equipment_or_materials", "deliverables", "standards_or_rules", "regions", "keywords",
 )
 
+# 项目范围画像必须优先依据业务章节，而不能只抽样全文的前中后位置；这些是章节
+# 定位词，不参与任何正负结论，也不会以固定词表过滤异常内容。
+_SCOPE_SECTION_TERMS = (
+    "项目概况", "项目背景", "采购范围", "招标范围", "服务范围", "工作范围",
+    "技术需求", "技术要求", "建设内容", "采购需求", "设备清单", "服务内容",
+    "交付", "成果", "实施地点", "服务地点", "项目地点", "适用标准",
+)
+
+
+def _scope_excerpt(text: str, budget: int) -> str:
+    """以项目范围章节为主、全篇均衡抽样为兜底地构造范围画像原文。"""
+    value = str(text or "").strip()
+    if len(value) <= budget:
+        return value
+    pages = [item.strip() for item in re.split(r"(?=\[第\d+页\])", value) if item.strip()]
+    if len(pages) <= 1:
+        # 无页码文本也优先抽取包含范围章节词的段落；其余位置只承担兜底覆盖。
+        pages = [item.strip() for item in re.split(r"\n{2,}", value) if item.strip()]
+    ranked: list[tuple[int, int]] = []
+    for index, item in enumerate(pages):
+        score = sum(1 for term in _SCOPE_SECTION_TERMS if term in item)
+        if score:
+            ranked.append((score, index))
+    selected: list[int] = []
+    # 每个范围章节最多取一个最相关片段，避免“技术需求”长表挤掉项目概况或交付要求。
+    for _, index in sorted(ranked, key=lambda item: (-item[0], item[1])):
+        if index not in selected:
+            selected.append(index)
+        if len(selected) >= 6:
+            break
+    # 章节解析不完整时仍保留前、中、后三处覆盖，避免把范围画像退化为关键词窗口。
+    for index in (0, len(pages) // 2, max(0, len(pages) - 1)):
+        if index not in selected:
+            selected.append(index)
+    selected.sort()
+    if not selected:
+        selected = [0]
+    per_piece = max(800, budget // len(selected))
+    pieces = []
+    for index in selected:
+        label = "范围相关章节" if any(term in pages[index] for term in _SCOPE_SECTION_TERMS) else "全文覆盖样本"
+        pieces.append(f"【{label}】\n{pages[index][:per_piece]}")
+    return "\n\n".join(pieces)[:budget]
+
 
 def _scope_source(documents: list[dict], char_limit: int) -> str:
-    """构造项目范围画像依据；长招标文件均衡保留前、中、后段。"""
+    """构造项目范围画像依据；优先保留范围章节，并以全篇覆盖作兜底。"""
     sources = []
     tender_documents = [item for item in documents if item.get("role") in {"tender", "tender_attachment"}]
     # 平均分配预算，避免多个招标附件时前几份文件挤占全部上下文。
@@ -2539,16 +2648,7 @@ def _scope_source(documents: list[dict], char_limit: int) -> str:
         if not path.is_file():
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
-        if len(text) > per_document:
-            # 项目范围、技术要求和评分附件常位于正文中段；只保留首尾会让范围画像产生
-            # 结构性盲区。三段等额抽样只用于建立范围基准，不替代后续投标文件全文扫描。
-            segment = max(1, (per_document - 100) // 3)
-            middle_start = max(0, len(text) // 2 - segment // 2)
-            text = (
-                f"【文件前段】\n{text[:segment]}\n\n"
-                f"【文件中段】\n{text[middle_start:middle_start + segment]}\n\n"
-                f"【文件后段】\n{text[-segment:]}"
-            )
+        text = _scope_excerpt(text, per_document)
         sources.append(f"【{document.get('original_name') or '招标文件'}】\n{text}")
     return "\n\n".join(sources)[:char_limit]
 
@@ -2716,7 +2816,7 @@ def _scan_document_fulltext(app, task: dict, profile: dict, document: dict, rule
         text_length = len(Path(document["parsed_path"]).read_text(encoding="utf-8", errors="ignore"))
     if text_length <= FULL_SCAN_THRESHOLD_CHARS:
         return None
-    chunks = split_full_text_chunks(document["parsed_path"], FULL_SCAN_CHUNK_CHARS, overlap_pages=1)
+    chunks = _document_evidence_chunks(app, document)
     if not chunks:
         return None
     catalog = _full_scan_catalog(rules)
@@ -2799,6 +2899,61 @@ def _scan_strategy(rules: list[dict]) -> str:
         if value in strategies:
             return value
     return "point"
+
+
+def _build_rule_evidence_ledger(scan: dict, rules: list[dict]) -> dict[str, dict]:
+    """将全文扫描和本地召回合成为逐规则证据账本。
+
+    账本只在任务运行期间保存，不重复落入数据库或常驻内存；它把“模型首轮命中”
+    和“本地可复核命中”一起交给最终组，避免任何一种来源单独失效时丢失证据。
+    """
+    chunks = scan.get("chunks", []) if isinstance(scan, dict) else []
+    local_matches = select_rule_chunk_evidence_map(chunks, rules, per_rule=6)
+    priority_rank = {"high": 0, "medium": 1, "low": 2}
+    polarity_rank = {"contradicts": 0, "partial": 1, "suspected": 2, "supports": 3}
+    findings_by_rule: dict[str, list[dict]] = {}
+    for finding in scan.get("findings", []) if isinstance(scan, dict) else []:
+        rule_id = str(finding.get("rule_id") or "")
+        if rule_id:
+            findings_by_rule.setdefault(rule_id, []).append(finding)
+    ledger: dict[str, dict] = {}
+    for rule in rules:
+        rule_id = str(rule.get("rule_id") or "")
+        candidates: list[dict] = []
+        seen: set[str] = set()
+        values = sorted(
+            findings_by_rule.get(rule_id, []),
+            key=lambda item: (
+                priority_rank.get(item.get("evidence_priority"), 1),
+                polarity_rank.get(item.get("tentative_status"), 2),
+                -{"high": 3, "medium": 2, "low": 1}.get(item.get("confidence"), 2),
+            ),
+        )
+        for finding in values:
+            chunk_id = str(finding.get("chunk_id") or "").split(".", 1)[0]
+            if not chunk_id or chunk_id in seen:
+                continue
+            seen.add(chunk_id)
+            candidates.append({
+                "chunk_id": chunk_id, "offset": 0, "source": "scan",
+                "evidence": str(finding.get("evidence") or ""),
+                "priority": finding.get("evidence_priority") or "medium",
+            })
+            if len(candidates) >= 6:
+                break
+        for match in local_matches.get(rule_id, []):
+            chunk_id = str(match.get("chunk_id") or "")
+            if not chunk_id or chunk_id in seen:
+                continue
+            seen.add(chunk_id)
+            candidates.append({
+                "chunk_id": chunk_id, "offset": max(0, int(match.get("offset") or 0)),
+                "source": "local", "anchor": str(match.get("anchor") or ""),
+            })
+            if len(candidates) >= 6:
+                break
+        ledger[rule_id] = {"strategy": _rule_execution_strategy(rule), "candidates": candidates}
+    return ledger
 
 
 def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *, targeted: bool = False) -> dict:
@@ -2893,16 +3048,26 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
             failed_root_ids.append(root_id)
         if root_id and root_id not in selected_ids:
             selected_ids.insert(0, root_id)
-    # 最终组不需要重发首轮记录的所有内部字段。压缩为可追溯的证据目录后，优先给原页
-    # 留出空间，避免“候选 JSON 很完整、重点原文却被截断”的反向退化。
-    compact_findings = [
-        {
-            "rule_id": item.get("rule_id"), "page": item.get("page_hint") or item.get("page_range"),
-            "evidence": item.get("evidence"), "status": item.get("tentative_status"),
-            "priority": item.get("evidence_priority"), "evidence_origin": item.get("observation"),
-        }
-        for item in ranked_findings
-    ]
+    # 最终组不需要重发首轮记录的所有内部字段。证据目录按规则轮转保留首条，再填充
+    # 第二、三条，避免全局高优先级结果挤掉同组靠后规则的唯一证据。
+    by_rule_findings: dict[str, list[dict]] = {}
+    for item in ranked_findings:
+        rule_id = str(item.get("rule_id") or "")
+        if rule_id:
+            by_rule_findings.setdefault(rule_id, []).append(item)
+    compact_findings: list[dict] = []
+    max_rounds = max((len(values) for values in by_rule_findings.values()), default=0)
+    for round_index in range(max_rounds):
+        for rule in rules:
+            values = by_rule_findings.get(str(rule.get("rule_id") or ""), [])
+            if round_index >= len(values):
+                continue
+            item = values[round_index]
+            compact_findings.append({
+                "rule_id": item.get("rule_id"), "page": item.get("page_hint") or item.get("page_range"),
+                "evidence": item.get("evidence"), "status": item.get("tentative_status"),
+                "priority": item.get("evidence_priority"), "evidence_origin": item.get("observation"),
+            })
     scope_packet = ""
     if is_review_group:
         scope_packet = (
@@ -2943,13 +3108,19 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
     # 原页不会被前面规则的大段材料饿死，最终模型仍可基于真实全文片段作判断。
     rule_evidence: dict[str, list[str]] = {}
     required_ids: list[str] = []
-    fallback_by_rule = select_rule_chunk_map(scan.get("chunks", []), rules, per_rule=1)
+    ledger = scan.get("evidence_ledger", {}) if isinstance(scan.get("evidence_ledger"), dict) else {}
+    fallback_by_rule = select_rule_chunk_evidence_map(scan.get("chunks", []), rules, per_rule=1)
+    fallback_offsets: dict[str, int] = {}
     for rule in rules:
         rule_id = str(rule.get("rule_id") or "")
         finding = best_by_rule.get(rule_id)
         chunk_id = str((finding or {}).get("chunk_id") or "").split(".", 1)[0]
         if not chunk_id:
-            chunk_id = next(iter(fallback_by_rule.get(rule_id, [])), "")
+            ledger_candidate = next(iter((ledger.get(rule_id) or {}).get("candidates", [])), {})
+            fallback = ledger_candidate or next(iter(fallback_by_rule.get(rule_id, [])), {})
+            chunk_id = str(fallback.get("chunk_id") or "")
+            if chunk_id:
+                fallback_offsets[chunk_id] = int(fallback.get("offset") or 0)
         if not chunk_id:
             continue
         if finding and finding.get("evidence"):
@@ -2958,11 +3129,11 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
             required_ids.append(chunk_id)
     ordered_ids = required_ids + [item for item in selected_ids if item not in required_ids]
 
-    def source_excerpt(chunk: dict, evidence_values: list[str], budget: int) -> str:
+    def source_excerpt(chunk: dict, evidence_values: list[str], budget: int, fallback_offset: int | None = None) -> str:
         source = str(chunk.get("text") or "")
         if len(source) <= budget:
             return source
-        offset = 0
+        offset = max(0, int(fallback_offset or 0))
         for evidence in evidence_values:
             fragments = sorted(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]{6,}", evidence), key=len, reverse=True)
             for fragment in fragments:
@@ -2990,7 +3161,7 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
         body_budget = max(300, min(remaining - 40, fair_share - 40))
         if body_budget <= 0:
             break
-        body = source_excerpt(chunk, rule_evidence.get(chunk_id, []), body_budget)
+        body = source_excerpt(chunk, rule_evidence.get(chunk_id, []), body_budget, fallback_offsets.get(chunk_id))
         piece = f"\n\n【{_full_scan_chunk_label(chunk)}】\n{body}"
         if len(piece) > remaining:
             piece = piece[:remaining]
@@ -3028,10 +3199,7 @@ def _combined_manual_results(component: str, rules: list[dict], payload: list[di
 
 
 def _is_minimax_m3_profile(profile: dict) -> bool:
-    return (
-        "api.minimaxi.com" in str(profile.get("base_url") or "").lower()
-        and str(profile.get("model_name") or "").lower() == "minimax-m3"
-    )
+    return bool(model_capabilities(profile).get("vision")) and str(profile.get("model_name") or "").lower() == "minimax-m3"
 
 
 def _ordered_combined_results(rules: list[dict], values: list[dict]) -> list[dict]:
@@ -3266,9 +3434,11 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
 def _cross_bid_price_rules(rules: list[dict]) -> list[dict]:
     """只有必须横向比较投标报价的规则才进入统一价格计算。"""
     pattern = re.compile(r"最低(?:投标)?价|评审价|评标价|基准价|价格分|报价得分|投标报价[^，。；]{0,20}得分")
-    return [rule for rule in rules if pattern.search(
-        f"{rule.get('title', '')} {rule.get('check_rule', '')} {rule.get('source_text', '')}"
-    )]
+    return [
+        rule for rule in rules
+        if str(rule.get("execution_strategy") or "") == "cross_bid"
+        or pattern.search(f"{rule.get('title', '')} {rule.get('check_rule', '')} {rule.get('source_text', '')}")
+    ]
 
 
 def _cross_bid_price_context(documents: list[dict], rules: list[dict]) -> str:
@@ -3441,6 +3611,10 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
         app, task, profile, document, review_rules + objective_rules + subjective_rules, project_scope, system_prompt,
         progress_callback=progress.advance,
     )
+    if scan_index:
+        scan_index["evidence_ledger"] = _build_rule_evidence_ledger(
+            scan_index, review_rules + objective_rules + subjective_rules,
+        )
     values = {
         "reused_document_count": 0,
         "full_scan_document_count": 1 if scan_index else 0,
@@ -3455,13 +3629,25 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
     for component, component_rules, run in components:
         # 长文件已有全文扫描索引时，按重合证据页重组规则，减少不同组重复携带同一页。
         groups = _evaluation_rule_batches(component, component_rules, scan_index=scan_index)
-        for group_index, group in enumerate(groups, start=1):
+        def run_group(group_index: int, group: list[dict]):
             label = f"{bidder_name}·{component} 第{group_index}组"
             progress.message(f"正在综合评审：{label}")
             results, compact_count, split_count, fallback_count, _ = _run_combined_batch(
                 app, task, profile, document, component, group, system_prompt, char_limit, label, scan_index=scan_index,
             )
-            # 每个规则组成功后立即持久化；只有完成该投标人的全部规则后才对页面公开展示。
+            return group_index, label, results, compact_count, split_count, fallback_count
+
+        # 单一投标文件过去会把全部规则组串行执行；现在复用任务级请求闸门，在不超过
+        # 当前模型并发上限的前提下并行独立规则组。小服务器只增加短生命周期线程，
+        # 不加载模型或维持后台队列。
+        gate = task.get("_evaluation_request_gate")
+        # 与请求闸门的当前已验证并发位保持一致：单文件首轮仍串行建立服务商稳定性，
+        # 连续成功后由 gate 升档，下一类规则组即可并行，避免瞬时并发改变既有容错语义。
+        admitted_limit = int(getattr(gate, "limit", 1) or 1)
+        worker_count = min(_profile_parallel_limit(profile, len(groups)), admitted_limit, len(groups)) if groups else 0
+        def persist_completed(value):
+            group_index, label, results, compact_count, split_count, fallback_count = value
+            # 每个规则组成功后立即持久化；后续组异常时，页面仍能获得已完成部分。
             if component == "review" and run:
                 storage.save_review_results(app, run["review_run_id"], document["document_id"], results)
             elif run:
@@ -3471,6 +3657,18 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
             values["manual_fallback_rule_count"] += fallback_count
             values["batch_count"] += 1
             progress.advance(f"已完成综合评审：{label}")
+
+        if worker_count > 1:
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="evaluation-rule") as executor:
+                futures = [executor.submit(run_group, index, group) for index, group in enumerate(groups, start=1)]
+                completed_groups = []
+                for future in as_completed(futures):
+                    completed_groups.append(future.result())
+            for value in sorted(completed_groups):
+                persist_completed(value)
+        else:
+            for index, group in enumerate(groups, start=1):
+                persist_completed(run_group(index, group))
     progress.document_completed(document)
     return values
 
@@ -3682,6 +3880,8 @@ def _evaluate_all(app, task: dict) -> dict:
     # 对 2 核 2GB 服务器而言这主要增加网络等待并行，不常驻加载额外模型。
     parallel_limit = _profile_parallel_limit(profile, len(documents))
     task["_evaluation_request_gate"] = _EvaluationRequestGate(
+        # 多投标人两路保守启动；单份文件先串行确认服务商稳定性，连续成功后 gate
+        # 自动升档，后续独立规则组才会并行。
         min(2 if len(documents) > 1 else 1, parallel_limit),
         max_limit=parallel_limit,
     )
