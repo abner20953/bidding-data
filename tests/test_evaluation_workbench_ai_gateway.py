@@ -31,7 +31,11 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
         ))
 
         self.assertEqual(capabilities["structured_output"], "prompt_constrained")
-        self.assertTrue(capabilities["vision"])
+        # 是否可识图由模型档案中的人工多模态标识决定，不能再按某个模型名称硬编码。
+        self.assertFalse(capabilities["vision"])
+        self.assertTrue(model_capabilities(self._profile(
+            base_url="https://api.minimaxi.com/v1", model_name="MiniMax-M3", supports_vision=True,
+        ))["vision"])
         self.assertFalse(capabilities["strict_tool_schema"])
 
     def test_model_capabilities_expose_deepseek_structured_output(self):

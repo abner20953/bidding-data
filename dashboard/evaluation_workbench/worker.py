@@ -12,6 +12,7 @@ import threading
 import time
 import traceback
 import zipfile
+import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -119,7 +120,16 @@ def _lock_path(app) -> Path:
     return storage.data_dir(app) / "worker.lock"
 
 
-def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt: str, user_prompt: str,
+def _prompt_input_chars(value: object) -> int:
+    if isinstance(value, str):
+        return len(value)
+    try:
+        return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    except (TypeError, ValueError):
+        return len(str(value or ""))
+
+
+def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt: str, user_prompt: object,
                        *, document_id: str | None = None, context_mode: str = "full_prefix",
                        max_tokens: int | None = None, thinking_mode: str | None = None) -> dict:
     """调用模型并只记录用量元数据，不记录正文或提示词。"""
@@ -175,7 +185,7 @@ def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt
                 # 部分兼容接口不返回 usage；仍保留发送字符数与截断元数据以便统计和优化。
                 storage.record_model_call(
                     app, task["task_id"], task["project_id"], phase, profile.get("profile_id"),
-                    document_id=document_id, input_chars=len(system_prompt) + len(user_prompt),
+                    document_id=document_id, input_chars=len(system_prompt) + _prompt_input_chars(user_prompt),
                     context_mode=context_mode, usage=usage, response_metadata=response_metadata,
                 )
         finally:
@@ -1230,6 +1240,16 @@ def _rule_requires_visual_verification(item: dict) -> bool:
     # 提取模型已经明确给出布尔判断时，不能再因规则文字中提及“证照”“签章”等
     # 触发词把整条规则强行升级为 OCR。混合型规则可能以文字为决定性证据，视觉
     # 兜底只服务于旧规则或没有给出明确分类的输入。
+    configured_trigger = str(item.get("vision_trigger") or "")
+    if not configured_trigger:
+        try:
+            configured_trigger = str(storage.rule_execution_meta(item).get("vision_trigger") or "")
+        except (TypeError, ValueError):
+            configured_trigger = ""
+    if configured_trigger == "text_fallback":
+        return False
+    if configured_trigger == "required":
+        return True
     requirements = item.get("evidence_requirements")
     if not isinstance(requirements, list):
         try:
@@ -1256,54 +1276,27 @@ def _rule_requires_visual_verification(item: dict) -> bool:
     return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in VISUAL_EVIDENCE_PATTERNS)
 
 
-def _ensure_small_business_declaration_text_rules(rules: list[dict]) -> list[dict]:
-    """将中小企业声明函的可读字段检查与图片外观核验分开。
+def _normalise_visual_rule_policies(rules: list[dict]) -> list[dict]:
+    """为任意规则补齐通用的图片识别策略，不按材料名称打补丁。
 
-    文字版声明函不应因为同一文件也可能含扫描签章而被整体排除在默认审查外；
-    同时保留视觉规则，避免文字提取替代签章、勾选和手写修改的核验。
+    规则语义仍由提取模型和人工维护；这里仅把已有的 text/visual 证据类型转换为
+    默认关闭的执行策略。用户随后可在规则集里选择是否启用图片识别及其强度。
     """
     result: list[dict] = []
-    for rule in rules:
-        if not isinstance(rule, dict):
+    for item in rules:
+        if not isinstance(item, dict):
             continue
-        combined = " ".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text"))
-        if "中小企业声明函" not in combined:
-            result.append(rule)
-            continue
-        if not _rule_requires_visual_verification(rule):
-            value = dict(rule)
-            requirements = value.get("evidence_requirements")
-            if not isinstance(requirements, list) or not requirements:
-                value["evidence_requirements"] = ["text"]
-            value["ocr_required"] = False
-            value["check_mode"] = "auto"
-            result.append(value)
-            continue
-
-        base_title = str(rule.get("title") or "中小企业声明函").strip()[:92]
-        text_rule = dict(rule)
-        text_rule.update({
-            "title": f"{base_title}（填写内容完整性）"[:120],
-            "check_rule": (
-                "核验《中小企业声明函》中可读取的标的名称、所属行业、承接企业名称、"
-                "从业人员、营业收入、资产总额和企业类型是否逐项填写；模板占位、下划线、"
-                "未删除的互斥选项或仅保留提示文字时判为部分或未完成。"
-            ),
-            "ocr_required": False,
-            "check_mode": "auto",
-            "execution_strategy": "point",
-            "evidence_requirements": ["text"],
-        })
-        visual_rule = dict(rule)
-        visual_rule.update({
-            "title": f"{base_title}（签章与勾选外观）"[:120],
-            "check_rule": "仅核验《中小企业声明函》的签章、勾选状态、手写修改及其他必须依赖图片外观确认的事实。",
-            "ocr_required": True,
-            "check_mode": "ocr",
-            "execution_strategy": "visual",
-            "evidence_requirements": ["visual"],
-        })
-        result.extend((text_rule, visual_rule))
+        rule = dict(item)
+        requirements = rule.get("evidence_requirements")
+        if not isinstance(requirements, list):
+            requirements = []
+        requirements = {str(value) for value in requirements}
+        visual = "visual" in requirements or _rule_requires_visual_verification(rule)
+        text = "text" in requirements
+        rule["vision_trigger"] = "text_fallback" if visual and text else "required" if visual else "off"
+        # 默认关闭，保持既有“默认仅选择无需 OCR 项”的行为；人工在规则集开启后才调用图片模型。
+        rule["vision_level"] = "off"
+        result.append(rule)
     return result
 
 
@@ -1847,6 +1840,7 @@ def _extract_rules(app, task: dict) -> dict:
     if not main_text:
         raise ValueError("主招标文件未提取到可用文本，扫描件需要先提供可检索版本")
     profile = storage.get_model_profile(app, task.get("payload", {}).get("profile_id"), "deepseek-v4-flash")
+    vision_profile = storage.resolve_vision_model_profile(app, profile)
     char_limit = _prompt_char_limit(profile, 180_000, 400_000)
     source_documents = [(f"主招标文件：{tender['original_name']}", main_text)]
     attachments = [item for item in documents if item["role"] == "tender_attachment" and item.get("parse_status") == "success" and item.get("parsed_path")]
@@ -2010,7 +2004,7 @@ def _extract_rules(app, task: dict) -> dict:
         app, task, profile, system_prompt, rules,
     )
     rules = _filter_inapplicable_template_rules(_filter_rules_for_package(rules, package_number), text)
-    rules = _ensure_small_business_declaration_text_rules(rules)
+    rules = _normalise_visual_rule_policies(rules)
     for item in rules:
         if _rule_requires_visual_verification(item):
             item["ocr_required"] = True
@@ -3311,7 +3305,144 @@ def _combined_manual_results(component: str, rules: list[dict], payload: list[di
 
 
 def _is_minimax_m3_profile(profile: dict) -> bool:
-    return bool(model_capabilities(profile).get("vision")) and str(profile.get("model_name") or "").lower() == "minimax-m3"
+    return str(profile.get("model_name") or "").lower() == "minimax-m3" and "api.minimaxi.com" in str(profile.get("base_url") or "").lower()
+
+
+_VISION_LEVEL_SETTINGS = {
+    "low": {"detail": "low", "max_pages": 1, "scale": 1.15, "quality": 72},
+    "standard": {"detail": "default", "max_pages": 2, "scale": 1.55, "quality": 82},
+    "high": {"detail": "high", "max_pages": 3, "scale": 2.0, "quality": 88},
+}
+_VISION_REQUEST_GATE = threading.BoundedSemaphore(1)
+
+
+def _rule_vision_policy(rule: dict) -> tuple[str, str]:
+    """读取可向后兼容的图片识别执行策略。"""
+    try:
+        meta = storage.rule_execution_meta(rule)
+    except (TypeError, ValueError):
+        meta = {}
+    trigger = str(rule.get("vision_trigger") or meta.get("vision_trigger") or "off")
+    level = str(rule.get("vision_level") or meta.get("vision_level") or "off")
+    return (trigger if trigger in {"off", "text_fallback", "required"} else "off",
+            level if level in _VISION_LEVEL_SETTINGS else "off")
+
+
+def _needs_visual_fallback(component: str, result: dict) -> bool:
+    if component == "review":
+        return result.get("status") in {"ocr_required", "manual", "not_found", "partial"} or result.get("evidence_quality") != "sufficient"
+    return result.get("suggested_score") is None or result.get("confidence") != "high" or "OCR" in str(result.get("reason") or "")
+
+
+def _vision_page_candidates(document: dict, rule: dict, result: dict, maximum: int) -> list[int]:
+    """仅使用文字审查已定位的页码；首期不为未知扫描件盲发整份文件。"""
+    if document.get("extension") != ".pdf" or not document.get("page_count"):
+        return []
+    pages: list[int] = []
+    for source in (result.get("page_hint"), result.get("evidence"), result.get("reason")):
+        for raw in re.findall(r"第?\s*(\d{1,4})\s*页?", str(source or "")):
+            page = int(raw)
+            if 1 <= page <= int(document["page_count"]) and page not in pages:
+                pages.append(page)
+            if len(pages) >= maximum:
+                return pages
+    # 规则本身的招标页不是投标文件证据，不能作为候选页；没有定位结果时宁可保留待核验。
+    return pages
+
+
+def _render_vision_images(app, document: dict, pages: list[int], level: str) -> list[dict]:
+    setting = _VISION_LEVEL_SETTINGS[level]
+    source = storage.document_path(app, document)
+    images: list[dict] = []
+    with fitz.open(source) as pdf:
+        for page_number in pages[:setting["max_pages"]]:
+            page = pdf[page_number - 1]
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(setting["scale"], setting["scale"]), alpha=False)
+            content = pixmap.tobytes("jpeg", jpg_quality=setting["quality"])
+            # 一张图片控制在约 4MB 内，既低于接口上限，也避免 2GB 小服务器出现大块内存峰值。
+            while len(content) > 4 * 1024 * 1024 and setting["scale"] > 0.8:
+                setting = {**setting, "scale": setting["scale"] * 0.75, "quality": max(60, setting["quality"] - 8)}
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(setting["scale"], setting["scale"]), alpha=False)
+                content = pixmap.tobytes("jpeg", jpg_quality=setting["quality"])
+            images.append({
+                "page": page_number,
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(content).decode("ascii"), "detail": setting["detail"]},
+            })
+    return images
+
+
+def _visual_rule_packet(rule: dict) -> dict:
+    scoring = _rule_scoring(rule)
+    return {
+        "rule_id": rule["rule_id"], "category": rule.get("category"), "title": rule.get("title"),
+        "check_rule": rule.get("check_rule") or rule.get("title"), "source_text": rule.get("source_text"),
+        "scoring": scoring if scoring else None,
+    }
+
+
+def _run_visual_supplement(app, task: dict, document: dict, component: str, rule: dict, result: dict,
+                           vision_profile: dict) -> dict:
+    trigger, level = _rule_vision_policy(rule)
+    if trigger == "off" or level == "off":
+        return result
+    if trigger == "text_fallback" and not _needs_visual_fallback(component, result):
+        return result
+    pages = _vision_page_candidates(document, rule, result, _VISION_LEVEL_SETTINGS[level]["max_pages"])
+    if not pages:
+        return result
+    prompt = storage.render_prompt_template(
+        app, "evaluate_all_visual_user", rule=json.dumps(_visual_rule_packet(rule), ensure_ascii=False, separators=(",", ":")),
+        document_name=document.get("original_name") or "投标文件", bidder_name=document.get("bidder_name") or document.get("original_name") or "投标人",
+        vision_trigger=trigger, vision_level=level, text_result=json.dumps(result, ensure_ascii=False, separators=(",", ":")),
+    )
+    images = _render_vision_images(app, document, pages, level)
+    if not images:
+        return result
+    content = [{"type": "text", "text": prompt}, *images]
+    try:
+        with _VISION_REQUEST_GATE:
+            parsed = _request_task_json(
+                app, task, vision_profile, f"evaluate_all_{component}_vision", _system_prompt(app, "evaluate_all"), content,
+                document_id=document["document_id"], context_mode=f"vision_{level}",
+                max_tokens=_output_token_budget(vision_profile, 1_800), thinking_mode="disabled",
+            )
+    except ValueError:
+        # 图片补充失败绝不覆盖原始文字结论，也不让整份综合评审失败。
+        return result
+    if not isinstance(parsed, dict):
+        return result
+    page_hint = str(parsed.get("page_hint") or f"第{'、'.join(str(page) for page in pages)}页")[:80]
+    visual_evidence = _clean_model_text(parsed.get("evidence"))[:1600]
+    visual_reason = _clean_model_text(parsed.get("reason"))[:1200]
+    prefix = f"【图片识别·{level}·{page_hint}】"
+    if component == "review":
+        status = str(parsed.get("status") or "manual")
+        if status not in {"satisfied", "not_satisfied", "partial", "not_found", "manual"}:
+            status = "manual"
+        merged = _review_result_from_model({
+            "evidence": "\n".join(value for value in (result.get("evidence"), f"{prefix}{visual_evidence}" if visual_evidence else "") if value),
+            "page_hint": page_hint,
+            "reason": "\n".join(value for value in (result.get("reason"), f"{prefix}{visual_reason}" if visual_reason else "") if value),
+            "risk_level": parsed.get("risk_level") or result.get("risk_level"),
+            "confidence": parsed.get("confidence") or result.get("confidence"),
+            "evidence_quality": "sufficient" if visual_evidence else result.get("evidence_quality"),
+        }, rule["rule_id"], status)
+        return merged
+    max_score = float(_rule_scoring(rule).get("max_score") or result.get("max_score") or 0)
+    suggested = _bounded_model_score(parsed.get("suggested_score"), max_score) if max_score > 0 else None
+    if suggested is None:
+        suggested = result.get("suggested_score")
+    return {
+        **result,
+        "suggested_score": suggested,
+        "evidence": "\n".join(value for value in (result.get("evidence"), f"{prefix}{visual_evidence}" if visual_evidence else "") if value)[:2000],
+        "reason": "\n".join(value for value in (result.get("reason"), f"{prefix}{visual_reason}" if visual_reason else "") if value)[:2000],
+        "confidence": parsed.get("confidence") if parsed.get("confidence") in {"high", "medium", "low"} else result.get("confidence"),
+        "requires_review": True,
+        "automation_status": "needs_review",
+        "review_reason": "图片识别结果已补充，需人工复核。",
+    }
 
 
 def _ordered_combined_results(rules: list[dict], values: list[dict]) -> list[dict]:
@@ -3742,7 +3873,8 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
                        expected_rule_ids: dict[str, set[str]], review_rules: list[dict], objective_rules: list[dict],
                        subjective_rules: list[dict], review_run: dict | None, objective_run: dict | None,
                        subjective_run: dict | None, project_scope: dict, system_prompt: str,
-                       scan_units: int, groups_per_document: int, progress: _EvaluationProgress) -> dict:
+                       scan_units: int, groups_per_document: int, vision_profile: dict | None,
+                       visual_units: int, progress: _EvaluationProgress) -> dict:
     """处理一份投标文件；不同投标人可并行，单份文件内仍严格顺序执行。"""
     bidder_name = document["bidder_name"] or document["original_name"]
     progress.message(f"正在综合评审：{bidder_name}")
@@ -3757,7 +3889,7 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
             storage.save_score_results(app, objective_run["score_run_id"], document["document_id"], reusable["objective"])
         if subjective_run:
             storage.save_score_results(app, subjective_run["score_run_id"], document["document_id"], reusable["subjective"])
-        progress.advance(f"已复用 {bidder_name} 的完整评审结果", scan_units + groups_per_document)
+        progress.advance(f"已复用 {bidder_name} 的完整评审结果", scan_units + groups_per_document + visual_units)
         progress.document_completed(document, reused=True)
         return {"reused_document_count": 1}
 
@@ -3784,6 +3916,7 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
             1 for value in ledger.values() if not value.get("candidates")
         ) if isinstance(ledger, dict) else 0,
     }
+    completed_results: dict[str, dict[str, dict]] = {"review": {}, "objective": {}, "subjective": {}}
     components = (("review", review_rules, review_run), ("objective", objective_rules, objective_run), ("subjective", subjective_rules, subjective_run))
     for component, component_rules, run in components:
         # 长文件已有全文扫描索引时，按重合证据页重组规则，减少不同组重复携带同一页。
@@ -3811,6 +3944,7 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
                 storage.save_review_results(app, run["review_run_id"], document["document_id"], results)
             elif run:
                 storage.save_score_results(app, run["score_run_id"], document["document_id"], results)
+            completed_results[component].update({item["rule_id"]: item for item in results})
             values["compact_retry_count"] += compact_count
             values["split_retry_count"] += split_count
             values["manual_fallback_rule_count"] += fallback_count
@@ -3828,6 +3962,30 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
         else:
             for index, group in enumerate(groups, start=1):
                 persist_completed(run_group(index, group))
+    if vision_profile:
+        visual_components = (
+            ("review", review_rules, review_run),
+            ("objective", objective_rules, objective_run),
+            ("subjective", subjective_rules, subjective_run),
+        )
+        for component, component_rules, run in visual_components:
+            for rule in component_rules:
+                trigger, level = _rule_vision_policy(rule)
+                if trigger == "off" or level == "off":
+                    continue
+                base = completed_results[component].get(rule["rule_id"])
+                if not base:
+                    progress.advance(f"跳过未产生文字结果的图片识别：{bidder_name}")
+                    continue
+                progress.message(f"正在图片识别：{bidder_name} · {rule.get('title') or rule.get('check_rule')}")
+                merged = _run_visual_supplement(app, task, document, component, rule, base, vision_profile)
+                completed_results[component][rule["rule_id"]] = merged
+                if component == "review" and run:
+                    storage.save_review_results(app, run["review_run_id"], document["document_id"], [merged])
+                elif run:
+                    storage.save_score_results(app, run["score_run_id"], document["document_id"], [merged])
+                values["batch_count"] += 1
+                progress.advance(f"已完成图片识别：{bidder_name} · {rule.get('title') or rule.get('check_rule')}")
     progress.document_completed(document)
     return values
 
@@ -4005,6 +4163,8 @@ def _evaluate_all(app, task: dict) -> dict:
     if not documents or any(item["parse_status"] != "success" or not item["parsed_path"] for item in documents):
         raise ValueError("请先成功解析全部投标文件")
     profile = storage.get_model_profile(app, task.get("payload", {}).get("profile_id"), "deepseek-v4-flash")
+    # 仅在全局开关已开启时返回可用的多模态档案；否则保留既有纯文本评审路径。
+    vision_profile = storage.resolve_vision_model_profile(app, profile)
     char_limit = _prompt_char_limit(profile, 260_000, 600_000)
     review_run = storage.create_review_run(app, task["project_id"], task["task_id"], profile["profile_id"]) if review_rules else None
     objective_run = storage.create_score_run(app, task["project_id"], task["task_id"], "objective", profile["profile_id"]) if objective_rules else None
@@ -4030,12 +4190,16 @@ def _evaluate_all(app, task: dict) -> dict:
         for component, component_rules in (("review", review_rules), ("objective", local_objective_rules), ("subjective", subjective_rules))
     )
     has_local_rules = bool(review_rules or local_objective_rules or subjective_rules)
+    visual_rule_count = sum(
+        1 for item in (review_rules + local_objective_rules + subjective_rules)
+        if _rule_vision_policy(item)[0] != "off" and _rule_vision_policy(item)[1] != "off"
+    ) if vision_profile else 0
     scan_units_by_document = {
         item["document_id"]: _full_scan_chunk_count(item) if has_local_rules else 0
         for item in documents
     }
     cross_bid_units = 1 if objective_run and len(documents) >= 2 and cross_bid_price_rules else 0
-    total_work_units = max(1, sum(scan_units_by_document.values()) + len(documents) * groups_per_document + cross_bid_units)
+    total_work_units = max(1, sum(scan_units_by_document.values()) + len(documents) * (groups_per_document + visual_rule_count) + cross_bid_units)
     # 首次仍以两路保守启动；连续成功后再按模型档案增加并行位。
     # 对 2 核 2GB 服务器而言这主要增加网络等待并行，不常驻加载额外模型。
     parallel_limit = _profile_parallel_limit(profile, len(documents))
@@ -4054,7 +4218,7 @@ def _evaluate_all(app, task: dict) -> dict:
             subjective_rules=subjective_rules, review_run=review_run, objective_run=objective_run,
             subjective_run=subjective_run, project_scope=project_scope, system_prompt=system_prompt,
             scan_units=scan_units_by_document[document["document_id"]], groups_per_document=groups_per_document,
-            progress=progress,
+            vision_profile=vision_profile, visual_units=visual_rule_count, progress=progress,
         )
 
     # 只有投标人之间的文件审查并行；单份文件仍保持页块、规则组的先后顺序。
@@ -4098,6 +4262,8 @@ def _evaluate_all(app, task: dict) -> dict:
             "subjective_run_id": subjective_run["score_run_id"] if subjective_run else None, "document_count": len(documents),
             "reused_document_count": reused_document_count, "model_document_count": len(documents) - reused_document_count,
             "rule_count": len(all_rules), "profile": profile["display_name"],
+            "vision_profile": vision_profile.get("display_name") if vision_profile and visual_rule_count else None,
+            "vision_rule_count": visual_rule_count,
             # format_recovery_count 保留旧任务结果的统计语义；其余字段按真实调用路径拆分，
             # 避免把 JSON 修复误显示为“紧凑重试”。
             "format_recovery_count": compact_retry_count,

@@ -291,12 +291,15 @@ def model_capabilities(profile: dict) -> dict:
     base_url = str(profile.get("base_url") or "").lower()
     minimax = "api.minimaxi.com" in base_url
     m3 = minimax and model_name == "minimax-m3"
+    declared_vision = bool(profile.get("supports_vision"))
+    vision_protocol = str(profile.get("vision_protocol") or "")
     deepseek = "api.deepseek.com" in base_url or model_name.startswith("deepseek-")
     if deepseek:
         return {
             "structured_output": "json_object",
             "strict_tool_schema": True,
-            "vision": False,
+            "vision": declared_vision,
+            "vision_protocol": vision_protocol if declared_vision else "",
             "thinking_modes": ["enabled", "disabled"],
             "parallel_limit": 3,
             "prompt_cache": "prefix",
@@ -307,7 +310,8 @@ def model_capabilities(profile: dict) -> dict:
             # 本地 JSON 恢复兜底，而不是让界面产生“严格 JSON 已开启”的错觉。
             "structured_output": "prompt_constrained",
             "strict_tool_schema": False,
-            "vision": m3,
+            "vision": declared_vision,
+            "vision_protocol": vision_protocol if declared_vision else "",
             "thinking_modes": ["adaptive", "disabled"] if m3 else ["default"],
             "parallel_limit": 2,
             "prompt_cache": "prefix",
@@ -315,7 +319,8 @@ def model_capabilities(profile: dict) -> dict:
     return {
         "structured_output": "prompt_constrained",
         "strict_tool_schema": False,
-        "vision": False,
+        "vision": declared_vision,
+        "vision_protocol": vision_protocol if declared_vision else "",
         "thinking_modes": ["default", "enabled", "disabled"],
         "parallel_limit": 1,
         "prompt_cache": "unknown",
@@ -450,7 +455,7 @@ def _record_response_metadata(callback, body: object, requested_output_tokens: i
     })
 
 
-def request_json(profile: dict, system_prompt: str, user_prompt: str, *, usage_callback=None,
+def request_json(profile: dict, system_prompt: str, user_prompt: object, *, usage_callback=None,
                  response_metadata_callback=None, max_tokens: int | None = None) -> dict:
     api_key = _api_key_for(profile)
     base_url = profile["base_url"].rstrip("/")

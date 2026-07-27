@@ -1170,6 +1170,38 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "未找到已启用的模型档案"):
             storage.get_model_profile(self.app, profile["profile_id"])
 
+    def test_vision_configuration_is_opt_in_and_clears_when_default_model_becomes_unusable(self):
+        self.assertEqual(storage.vision_configuration(self.app), {"enabled": False, "default_profile_id": None})
+        profile = storage.create_model_profile(self.app, {
+            "display_name": "图片模型", "base_url": "https://example.test/v1", "model_name": "vision-model",
+            "api_key": "test-key", "supports_vision": True,
+        })
+        with self.assertRaisesRegex(ValueError, "先选择默认图片识别模型"):
+            storage.update_vision_configuration(self.app, {"enabled": True, "default_profile_id": None})
+        config = storage.update_vision_configuration(self.app, {
+            "enabled": True, "default_profile_id": profile["profile_id"],
+        })
+        self.assertTrue(config["enabled"])
+        self.assertEqual(storage.resolve_vision_model_profile(self.app, {"supports_vision": False})["profile_id"], profile["profile_id"])
+
+        storage.update_model_profile(self.app, profile["profile_id"], {"supports_vision": False})
+        self.assertEqual(storage.vision_configuration(self.app), {"enabled": False, "default_profile_id": None})
+
+    def test_rule_vision_policy_round_trip_keeps_existing_ocr_rule_disabled_until_strength_selected(self):
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "扫描证明材料", "check_rule": "核验扫描件盖章", "ocr_required": True,
+        })
+        _, listed_rules = storage.list_rules(self.app, self.project["project_id"])
+        listed = next(item for item in listed_rules if item["rule_id"] == rule["rule_id"])
+        # 旧 OCR 规则默认只保留“需要图片”的语义；不因升级而自动产生图片模型调用。
+        self.assertEqual(listed["vision_trigger"], "required")
+        self.assertEqual(listed["vision_level"], "off")
+        updated = storage.update_rule(self.app, self.project["project_id"], rule["rule_id"], {
+            "vision_trigger": "text_fallback", "vision_level": "standard",
+        })
+        self.assertEqual(updated["vision_trigger"], "text_fallback")
+        self.assertEqual(updated["vision_level"], "standard")
+
     def test_model_configuration_management_requires_password(self):
         client = self.app.test_client()
         locked = client.post("/api/evaluation-workbench/model-profiles", json={
@@ -1989,18 +2021,16 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         titles = [item["title"] for item in worker._filter_inapplicable_template_rules(rules[:2], active_tender)]
         self.assertEqual(titles, ["★号条款响应", "进口产品限制"])
 
-    def test_small_business_declaration_splits_text_and_visual_checks(self):
-        rules = worker._ensure_small_business_declaration_text_rules([{
-            "rule_id": "sme", "category": "qualification", "title": "中小企业声明函",
-            "check_rule": "核验中小企业声明函填写并加盖公章", "source_text": "提供中小企业声明函",
-            "check_mode": "ocr",
+    def test_visual_rule_policy_is_generic_and_default_disabled(self):
+        rules = worker._normalise_visual_rule_policies([{
+            "rule_id": "any-visual-rule", "category": "qualification", "title": "任意扫描材料",
+            "check_rule": "核验扫描件上的盖章状态", "source_text": "应加盖单位章",
+            "check_mode": "ocr", "evidence_requirements": ["visual"],
         }])
-        self.assertEqual(len(rules), 2)
-        text_rule = next(item for item in rules if item["check_mode"] == "auto")
-        visual_rule = next(item for item in rules if item["check_mode"] == "ocr")
-        self.assertIn("所属行业", text_rule["check_rule"])
-        self.assertEqual(text_rule["evidence_requirements"], ["text"])
-        self.assertEqual(visual_rule["evidence_requirements"], ["visual"])
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0]["vision_trigger"], "required")
+        # 提取阶段只给出建议条件，真正的图片调用必须由人工选择强度后启用。
+        self.assertEqual(rules[0]["vision_level"], "off")
 
     def test_review_normalisation_reconciles_positive_reason_and_negative_status(self):
         result = worker._normalise_review_results([{

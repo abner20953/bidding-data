@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 PROMPT_TEMPLATE_SETTING = "evaluation_workbench_prompt_templates"
-EVALUATION_PROMPT_VERSION = "review-anchor-gate-v18"
+EVALUATION_PROMPT_VERSION = "vision-policy-v19"
 
 
 def _template(name: str, description: str, content: str, *placeholders: str) -> dict:
@@ -157,6 +157,20 @@ _APPLICABILITY_AND_RESULT_CONSISTENCY_GUIDANCE = (
 )
 PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += "\n\n" + _APPLICABILITY_AND_RESULT_CONSISTENCY_GUIDANCE
 PROMPT_TEMPLATES["evaluate_all_guidance"]["content"] += "\n\n" + _APPLICABILITY_AND_RESULT_CONSISTENCY_GUIDANCE
+PROMPT_TEMPLATES["evaluate_all_visual_user"] = _template(
+    "综合评审 · 图片识别补充",
+    "仅对已启用图片识别的单条规则和候选页面进行补充判断。",
+    "你正在进行单条招投标规则的图片识别补充审查。图片可能是扫描件、证照、签章、表格或图纸。"
+    "只能依据图片中可见内容和给出的规则判断，不得猜测图片外不可见事实，不得判断证照真实性或外部状态。"
+    "若文字可读字段已足够，应直接列出可见字段；若图片模糊、页面不完整或无法确认，应如实说明。"
+    "只返回合法 JSON：{\"status\":\"satisfied|not_satisfied|partial|not_found|manual\",\"suggested_score\":数字或null,"
+    "\"evidence\":\"图片中可见的关键事实\",\"page_hint\":\"页码或null\",\"reason\":\"简洁判断理由\","
+    "\"risk_level\":\"low|medium|high\",\"confidence\":\"high|medium|low\",\"needs_more_image\":true|false}。"
+    "suggested_score 仅在评分规则存在时填写，且不得超出满分；非评分规则必须为 null。"
+    "证据和理由不得复述规则。\n规则：{{rule}}\n投标文件：{{document_name}}；投标人：{{bidder_name}}\n"
+    "图片识别条件：{{vision_trigger}}；识图强度：{{vision_level}}。\n已有文字结论（仅作辅助，不得照抄）：{{text_result}}",
+    "rule", "document_name", "bidder_name", "vision_trigger", "vision_level", "text_result",
+)
 PROMPT_TEMPLATES["extract_rules_validation_guidance"]["content"] += (
     " 条件模板的前提必须由当前采购包原文中的明确勾选、明确说明或直接陈述支持；仅出现“如有/如允许/"
     "当……时/★号条款”字样而未定位具体已启用事实时，删除该候选。中小企业声明函应把可读取的填写"
@@ -204,6 +218,7 @@ PROMPT_TEMPLATE_PRESENTATION = {
     "evaluate_all_subjective_user": ("workflow", "综合评审", 134, "careful"),
     "evaluate_all_cross_bid_price_user": ("workflow", "综合评审", 135, "careful"),
     "evaluate_all_highlights_user": ("workflow", "综合评审", 136, "careful"),
+    "evaluate_all_visual_user": ("workflow", "综合评审", 137, "careful"),
 
     # 系统角色、格式修复和旧接口兼容模板；保留编辑能力但默认收起。
     "model_connection_test": ("system", "连接与修复", 210, "advanced"),

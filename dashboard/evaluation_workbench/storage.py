@@ -27,6 +27,8 @@ MAX_QUEUED_TASKS = 3
 MAX_UPLOAD_MB = max(1, int(os.environ.get("EVALUATION_WORKBENCH_MAX_UPLOAD_MB", "500")))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 GLOBAL_RULE_CATEGORIES = {"qualification", "compliance", "substantive", "other"}
+VISION_ENABLED_SETTING = "evaluation_workbench_vision_enabled"
+DEFAULT_VISION_MODEL_SETTING = "default_vision_model_profile_id"
 
 _SCORE_TOTAL_PATTERN = re.compile(r"(?:总计|共计|合计|最高(?:得)?|最多(?:得)?|满分(?:为)?)\s*(\d+(?:\.\d+)?)\s*分")
 _SCORE_VALUE_PATTERN = re.compile(r"(?:得|扣)\s*(\d+(?:\.\d+)?)\s*分")
@@ -122,6 +124,7 @@ def task_prompt_template_fingerprint(app, task_type: str) -> str | None:
             "evaluate_all", "evaluate_all_guidance", "evaluate_all_highlights", "evaluate_all_scope_profile", "evaluate_all_scope_profile_user",
             "evaluate_all_full_scan_user", "evaluate_all_review_user", "evaluate_all_objective_user",
             "evaluate_all_subjective_user", "evaluate_all_cross_bid_price_user", "evaluate_all_highlights_user",
+            "evaluate_all_visual_user",
             "evaluate_all_output_contract",
             "json_repair", "json_repair_user",
         },
@@ -335,6 +338,8 @@ def init_database(app) -> None:
                 timeout_seconds INTEGER NOT NULL DEFAULT 600,
                 json_mode INTEGER NOT NULL DEFAULT 1,
                 thinking_mode TEXT NOT NULL DEFAULT 'default',
+                supports_vision INTEGER NOT NULL DEFAULT 0,
+                vision_protocol TEXT NOT NULL DEFAULT '',
                 enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -432,6 +437,8 @@ def init_database(app) -> None:
         _ensure_column(conn, "ew_review_results", "final_status", "TEXT")
         _ensure_column(conn, "ew_review_results", "confirmed_at", "TEXT")
         _ensure_column(conn, "ew_model_profiles", "api_key_encrypted", "TEXT")
+        _ensure_column(conn, "ew_model_profiles", "supports_vision", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "ew_model_profiles", "vision_protocol", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "ew_review_results", "confidence", "TEXT")
         _ensure_column(conn, "ew_review_results", "evidence_quality", "TEXT")
         _ensure_column(conn, "ew_review_results", "automation_status", "TEXT NOT NULL DEFAULT 'needs_review'")
@@ -840,6 +847,7 @@ def task_input_fingerprint(app, project_id: str, task_type: str, profile_id: str
     documents = list_documents(app, project_id)
     rule_set = current_rule_set(app, project_id)
     profile = get_model_profile(app, profile_id, "deepseek-v4-flash")
+    vision_profile = resolve_vision_model_profile(app, profile) if task_type == "evaluate_all" else None
     relevant_roles = {
         "compare_documents": {"tender", "bid"},
         "extract_rules": {"tender", "tender_attachment"},
@@ -859,6 +867,8 @@ def task_input_fingerprint(app, project_id: str, task_type: str, profile_id: str
         "rule_set_updated_at": (rule_set or {}).get("updated_at") if uses_rules else None,
         "profile": (profile.get("profile_id"), profile.get("model_name"), profile.get("base_url"), profile.get("updated_at"), profile.get("json_mode"), profile.get("thinking_mode")),
         "comparison_version": "cross-bid-signals-v3" if task_type == "compare_documents" else None,
+        "vision_configuration": vision_configuration(app) if task_type == "evaluate_all" else None,
+        "vision_profile": (vision_profile.get("profile_id"), vision_profile.get("model_name"), vision_profile.get("base_url"), vision_profile.get("updated_at")) if vision_profile else None,
         "prompt_templates": task_prompt_template_fingerprint(app, task_type),
     }
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
@@ -1275,20 +1285,114 @@ def _public_model_profile(profile: dict) -> dict:
     env_configured = bool(value.get("api_key_env") and os.environ.get(value["api_key_env"], "").strip())
     value["api_key_configured"] = encrypted or env_configured
     value["api_key_source"] = "manual" if encrypted else "environment" if env_configured else "none"
+    value["supports_vision"] = bool(value.get("supports_vision"))
+    value["vision_protocol"] = str(value.get("vision_protocol") or "") if value.get("supports_vision") else ""
     return value
+
+
+def _clear_vision_default_for_profile(conn: sqlite3.Connection, profile_id: str) -> None:
+    """避免删除/禁用默认图片模型后留下一个看似开启、实际不可用的全局开关。"""
+    default_row = conn.execute(
+        "SELECT setting_value FROM ew_settings WHERE setting_key = ?", (DEFAULT_VISION_MODEL_SETTING,)
+    ).fetchone()
+    if not default_row or default_row["setting_value"] != profile_id:
+        return
+    conn.execute("DELETE FROM ew_settings WHERE setting_key = ?", (DEFAULT_VISION_MODEL_SETTING,))
+    conn.execute(
+        "INSERT INTO ew_settings(setting_key, setting_value, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value, updated_at=excluded.updated_at",
+        (VISION_ENABLED_SETTING, "0", now_iso()),
+    )
 
 
 def list_model_profiles(app) -> list[dict]:
     with connection(app) as conn:
         rows = conn.execute("SELECT * FROM ew_model_profiles ORDER BY created_at").fetchall()
         default_row = conn.execute("SELECT setting_value FROM ew_settings WHERE setting_key = 'default_model_profile_id'").fetchone()
+        vision_default_row = conn.execute("SELECT setting_value FROM ew_settings WHERE setting_key = ?", (DEFAULT_VISION_MODEL_SETTING,)).fetchone()
     default_id = default_row["setting_value"] if default_row else None
+    vision_default_id = vision_default_row["setting_value"] if vision_default_row else None
     profiles = []
     for row in rows:
         profile = _public_model_profile(dict(row))
         profile["is_default"] = profile["profile_id"] == default_id
+        profile["is_default_vision"] = profile["profile_id"] == vision_default_id
         profiles.append(profile)
     return profiles
+
+
+def vision_configuration(app) -> dict:
+    """全局视觉功能默认关闭；开关关闭时必须保持纯文字评审行为。"""
+    with connection(app) as conn:
+        enabled_row = conn.execute("SELECT setting_value FROM ew_settings WHERE setting_key = ?", (VISION_ENABLED_SETTING,)).fetchone()
+        profile_row = conn.execute("SELECT setting_value FROM ew_settings WHERE setting_key = ?", (DEFAULT_VISION_MODEL_SETTING,)).fetchone()
+    return {
+        "enabled": str(enabled_row["setting_value"] if enabled_row else "0") == "1",
+        "default_profile_id": profile_row["setting_value"] if profile_row else None,
+    }
+
+
+def update_vision_configuration(app, payload: dict) -> dict:
+    enabled = payload.get("enabled")
+    if not isinstance(enabled, bool):
+        raise ValueError("图片识别总开关必须为布尔值")
+    requested_profile = payload.get("default_profile_id")
+    with connection(app) as conn:
+        profile_id = str(requested_profile or "").strip()
+        if profile_id:
+            row = conn.execute("SELECT * FROM ew_model_profiles WHERE profile_id=? AND enabled=1", (profile_id,)).fetchone()
+            if not row:
+                raise ValueError("默认图片识别模型不存在或已禁用")
+            profile = dict(row)
+            has_key = bool(profile.get("api_key_encrypted")) or bool(profile.get("api_key_env") and os.environ.get(profile["api_key_env"], "").strip())
+            if not profile.get("supports_vision"):
+                raise ValueError("所选默认图片识别模型未标记为多模态模型")
+            if not has_key:
+                raise ValueError("默认图片识别模型必须已配置 API Key")
+        elif enabled:
+            existing = conn.execute("SELECT setting_value FROM ew_settings WHERE setting_key=?", (DEFAULT_VISION_MODEL_SETTING,)).fetchone()
+            if not existing:
+                raise ValueError("开启图片识别前，请先选择默认图片识别模型")
+            row = conn.execute("SELECT * FROM ew_model_profiles WHERE profile_id=? AND enabled=1", (existing["setting_value"],)).fetchone()
+            if not row or not row["supports_vision"]:
+                raise ValueError("默认图片识别模型已不可用，请重新选择已标记为多模态的模型")
+            existing_profile = dict(row)
+            if not (existing_profile.get("api_key_encrypted") or (
+                existing_profile.get("api_key_env") and os.environ.get(existing_profile["api_key_env"], "").strip()
+            )):
+                raise ValueError("默认图片识别模型未配置 API Key，请先完善模型档案")
+        conn.execute(
+            "INSERT INTO ew_settings(setting_key, setting_value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value, updated_at=excluded.updated_at",
+            (VISION_ENABLED_SETTING, "1" if enabled else "0", now_iso()),
+        )
+        if profile_id:
+            conn.execute(
+                "INSERT INTO ew_settings(setting_key, setting_value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value, updated_at=excluded.updated_at",
+                (DEFAULT_VISION_MODEL_SETTING, profile_id, now_iso()),
+            )
+    return vision_configuration(app)
+
+
+def get_default_vision_model_profile(app) -> dict | None:
+    configuration = vision_configuration(app)
+    if not configuration["enabled"] or not configuration.get("default_profile_id"):
+        return None
+    try:
+        profile = get_model_profile(app, configuration["default_profile_id"])
+    except ValueError:
+        return None
+    return profile if profile.get("supports_vision") else None
+
+
+def resolve_vision_model_profile(app, primary_profile: dict | None = None) -> dict | None:
+    """优先复用当前评审模型；否则使用独立默认图片模型。"""
+    if not vision_configuration(app)["enabled"]:
+        return None
+    if primary_profile and primary_profile.get("supports_vision"):
+        return primary_profile
+    return get_default_vision_model_profile(app)
 
 
 def default_model_profile_id(app) -> str | None:
@@ -1361,6 +1465,17 @@ def _model_profile_values(app, payload: dict, *, existing: dict | None = None) -
     enabled = payload.get("enabled", existing.get("enabled", 1) if existing else 1)
     if not isinstance(enabled, bool) and enabled not in {0, 1}:
         raise ValueError("模型启用状态格式不正确")
+    supports_vision = payload.get("supports_vision", existing.get("supports_vision", 0) if existing else False)
+    if not isinstance(supports_vision, bool) and supports_vision not in {0, 1}:
+        raise ValueError("多模态能力标识格式不正确")
+    vision_protocol = str(payload.get("vision_protocol", existing.get("vision_protocol", "") if existing else "") or "").strip()
+    if supports_vision:
+        # 首期仅实现通用 OpenAI-compatible 图片内容块；模型名称不参与能力判断。
+        vision_protocol = vision_protocol or "openai-image-url"
+        if vision_protocol not in {"openai-image-url"}:
+            raise ValueError("暂不支持该图片识别接口协议")
+    else:
+        vision_protocol = ""
     values = {
         "profile_id": profile_id,
         "display_name": str(payload["display_name"]).strip(),
@@ -1373,6 +1488,8 @@ def _model_profile_values(app, payload: dict, *, existing: dict | None = None) -
         "timeout_seconds": min(1800, max(30, int(payload.get("timeout_seconds") or 600))),
         "json_mode": 1 if payload.get("json_mode", True) else 0,
         "thinking_mode": payload.get("thinking_mode") if payload.get("thinking_mode") in {"default", "enabled", "adaptive", "disabled"} else "default",
+        "supports_vision": 1 if supports_vision else 0,
+        "vision_protocol": vision_protocol,
         "enabled": 1 if enabled else 0,
         "created_at": existing["created_at"] if existing else timestamp,
         "updated_at": timestamp,
@@ -1385,9 +1502,9 @@ def create_model_profile(app, payload: dict) -> dict:
     with connection(app) as conn:
         conn.execute(
             """INSERT INTO ew_model_profiles(profile_id, display_name, protocol, base_url, model_name, api_key_env, api_key_encrypted,
-            context_limit, timeout_seconds, json_mode, thinking_mode, enabled, created_at, updated_at)
+            context_limit, timeout_seconds, json_mode, thinking_mode, supports_vision, vision_protocol, enabled, created_at, updated_at)
             VALUES (:profile_id, :display_name, :protocol, :base_url, :model_name, :api_key_env, :api_key_encrypted, :context_limit,
-            :timeout_seconds, :json_mode, :thinking_mode, :enabled, :created_at, :updated_at)""",
+            :timeout_seconds, :json_mode, :thinking_mode, :supports_vision, :vision_protocol, :enabled, :created_at, :updated_at)""",
             values,
         )
     return _public_model_profile(values)
@@ -1419,9 +1536,12 @@ def update_model_profile(app, profile_id: str, payload: dict) -> dict:
             """UPDATE ew_model_profiles SET display_name=:display_name, protocol=:protocol, base_url=:base_url,
                model_name=:model_name, api_key_env=:api_key_env, api_key_encrypted=:api_key_encrypted,
                context_limit=:context_limit, timeout_seconds=:timeout_seconds, json_mode=:json_mode,
-               thinking_mode=:thinking_mode, enabled=:enabled, updated_at=:updated_at WHERE profile_id=:profile_id""",
+               thinking_mode=:thinking_mode, supports_vision=:supports_vision, vision_protocol=:vision_protocol,
+               enabled=:enabled, updated_at=:updated_at WHERE profile_id=:profile_id""",
             values,
         )
+        if not values["enabled"] or not values["supports_vision"]:
+            _clear_vision_default_for_profile(conn, profile_id)
         if not values["enabled"]:
             default_row = conn.execute(
                 "SELECT setting_value FROM ew_settings WHERE setting_key = 'default_model_profile_id'"
@@ -1450,6 +1570,17 @@ def delete_model_profile(app, profile_id: str) -> None:
         row = conn.execute("SELECT 1 FROM ew_model_profiles WHERE profile_id = ?", (profile_id,)).fetchone()
         if not row:
             raise ValueError("模型档案不存在")
+        # 先检查任务引用，再处理默认模型/图片模型设置；删除被拒绝时不能产生任何配置副作用。
+        active_rows = conn.execute(
+            "SELECT payload_json FROM ew_tasks WHERE status IN ('queued', 'running')"
+        ).fetchall()
+        for active in active_rows:
+            try:
+                payload = json.loads(active["payload_json"] or "{}")
+            except json.JSONDecodeError:
+                payload = {}
+            if payload.get("profile_id") == profile_id:
+                raise ValueError("该模型正在被排队或运行中的任务使用，暂不能删除")
         default_row = conn.execute("SELECT setting_value FROM ew_settings WHERE setting_key = 'default_model_profile_id'").fetchone()
         if default_row and default_row["setting_value"] == profile_id:
             candidates = conn.execute(
@@ -1467,16 +1598,7 @@ def delete_model_profile(app, profile_id: str) -> None:
                 )
             else:
                 conn.execute("DELETE FROM ew_settings WHERE setting_key = 'default_model_profile_id'")
-        active_rows = conn.execute(
-            "SELECT payload_json FROM ew_tasks WHERE status IN ('queued', 'running')"
-        ).fetchall()
-        for active in active_rows:
-            try:
-                payload = json.loads(active["payload_json"] or "{}")
-            except json.JSONDecodeError:
-                payload = {}
-            if payload.get("profile_id") == profile_id:
-                raise ValueError("该模型正在被排队或运行中的任务使用，暂不能删除")
+        _clear_vision_default_for_profile(conn, profile_id)
         conn.execute("DELETE FROM ew_model_profiles WHERE profile_id = ?", (profile_id,))
 
 
@@ -1493,6 +1615,8 @@ def current_rule_set(app, project_id: str, create: bool = False) -> dict | None:
 
 _RULE_EXECUTION_STRATEGIES = {"point", "counting", "section", "consistency", "cross_bid", "visual", "external"}
 _RULE_EVIDENCE_TYPES = {"text", "visual", "cross_bid", "external"}
+_VISION_TRIGGERS = {"off", "text_fallback", "required"}
+_VISION_LEVELS = {"off", "low", "standard", "high"}
 
 
 def rule_execution_meta(rule: dict) -> dict:
@@ -1512,10 +1636,19 @@ def rule_execution_meta(rule: dict) -> dict:
     applicability = value.get("applicability")
     if not isinstance(applicability, dict):
         applicability = {}
+    legacy_visual = str(rule.get("check_mode") or "") == "ocr" or bool(rule.get("ocr_required"))
+    trigger = str(value.get("vision_trigger") or "")
+    if trigger not in _VISION_TRIGGERS:
+        trigger = "required" if legacy_visual else "off"
+    level = str(value.get("vision_level") or "")
+    if level not in _VISION_LEVELS:
+        level = "off"
     return {
         "execution_strategy": strategy if strategy in _RULE_EXECUTION_STRATEGIES else "",
         "evidence_requirements": list(dict.fromkeys(requirements)),
         "applicability": applicability,
+        "vision_trigger": trigger,
+        "vision_level": level,
     }
 
 
@@ -1532,10 +1665,27 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
     applicability = payload.get("applicability", base["applicability"])
     if not isinstance(applicability, dict):
         applicability = {}
+    trigger_value = payload.get("vision_trigger")
+    trigger = str(trigger_value if trigger_value is not None else base["vision_trigger"] or "off")
+    # 新建或重新标记为 OCR 的规则，默认只表达“图片可能是决定性证据”；强度仍为 off，
+    # 因而绝不会在升级后自动增加图片调用。人工可再选文字兜底/必须识图和具体强度。
+    if trigger_value is None and trigger == "off" and (
+        "visual" in normalized or payload.get("ocr_required") or payload.get("check_mode") == "ocr"
+    ):
+        trigger = "text_fallback" if "text" in normalized else "required"
+    level = str(payload.get("vision_level", base["vision_level"]) or "off")
+    if trigger not in _VISION_TRIGGERS:
+        raise ValueError("图片识别条件不正确")
+    if level not in _VISION_LEVELS:
+        raise ValueError("图片识别强度不正确")
+    if trigger == "off":
+        level = "off"
     value = {
         "execution_strategy": strategy if strategy in _RULE_EXECUTION_STRATEGIES else "",
         "evidence_requirements": normalized,
         "applicability": applicability,
+        "vision_trigger": trigger,
+        "vision_level": level,
     }
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
@@ -1720,7 +1870,7 @@ def update_rule(app, project_id: str, rule_id: str, payload: dict) -> dict:
                 "UPDATE ew_rules SET enabled = ?, updated_at = ? WHERE rule_id = ?",
                 (enabled, now_iso(), rule_id),
             )
-        if any(key in payload for key in ("execution_strategy", "evidence_requirements", "applicability", "ocr_required", "check_mode")):
+        if any(key in payload for key in ("execution_strategy", "evidence_requirements", "applicability", "ocr_required", "check_mode", "vision_trigger", "vision_level")):
             conn.execute(
                 "UPDATE ew_rules SET execution_meta_json = ?, updated_at = ? WHERE rule_id = ?",
                 (_execution_meta_json(payload, fallback=rule), now_iso(), rule_id),

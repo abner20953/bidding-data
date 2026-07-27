@@ -402,6 +402,16 @@ def tasks_api(project_id):
         executable = categories & {"qualification", "compliance", "substantive", "rejection", "other", "objective", "subjective"}
         if not rule_set or rule_set["status"] != "confirmed" or not executable:
             return jsonify({"error": "请先确认至少一条可执行的审查或评分规则"}), 400
+        if storage.vision_configuration(current_app)["enabled"]:
+            visual_rules = [item for item in rules if item.get("enabled") and item.get("vision_trigger") != "off" and item.get("vision_level") != "off"]
+            if visual_rules:
+                try:
+                    primary = storage.get_model_profile(current_app, data.get("profile_id") or storage.default_model_profile_id(current_app))
+                    visual = storage.resolve_vision_model_profile(current_app, primary)
+                except ValueError:
+                    visual = None
+                if not visual:
+                    return jsonify({"error": "已启用图片识别规则，但当前评审模型不是多模态模型，且未配置可用的默认图片识别模型。请在模型配置中勾选多模态模型并设为默认图片模型。"}), 400
     try:
         requested_profile_id = data.get("profile_id") or storage.default_model_profile_id(current_app)
         # force_rerun 必须随任务进入后台。仅在 API 层跳过整任务复用还不够：
@@ -473,6 +483,20 @@ def unlock_model_configuration_api():
         return jsonify({"error": "配置口令错误"}), 403
     session["evaluation_workbench_model_configuration_unlocked"] = True
     return jsonify({"status": "success"})
+
+
+@evaluation_workbench_bp.route("/api/evaluation-workbench/vision-configuration", methods=["GET", "PATCH"])
+def vision_configuration_api():
+    _init()
+    if request.method == "PATCH":
+        access_error = _model_configuration_access_error()
+        if access_error:
+            return access_error
+        try:
+            return jsonify({"configuration": storage.update_vision_configuration(current_app, _json_body())})
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+    return jsonify({"configuration": storage.vision_configuration(current_app)})
 
 
 @evaluation_workbench_bp.route("/api/evaluation-workbench/prompt-templates", methods=["GET"])
