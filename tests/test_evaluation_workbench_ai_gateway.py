@@ -3,7 +3,7 @@ from unittest.mock import Mock, patch
 
 from dashboard.evaluation_workbench.ai_gateway import (
     InvalidJsonResponse, ModelResponseEnvelopeError, _decode_json_content, _recover_complete_json_array,
-    request_json, test_connection,
+    model_capabilities, request_json, test_connection,
 )
 
 
@@ -24,6 +24,23 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
         }
         profile.update(overrides)
         return profile
+
+    def test_model_capabilities_do_not_claim_strict_json_for_minimax_m3(self):
+        capabilities = model_capabilities(self._profile(
+            base_url="https://api.minimaxi.com/v1", model_name="MiniMax-M3",
+        ))
+
+        self.assertEqual(capabilities["structured_output"], "prompt_constrained")
+        self.assertTrue(capabilities["vision"])
+        self.assertFalse(capabilities["strict_tool_schema"])
+
+    def test_model_capabilities_expose_deepseek_structured_output(self):
+        capabilities = model_capabilities(self._profile(
+            base_url="https://api.deepseek.com/v1", model_name="deepseek-v4-flash",
+        ))
+
+        self.assertEqual(capabilities["structured_output"], "json_object")
+        self.assertTrue(capabilities["strict_tool_schema"])
 
     def test_connection_rejects_non_ascii_api_key_before_network_request(self):
         with patch("dashboard.evaluation_workbench.ai_gateway._http_post") as post:
