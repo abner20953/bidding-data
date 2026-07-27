@@ -76,7 +76,8 @@
   let modelProfiles = [];
   const modelPresets = {
     'minimax-m27': {displayName:'MiniMax M2.7', baseUrl:'https://api.minimaxi.com/v1', modelName:'MiniMax-M2.7', jsonMode:'false', thinking:'default'},
-    // M3 支持 OpenAI-compatible JSON object；关闭它会显著提高长任务的格式修复概率。
+    // M3 当前通过提示词与本地恢复保证结构化输出；保留兼容开关，但界面会如实显示
+    // 其不是服务商强制 JSON Schema，避免误以为可以完全消除格式异常。
     'minimax-m3': {displayName:'MiniMax M3', baseUrl:'https://api.minimaxi.com/v1', modelName:'MiniMax-M3', jsonMode:'true', thinking:'disabled'},
   };
   function normalizedThinkingMode(modelName, thinkingMode) { if (String(modelName).toLowerCase() === 'minimax-m3' && thinkingMode === 'enabled') return 'adaptive'; if (String(modelName).toLowerCase().startsWith('minimax-m2') && thinkingMode === 'disabled') return 'default'; return thinkingMode; }

@@ -3615,6 +3615,7 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
         scan_index["evidence_ledger"] = _build_rule_evidence_ledger(
             scan_index, review_rules + objective_rules + subjective_rules,
         )
+    ledger = scan_index.get("evidence_ledger", {}) if scan_index else {}
     values = {
         "reused_document_count": 0,
         "full_scan_document_count": 1 if scan_index else 0,
@@ -3624,6 +3625,10 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
         "split_retry_count": scan_index.get("split_retry_count", 0) if scan_index else 0,
         "manual_fallback_rule_count": 0,
         "batch_count": 0,
+        "evidence_ledger_rule_count": len(ledger),
+        "evidence_ledger_empty_rule_count": sum(
+            1 for value in ledger.values() if not value.get("candidates")
+        ) if isinstance(ledger, dict) else 0,
     }
     components = (("review", review_rules, review_run), ("objective", objective_rules, objective_run), ("subjective", subjective_rules, subjective_run))
     for component, component_rules, run in components:
@@ -3862,6 +3867,7 @@ def _evaluate_all(app, task: dict) -> dict:
     )
     compact_retry_count = split_retry_count = 0
     manual_fallback_rule_count = 0
+    evidence_ledger_rule_count = evidence_ledger_empty_rule_count = 0
     reused_document_count = 0
     batch_count = 0
     full_scan_document_count = full_scan_batch_count = full_scan_failed_chunk_count = 0
@@ -3912,6 +3918,8 @@ def _evaluate_all(app, task: dict) -> dict:
         compact_retry_count += value.get("compact_retry_count", 0)
         split_retry_count += value.get("split_retry_count", 0)
         manual_fallback_rule_count += value.get("manual_fallback_rule_count", 0)
+        evidence_ledger_rule_count += value.get("evidence_ledger_rule_count", 0)
+        evidence_ledger_empty_rule_count += value.get("evidence_ledger_empty_rule_count", 0)
         batch_count += value.get("batch_count", 0)
         full_scan_document_count += value.get("full_scan_document_count", 0)
         full_scan_batch_count += value.get("full_scan_batch_count", 0)
@@ -3947,6 +3955,8 @@ def _evaluate_all(app, task: dict) -> dict:
             "batch_count": batch_count, "full_scan_document_count": full_scan_document_count,
             "full_scan_batch_count": full_scan_batch_count, "full_scan_failed_chunk_count": full_scan_failed_chunk_count,
             "cross_bid_price": cross_bid_price,
+            "evidence_ledger_rule_count": evidence_ledger_rule_count,
+            "evidence_ledger_empty_rule_count": evidence_ledger_empty_rule_count,
             "highlights": highlights, "highlight_failure_count": highlight_failure_count,
             "prompt_version": PROMPT_VERSION}
 
