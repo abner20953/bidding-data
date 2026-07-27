@@ -402,6 +402,10 @@ def init_database(app) -> None:
                 page_hint TEXT,
                 reason TEXT NOT NULL DEFAULT '',
                 risk_level TEXT NOT NULL DEFAULT 'medium',
+                vision_status TEXT NOT NULL DEFAULT 'not_requested',
+                vision_pages_json TEXT NOT NULL DEFAULT '[]',
+                vision_model TEXT NOT NULL DEFAULT '',
+                vision_message TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 confirmed_at TEXT,
                 UNIQUE(review_run_id, document_id, rule_id)
@@ -427,6 +431,10 @@ def init_database(app) -> None:
                 evidence TEXT NOT NULL DEFAULT '',
                 reason TEXT NOT NULL DEFAULT '',
                 confidence TEXT,
+                vision_status TEXT NOT NULL DEFAULT 'not_requested',
+                vision_pages_json TEXT NOT NULL DEFAULT '[]',
+                vision_model TEXT NOT NULL DEFAULT '',
+                vision_message TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(score_run_id, document_id, rule_id)
@@ -444,10 +452,18 @@ def init_database(app) -> None:
         _ensure_column(conn, "ew_review_results", "automation_status", "TEXT NOT NULL DEFAULT 'needs_review'")
         _ensure_column(conn, "ew_review_results", "requires_review", "INTEGER NOT NULL DEFAULT 1")
         _ensure_column(conn, "ew_review_results", "review_reason", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "ew_review_results", "vision_status", "TEXT NOT NULL DEFAULT 'not_requested'")
+        _ensure_column(conn, "ew_review_results", "vision_pages_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "ew_review_results", "vision_model", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "ew_review_results", "vision_message", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "ew_score_results", "effective_score", "REAL")
         _ensure_column(conn, "ew_score_results", "automation_status", "TEXT NOT NULL DEFAULT 'needs_review'")
         _ensure_column(conn, "ew_score_results", "requires_review", "INTEGER NOT NULL DEFAULT 1")
         _ensure_column(conn, "ew_score_results", "review_reason", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "ew_score_results", "vision_status", "TEXT NOT NULL DEFAULT 'not_requested'")
+        _ensure_column(conn, "ew_score_results", "vision_pages_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "ew_score_results", "vision_model", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "ew_score_results", "vision_message", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "ew_rules", "source_type", "TEXT")
         _ensure_column(conn, "ew_rules", "source_task_id", "TEXT")
         _ensure_column(conn, "ew_rules", "check_rule", "TEXT NOT NULL DEFAULT ''")
@@ -1997,23 +2013,62 @@ def create_review_run(app, project_id: str, task_id: str, profile_id: str | None
     return value
 
 
+def _vision_pages_json(item: dict) -> str:
+    """兼容内存中的页码列表和数据库复用结果中的 JSON 字段。"""
+    values = item.get("vision_pages")
+    if values is None:
+        values = item.get("vision_pages_json")
+    if isinstance(values, str):
+        try:
+            values = json.loads(values)
+        except (TypeError, json.JSONDecodeError):
+            values = []
+    pages: list[int] = []
+    if isinstance(values, list):
+        for value in values:
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and int(value) > 0:
+                page = int(value)
+                if page not in pages:
+                    pages.append(page)
+    return json.dumps(pages, ensure_ascii=False, separators=(",", ":"))
+
+
+def _public_vision_result(value: dict) -> dict:
+    """将内部 JSON 列转换为向后兼容的新增公开字段。"""
+    raw = value.pop("vision_pages_json", "[]")
+    try:
+        pages = json.loads(raw or "[]")
+    except (TypeError, json.JSONDecodeError):
+        pages = []
+    value["vision_pages"] = [
+        int(page) for page in pages
+        if isinstance(page, (int, float)) and not isinstance(page, bool) and int(page) > 0
+    ] if isinstance(pages, list) else []
+    return value
+
+
 def save_review_results(app, review_run_id: str, document_id: str, results: list[dict]) -> None:
     timestamp = now_iso()
     with connection(app) as conn:
         for item in results:
             conn.execute(
                 """INSERT INTO ew_review_results(review_result_id, review_run_id, document_id, rule_id, status, evidence, page_hint, reason, risk_level,
-                   confidence, evidence_quality, automation_status, requires_review, review_reason, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   confidence, evidence_quality, automation_status, requires_review, review_reason,
+                   vision_status, vision_pages_json, vision_model, vision_message, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(review_run_id, document_id, rule_id) DO UPDATE SET
                 status=excluded.status, evidence=excluded.evidence, page_hint=excluded.page_hint, reason=excluded.reason,
                 risk_level=excluded.risk_level, confidence=excluded.confidence, evidence_quality=excluded.evidence_quality,
                 automation_status=excluded.automation_status, requires_review=excluded.requires_review,
-                review_reason=excluded.review_reason, final_status=NULL, confirmed_at=NULL, created_at=excluded.created_at""",
+                review_reason=excluded.review_reason, vision_status=excluded.vision_status,
+                vision_pages_json=excluded.vision_pages_json, vision_model=excluded.vision_model,
+                vision_message=excluded.vision_message, final_status=NULL, confirmed_at=NULL, created_at=excluded.created_at""",
                 (str(uuid.uuid4()), review_run_id, document_id, item["rule_id"], item["status"], item.get("evidence", ""),
                  item.get("page_hint"), item.get("reason", ""), item.get("risk_level", "medium"), item.get("confidence", "medium"),
                  item.get("evidence_quality", "limited"), item.get("automation_status", "needs_review"),
-                 1 if item.get("requires_review", True) else 0, item.get("review_reason", ""), timestamp),
+                 1 if item.get("requires_review", True) else 0, item.get("review_reason", ""),
+                 item.get("vision_status", "not_requested"), _vision_pages_json(item),
+                 item.get("vision_model", ""), item.get("vision_message", ""), timestamp),
             )
 
 
@@ -2040,7 +2095,7 @@ def latest_review_results(app, project_id: str) -> tuple[dict | None, list[dict]
                 CASE r.risk_level WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC,
                 rule.category, rule.sort_order""", (run["review_run_id"],)
         ).fetchall()
-    results = [dict(row) for row in rows]
+    results = [_public_vision_result(dict(row)) for row in rows]
     # 兼容历史评审结果：OCR 待识别不是风险结论，展示和报告均统一为低风险。
     for result in results:
         if result.get("status") == "ocr_required":
@@ -2111,7 +2166,8 @@ def reusable_evaluation_document_results(app, project_id: str, rule_set_id: str,
                         break
                     rows = conn.execute(
                         """SELECT rule_id, status, evidence, page_hint, reason, risk_level, confidence, evidence_quality,
-                           automation_status, requires_review, review_reason FROM ew_review_results
+                           automation_status, requires_review, review_reason, vision_status, vision_pages_json,
+                           vision_model, vision_message FROM ew_review_results
                            WHERE review_run_id=? AND document_id=?""",
                         (run["review_run_id"], document_id),
                     ).fetchall()
@@ -2125,7 +2181,8 @@ def reusable_evaluation_document_results(app, project_id: str, rule_set_id: str,
                         break
                     rows = conn.execute(
                         """SELECT rule_id, suggested_score, effective_score, max_score, evidence, reason, confidence,
-                           automation_status, requires_review, review_reason FROM ew_score_results
+                           automation_status, requires_review, review_reason, vision_status, vision_pages_json,
+                           vision_model, vision_message FROM ew_score_results
                            WHERE score_run_id=? AND document_id=?""",
                         (run["score_run_id"], document_id),
                     ).fetchall()
@@ -2187,17 +2244,21 @@ def save_score_results(app, score_run_id: str, document_id: str, results: list[d
         for item in results:
             conn.execute(
                 """INSERT INTO ew_score_results(score_result_id, score_run_id, document_id, rule_id, suggested_score, final_score, effective_score, max_score,
-                   evidence, reason, confidence, automation_status, requires_review, review_reason, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   evidence, reason, confidence, automation_status, requires_review, review_reason,
+                   vision_status, vision_pages_json, vision_model, vision_message, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(score_run_id, document_id, rule_id) DO UPDATE SET
                 suggested_score=excluded.suggested_score, final_score=excluded.final_score, effective_score=excluded.effective_score,
                 max_score=excluded.max_score, evidence=excluded.evidence, reason=excluded.reason, confidence=excluded.confidence,
                 automation_status=excluded.automation_status, requires_review=excluded.requires_review,
-                review_reason=excluded.review_reason, updated_at=excluded.updated_at""",
+                review_reason=excluded.review_reason, vision_status=excluded.vision_status,
+                vision_pages_json=excluded.vision_pages_json, vision_model=excluded.vision_model,
+                vision_message=excluded.vision_message, updated_at=excluded.updated_at""",
                 (str(uuid.uuid4()), score_run_id, document_id, item["rule_id"], item.get("suggested_score"), item.get("final_score"),
                  item.get("effective_score"), item.get("max_score"), item.get("evidence", ""), item.get("reason", ""), item.get("confidence"),
                  item.get("automation_status", "needs_review"), 1 if item.get("requires_review", True) else 0,
-                 item.get("review_reason", ""), timestamp, timestamp),
+                 item.get("review_reason", ""), item.get("vision_status", "not_requested"), _vision_pages_json(item),
+                 item.get("vision_model", ""), item.get("vision_message", ""), timestamp, timestamp),
             )
 
 
@@ -2230,7 +2291,7 @@ def latest_score_results(app, project_id: str, score_type: str) -> tuple[dict | 
             item["document_id"] for item in partial["completed_documents"]
             if isinstance(item, dict) and item.get("document_id")
         ]
-    return value, [dict(row) for row in rows]
+    return value, [_public_vision_result(dict(row)) for row in rows]
 
 
 def update_final_score(app, score_result_id: str, final_score: float) -> dict:

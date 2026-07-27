@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 PROMPT_TEMPLATE_SETTING = "evaluation_workbench_prompt_templates"
-EVALUATION_PROMPT_VERSION = "vision-page-routing-v20"
+EVALUATION_PROMPT_VERSION = "vision-evidence-routing-v21"
 
 
 def _template(name: str, description: str, content: str, *placeholders: str) -> dict:
@@ -166,10 +166,14 @@ PROMPT_TEMPLATES["evaluate_all_visual_user"] = _template(
     "只返回合法 JSON：{\"status\":\"satisfied|not_satisfied|partial|not_found|manual\",\"suggested_score\":数字或null,"
     "\"evidence\":\"图片中可见的关键事实\",\"reason\":\"简洁判断理由\","
     "\"risk_level\":\"low|medium|high\",\"confidence\":\"high|medium|low\","
+    "\"conclusion_scope\":\"full|partial|none\","
     "\"coverage\":\"covered|not_covered|uncertain\",\"needs_more_image\":true|false,\"requested_pages\":[页码]}。"
     "suggested_score 仅在评分规则存在时填写，且不得超出满分；非评分规则必须为 null。"
-    "coverage=covered 仅在本次传入图片已实际包含决定性材料时使用；图片未包含目标材料时必须返回"
-    "not_covered、needs_more_image=true，且不得据此作出不满足、不得分或负面风险结论。requested_pages 只能填写"
+    "coverage=covered 表示本次图片至少包含一项与规则直接相关且可引用的可见事实；只覆盖部分材料时仍返回"
+    "covered，但 conclusion_scope=partial、needs_more_image=true，并列出已经看清的事实。只有图片足以完成整条"
+    "规则判断时才使用 conclusion_scope=full。图片完全未包含目标材料时返回 not_covered、conclusion_scope=none、"
+    "needs_more_image=true；图片疑似包含但模糊不可读时返回 uncertain。不得因未覆盖作出不满足、不得分或负面"
+    "风险结论。requested_pages 只能填写"
     "与本次传入页相邻、且确有必要补看的页码；无法判断时返回空数组。证据和理由不得复述规则。\n规则：{{rule}}\n投标文件：{{document_name}}；投标人：{{bidder_name}}\n"
     "图片识别条件：{{vision_trigger}}；识图强度：{{vision_level}}。\n已有文字结论（仅作辅助，不得照抄）：{{text_result}}",
     "rule", "document_name", "bidder_name", "vision_trigger", "vision_level", "text_result",

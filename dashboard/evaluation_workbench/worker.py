@@ -2279,6 +2279,99 @@ def _score_visual_page_candidates(raw: dict) -> list[int]:
     return pages
 
 
+_VISUAL_PAGE_CONTEXT_PATTERN = re.compile(
+    r"OCR|扫描|复印件|影印件|图片|图像|照片|签章|盖章|印章|签字|手写|勾选|"
+    r"图纸|外观|截图|彩页|二维码|水印|骑缝章",
+    re.IGNORECASE,
+)
+_VISUAL_DOCUMENT_CONTEXT_PATTERN = re.compile(r"证照|证书|执照|许可证|声明函|表单|检测报告|检验报告")
+_VISUAL_GAP_CONTEXT_PATTERN = re.compile(
+    r"待(?:OCR|图片|图像|人工)?核验|需(?:OCR|图片|图像)?核验|文字层.{0,12}(?:未|无法|不可)|"
+    r"不可读|未呈现|空白页|页面不完整",
+    re.IGNORECASE,
+)
+
+
+def _sample_visual_page_range(start: int, end: int, page_count: int) -> list[int]:
+    """在固定图片预算内代表性覆盖页段，兼顾首尾、中心与长区间内部。"""
+    if start > end:
+        start, end = end, start
+    start, end = max(1, start), min(page_count, end)
+    if start > end:
+        return []
+    if start == end:
+        return [start]
+    span = end - start
+    candidates = [start, end]
+    if span >= 2:
+        candidates.append(start + span // 2)
+    if span >= 6:
+        candidates.extend((start + span // 3, start + (span * 2) // 3))
+    pages: list[int] = []
+    for page in candidates:
+        if page not in pages:
+            pages.append(page)
+    return pages
+
+
+def _visual_page_groups(value: object, page_count: int) -> list[list[int]]:
+    """提取页码组并保留范围结构；多个页段采用轮询取样，避免首段耗尽图片名额。"""
+    text = str(value or "")
+    matches: list[tuple[int, int, list[int]]] = []
+    for match in _EXPLICIT_PAGE_RANGE_PATTERN.finditer(text):
+        if not re.search(r"[Pp第页]", match.group(0)):
+            continue
+        pages = _sample_visual_page_range(int(match.group(1)), int(match.group(2)), page_count)
+        if pages:
+            matches.append((match.start(), match.end(), pages))
+    for match in _EXPLICIT_PAGE_SINGLE_PATTERN.finditer(text):
+        if any(left <= match.start() < right for left, right, _ in matches):
+            continue
+        raw = next((item for item in match.groups() if item is not None), None)
+        if raw is None:
+            continue
+        page = int(raw)
+        if 1 <= page <= page_count:
+            matches.append((match.start(), match.end(), [page]))
+    return [pages for _, _, pages in sorted(matches, key=lambda item: item[0])]
+
+
+def _round_robin_visual_pages(groups: list[list[int]]) -> list[int]:
+    """让同一句中的不同页段优先各获得一次识图机会。"""
+    pages: list[int] = []
+    depth = max((len(group) for group in groups), default=0)
+    for index in range(depth):
+        for group in groups:
+            if index < len(group) and group[index] not in pages:
+                pages.append(group[index])
+    return pages
+
+
+def _visual_context_candidates(value: object, page_count: int) -> tuple[list[int], list[int]]:
+    """按“图片属性 + 尚待核验”对证据语句排序，返回高优先和普通候选页。"""
+    ranked: list[tuple[int, int, list[int]]] = []
+    for order, clause in enumerate(re.split(r"[\n。；;]+", str(value or ""))):
+        groups = _visual_page_groups(clause, page_count)
+        if not groups:
+            continue
+        score = 0
+        if _VISUAL_PAGE_CONTEXT_PATTERN.search(clause):
+            score += 20
+        if _VISUAL_GAP_CONTEXT_PATTERN.search(clause):
+            score += 12
+        if _VISUAL_DOCUMENT_CONTEXT_PATTERN.search(clause):
+            score += 4
+        ranked.append((score, order, _round_robin_visual_pages(groups)))
+    priority: list[int] = []
+    ordinary: list[int] = []
+    for score, _, pages in sorted(ranked, key=lambda item: (-item[0], item[1])):
+        target = priority if score >= 12 else ordinary
+        for page in pages:
+            if page not in target:
+                target.append(page)
+    return priority, ordinary
+
+
 def _bounded_model_score(value: object, max_score: float) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -3405,18 +3498,28 @@ def _append_unique_pages(target: list[int], values: object, page_count: int) -> 
 
 
 def _vision_page_candidates(document: dict, rule: dict, result: dict) -> list[int]:
-    """按可靠性返回候选页：结构化页码 > 单条结论页码 > 展示证据中的明确页码。"""
+    """按图片核验价值返回候选页，再以结构化页码和普通证据页补齐。"""
     if document.get("extension") != ".pdf" or not document.get("page_count"):
         return []
     page_count = int(document["page_count"])
     pages: list[int] = []
-    # score 的 evidence_items / review 的 scan ledger 可在内存中直接保留页码，优先级最高。
+    ordinary: list[int] = []
+    # “扫描件待核验”“签章不可读”等语句直接描述当前图片缺口，应先于纯文字明细页。
+    for source in (result.get("evidence"), result.get("reason")):
+        priority_values, ordinary_values = _visual_context_candidates(source, page_count)
+        for page in priority_values:
+            if page not in pages:
+                pages.append(page)
+        for page in ordinary_values:
+            if page not in ordinary:
+                ordinary.append(page)
+    # score 的 evidence_items / review 的 scan ledger 可在内存中保留明确页码，作为可靠后备。
     for source in result.get("visual_page_candidates") or []:
         _append_unique_pages(pages, source, page_count)
     _append_unique_pages(pages, result.get("page_hint"), page_count)
-    # 展示文本只是兼容旧流程的后备来源；只读取显式 Pxx / 第xx页 / xx页格式。
-    for source in (result.get("evidence"), result.get("reason")):
-        _append_unique_pages(pages, source, page_count)
+    for page in ordinary:
+        if page not in pages:
+            pages.append(page)
     return pages
 
 
@@ -3482,6 +3585,49 @@ def _visual_response_needs_more(parsed: dict) -> bool:
     if parsed.get("needs_more_image") is True:
         return True
     return str(parsed.get("coverage") or "").lower() in {"not_covered", "uncertain"}
+
+
+def _visual_response_coverage(parsed: dict) -> str:
+    coverage = str(parsed.get("coverage") or "").lower()
+    if coverage in {"covered", "not_covered", "uncertain"}:
+        return coverage
+    # 兼容旧的自定义提示词：有可引用图片事实时视为已覆盖，否则仍需补页。
+    return "covered" if _clean_model_text(parsed.get("evidence")) or _clean_model_text(parsed.get("reason")) else "uncertain"
+
+
+def _visual_response_scope(parsed: dict) -> str:
+    if _visual_response_coverage(parsed) != "covered":
+        return "none"
+    scope = str(parsed.get("conclusion_scope") or "").lower()
+    if scope in {"full", "partial"}:
+        return scope
+    return "partial" if parsed.get("needs_more_image") is True else "full"
+
+
+def _merge_usable_visual_responses(responses: list[tuple[list[int], dict]]) -> tuple[dict | None, str, list[int]]:
+    """保留各轮已看见的有效事实；后续页未覆盖时也不丢弃前一轮的部分图片证据。"""
+    usable = [(pages, parsed) for pages, parsed in responses if _visual_response_scope(parsed) in {"full", "partial"}]
+    if not usable:
+        return None, "none", []
+    full = [(pages, parsed) for pages, parsed in usable if _visual_response_scope(parsed) == "full"]
+    selected_pages, selected = (full or usable)[-1]
+    merged = dict(selected)
+    evidence_values: list[str] = []
+    reason_values: list[str] = []
+    applied_pages: list[int] = []
+    for pages, parsed in usable:
+        for page in pages:
+            if page not in applied_pages:
+                applied_pages.append(page)
+        evidence = _clean_model_text(parsed.get("evidence"))
+        reason = _clean_model_text(parsed.get("reason"))
+        if evidence and evidence not in evidence_values:
+            evidence_values.append(evidence)
+        if reason and reason not in reason_values:
+            reason_values.append(reason)
+    merged["evidence"] = "\n".join(evidence_values)
+    merged["reason"] = "\n".join(reason_values)
+    return merged, "full" if full else "partial", applied_pages or selected_pages
 
 
 def _render_vision_images(app, document: dict, pages: list[int], level: str) -> list[dict]:
@@ -3610,13 +3756,32 @@ def _visual_rule_packet(rule: dict) -> dict:
     }
 
 
+def _with_vision_execution(result: dict, status: str, pages: list[int], profile: dict, message: str) -> dict:
+    """记录图片流程本身的结果，和业务结论分离，便于页面与报告准确说明。"""
+    unique_pages: list[int] = []
+    for value in pages:
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and int(value) > 0:
+            page = int(value)
+            if page not in unique_pages:
+                unique_pages.append(page)
+    return {
+        **result,
+        "vision_status": status,
+        "vision_pages": unique_pages,
+        "vision_model": str(profile.get("display_name") or profile.get("model_name") or ""),
+        "vision_message": message,
+    }
+
+
 def _run_visual_supplement(app, task: dict, document: dict, component: str, rule: dict, result: dict,
                            vision_profile: dict) -> dict:
     trigger, level = _rule_vision_policy(rule)
     if trigger == "off" or level == "off":
         return result
     if trigger == "text_fallback" and not _needs_visual_fallback(component, result):
-        return result
+        return _with_vision_execution(
+            result, "skipped_text_sufficient", [], vision_profile, "文字证据已足够，本次无需调用图片模型。",
+        )
     all_pages = _vision_page_candidates(document, rule, result)
     # 纯扫描件可能没有可供文字流程定位的页码。仅精细模式进入低清联系表找页，
     # 找到候选后才发送高清目标页；快速/标准模式仍严格保持零额外图片调用。
@@ -3624,16 +3789,25 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
         all_pages = _locate_visual_pages(app, task, document, rule, vision_profile)
     pages = all_pages[:_VISION_LEVEL_SETTINGS[level]["max_pages"]]
     if not pages:
-        return result
+        return _with_vision_execution(
+            result, "not_located", [], vision_profile, "未定位到可靠候选页，未发送图片，保留文字结论。",
+        )
     prompt = storage.render_prompt_template(
         app, "evaluate_all_visual_user", rule=json.dumps(_visual_rule_packet(rule), ensure_ascii=False, separators=(",", ":")),
         document_name=document.get("original_name") or "投标文件", bidder_name=document.get("bidder_name") or document.get("original_name") or "投标人",
         vision_trigger=trigger, vision_level=level, text_result=json.dumps(result, ensure_ascii=False, separators=(",", ":")),
     )
+    attempted_pages: list[int] = []
+    responses: list[tuple[list[int], dict]] = []
+
     def request_pages(selected_pages: list[int], *, attempt: int) -> dict | None:
         images = _render_vision_images(app, document, selected_pages, level)
         if not images:
             return None
+        for image in images:
+            page = int(image["page"])
+            if page not in attempted_pages:
+                attempted_pages.append(page)
         try:
             with _VISION_REQUEST_GATE:
                 parsed_value = _request_task_json(
@@ -3649,7 +3823,10 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
 
     parsed = request_pages(pages, attempt=1)
     if not parsed:
-        return result
+        return _with_vision_execution(
+            result, "failed", attempted_pages, vision_profile, "图片模型调用或结果解析失败，已保留文字结论。",
+        )
+    responses.append((list(pages), parsed))
     if _visual_response_needs_more(parsed):
         followup = _visual_followup_pages(document, pages, all_pages, parsed, level)
         if followup:
@@ -3657,42 +3834,57 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
             if retry:
                 pages = followup
                 parsed = retry
-    # 若图片仍未覆盖目标材料，不能把“未看到”当成规则的负面证据，也不要把无效提示
+                responses.append((list(followup), retry))
+    parsed, conclusion_scope, applied_pages = _merge_usable_visual_responses(responses)
+    # 若所有图片都未覆盖目标材料，不能把“未看到”当成规则的负面证据，也不要把无效提示
     # 混入最终理由。原有文字结论和“需 OCR”提示会完整保留。
-    if _visual_response_needs_more(parsed):
-        return result
+    if not parsed:
+        page_text = "、".join(f"P{page}" for page in attempted_pages)
+        return _with_vision_execution(
+            result, "uncovered", attempted_pages, vision_profile,
+            f"已识别{page_text or '候选页'}，但尚未覆盖可形成结论的关键材料，已保留文字结论。",
+        )
     # 页码必须以系统实际发送的图片为准，模型返回的 page_hint 仅作内部参考，不能覆盖它。
-    page_hint = "P" + "、P".join(str(page) for page in pages)
+    page_hint = "P" + "、P".join(str(page) for page in applied_pages)
     visual_evidence = _clean_model_text(parsed.get("evidence"))[:1600]
     visual_reason = _clean_model_text(parsed.get("reason"))[:1200]
     prefix = f"【图片识别·{level}·{page_hint}】"
     if component == "review":
-        status = str(parsed.get("status") or "manual")
+        status = str(parsed.get("status") or "manual") if conclusion_scope == "full" else str(result.get("status") or "manual")
         if status not in {"satisfied", "not_satisfied", "partial", "not_found", "manual"}:
             status = "manual"
         merged = _review_result_from_model({
             "evidence": "\n".join(value for value in (result.get("evidence"), f"{prefix}{visual_evidence}" if visual_evidence else "") if value),
             "page_hint": page_hint,
             "reason": "\n".join(value for value in (result.get("reason"), f"{prefix}{visual_reason}" if visual_reason else "") if value),
-            "risk_level": parsed.get("risk_level") or result.get("risk_level"),
-            "confidence": parsed.get("confidence") or result.get("confidence"),
-            "evidence_quality": "sufficient" if visual_evidence else result.get("evidence_quality"),
+            "risk_level": parsed.get("risk_level") if conclusion_scope == "full" else result.get("risk_level"),
+            "confidence": parsed.get("confidence") if conclusion_scope == "full" else result.get("confidence"),
+            "evidence_quality": "sufficient" if conclusion_scope == "full" and visual_evidence else result.get("evidence_quality"),
         }, rule["rule_id"], status)
-        return merged
+        return _with_vision_execution(
+            merged, "applied" if conclusion_scope == "full" else "applied_partial", attempted_pages, vision_profile,
+            "图片识别已形成完整补充并写入本条结论。" if conclusion_scope == "full"
+            else "图片识别已补充可见事实；因材料覆盖不完整，原文字结论和建议分保持不变。",
+        )
     max_score = float(_rule_scoring(rule).get("max_score") or result.get("max_score") or 0)
-    suggested = _bounded_model_score(parsed.get("suggested_score"), max_score) if max_score > 0 else None
+    suggested = _bounded_model_score(parsed.get("suggested_score"), max_score) if max_score > 0 and conclusion_scope == "full" else None
     if suggested is None:
         suggested = result.get("suggested_score")
-    return {
+    merged = {
         **result,
         "suggested_score": suggested,
         "evidence": "\n".join(value for value in (result.get("evidence"), f"{prefix}{visual_evidence}" if visual_evidence else "") if value)[:2000],
         "reason": "\n".join(value for value in (result.get("reason"), f"{prefix}{visual_reason}" if visual_reason else "") if value)[:2000],
-        "confidence": parsed.get("confidence") if parsed.get("confidence") in {"high", "medium", "low"} else result.get("confidence"),
+        "confidence": parsed.get("confidence") if conclusion_scope == "full" and parsed.get("confidence") in {"high", "medium", "low"} else result.get("confidence"),
         "requires_review": True,
         "automation_status": "needs_review",
         "review_reason": "图片识别结果已补充，需人工复核。",
     }
+    return _with_vision_execution(
+        merged, "applied" if conclusion_scope == "full" else "applied_partial", attempted_pages, vision_profile,
+        "图片识别已形成完整补充并写入本条结论。" if conclusion_scope == "full"
+        else "图片识别已补充可见事实；因材料覆盖不完整，原文字结论和建议分保持不变。",
+    )
 
 
 def _ordered_combined_results(rules: list[dict], values: list[dict]) -> list[dict]:
@@ -4215,12 +4407,12 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
         else:
             for index, group in enumerate(groups, start=1):
                 persist_completed(run_group(index, group))
+    visual_components = (
+        ("review", review_rules, review_run),
+        ("objective", objective_rules, objective_run),
+        ("subjective", subjective_rules, subjective_run),
+    )
     if vision_profile:
-        visual_components = (
-            ("review", review_rules, review_run),
-            ("objective", objective_rules, objective_run),
-            ("subjective", subjective_rules, subjective_run),
-        )
         for component, component_rules, run in visual_components:
             for rule in component_rules:
                 trigger, level = _rule_vision_policy(rule)
@@ -4239,6 +4431,25 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
                     storage.save_score_results(app, run["score_run_id"], document["document_id"], [merged])
                 values["batch_count"] += 1
                 progress.advance(f"已完成图片识别：{bidder_name} · {rule.get('title') or rule.get('check_rule')}")
+    else:
+        # 规则已启用识图但全局开关关闭、默认模型不可用或模型未标记为多模态时，
+        # 仍把“为何未执行”写入结果，避免用户把纯文字结论误认为图片结论。
+        for component, component_rules, run in visual_components:
+            for rule in component_rules:
+                trigger, level = _rule_vision_policy(rule)
+                if trigger == "off" or level == "off":
+                    continue
+                base = completed_results[component].get(rule["rule_id"])
+                if not base:
+                    continue
+                marked = _with_vision_execution(
+                    base, "unavailable", [], {}, "本次未获得可用的多模态模型，未执行图片识别。",
+                )
+                completed_results[component][rule["rule_id"]] = marked
+                if component == "review" and run:
+                    storage.save_review_results(app, run["review_run_id"], document["document_id"], [marked])
+                elif run:
+                    storage.save_score_results(app, run["score_run_id"], document["document_id"], [marked])
     progress.document_completed(document)
     return values
 

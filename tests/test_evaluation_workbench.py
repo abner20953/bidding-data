@@ -1434,10 +1434,12 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         review_run = storage.create_review_run(self.app, self.project["project_id"], task["task_id"], None)
         score_run = storage.create_score_run(self.app, self.project["project_id"], task["task_id"], "objective", None)
         storage.save_review_results(self.app, review_run["review_run_id"], document["document_id"], [
-            {"rule_id": review_rule["rule_id"], "status": "satisfied", "confidence": "high", "evidence_quality": "sufficient", "risk_level": "low", "requires_review": False, "automation_status": "ready_for_batch_confirmation"},
+            {"rule_id": review_rule["rule_id"], "status": "satisfied", "confidence": "high", "evidence_quality": "sufficient", "risk_level": "low", "requires_review": False, "automation_status": "ready_for_batch_confirmation",
+             "vision_status": "applied", "vision_pages": [3, 5], "vision_model": "图片模型", "vision_message": "图片证据已写入。"},
         ])
         storage.save_score_results(self.app, score_run["score_run_id"], document["document_id"], [
-            {"rule_id": score_rule["rule_id"], "suggested_score": 5, "effective_score": 5, "max_score": 5, "confidence": "high", "evidence": "资质证书", "requires_review": False, "automation_status": "ready_for_batch_confirmation"},
+            {"rule_id": score_rule["rule_id"], "suggested_score": 5, "effective_score": 5, "max_score": 5, "confidence": "high", "evidence": "资质证书", "requires_review": False, "automation_status": "ready_for_batch_confirmation",
+             "vision_status": "applied_partial", "vision_pages": [8], "vision_model": "图片模型", "vision_message": "已补充部分图片事实。"},
         ])
 
         reviews = self.app.test_client().post(f"/api/evaluation-workbench/projects/{self.project['project_id']}/review-results/confirm-auto")
@@ -1448,7 +1450,11 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(reviews.get_json()["confirmed_count"], 1)
         self.assertEqual(scores.get_json()["confirmed_count"], 1)
         self.assertEqual(review_rows[0]["final_status"], "satisfied")
+        self.assertEqual(review_rows[0]["vision_pages"], [3, 5])
+        self.assertEqual(review_rows[0]["vision_status"], "applied")
         self.assertEqual(score_rows[0]["final_score"], 5.0)
+        self.assertEqual(score_rows[0]["vision_pages"], [8])
+        self.assertEqual(score_rows[0]["vision_status"], "applied_partial")
 
     def test_deleting_project_removes_files_and_related_records(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案：稳定运行。")
@@ -2032,6 +2038,30 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         # 提取阶段只给出建议条件，真正的图片调用必须由人工选择强度后启用。
         self.assertEqual(rules[0]["vision_level"], "off")
 
+    def test_enabled_visual_rule_reports_unavailable_model_instead_of_looking_like_visual_result(self):
+        self._add_pdf("bid.pdf", "bid", "甲公司", "已提供证书明细，扫描件见附件。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "证书评分", "check_rule": "核验证书扫描件",
+            "check_mode": "ocr", "scoring": {"kind": "boolean", "max_score": 2},
+        })
+        storage.update_rule(self.app, self.project["project_id"], rule["rule_id"], {
+            "vision_trigger": "required", "vision_level": "standard",
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value={
+            "results": [{"rule_id": rule["rule_id"], "suggested_score": 0, "needs_ocr": True,
+                         "evidence": "扫描件见P1", "reason": "需图片核验", "confidence": "low"}],
+        }):
+            finished = self._run_next_task()
+        _, rows = storage.latest_score_results(self.app, self.project["project_id"], "objective")
+
+        self.assertEqual(finished["status"], "success")
+        self.assertEqual(rows[0]["vision_status"], "unavailable")
+        self.assertEqual(rows[0]["vision_pages"], [])
+
     def test_visual_page_candidates_only_accept_explicit_page_references(self):
         document = {"extension": ".pdf", "page_count": 300}
         result = {
@@ -2044,6 +2074,22 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         # 旧展示文本没有结构化页码时，也只能识别 P224 / P227，不能把“2项”“1.”误作页码。
         legacy = {"evidence": result["evidence"], "reason": result["reason"]}
         self.assertEqual(worker._vision_page_candidates(document, {}, legacy), [224, 227])
+
+    def test_visual_page_candidates_prioritise_unresolved_visual_ranges_and_sample_across_bands(self):
+        document = {"extension": ".pdf", "page_count": 300}
+        result = {
+            "visual_page_candidates": [224, 227],
+            "evidence": (
+                "节能证书明细（P224）；环境标志证书明细（P227）；"
+                "证书扫描件齐备性（第195-197、200-208页）待 OCR 核验"
+            ),
+            "reason": "文字层尚未确认扫描件外观。",
+        }
+        candidates = worker._vision_page_candidates(document, {}, result)
+        # 标准模式的四页预算会先跨两个待核验页段取样，不再被文字明细页耗尽。
+        self.assertEqual(candidates[:4], [195, 200, 197, 208])
+        self.assertLess(candidates.index(224), len(candidates))
+        self.assertLess(candidates.index(227), len(candidates))
 
     def test_score_results_preserve_structured_evidence_pages_for_visual_routing(self):
         payload = [{"rule_id": "cert", "scoring": {"max_score": 2}, "ocr_required": True}]
@@ -2086,7 +2132,40 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             "coverage": "not_covered", "needs_more_image": True, "requested_pages": [],
         }):
             result = worker._run_visual_supplement(self.app, task, document, "objective", rule, original, profile)
-        self.assertEqual(result, original)
+        self.assertEqual(result["evidence"], original["evidence"])
+        self.assertEqual(result["reason"], original["reason"])
+        self.assertEqual(result["vision_status"], "uncovered")
+        self.assertEqual(result["vision_pages"], [224])
+        self.assertNotIn("图片未触及", result["evidence"])
+
+    def test_partial_visual_evidence_is_kept_without_overriding_text_score(self):
+        document = {"document_id": "doc", "extension": ".pdf", "page_count": 300, "original_name": "投标.pdf", "bidder_name": "甲"}
+        rule = {"rule_id": "cert", "title": "认证证书", "check_rule": "核验证书", "vision_trigger": "required", "vision_level": "standard",
+                "scoring": {"max_score": 2}}
+        original = {"rule_id": "cert", "suggested_score": 0, "max_score": 2, "evidence": "文字层待核验",
+                    "reason": "需 OCR 核验证书", "confidence": "low", "visual_page_candidates": [195, 200, 197, 208]}
+        task = {"task_id": "task"}
+        profile = {"profile_id": "vision", "display_name": "图片模型"}
+
+        def render_images(app, document, pages, level):
+            return [{"page": page, "type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AA==", "detail": "low"}} for page in pages]
+
+        responses = [
+            {"coverage": "covered", "conclusion_scope": "partial", "needs_more_image": True,
+             "requested_pages": [], "evidence": "P195 可见证书编号", "reason": "仅覆盖一份证书",
+             "suggested_score": 2, "confidence": "high"},
+            {"coverage": "not_covered", "conclusion_scope": "none", "needs_more_image": True,
+             "requested_pages": [], "evidence": "", "reason": "未见另一份证书"},
+        ]
+        with patch("dashboard.evaluation_workbench.worker._render_vision_images", side_effect=render_images), \
+             patch("dashboard.evaluation_workbench.worker._request_task_json", side_effect=responses):
+            result = worker._run_visual_supplement(self.app, task, document, "objective", rule, original, profile)
+
+        self.assertEqual(result["vision_status"], "applied_partial")
+        self.assertEqual(result["suggested_score"], 0)
+        self.assertEqual(result["confidence"], "low")
+        self.assertIn("P195 可见证书编号", result["evidence"])
+        self.assertEqual(result["vision_pages"], [195, 200, 197, 208])
 
     def test_review_normalisation_reconciles_positive_reason_and_negative_status(self):
         result = worker._normalise_review_results([{

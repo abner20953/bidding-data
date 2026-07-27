@@ -38,6 +38,15 @@ _REPORT_STATUS_LABELS = {
 _REPORT_RISK_LABELS = {"high": "高风险", "medium": "中风险", "low": "低风险"}
 _REPORT_CONFIDENCE_LABELS = {"high": "高", "medium": "中", "low": "低"}
 _REPORT_EVIDENCE_LABELS = {"sufficient": "充分", "limited": "有限", "missing": "缺失"}
+_REPORT_VISION_STATUS_LABELS = {
+    "applied": "图片识别已采纳",
+    "applied_partial": "图片识别已补充部分事实",
+    "uncovered": "图片识别已执行，未覆盖关键材料",
+    "failed": "图片识别失败，已保留文字结论",
+    "unavailable": "未获得可用的多模态模型",
+    "not_located": "未定位到可靠图片页",
+    "skipped_text_sufficient": "文字证据充分，未调用图片模型",
+}
 _REPORT_AI_DECISION_LABELS = {
     "pending_human_review": "待 AI 复核", "no_signal_detected": "未发现线索",
     "confirmed_clue": "AI 确认线索", "suspected_clue": "AI 疑似线索",
@@ -107,6 +116,16 @@ def _report_presentation(documents: list[dict], rule_set: dict | None, rules: li
         value["evidence_brief"] = _report_compact_text(_report_result_explanation(value.get("evidence"), value), 200)
         value["reason_brief"] = _report_compact_text(_report_result_explanation(value.get("reason"), value), 200)
         value["confidence_label"] = _report_label(_REPORT_CONFIDENCE_LABELS, value.get("confidence"))
+        vision_status = str(value.get("vision_status") or "not_requested")
+        if vision_status != "not_requested":
+            page_text = "、".join(f"P{page}" for page in value.get("vision_pages") or [])
+            value["vision_summary"] = " · ".join(part for part in (
+                _report_label(_REPORT_VISION_STATUS_LABELS, vision_status),
+                str(value.get("vision_model") or "").strip(),
+                page_text,
+            ) if part and part != "-")
+        else:
+            value["vision_summary"] = ""
         if score:
             value["suggested_score_label"] = value.get("suggested_score")
             if value["suggested_score_label"] is None:
