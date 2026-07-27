@@ -3551,13 +3551,25 @@ def _with_scan_visual_candidates(results: list[dict], scan_index: dict | None, d
 
 
 def _visual_followup_pages(document: dict, primary: list[int], all_candidates: list[int], parsed: dict, level: str) -> list[int]:
-    """仅当首轮未覆盖时，按模型请求、其余证据页和相邻页追加一次识别。"""
+    """仅当首轮未覆盖时，优先均衡覆盖证据页段，再参考模型请求追加识别。"""
     setting = _VISION_LEVEL_SETTINGS[level]
     remaining = setting["followup_pages"]
     if remaining <= 0:
         return []
     page_count = int(document.get("page_count") or 0)
     pages: list[int] = []
+    # 候选列表已按“图片缺口 + 跨页段取样”排好优先级；先使用尚未发送的候选，
+    # 避免模型的一组补页请求把所有名额集中到同一个证书或附件附近。
+    for page in all_candidates:
+        if page not in primary and page not in pages:
+            pages.append(page)
+    # 若首轮的多个锚点分别是明细表、目录或声明页，下一页通常分别对应各自的附件。
+    # 按锚点轮询分配 +1/-1，相同图片预算下能覆盖更多独立证据分支。
+    for offset in (1, -1):
+        for page in primary:
+            adjacent = page + offset
+            if 1 <= adjacent <= page_count and adjacent not in primary and adjacent not in pages:
+                pages.append(adjacent)
     requested = parsed.get("requested_pages") if isinstance(parsed, dict) else []
     if isinstance(requested, list):
         for item in requested:
@@ -3565,17 +3577,8 @@ def _visual_followup_pages(document: dict, primary: list[int], all_candidates: l
                 page = int(item)
                 # 仅接受与首轮图片相邻的请求，避免模型凭空要求远处页面造成无边界调用。
                 if 1 <= page <= page_count and page not in primary and any(abs(page - sent) <= 2 for sent in primary):
-                    pages.append(page)
-    for page in all_candidates:
-        if page not in primary and page not in pages:
-            pages.append(page)
-    # 明确证据页显示为目录/明细表时，证书、签章、附件通常紧随其后；这是一条与材料类型无关的
-    # 邻页策略，只在模型报告未覆盖时生效。
-    for offset in (1, -1):
-        for page in primary:
-            adjacent = page + offset
-            if 1 <= adjacent <= page_count and adjacent not in primary and adjacent not in pages:
-                pages.append(adjacent)
+                    if page not in pages:
+                        pages.append(page)
     return pages[:remaining]
 
 
@@ -3604,6 +3607,31 @@ def _visual_response_scope(parsed: dict) -> str:
     return "partial" if parsed.get("needs_more_image") is True else "full"
 
 
+def _visual_response_conflict_level(parsed: dict) -> str:
+    level = str(parsed.get("conflict_level") or "").lower()
+    if level in {"possible", "material"}:
+        return level
+    checks = parsed.get("field_checks")
+    if isinstance(checks, list) and any(
+        isinstance(item, dict) and str(item.get("match") or "").lower() in {"conflict", "mismatch", "no"}
+        for item in checks
+    ):
+        return "possible"
+    return "none"
+
+
+def _visual_field_conflict_text(parsed: dict) -> str:
+    values: list[str] = []
+    for item in parsed.get("field_checks") or []:
+        if not isinstance(item, dict) or str(item.get("match") or "").lower() not in {"conflict", "mismatch", "no"}:
+            continue
+        field = _clean_model_text(item.get("field")) or "关键字段"
+        text_value = _clean_model_text(item.get("text_value")) or "未提供"
+        image_value = _clean_model_text(item.get("image_value")) or "无法辨认"
+        values.append(f"{field}：文字层“{text_value}”/ 图片“{image_value}”")
+    return "；".join(values)[:800]
+
+
 def _merge_usable_visual_responses(responses: list[tuple[list[int], dict]]) -> tuple[dict | None, str, list[int]]:
     """保留各轮已看见的有效事实；后续页未覆盖时也不丢弃前一轮的部分图片证据。"""
     usable = [(pages, parsed) for pages, parsed in responses if _visual_response_scope(parsed) in {"full", "partial"}]
@@ -3615,6 +3643,9 @@ def _merge_usable_visual_responses(responses: list[tuple[list[int], dict]]) -> t
     evidence_values: list[str] = []
     reason_values: list[str] = []
     applied_pages: list[int] = []
+    field_checks: list[dict] = []
+    conflict_level = "none"
+    conflict_rank = {"none": 0, "possible": 1, "material": 2}
     for pages, parsed in usable:
         for page in pages:
             if page not in applied_pages:
@@ -3625,8 +3656,16 @@ def _merge_usable_visual_responses(responses: list[tuple[list[int], dict]]) -> t
             evidence_values.append(evidence)
         if reason and reason not in reason_values:
             reason_values.append(reason)
+        for item in parsed.get("field_checks") or []:
+            if isinstance(item, dict) and item not in field_checks:
+                field_checks.append(item)
+        current_conflict = _visual_response_conflict_level(parsed)
+        if conflict_rank[current_conflict] > conflict_rank[conflict_level]:
+            conflict_level = current_conflict
     merged["evidence"] = "\n".join(evidence_values)
     merged["reason"] = "\n".join(reason_values)
+    merged["field_checks"] = field_checks
+    merged["conflict_level"] = conflict_level
     return merged, "full" if full else "partial", applied_pages or selected_pages
 
 
@@ -3844,11 +3883,27 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
             result, "uncovered", attempted_pages, vision_profile,
             f"已识别{page_text or '候选页'}，但尚未覆盖可形成结论的关键材料，已保留文字结论。",
         )
+    conflict_level = _visual_response_conflict_level(parsed)
+    has_conflict = conflict_level in {"possible", "material"}
+    if has_conflict:
+        # 图片层与文字层字段不一致时，图片结果只能作为待复核线索，不能覆盖原结论或建议分。
+        conclusion_scope = "partial"
     # 页码必须以系统实际发送的图片为准，模型返回的 page_hint 仅作内部参考，不能覆盖它。
     page_hint = "P" + "、P".join(str(page) for page in applied_pages)
     visual_evidence = _clean_model_text(parsed.get("evidence"))[:1600]
     visual_reason = _clean_model_text(parsed.get("reason"))[:1200]
+    conflict_text = _visual_field_conflict_text(parsed)
+    if conflict_text:
+        visual_reason = "\n".join(value for value in (visual_reason, f"图片与文字候选字段疑似不一致：{conflict_text}") if value)[:1200]
     prefix = f"【图片识别·{level}·{page_hint}】"
+    vision_status = "conflict" if has_conflict else ("applied" if conclusion_scope == "full" else "applied_partial")
+    vision_message = (
+        "图片检查发现文字层与图片层关键字段疑似不一致，已保留原结论并标记人工重点复核。"
+        if has_conflict else (
+            "图片识别已形成完整补充并写入本条结论。" if conclusion_scope == "full"
+            else "图片识别已补充可见事实；因材料覆盖不完整，原文字结论和建议分保持不变。"
+        )
+    )
     if component == "review":
         status = str(parsed.get("status") or "manual") if conclusion_scope == "full" else str(result.get("status") or "manual")
         if status not in {"satisfied", "not_satisfied", "partial", "not_found", "manual"}:
@@ -3856,15 +3911,16 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
         merged = _review_result_from_model({
             "evidence": "\n".join(value for value in (result.get("evidence"), f"{prefix}{visual_evidence}" if visual_evidence else "") if value),
             "page_hint": page_hint,
-            "reason": "\n".join(value for value in (result.get("reason"), f"{prefix}{visual_reason}" if visual_reason else "") if value),
+            "reason": "\n".join(value for value in (
+                (f"{prefix}{visual_reason}" if visual_reason else "", result.get("reason"))
+                if has_conflict else (result.get("reason"), f"{prefix}{visual_reason}" if visual_reason else "")
+            ) if value),
             "risk_level": parsed.get("risk_level") if conclusion_scope == "full" else result.get("risk_level"),
-            "confidence": parsed.get("confidence") if conclusion_scope == "full" else result.get("confidence"),
+            "confidence": "low" if has_conflict else (parsed.get("confidence") if conclusion_scope == "full" else result.get("confidence")),
             "evidence_quality": "sufficient" if conclusion_scope == "full" and visual_evidence else result.get("evidence_quality"),
         }, rule["rule_id"], status)
         return _with_vision_execution(
-            merged, "applied" if conclusion_scope == "full" else "applied_partial", attempted_pages, vision_profile,
-            "图片识别已形成完整补充并写入本条结论。" if conclusion_scope == "full"
-            else "图片识别已补充可见事实；因材料覆盖不完整，原文字结论和建议分保持不变。",
+            merged, vision_status, attempted_pages, vision_profile, vision_message,
         )
     max_score = float(_rule_scoring(rule).get("max_score") or result.get("max_score") or 0)
     suggested = _bounded_model_score(parsed.get("suggested_score"), max_score) if max_score > 0 and conclusion_scope == "full" else None
@@ -3874,16 +3930,20 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
         **result,
         "suggested_score": suggested,
         "evidence": "\n".join(value for value in (result.get("evidence"), f"{prefix}{visual_evidence}" if visual_evidence else "") if value)[:2000],
-        "reason": "\n".join(value for value in (result.get("reason"), f"{prefix}{visual_reason}" if visual_reason else "") if value)[:2000],
-        "confidence": parsed.get("confidence") if conclusion_scope == "full" and parsed.get("confidence") in {"high", "medium", "low"} else result.get("confidence"),
+        "reason": "\n".join(value for value in (
+            (f"{prefix}{visual_reason}" if visual_reason else "", result.get("reason"))
+            if has_conflict else (result.get("reason"), f"{prefix}{visual_reason}" if visual_reason else "")
+        ) if value)[:2000],
+        "confidence": "low" if has_conflict else (
+            parsed.get("confidence") if conclusion_scope == "full" and parsed.get("confidence") in {"high", "medium", "low"}
+            else result.get("confidence")
+        ),
         "requires_review": True,
         "automation_status": "needs_review",
-        "review_reason": "图片识别结果已补充，需人工复核。",
+        "review_reason": "图片与文字候选字段疑似冲突，需人工重点复核。" if has_conflict else "图片识别结果已补充，需人工复核。",
     }
     return _with_vision_execution(
-        merged, "applied" if conclusion_scope == "full" else "applied_partial", attempted_pages, vision_profile,
-        "图片识别已形成完整补充并写入本条结论。" if conclusion_scope == "full"
-        else "图片识别已补充可见事实；因材料覆盖不完整，原文字结论和建议分保持不变。",
+        merged, vision_status, attempted_pages, vision_profile, vision_message,
     )
 
 

@@ -2107,6 +2107,15 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         )
         self.assertEqual(followup, [225, 228])
 
+    def test_visual_followup_does_not_let_one_anchor_consume_all_requested_pages(self):
+        document = {"page_count": 300}
+        followup = worker._visual_followup_pages(
+            document, [224, 227], [224, 227],
+            {"coverage": "not_covered", "requested_pages": [225, 226]}, "standard",
+        )
+        # 即使模型连续请求第一处附近页面，系统也给第二个独立证据锚点保留一页。
+        self.assertEqual(followup, [225, 228])
+
     def test_high_vision_locator_groups_cover_scanned_document_without_persistent_cache(self):
         groups = worker._vision_locator_groups(25)
         self.assertEqual(groups[0], list(range(1, 13)))
@@ -2166,6 +2175,36 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(result["confidence"], "low")
         self.assertIn("P195 可见证书编号", result["evidence"])
         self.assertEqual(result["vision_pages"], [195, 200, 197, 208])
+
+    def test_visual_field_conflict_is_highlighted_without_overriding_score(self):
+        document = {"document_id": "doc", "extension": ".pdf", "page_count": 300, "original_name": "投标.pdf", "bidder_name": "甲"}
+        rule = {"rule_id": "cert", "title": "认证证书", "check_rule": "核验证书", "vision_trigger": "required",
+                "vision_level": "low", "scoring": {"max_score": 2}}
+        original = {"rule_id": "cert", "suggested_score": 2, "max_score": 2, "evidence": "文字层证书号A123",
+                    "reason": "文字层建议2分", "confidence": "high", "visual_page_candidates": [10]}
+        task = {"task_id": "task"}
+        profile = {"profile_id": "vision", "display_name": "图片模型"}
+        response = {
+            "coverage": "covered", "conclusion_scope": "full", "needs_more_image": False,
+            "conflict_level": "material", "field_checks": [{
+                "field": "证书号", "text_value": "A123", "image_value": "A128", "match": "conflict",
+            }],
+            "suggested_score": 0, "confidence": "high", "evidence": "图片可见证书号A128", "reason": "编号不一致",
+        }
+        with patch("dashboard.evaluation_workbench.worker._render_vision_images", return_value=[{
+            "page": 10, "type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AA==", "detail": "low"},
+        }]), patch("dashboard.evaluation_workbench.worker._request_task_json", return_value=response):
+            result = worker._run_visual_supplement(self.app, task, document, "objective", rule, original, profile)
+
+        self.assertEqual(result["vision_status"], "conflict")
+        self.assertEqual(result["suggested_score"], 2)
+        self.assertEqual(result["confidence"], "low")
+        self.assertIn("文字层“A123”/ 图片“A128”", result["reason"])
+        self.assertIn("重点复核", result["vision_message"])
+        self.assertEqual(worker._visual_response_conflict_level({
+            "conflict_level": "none",
+            "field_checks": [{"match": "conflict"}],
+        }), "possible")
 
     def test_review_normalisation_reconciles_positive_reason_and_negative_status(self):
         result = worker._normalise_review_results([{

@@ -41,6 +41,7 @@ _REPORT_EVIDENCE_LABELS = {"sufficient": "充分", "limited": "有限", "missing
 _REPORT_VISION_STATUS_LABELS = {
     "applied": "图片识别已采纳",
     "applied_partial": "图片识别已补充部分事实",
+    "conflict": "图片检查发现疑似字段冲突",
     "uncovered": "图片识别已执行，未覆盖关键材料",
     "failed": "图片识别失败，已保留文字结论",
     "unavailable": "未获得可用的多模态模型",
