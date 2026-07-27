@@ -2224,6 +2224,61 @@ def _clean_model_text(value: object) -> str:
     return text.strip()
 
 
+# 页码只能从明确的页码表达取得，绝不能把“2 项”“3 分”“2029 年”等普通数字当成页码。
+# 同时兼容 PDF 文本、模型输出和人工习惯中常见的 P224、P224-P227、P224、P227、
+# 第224页、224页、以及“第P224页”等写法。
+_EXPLICIT_PAGE_RANGE_PATTERN = re.compile(
+    r"(?:第\s*)?[Pp]?\s*(\d{1,4})\s*(?:页)?\s*(?:[-—–~～至到]\s*(?:第\s*)?[Pp]?\s*(\d{1,4})\s*(?:页)?)"
+)
+_EXPLICIT_PAGE_SINGLE_PATTERN = re.compile(
+    r"(?:第\s*)?[Pp]\s*(\d{1,4})(?:\s*页)?|第\s*(\d{1,4})\s*页|(?<!\d)(\d{1,4})\s*页"
+)
+
+
+def _explicit_page_references(value: object, page_count: int | None = None) -> list[int]:
+    """按出现顺序提取明确标注的页码；范围仅保留两端，避免长范围挤占识图配额。"""
+    text = str(value or "")
+    matches: list[tuple[int, int, list[int]]] = []
+    for match in _EXPLICIT_PAGE_RANGE_PATTERN.finditer(text):
+        # “2029-12-17”等日期也含连字符；范围至少必须带 P / 第 / 页中的一个页码语义标记。
+        if not re.search(r"[Pp第页]", match.group(0)):
+            continue
+        start, end = int(match.group(1)), int(match.group(2))
+        if page_count and (start > page_count or end > page_count):
+            continue
+        pages = [start] if start == end else [start, end]
+        matches.append((match.start(), match.end(), pages))
+    for match in _EXPLICIT_PAGE_SINGLE_PATTERN.finditer(text):
+        if any(left <= match.start() < right for left, right, _ in matches):
+            continue
+        raw = next((item for item in match.groups() if item is not None), None)
+        if raw is not None:
+            matches.append((match.start(), match.end(), [int(raw)]))
+    pages: list[int] = []
+    for _, _, values in sorted(matches, key=lambda item: item[0]):
+        for page in values:
+            if page < 1 or (page_count and page > page_count) or page in pages:
+                continue
+            pages.append(page)
+    return pages
+
+
+def _score_visual_page_candidates(raw: dict) -> list[int]:
+    """保留评分模型已结构化返回的证据页，避免从展示文本反向猜测页码。"""
+    sources: list[object] = [raw.get("page_hint"), raw.get("page")]
+    items = raw.get("evidence_items")
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, dict):
+                sources.extend((item.get("page_hint"), item.get("page")))
+    pages: list[int] = []
+    for source in sources:
+        for page in _explicit_page_references(source):
+            if page not in pages:
+                pages.append(page)
+    return pages
+
+
 def _bounded_model_score(value: object, max_score: float) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -2336,6 +2391,8 @@ def _score_result_from_model(rule_id: str, suggested: float | None, max_score: f
             "effective_score": suggested if auto_ready else None, "max_score": max_score or None,
             "evidence": evidence[:2000],
             "reason": _score_reason_text(raw, suggested)[:2000],
+            # 仅在当前任务内供图片识别定位使用；存储层会忽略该临时字段，避免改变历史结果 API。
+            "visual_page_candidates": _score_visual_page_candidates(raw),
             "confidence": confidence, "automation_status": "ready_for_batch_confirmation" if auto_ready else "needs_review",
             "requires_review": not auto_ready,
             "review_reason": "" if auto_ready else "未得到高置信、可引用的建议分，需人工复核。"}
@@ -3309,11 +3366,15 @@ def _is_minimax_m3_profile(profile: dict) -> bool:
 
 
 _VISION_LEVEL_SETTINGS = {
-    "low": {"detail": "low", "max_pages": 1, "scale": 1.15, "quality": 72},
-    "standard": {"detail": "default", "max_pages": 2, "scale": 1.55, "quality": 82},
-    "high": {"detail": "high", "max_pages": 3, "scale": 2.0, "quality": 88},
+    # 各强度均先审查最相关的明确页码；标准/精细仅在模型明确表示未覆盖时追加一次，
+    # 避免常规任务把整份文件转换为图片。
+    "low": {"detail": "low", "max_pages": 1, "followup_pages": 0, "scale": 1.15, "quality": 72},
+    "standard": {"detail": "default", "max_pages": 2, "followup_pages": 2, "scale": 1.55, "quality": 82},
+    "high": {"detail": "high", "max_pages": 3, "followup_pages": 3, "scale": 2.0, "quality": 88},
 }
 _VISION_REQUEST_GATE = threading.BoundedSemaphore(1)
+_VISION_LOCATOR_THUMBNAILS_PER_SHEET = 12
+_VISION_LOCATOR_SHEETS_PER_REQUEST = 6
 
 
 def _rule_vision_policy(rule: dict) -> tuple[str, str]:
@@ -3334,20 +3395,93 @@ def _needs_visual_fallback(component: str, result: dict) -> bool:
     return result.get("suggested_score") is None or result.get("confidence") != "high" or "OCR" in str(result.get("reason") or "")
 
 
-def _vision_page_candidates(document: dict, rule: dict, result: dict, maximum: int) -> list[int]:
-    """仅使用文字审查已定位的页码；首期不为未知扫描件盲发整份文件。"""
+def _append_unique_pages(target: list[int], values: object, page_count: int) -> None:
+    """将明确页码安全并入候选列表，绝不接受裸数字。"""
+    if isinstance(values, (int, float)) and not isinstance(values, bool):
+        values = f"P{int(values)}"
+    for page in _explicit_page_references(values, page_count):
+        if page not in target:
+            target.append(page)
+
+
+def _vision_page_candidates(document: dict, rule: dict, result: dict) -> list[int]:
+    """按可靠性返回候选页：结构化页码 > 单条结论页码 > 展示证据中的明确页码。"""
     if document.get("extension") != ".pdf" or not document.get("page_count"):
         return []
+    page_count = int(document["page_count"])
     pages: list[int] = []
-    for source in (result.get("page_hint"), result.get("evidence"), result.get("reason")):
-        for raw in re.findall(r"第?\s*(\d{1,4})\s*页?", str(source or "")):
-            page = int(raw)
-            if 1 <= page <= int(document["page_count"]) and page not in pages:
-                pages.append(page)
-            if len(pages) >= maximum:
-                return pages
-    # 规则本身的招标页不是投标文件证据，不能作为候选页；没有定位结果时宁可保留待核验。
+    # score 的 evidence_items / review 的 scan ledger 可在内存中直接保留页码，优先级最高。
+    for source in result.get("visual_page_candidates") or []:
+        _append_unique_pages(pages, source, page_count)
+    _append_unique_pages(pages, result.get("page_hint"), page_count)
+    # 展示文本只是兼容旧流程的后备来源；只读取显式 Pxx / 第xx页 / xx页格式。
+    for source in (result.get("evidence"), result.get("reason")):
+        _append_unique_pages(pages, source, page_count)
     return pages
+
+
+def _scan_visual_page_candidates(scan_index: dict | None, rule_id: str, page_count: int) -> list[int]:
+    """从全文扫描台账补充候选页，供没有评分 evidence_items 的规则使用。"""
+    if not isinstance(scan_index, dict):
+        return []
+    pages: list[int] = []
+    for finding in scan_index.get("findings") or []:
+        if not isinstance(finding, dict) or finding.get("rule_id") != rule_id:
+            continue
+        _append_unique_pages(pages, finding.get("page_hint"), page_count)
+        _append_unique_pages(pages, finding.get("page_range"), page_count)
+    return pages
+
+
+def _with_scan_visual_candidates(results: list[dict], scan_index: dict | None, document: dict) -> list[dict]:
+    page_count = int(document.get("page_count") or 0)
+    if page_count <= 0:
+        return results
+    values = []
+    for result in results:
+        current = list(result.get("visual_page_candidates") or [])
+        for page in _scan_visual_page_candidates(scan_index, str(result.get("rule_id") or ""), page_count):
+            if page not in current:
+                current.append(page)
+        values.append({**result, "visual_page_candidates": current})
+    return values
+
+
+def _visual_followup_pages(document: dict, primary: list[int], all_candidates: list[int], parsed: dict, level: str) -> list[int]:
+    """仅当首轮未覆盖时，按模型请求、其余证据页和相邻页追加一次识别。"""
+    setting = _VISION_LEVEL_SETTINGS[level]
+    remaining = setting["followup_pages"]
+    if remaining <= 0:
+        return []
+    page_count = int(document.get("page_count") or 0)
+    pages: list[int] = []
+    requested = parsed.get("requested_pages") if isinstance(parsed, dict) else []
+    if isinstance(requested, list):
+        for item in requested:
+            if isinstance(item, (int, float)) and not isinstance(item, bool):
+                page = int(item)
+                # 仅接受与首轮图片相邻的请求，避免模型凭空要求远处页面造成无边界调用。
+                if 1 <= page <= page_count and page not in primary and any(abs(page - sent) <= 2 for sent in primary):
+                    pages.append(page)
+    for page in all_candidates:
+        if page not in primary and page not in pages:
+            pages.append(page)
+    # 明确证据页显示为目录/明细表时，证书、签章、附件通常紧随其后；这是一条与材料类型无关的
+    # 邻页策略，只在模型报告未覆盖时生效。
+    for offset in (1, -1):
+        for page in primary:
+            adjacent = page + offset
+            if 1 <= adjacent <= page_count and adjacent not in primary and adjacent not in pages:
+                pages.append(adjacent)
+    return pages[:remaining]
+
+
+def _visual_response_needs_more(parsed: dict) -> bool:
+    if not isinstance(parsed, dict):
+        return False
+    if parsed.get("needs_more_image") is True:
+        return True
+    return str(parsed.get("coverage") or "").lower() in {"not_covered", "uncertain"}
 
 
 def _render_vision_images(app, document: dict, pages: list[int], level: str) -> list[dict]:
@@ -3372,6 +3506,101 @@ def _render_vision_images(app, document: dict, pages: list[int], level: str) -> 
     return images
 
 
+def _vision_content(prompt: str, images: list[dict]) -> list[dict]:
+    """逐图写明真实页码，避免模型把封面、目录或自行推断的页码混入结论。"""
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    for image in images:
+        content.append({"type": "text", "text": f"以下图片对应投标文件第{image['page']}页。"})
+        content.append({key: value for key, value in image.items() if key != "page"})
+    return content
+
+
+def _vision_locator_groups(page_count: int) -> list[list[int]]:
+    """高强度且无文字页码时，按连续页做低清缩略图索引；不常驻、不落盘。"""
+    return [
+        list(range(start, min(page_count, start + _VISION_LOCATOR_THUMBNAILS_PER_SHEET - 1) + 1))
+        for start in range(1, page_count + 1, _VISION_LOCATOR_THUMBNAILS_PER_SHEET)
+    ]
+
+
+def _render_vision_locator_sheets(app, document: dict, groups: list[list[int]]) -> list[dict]:
+    """将一组连续页压成带页码标记的低清联系表，用于纯扫描件找页。"""
+    source = storage.document_path(app, document)
+    sheets: list[dict] = []
+    with fitz.open(source) as pdf:
+        for group in groups:
+            contact = fitz.open()
+            try:
+                page = contact.new_page(width=900, height=1180)
+                columns = 3
+                cell_width, cell_height = 280, 280
+                for index, page_number in enumerate(group):
+                    row, column = divmod(index, columns)
+                    left, top = 10 + column * 295, 12 + row * 292
+                    source_page = pdf[page_number - 1]
+                    thumbnail = source_page.get_pixmap(matrix=fitz.Matrix(0.32, 0.32), alpha=False)
+                    rect = fitz.Rect(left, top + 18, left + cell_width, top + cell_height)
+                    page.insert_text((left, top + 12), f"P{page_number}", fontsize=11, color=(0, 0, 0))
+                    page.insert_image(rect, stream=thumbnail.tobytes("jpeg", jpg_quality=62), keep_proportion=True)
+                output = b""
+                for scale, quality in ((0.9, 68), (0.65, 55), (0.45, 45)):
+                    output = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False).tobytes("jpeg", jpg_quality=quality)
+                    if len(output) <= 4 * 1024 * 1024:
+                        break
+            finally:
+                contact.close()
+            sheets.append({
+                "pages": group,
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(output).decode("ascii"), "detail": "low"},
+            })
+    return sheets
+
+
+def _vision_locator_content(prompt: str, sheets: list[dict]) -> list[dict]:
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    for sheet in sheets:
+        content.append({"type": "text", "text": "以下联系表含投标文件页面：" + "、".join(f"P{page}" for page in sheet["pages"])})
+        content.append({key: value for key, value in sheet.items() if key != "pages"})
+    return content
+
+
+def _locate_visual_pages(app, task: dict, document: dict, rule: dict, vision_profile: dict) -> list[int]:
+    """仅在精细模式、且文字流程完全未定位到页码时，按低清联系表找页后再精识别。"""
+    if document.get("extension") != ".pdf" or not document.get("page_count"):
+        return []
+    groups = _vision_locator_groups(int(document["page_count"]))
+    for batch_number, offset in enumerate(range(0, len(groups), _VISION_LOCATOR_SHEETS_PER_REQUEST), start=1):
+        batch = groups[offset:offset + _VISION_LOCATOR_SHEETS_PER_REQUEST]
+        sheets = _render_vision_locator_sheets(app, document, batch)
+        if not sheets:
+            continue
+        prompt = storage.render_prompt_template(
+            app, "evaluate_all_visual_locator_user", rule=json.dumps(_visual_rule_packet(rule), ensure_ascii=False, separators=(",", ":")),
+            document_name=document.get("original_name") or "投标文件", bidder_name=document.get("bidder_name") or document.get("original_name") or "投标人",
+            candidate_pages=json.dumps([sheet["pages"] for sheet in sheets], ensure_ascii=False),
+        )
+        try:
+            with _VISION_REQUEST_GATE:
+                parsed = _request_task_json(
+                    app, task, vision_profile, "evaluate_all_visual_locator", _system_prompt(app, "evaluate_all"),
+                    _vision_locator_content(prompt, sheets), document_id=document["document_id"],
+                    context_mode=f"vision_locator_{batch_number}", max_tokens=_output_token_budget(vision_profile, 360),
+                    thinking_mode="disabled",
+                )
+        except ValueError:
+            return []
+        available = {page for group in batch for page in group}
+        requested = parsed.get("requested_pages") if isinstance(parsed, dict) else []
+        selected = [
+            int(page) for page in requested
+            if isinstance(page, (int, float)) and not isinstance(page, bool) and int(page) in available
+        ] if isinstance(requested, list) else []
+        if selected:
+            return list(dict.fromkeys(selected))[:_VISION_LEVEL_SETTINGS["high"]["max_pages"]]
+    return []
+
+
 def _visual_rule_packet(rule: dict) -> dict:
     scoring = _rule_scoring(rule)
     return {
@@ -3388,7 +3617,12 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
         return result
     if trigger == "text_fallback" and not _needs_visual_fallback(component, result):
         return result
-    pages = _vision_page_candidates(document, rule, result, _VISION_LEVEL_SETTINGS[level]["max_pages"])
+    all_pages = _vision_page_candidates(document, rule, result)
+    # 纯扫描件可能没有可供文字流程定位的页码。仅精细模式进入低清联系表找页，
+    # 找到候选后才发送高清目标页；快速/标准模式仍严格保持零额外图片调用。
+    if not all_pages and level == "high":
+        all_pages = _locate_visual_pages(app, task, document, rule, vision_profile)
+    pages = all_pages[:_VISION_LEVEL_SETTINGS[level]["max_pages"]]
     if not pages:
         return result
     prompt = storage.render_prompt_template(
@@ -3396,23 +3630,39 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
         document_name=document.get("original_name") or "投标文件", bidder_name=document.get("bidder_name") or document.get("original_name") or "投标人",
         vision_trigger=trigger, vision_level=level, text_result=json.dumps(result, ensure_ascii=False, separators=(",", ":")),
     )
-    images = _render_vision_images(app, document, pages, level)
-    if not images:
+    def request_pages(selected_pages: list[int], *, attempt: int) -> dict | None:
+        images = _render_vision_images(app, document, selected_pages, level)
+        if not images:
+            return None
+        try:
+            with _VISION_REQUEST_GATE:
+                parsed_value = _request_task_json(
+                    app, task, vision_profile, f"evaluate_all_{component}_vision_{attempt}", _system_prompt(app, "evaluate_all"),
+                    _vision_content(prompt, images), document_id=document["document_id"],
+                    context_mode=f"vision_{level}_{attempt}", max_tokens=_output_token_budget(vision_profile, 1_800),
+                    thinking_mode="disabled",
+                )
+        except ValueError:
+            # 图片补充失败绝不覆盖原始文字结论，也不让整份综合评审失败。
+            return None
+        return parsed_value if isinstance(parsed_value, dict) else None
+
+    parsed = request_pages(pages, attempt=1)
+    if not parsed:
         return result
-    content = [{"type": "text", "text": prompt}, *images]
-    try:
-        with _VISION_REQUEST_GATE:
-            parsed = _request_task_json(
-                app, task, vision_profile, f"evaluate_all_{component}_vision", _system_prompt(app, "evaluate_all"), content,
-                document_id=document["document_id"], context_mode=f"vision_{level}",
-                max_tokens=_output_token_budget(vision_profile, 1_800), thinking_mode="disabled",
-            )
-    except ValueError:
-        # 图片补充失败绝不覆盖原始文字结论，也不让整份综合评审失败。
+    if _visual_response_needs_more(parsed):
+        followup = _visual_followup_pages(document, pages, all_pages, parsed, level)
+        if followup:
+            retry = request_pages(followup, attempt=2)
+            if retry:
+                pages = followup
+                parsed = retry
+    # 若图片仍未覆盖目标材料，不能把“未看到”当成规则的负面证据，也不要把无效提示
+    # 混入最终理由。原有文字结论和“需 OCR”提示会完整保留。
+    if _visual_response_needs_more(parsed):
         return result
-    if not isinstance(parsed, dict):
-        return result
-    page_hint = str(parsed.get("page_hint") or f"第{'、'.join(str(page) for page in pages)}页")[:80]
+    # 页码必须以系统实际发送的图片为准，模型返回的 page_hint 仅作内部参考，不能覆盖它。
+    page_hint = "P" + "、P".join(str(page) for page in pages)
     visual_evidence = _clean_model_text(parsed.get("evidence"))[:1600]
     visual_reason = _clean_model_text(parsed.get("reason"))[:1200]
     prefix = f"【图片识别·{level}·{page_hint}】"
@@ -3939,6 +4189,9 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
         worker_count = min(_profile_parallel_limit(profile, len(groups)), admitted_limit, len(groups)) if groups else 0
         def persist_completed(value):
             group_index, label, results, compact_count, split_count, fallback_count = value
+            # 将全文扫描阶段已定位的页码保留给后续图片识别；此字段只在本次任务内流转，
+            # 不改变既有评审结果的存储结构或对外 API。
+            results = _with_scan_visual_candidates(results, scan_index, document)
             # 每个规则组成功后立即持久化；后续组异常时，页面仍能获得已完成部分。
             if component == "review" and run:
                 storage.save_review_results(app, run["review_run_id"], document["document_id"], results)

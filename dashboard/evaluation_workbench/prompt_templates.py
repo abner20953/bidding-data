@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 PROMPT_TEMPLATE_SETTING = "evaluation_workbench_prompt_templates"
-EVALUATION_PROMPT_VERSION = "vision-policy-v19"
+EVALUATION_PROMPT_VERSION = "vision-page-routing-v20"
 
 
 def _template(name: str, description: str, content: str, *placeholders: str) -> dict:
@@ -164,12 +164,26 @@ PROMPT_TEMPLATES["evaluate_all_visual_user"] = _template(
     "只能依据图片中可见内容和给出的规则判断，不得猜测图片外不可见事实，不得判断证照真实性或外部状态。"
     "若文字可读字段已足够，应直接列出可见字段；若图片模糊、页面不完整或无法确认，应如实说明。"
     "只返回合法 JSON：{\"status\":\"satisfied|not_satisfied|partial|not_found|manual\",\"suggested_score\":数字或null,"
-    "\"evidence\":\"图片中可见的关键事实\",\"page_hint\":\"页码或null\",\"reason\":\"简洁判断理由\","
-    "\"risk_level\":\"low|medium|high\",\"confidence\":\"high|medium|low\",\"needs_more_image\":true|false}。"
+    "\"evidence\":\"图片中可见的关键事实\",\"reason\":\"简洁判断理由\","
+    "\"risk_level\":\"low|medium|high\",\"confidence\":\"high|medium|low\","
+    "\"coverage\":\"covered|not_covered|uncertain\",\"needs_more_image\":true|false,\"requested_pages\":[页码]}。"
     "suggested_score 仅在评分规则存在时填写，且不得超出满分；非评分规则必须为 null。"
-    "证据和理由不得复述规则。\n规则：{{rule}}\n投标文件：{{document_name}}；投标人：{{bidder_name}}\n"
+    "coverage=covered 仅在本次传入图片已实际包含决定性材料时使用；图片未包含目标材料时必须返回"
+    "not_covered、needs_more_image=true，且不得据此作出不满足、不得分或负面风险结论。requested_pages 只能填写"
+    "与本次传入页相邻、且确有必要补看的页码；无法判断时返回空数组。证据和理由不得复述规则。\n规则：{{rule}}\n投标文件：{{document_name}}；投标人：{{bidder_name}}\n"
     "图片识别条件：{{vision_trigger}}；识图强度：{{vision_level}}。\n已有文字结论（仅作辅助，不得照抄）：{{text_result}}",
     "rule", "document_name", "bidder_name", "vision_trigger", "vision_level", "text_result",
+)
+PROMPT_TEMPLATES["evaluate_all_visual_locator_user"] = _template(
+    "综合评审 · 扫描件图片找页",
+    "仅在精细识图且文字流程未定位证据页时，先从低清联系表定位可能相关的页面。",
+    "你正在从带页码标签的投标文件缩略图联系表中定位单条规则可能需要查看的页面。"
+    "这一步只负责找页，不能评分、不能作满足或不满足结论，也不能猜测缩略图无法辨认的内容。"
+    "只返回合法 JSON：{\"found\":true|false,\"requested_pages\":[页码],\"reason\":\"简短找页理由\"}。"
+    "requested_pages 只能从本次联系表实际显示的页码中选择，最多3页；找不到时返回空数组。\n"
+    "规则：{{rule}}\n投标文件：{{document_name}}；投标人：{{bidder_name}}\n"
+    "本次联系表包含的页码组：{{candidate_pages}}",
+    "rule", "document_name", "bidder_name", "candidate_pages",
 )
 PROMPT_TEMPLATES["extract_rules_validation_guidance"]["content"] += (
     " 条件模板的前提必须由当前采购包原文中的明确勾选、明确说明或直接陈述支持；仅出现“如有/如允许/"
@@ -219,6 +233,7 @@ PROMPT_TEMPLATE_PRESENTATION = {
     "evaluate_all_cross_bid_price_user": ("workflow", "综合评审", 135, "careful"),
     "evaluate_all_highlights_user": ("workflow", "综合评审", 136, "careful"),
     "evaluate_all_visual_user": ("workflow", "综合评审", 137, "careful"),
+    "evaluate_all_visual_locator_user": ("workflow", "综合评审", 138, "careful"),
 
     # 系统角色、格式修复和旧接口兼容模板；保留编辑能力但默认收起。
     "model_connection_test": ("system", "连接与修复", 210, "advanced"),

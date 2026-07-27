@@ -124,7 +124,7 @@ def task_prompt_template_fingerprint(app, task_type: str) -> str | None:
             "evaluate_all", "evaluate_all_guidance", "evaluate_all_highlights", "evaluate_all_scope_profile", "evaluate_all_scope_profile_user",
             "evaluate_all_full_scan_user", "evaluate_all_review_user", "evaluate_all_objective_user",
             "evaluate_all_subjective_user", "evaluate_all_cross_bid_price_user", "evaluate_all_highlights_user",
-            "evaluate_all_visual_user",
+            "evaluate_all_visual_user", "evaluate_all_visual_locator_user",
             "evaluate_all_output_contract",
             "json_repair", "json_repair_user",
         },

@@ -2032,6 +2032,62 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         # 提取阶段只给出建议条件，真正的图片调用必须由人工选择强度后启用。
         self.assertEqual(rules[0]["vision_level"], "off")
 
+    def test_visual_page_candidates_only_accept_explicit_page_references(self):
+        document = {"extension": ".pdf", "page_count": 300}
+        result = {
+            "visual_page_candidates": [224, 227],
+            "evidence": "AI共识别2项；1. 节能证书（第P224页）；2. 环境标志证书（P227页）",
+            "reason": "建议得2分，有效期至2029-12-17。",
+        }
+        self.assertEqual(worker._vision_page_candidates(document, {}, result), [224, 227])
+
+        # 旧展示文本没有结构化页码时，也只能识别 P224 / P227，不能把“2项”“1.”误作页码。
+        legacy = {"evidence": result["evidence"], "reason": result["reason"]}
+        self.assertEqual(worker._vision_page_candidates(document, {}, legacy), [224, 227])
+
+    def test_score_results_preserve_structured_evidence_pages_for_visual_routing(self):
+        payload = [{"rule_id": "cert", "scoring": {"max_score": 2}, "ocr_required": True}]
+        output = [{"rule_id": "cert", "suggested_score": 2, "needs_ocr": True, "evidence_items": [
+            {"name": "节能证书", "page_hint": "P224"},
+            {"name": "环境标志证书", "page_hint": "第227页"},
+        ]}]
+        result = worker._normalise_score_results(output, payload, "objective")[0]
+        self.assertEqual(result["visual_page_candidates"], [224, 227])
+
+    def test_visual_followup_prefers_adjacent_pages_after_uncovered_result(self):
+        document = {"page_count": 300}
+        followup = worker._visual_followup_pages(
+            document, [224, 227], [224, 227], {"coverage": "not_covered", "requested_pages": []}, "standard",
+        )
+        self.assertEqual(followup, [225, 228])
+
+    def test_high_vision_locator_groups_cover_scanned_document_without_persistent_cache(self):
+        groups = worker._vision_locator_groups(25)
+        self.assertEqual(groups[0], list(range(1, 13)))
+        self.assertEqual(groups[1], list(range(13, 25)))
+        self.assertEqual(groups[2], [25])
+
+    def test_visual_locator_renders_labeled_contact_sheet_from_pdf(self):
+        document = self._add_pdf("scan.pdf", "bid", "甲", "扫描件示例")
+        document["page_count"] = 1
+        sheets = worker._render_vision_locator_sheets(self.app, document, [[1]])
+        self.assertEqual(sheets[0]["pages"], [1])
+        self.assertTrue(sheets[0]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
+
+    def test_uncovered_visual_response_does_not_pollute_text_result(self):
+        document = {"document_id": "doc", "extension": ".pdf", "page_count": 300, "original_name": "投标.pdf", "bidder_name": "甲"}
+        rule = {"rule_id": "cert", "title": "认证证书", "check_rule": "核验证书", "vision_trigger": "required", "vision_level": "low"}
+        original = {"rule_id": "cert", "suggested_score": 2, "max_score": 2, "evidence": "P224 证书明细", "reason": "需 OCR 核验证书", "confidence": "high", "visual_page_candidates": [224]}
+        task = {"task_id": "task"}
+        profile = {"profile_id": "vision", "display_name": "图片模型"}
+        with patch("dashboard.evaluation_workbench.worker._render_vision_images", return_value=[{
+            "page": 224, "type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AA==", "detail": "low"},
+        }]), patch("dashboard.evaluation_workbench.worker._request_task_json", return_value={
+            "coverage": "not_covered", "needs_more_image": True, "requested_pages": [],
+        }):
+            result = worker._run_visual_supplement(self.app, task, document, "objective", rule, original, profile)
+        self.assertEqual(result, original)
+
     def test_review_normalisation_reconciles_positive_reason_and_negative_status(self):
         result = worker._normalise_review_results([{
             "rule_id": "joint", "status": "not_satisfied", "risk_level": "medium",
