@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 PROMPT_TEMPLATE_SETTING = "evaluation_workbench_prompt_templates"
-EVALUATION_PROMPT_VERSION = "review-anchor-gate-v17"
+EVALUATION_PROMPT_VERSION = "review-anchor-gate-v18"
 
 
 def _template(name: str, description: str, content: str, *placeholders: str) -> dict:
@@ -132,6 +132,56 @@ _EVALUATE_ALL_EVIDENCE_GUIDANCE = (
     "文字层可确认存在歧义时应给 partial，只有勾选、签章或图片外观决定结论时才标记 ocr_required。"
 )
 PROMPT_TEMPLATES["evaluate_all_guidance"]["content"] += "\n\n" + _EVALUATE_ALL_EVIDENCE_GUIDANCE
+
+# 条件性模板、总项目名称和声明函的文字/图片双通道，是不同项目都会出现的解释边界。
+# 统一放在可维护提示词中，避免通过某个行业或某份文件的关键词打补丁。
+_APPLICABILITY_AND_RESULT_CONSISTENCY_GUIDANCE = (
+    "条件性条款必须先确认已被当前采购包明确启用，才可生成规则或给出不满足结论。含“如有”“如允许”"
+    "“当……时”“如不涉及”“是否接受”等前提的模板条款，只有招标文件以明确勾选、明确包别说明或"
+    "直接陈述证明前提成立时才适用；不能把条件句本身当作已启用要求。特别是评标表中“★号条款响应”"
+    "仅为交叉引用时，必须先在当前采购包采购需求中定位到实际带★的具体叶子条款；没有实际标记时不"
+    "生成该审查点，更不能因投标文件未单列★对照表而提示高风险。"
+    "投标文件出现招标文件的总项目名称，同时项目编号和当前采购包号正确时属于正常标注，不是无关内容"
+    "或混包；只有包号错误，或报价、技术方案、交付内容等实质材料明确属于其他采购包时才提出混包线索。"
+    "中小企业声明函等固定表单采用双通道：标的名称、所属行业、承接企业、从业人数、营业收入、资产总额"
+    "和企业类型等填写完整性，凡文字或表格可读取就必须直接检查；仅勾选框、签章、手写修改、图片外观"
+    "或文字不可读取时才转为 OCR 核验。文字可判定的缺填、模板占位或未删除互斥选项不得因文件也可能"
+    "是扫描件而跳过。"
+    "技术参数比较先判断交付口径是否真正不兼容：更高的内部制作规格、可转换格式或未证明的疑点不能直接"
+    "写成矛盾/不响应；只有与招标要求无法同时满足的明确事实才可作负面结论。照抄照搬必须有实质内容"
+    "大段复述且替代应有自主方案的证据，不能因项目名称、目录、必要的需求引用或格式文字相同就判风险。"
+    "状态、风险与理由必须一致：status=not_satisfied 只能用于有直接反证或明确缺失的事实；理由若说明"
+    "“满足”“符合”“未发现”或仅待核验，必须使用 satisfied、partial、manual 或 ocr_required，不能"
+    "保留不满足结论。技术/服务逐项响应覆盖规则必须以简明台账列出“已覆盖、部分覆盖、未找到”叶子项"
+    "及证据页；不得只写笼统的“部分覆盖”。"
+)
+PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += "\n\n" + _APPLICABILITY_AND_RESULT_CONSISTENCY_GUIDANCE
+PROMPT_TEMPLATES["evaluate_all_guidance"]["content"] += "\n\n" + _APPLICABILITY_AND_RESULT_CONSISTENCY_GUIDANCE
+PROMPT_TEMPLATES["extract_rules_validation_guidance"]["content"] += (
+    " 条件模板的前提必须由当前采购包原文中的明确勾选、明确说明或直接陈述支持；仅出现“如有/如允许/"
+    "当……时/★号条款”字样而未定位具体已启用事实时，删除该候选。中小企业声明函应把可读取的填写"
+    "完整性保留为文字审查，签章和勾选外观另作 OCR 条件，不得把两者混成仅 OCR 的规则。"
+)
+PROMPT_TEMPLATES["evaluate_all_scope_profile_user"]["content"] += (
+    "\n\n多包项目中必须同时保留总项目名称、当前采购包号和当前采购包名称的关系：总项目名称用于标识"
+    "整个采购项目，不能被视为当前包之外的异常；当前包号、预算、工作内容和交付范围才是判断混包的依据。"
+)
+PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"] += (
+    "\n\n范围偏离补充：总项目名称与招标文件一致、且项目编号及当前包号正确时，不报告为无关项目或混包；"
+    "只有实质报价、技术方案、交付清单或承诺明确对应其他包，才报告候选。对于 category=other 的逐项"
+    "响应覆盖规则，优先返回叶子项的支持/部分/未找到证据，避免只返回概括性承诺。"
+)
+PROMPT_TEMPLATES["evaluate_all_review_user"]["content"] += (
+    "\n\n补充判定：不存在可定位的★具体条款时，不得把未提供★逐项对照表判为不满足或高风险。总项目名称"
+    "加正确包号是正常格式。中小企业声明函应先检查文字字段完整性，扫描/签章/勾选外观才标 OCR。对于"
+    "逐项响应覆盖规则，evidence 使用“已覆盖：…；部分：…；未找到：…”的简明台账，必要时可至600字；"
+    "reason 最多220字。参数只有在交付要求无法兼容时才判矛盾；大段复述只有替代自主方案时才判照抄。"
+    "status、风险与理由必须相互一致。"
+)
+PROMPT_TEMPLATES["evaluate_all_cross_bid_price_user"]["content"] += (
+    "\n\n报价分为暂定建议：报价口径可识别时应输出 quoted_price；不得自行改变招标公式或提前认定资格"
+    "符合性是否通过。系统会按可识别报价复算常见比例公式并由人工最终确认有效报价范围。"
+)
 
 
 # 仅控制提示词配置界面的归类、排序和风险提示，不参与模型调用。业务原则集中

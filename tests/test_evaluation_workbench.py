@@ -1293,6 +1293,9 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不接受联合体", extraction_validation)
         self.assertIn("平台子账号", extraction_validation)
         self.assertIn("必须为 manual", extraction_validation)
+        self.assertIn("没有实际标记时不", extraction_guidance)
+        self.assertIn("中小企业声明函", extraction_guidance)
+        self.assertIn("总项目名称", evaluation_composed)
 
         compact_scan = worker._full_scan_prompt(
             self.app, {"original_name": "投标文件.pdf", "bidder_name": "投标人"},
@@ -1762,7 +1765,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self._run_next_task()
         rule = storage.add_rule(self.app, self.project["project_id"], {
             "category": "objective", "title": "最低价报价得分",
-            "check_rule": "最低评审价得10分，其他报价按最低价比例得分。",
+            "check_rule": "投标报价得分=（评标基准价／投标报价）×10，保留两位小数。",
             "source_text": "最低评审价得10分", "scoring": {"kind": "manual", "max_score": 10},
         })
         storage.confirm_rule_set(self.app, self.project["project_id"])
@@ -1771,7 +1774,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             {"document_id": bid_a["document_id"], "rule_id": rule["rule_id"], "quoted_price": 100,
              "suggested_score": 10, "evidence": "投标报价100万元", "calculation": "100/100×10=10", "confidence": "high"},
             {"document_id": bid_b["document_id"], "rule_id": rule["rule_id"], "quoted_price": 120,
-             "suggested_score": 8.33, "evidence": "投标报价120万元", "calculation": "100/120×10=8.33", "confidence": "high"},
+             "suggested_score": 8.32, "evidence": "投标报价120万元", "calculation": "100/120×10=8.32", "confidence": "high"},
         ]}
         with patch("dashboard.evaluation_workbench.worker.request_json", return_value=cross) as request_json:
             finished = self._run_next_task()
@@ -1972,6 +1975,58 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertFalse(worker._rule_requires_visual_verification({
             "title": "证照要求", "check_rule": "核验许可证名称及有效期", "ocr_required": False,
         }))
+
+    def test_inapplicable_template_rules_require_concrete_trigger(self):
+        rules = [
+            {"title": "★号条款响应", "check_rule": "核验★号条款", "source_text": "★号条款响应"},
+            {"title": "进口产品限制", "check_rule": "招标文件不接受进口产品投标的内容时核验", "source_text": "进口产品（如有）"},
+            {"title": "报价修正确认", "check_rule": "不涉及报价修正，或报价不一致时确认", "source_text": "报价修正（如有）"},
+        ]
+        tender = "项目属性：■服务。符合性审查包含★号条款响应的交叉引用。"
+        self.assertEqual(worker._filter_inapplicable_template_rules(rules, tender), [])
+
+        active_tender = "■本项目不接受进口产品。第五章：★ 音频文件必须为 WAV。"
+        titles = [item["title"] for item in worker._filter_inapplicable_template_rules(rules[:2], active_tender)]
+        self.assertEqual(titles, ["★号条款响应", "进口产品限制"])
+
+    def test_small_business_declaration_splits_text_and_visual_checks(self):
+        rules = worker._ensure_small_business_declaration_text_rules([{
+            "rule_id": "sme", "category": "qualification", "title": "中小企业声明函",
+            "check_rule": "核验中小企业声明函填写并加盖公章", "source_text": "提供中小企业声明函",
+            "check_mode": "ocr",
+        }])
+        self.assertEqual(len(rules), 2)
+        text_rule = next(item for item in rules if item["check_mode"] == "auto")
+        visual_rule = next(item for item in rules if item["check_mode"] == "ocr")
+        self.assertIn("所属行业", text_rule["check_rule"])
+        self.assertEqual(text_rule["evidence_requirements"], ["text"])
+        self.assertEqual(visual_rule["evidence_requirements"], ["visual"])
+
+    def test_review_normalisation_reconciles_positive_reason_and_negative_status(self):
+        result = worker._normalise_review_results([{
+            "rule_id": "joint", "status": "not_satisfied", "risk_level": "medium",
+            "reason": "全文未发现联合体协议，投标人为单一主体，符合不接受联合体要求。",
+        }], [{"rule_id": "joint", "check_mode": "auto"}])[0]
+        self.assertEqual(result["status"], "satisfied")
+        self.assertEqual(result["risk_level"], "low")
+
+    def test_lowest_price_formula_is_recalculated_with_decimal_rounding(self):
+        rule = {
+            "title": "投标报价得分", "check_rule": "投标报价得分=（评标基准价／投标报价）×20，保留两位小数。",
+            "source_text": "以最低评标价为评标基准价。",
+        }
+        score, calculation = worker._deterministic_price_score(rule, 835680, [833800, 835680, 838500], 20)
+        self.assertEqual(score, 19.96)
+        self.assertIn("19.96", calculation)
+
+    def test_coverage_rule_catalog_keeps_leaf_requirements(self):
+        rule = {
+            "rule_id": "coverage", "category": "other", "title": "采购需求逐项响应覆盖",
+            "check_rule": "；".join(f"第{index}项具体要求" for index in range(1, 100)),
+        }
+        catalog = worker._full_scan_catalog([rule])
+        self.assertEqual(catalog[0]["coverage"], 1)
+        self.assertGreater(len(catalog[0]["q"]), worker.FULL_SCAN_CATALOG_RULE_CHARS)
 
     def test_scope_anomaly_normalises_open_dimension_without_fixed_keywords(self):
         candidates = worker._normalise_scope_anomalies(

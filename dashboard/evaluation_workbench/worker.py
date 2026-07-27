@@ -13,6 +13,7 @@ import time
 import traceback
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -553,6 +554,41 @@ def _filter_rules_for_package(rules: list[dict], package_number: int | None) -> 
             continue
         values.append(rule)
     return values
+
+
+def _has_concrete_star_requirement(tender_text: str) -> bool:
+    """仅“★号条款响应”交叉引用不代表第五章真的存在星号叶子条款。"""
+    without_cross_reference = re.sub(r"★\s*号\s*条款\s*响应", "", tender_text or "")
+    return "★" in without_cross_reference
+
+
+def _has_explicit_import_restriction(tender_text: str) -> bool:
+    """进口限制必须在当前文件中被明确启用，不能由条件模板反推。"""
+    compact = re.sub(r"\s+", "", tender_text or "")
+    return bool(re.search(
+        r"(?:■|☑|√)?(?:本项目|本包|采购包\d+).{0,18}(?:不接受|不允许|禁止).{0,12}进口产品"
+        r"|(?:■|☑|√)不接受进口产品",
+        compact,
+    ))
+
+
+def _filter_inapplicable_template_rules(rules: list[dict], tender_text: str) -> list[dict]:
+    """剔除没有实际触发条件的模板规则，保守地保留其他候选。"""
+    has_star = _has_concrete_star_requirement(tender_text)
+    has_import_restriction = _has_explicit_import_restriction(tender_text)
+    kept: list[dict] = []
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        combined = " ".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text"))
+        if re.search(r"★\s*号|星号条款", combined) and not has_star:
+            continue
+        if "进口产品" in combined and re.search(r"如有|内容时|如.*?接受", combined) and not has_import_restriction:
+            continue
+        if "报价修正" in combined and re.search(r"如有|不涉及报价修正", combined):
+            continue
+        kept.append(rule)
+    return kept
 
 
 def _project_package_scope_instruction(app, project: dict) -> tuple[int | None, str]:
@@ -1220,6 +1256,57 @@ def _rule_requires_visual_verification(item: dict) -> bool:
     return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in VISUAL_EVIDENCE_PATTERNS)
 
 
+def _ensure_small_business_declaration_text_rules(rules: list[dict]) -> list[dict]:
+    """将中小企业声明函的可读字段检查与图片外观核验分开。
+
+    文字版声明函不应因为同一文件也可能含扫描签章而被整体排除在默认审查外；
+    同时保留视觉规则，避免文字提取替代签章、勾选和手写修改的核验。
+    """
+    result: list[dict] = []
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        combined = " ".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text"))
+        if "中小企业声明函" not in combined:
+            result.append(rule)
+            continue
+        if not _rule_requires_visual_verification(rule):
+            value = dict(rule)
+            requirements = value.get("evidence_requirements")
+            if not isinstance(requirements, list) or not requirements:
+                value["evidence_requirements"] = ["text"]
+            value["ocr_required"] = False
+            value["check_mode"] = "auto"
+            result.append(value)
+            continue
+
+        base_title = str(rule.get("title") or "中小企业声明函").strip()[:92]
+        text_rule = dict(rule)
+        text_rule.update({
+            "title": f"{base_title}（填写内容完整性）"[:120],
+            "check_rule": (
+                "核验《中小企业声明函》中可读取的标的名称、所属行业、承接企业名称、"
+                "从业人员、营业收入、资产总额和企业类型是否逐项填写；模板占位、下划线、"
+                "未删除的互斥选项或仅保留提示文字时判为部分或未完成。"
+            ),
+            "ocr_required": False,
+            "check_mode": "auto",
+            "execution_strategy": "point",
+            "evidence_requirements": ["text"],
+        })
+        visual_rule = dict(rule)
+        visual_rule.update({
+            "title": f"{base_title}（签章与勾选外观）"[:120],
+            "check_rule": "仅核验《中小企业声明函》的签章、勾选状态、手写修改及其他必须依赖图片外观确认的事实。",
+            "ocr_required": True,
+            "check_mode": "ocr",
+            "execution_strategy": "visual",
+            "evidence_requirements": ["visual"],
+        })
+        result.extend((text_rule, visual_rule))
+    return result
+
+
 def _rule_compilation_packet(items: list[dict], char_limit: int) -> str:
     """为规则编译阶段准备紧凑且可追溯的原始条款包。"""
     values = []
@@ -1798,7 +1885,9 @@ def _extract_rules(app, task: dict) -> dict:
         app, task, profile, system_prompt, batches, document_id=tender["document_id"],
         review_anchor_catalog=review_anchor_catalog,
     )
-    raw_rules = _filter_rules_for_package(_dedupe_rule_candidates(raw_rules), package_number)
+    raw_rules = _filter_inapplicable_template_rules(
+        _filter_rules_for_package(_dedupe_rule_candidates(raw_rules), package_number), text,
+    )
     primary_score_rules = [item for item in raw_rules if isinstance(item, dict) and item.get("category") in {"objective", "subjective"}]
     uncovered_score_packets = [
         packet for packet in score_packets
@@ -1887,7 +1976,7 @@ def _extract_rules(app, task: dict) -> dict:
         compilation_failure_count = 1
         storage.update_task(app, task["task_id"], progress=76, message=f"规则编译未完成，已保留原始提取结果：{exc}")
     # 是否可由投标文件核验交给完整提示词与人工确认判断；不以词表硬过滤，避免误删业绩有效期等规则。
-    rules = _filter_rules_for_package(candidates, package_number)
+    rules = _filter_inapplicable_template_rules(_filter_rules_for_package(candidates, package_number), text)
     for item in rules:
         if _rule_requires_visual_verification(item):
             item["ocr_required"] = True
@@ -1913,14 +2002,15 @@ def _extract_rules(app, task: dict) -> dict:
     rules, scoring_reconciliation = _reconcile_scoring_rules(
         app, task, profile, system_prompt, rules, score_packets,
     )
-    rules = _filter_rules_for_package(rules, package_number)
+    rules = _filter_inapplicable_template_rules(_filter_rules_for_package(rules, package_number), text)
     rules, quality_gate = _final_rule_quality_gate(
         app, task, profile, system_prompt, rules, score_packets,
     )
     rules, finalisation = _finalise_rule_operations(
         app, task, profile, system_prompt, rules,
     )
-    rules = _filter_rules_for_package(rules, package_number)
+    rules = _filter_inapplicable_template_rules(_filter_rules_for_package(rules, package_number), text)
+    rules = _ensure_small_business_declaration_text_rules(rules)
     for item in rules:
         if _rule_requires_visual_verification(item):
             item["ocr_required"] = True
@@ -2043,6 +2133,19 @@ def _is_explicit_ocr_gap(item: dict, rule: dict) -> bool:
     return any(term in text for term in ("ocr", "扫描件", "扫描图片", "图像识别", "图片识别"))
 
 
+def _status_conflicts_with_positive_reason(status: str, reason: object) -> bool:
+    """阻止模型把“符合/满足”的理由与“不满足”状态同时保存。"""
+    if status != "not_satisfied":
+        return False
+    text = _clean_model_text(reason)
+    if not text:
+        return False
+    negative_markers = ("不符合", "不满足", "未满足", "未提供", "未提交", "缺失", "无效", "不一致", "矛盾", "负偏离", "不响应")
+    if any(marker in text for marker in negative_markers):
+        return False
+    return any(marker in text for marker in ("符合", "满足要求", "满足", "未发现"))
+
+
 def _normalise_review_results(output: object, rules: list[dict]) -> list[dict]:
     by_id = {item["rule_id"]: item for item in rules}
     normalized = []
@@ -2054,6 +2157,9 @@ def _normalise_review_results(output: object, rules: list[dict]) -> list[dict]:
         if status not in {"satisfied", "not_satisfied", "partial", "not_found", "manual", "ocr_required"}:
             status = "manual"
         original_status = status
+        if _status_conflicts_with_positive_reason(status, item.get("reason")):
+            status = "satisfied" if any(marker in _clean_model_text(item.get("reason")) for marker in ("符合", "满足")) else "manual"
+            item = {**item, "risk_level": "low"}
         visual_rule = _rule_requires_visual_verification(by_id[rule_id])
         # OCR 规则在当前流程尚未真正识别图像时，不能因文本层未命中就输出高风险
         # 不满足；模型若在理由中明确提出 OCR 缺口，也统一回落到待 OCR。
@@ -2451,7 +2557,12 @@ def _full_scan_catalog(rules: list[dict]) -> list[dict]:
         query = re.sub(r"\s+", " ", f"{rule.get('title') or ''}；{rule.get('check_rule') or rule.get('title') or ''}").strip()
         # 主观评分表常把多个有独立分值的子项写在一条规则中。首轮只截取通用长度
         # 会丢掉末尾的子项，导致后续评分只能看到“总分”而不能看到完整评分维度。
-        query_limit = 420 if rule["category"] == "subjective" else FULL_SCAN_CATALOG_RULE_CHARS
+        is_coverage_rule = rule["category"] == "other" and (
+            "逐项响应覆盖" in str(rule.get("title") or "") or "叶子要求" in str(rule.get("check_rule") or "")
+        )
+        # 覆盖规则的末尾常是最关键的连续编号要求；保留较长目录只影响少数规则，
+        # 可避免首轮扫描在模型调用前就丢失叶子项。
+        query_limit = 1_200 if is_coverage_rule else (420 if rule["category"] == "subjective" else FULL_SCAN_CATALOG_RULE_CHARS)
         item = {
             "id": rule["rule_id"],
             # 保留旧字段，避免用户在提示词配置中保留了旧版 findings 模板时无法对应规则。
@@ -2459,6 +2570,7 @@ def _full_scan_catalog(rules: list[dict]) -> list[dict]:
             "q": query[:query_limit],
             "type": rule["category"],
             "strategy": _rule_execution_strategy(rule),
+            "coverage": 1 if is_coverage_rule else 0,
             "evidence_requirements": rule.get("evidence_requirements") or [],
         }
         if _rule_requires_visual_verification(rule):
@@ -3455,6 +3567,35 @@ def _cross_bid_price_context(documents: list[dict], rules: list[dict]) -> str:
     return json.dumps(packets, ensure_ascii=False, separators=(",", ":"))
 
 
+def _decimal_price(value: object) -> Decimal | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return parsed if parsed.is_finite() and parsed > 0 else None
+
+
+def _uses_lowest_price_ratio(rule: dict) -> bool:
+    text = re.sub(r"\s+", "", " ".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text")))
+    return bool(re.search(r"(?:评标价|评审价|评标基准价|基准价|最低(?:评标|评审|投标)?价).{0,36}[／/]?.{0,36}投标报价", text))
+
+
+def _deterministic_price_score(rule: dict, quoted_price: object, quoted_prices: list[object], max_score: float) -> tuple[float | None, str]:
+    """只复算招标原文明确的最低价比例公式，其他价格评分仍保留模型判断。"""
+    if not _uses_lowest_price_ratio(rule) or max_score <= 0:
+        return None, ""
+    current = _decimal_price(quoted_price)
+    prices = [value for value in (_decimal_price(item) for item in quoted_prices) if value is not None]
+    if current is None or len(prices) < 2:
+        return None, ""
+    base = min(prices)
+    score = (base / current * Decimal(str(max_score))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    bounded = min(Decimal(str(max_score)), max(Decimal("0"), score))
+    return float(bounded), f"系统复算：评标基准价{base}；{base}／{current}×{max_score}={bounded}（四舍五入保留两位小数）。"
+
+
 def _run_cross_bid_price_scoring(app, task: dict, profile: dict, documents: list[dict], rules: list[dict],
                                  score_run_id: str) -> dict:
     """在单文件评审后统一计算最低价/基准价，补足跨文件公式无法单独判断的问题。"""
@@ -3521,18 +3662,31 @@ def _run_cross_bid_price_scoring(app, task: dict, profile: dict, documents: list
         return {"rule_count": len(rules), "result_count": 0, "retry_count": retry_count,
                 "missing_count": len(expected), "format_failure": True}
 
+    valid_rows = [raw for raw in parsed["results"] if isinstance(raw, dict) and
+                  (str(raw.get("document_id") or ""), str(raw.get("rule_id") or "")) in expected]
+    prices_by_rule: dict[str, list[object]] = {}
+    for raw in valid_rows:
+        prices_by_rule.setdefault(str(raw.get("rule_id") or ""), []).append(raw.get("quoted_price"))
+
     received: set[tuple[str, str]] = set()
-    for raw in parsed["results"]:
-        if not isinstance(raw, dict):
-            continue
+    for raw in valid_rows:
         key = (str(raw.get("document_id") or ""), str(raw.get("rule_id") or ""))
-        if key not in expected:
-            continue
         rule_payload = rules_by_id[key[1]]
         try:
             max_score = float(rule_payload.get("scoring", {}).get("max_score") or 0)
         except (TypeError, ValueError):
             max_score = 0.0
+        deterministic_score, deterministic_calculation = _deterministic_price_score(
+            rule_payload, raw.get("quoted_price"), prices_by_rule.get(key[1], []), max_score,
+        )
+        if deterministic_score is not None:
+            previous_reason = _clean_model_text(raw.get("reason"))
+            raw = {
+                **raw,
+                "suggested_score": deterministic_score,
+                "calculation": deterministic_calculation,
+                "reason": (previous_reason + " 当前按全部可识别报价暂算，资格与符合性通过范围仍由人工最终确认。").strip(),
+            }
         suggested = _suggested_score(rule_payload, raw, "objective", max_score)
         result = _score_result_from_model(
             key[1], suggested, max_score, raw,
