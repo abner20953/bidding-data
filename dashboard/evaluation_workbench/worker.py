@@ -25,6 +25,7 @@ from dashboard.evaluation_workbench.ai_gateway import (
     InvalidJsonResponse, ModelResponseEnvelopeError, _recover_complete_json_array, model_capabilities, request_json,
 )
 from dashboard.evaluation_workbench.collusion_signals import build_cross_bid_analysis
+from dashboard.evaluation_workbench.ocr_gateway import request_tencent_ocr
 from dashboard.evaluation_workbench.prompt_context import (
     build_rule_context, select_rule_chunk_evidence_map, select_rule_chunk_map, select_rule_chunks,
     split_full_text_chunks,
@@ -3469,6 +3470,175 @@ _VISION_REQUEST_GATE = threading.BoundedSemaphore(1)
 _VISION_LOCATOR_THUMBNAILS_PER_SHEET = 12
 _VISION_LOCATOR_SHEETS_PER_REQUEST = 6
 
+_OCR_PAGE_LIMITS = {"low": 1, "standard": 2, "high": 3}
+_OCR_ROUTE_TABLE_TERMS = ("评分表", "业绩表", "参数表", "清单", "报价表", "人员表", "明细表", "统计表")
+_OCR_ROUTE_ACCURATE_TERMS = ("证书", "许可证", "资质", "编号", "有效期", "日期", "金额", "审计", "社保", "纳税", "声明函")
+
+
+def _ocr_service_for_rule(rule: dict, level: str) -> str:
+    """不调用额外分类接口，仅根据已确认规则路由到专用OCR资源包。"""
+    text = f"{rule.get('title') or ''}\n{rule.get('check_rule') or ''}\n{rule.get('source_text') or ''}"
+    if "营业执照" in text:
+        return "biz_license"
+    if any(term in text for term in _OCR_ROUTE_TABLE_TERMS):
+        return "table"
+    if level == "high" or any(term in text for term in _OCR_ROUTE_ACCURATE_TERMS):
+        return "accurate"
+    return "basic"
+
+
+def _render_ocr_page(app, document: dict, page_number: int, service: str) -> tuple[bytes, str] | None:
+    """仅在内存中渲染候选页，不落盘；高精度和表格接口使用更高分辨率。"""
+    if document.get("extension") != ".pdf":
+        return None
+    source = storage.document_path(app, document)
+    scale = 2.0 if service in {"accurate", "table", "biz_license"} else 1.5
+    quality = 88 if scale >= 2 else 80
+    try:
+        with fitz.open(source) as pdf:
+            if not 1 <= page_number <= pdf.page_count:
+                return None
+            content = pdf[page_number - 1].get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False).tobytes("jpeg", jpg_quality=quality)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return content, hashlib.sha256(content).hexdigest()
+
+
+def _ocr_response_coverage(value: dict) -> str:
+    coverage = str(value.get("coverage") or "").lower()
+    return coverage if coverage in {"covered", "not_covered", "uncertain"} else "uncertain"
+
+
+def _ocr_response_scope(value: dict) -> str:
+    scope = str(value.get("conclusion_scope") or "").lower()
+    return scope if scope in {"full", "partial", "none"} else "partial"
+
+
+def _ocr_candidate_pages(document: dict, rule: dict, result: dict, level: str) -> list[int]:
+    pages = _vision_page_candidates(document, rule, result)
+    return pages[:_OCR_PAGE_LIMITS.get(level, 1)]
+
+
+def _ocr_page_texts(app, task: dict, document: dict, rule: dict, result: dict, level: str) -> tuple[list[dict], str]:
+    service = _ocr_service_for_rule(rule, level)
+    configuration = storage.ocr_configuration(app)
+    service_config = next((item for item in configuration["services"] if item["service"] == service), None)
+    if not configuration["enabled"] or not service_config or not service_config["enabled"]:
+        return [], "腾讯 OCR 未启用"
+    pages = _ocr_candidate_pages(document, rule, result, level)
+    if not pages:
+        return [], "未定位到可靠 OCR 候选页"
+    values: list[dict] = []
+    failure = ""
+    for page in pages:
+        rendered = _render_ocr_page(app, document, page, service)
+        if not rendered:
+            continue
+        image, image_hash = rendered
+        cached = storage.get_ocr_page_cache(app, document["document_id"], page, image_hash, service)
+        if cached:
+            values.append({**cached, "page": page, "cached": True})
+            continue
+        response, error = request_tencent_ocr(app, task, service, image)
+        if response:
+            stored = {key: value for key, value in response.items() if key != "request_id"}
+            storage.save_ocr_page_cache(app, document["document_id"], page, image_hash, service, stored)
+            values.append({**stored, "page": page, "cached": False})
+            continue
+        failure = error or failure
+        # 普通接口出现可恢复错误时才尝试高精度接口，避免机械双调用。
+        if service == "basic" and configuration["services"]:
+            accurate = next((item for item in configuration["services"] if item["service"] == "accurate"), None)
+            if accurate and accurate["enabled"] and accurate["remaining"] > 0:
+                rerendered = _render_ocr_page(app, document, page, "accurate")
+                if rerendered:
+                    response, error = request_tencent_ocr(app, task, "accurate", rerendered[0])
+                    if response:
+                        stored = {key: value for key, value in response.items() if key != "request_id"}
+                        storage.save_ocr_page_cache(app, document["document_id"], page, rerendered[1], "accurate", stored)
+                        values.append({**stored, "page": page, "cached": False, "service": "accurate"})
+                        continue
+                    failure = error or failure
+    return values, failure
+
+
+def _ocr_service_label(service: str) -> str:
+    return storage.TENCENT_OCR_SERVICES.get(service, {}).get("label", "腾讯 OCR")
+
+
+def _with_ocr_raw_evidence(result: dict, prefix: str, text: str) -> dict:
+    """JSON归纳失败时仍把已识别文字留作人工可核验的证据，不改变原判断。"""
+    excerpt = _clean_model_text(text)[:1400]
+    if not excerpt:
+        return result
+    return {
+        **result,
+        "evidence": "\n".join(value for value in (result.get("evidence"), f"{prefix}{excerpt}") if value)[:2000],
+    }
+
+
+def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: dict, result: dict,
+                        profile: dict) -> dict:
+    """OCR先补足可读文字；失败/额度不足只记录原因，后续仍可进入原多模态路径。"""
+    trigger, level = _rule_vision_policy(rule)
+    if trigger == "off" or level == "off":
+        return result
+    if trigger == "text_fallback" and not _needs_visual_fallback(component, result):
+        return _with_vision_execution(result, "ocr_skipped_text_sufficient", [], {}, "文字证据已足够，本次无需调用腾讯 OCR。")
+    values, failure = _ocr_page_texts(app, task, document, rule, result, level)
+    if not values:
+        status = "ocr_quota_exhausted" if "额度" in failure else "ocr_not_located" if "定位" in failure else "ocr_failed"
+        return _with_vision_execution(result, status, [], {}, failure or "腾讯 OCR 未获得可用文字，已保留原文字结论。")
+    pages = [int(value["page"]) for value in values]
+    ocr_text = "\n\n".join(f"[第{value['page']}页·{_ocr_service_label(str(value.get('service') or ''))}]\n{value.get('text') or ''}" for value in values if value.get("text"))[:24000]
+    if not ocr_text.strip():
+        return _with_vision_execution(result, "ocr_failed", pages, {}, "腾讯 OCR 未识别到可用文字，已保留原文字结论。")
+    service_labels = "、".join(dict.fromkeys(_ocr_service_label(str(value.get("service") or "")) for value in values))
+    prompt = storage.render_prompt_template(
+        app, "evaluate_all_ocr_user", rule=json.dumps(_visual_rule_packet(rule), ensure_ascii=False, separators=(",", ":")),
+        document_name=document.get("original_name") or "投标文件", bidder_name=document.get("bidder_name") or document.get("original_name") or "投标人",
+        text_result=json.dumps(result, ensure_ascii=False, separators=(",", ":")), ocr_service=service_labels,
+        ocr_pages="、".join(f"P{page}" for page in pages), ocr_text=ocr_text,
+    )
+    try:
+        parsed = _request_task_json(
+            app, task, profile, f"evaluate_all_{component}_ocr", _system_prompt(app, "evaluate_all"), prompt,
+            document_id=document["document_id"], context_mode="tencent_ocr", max_tokens=_output_token_budget(profile, 1300), thinking_mode="disabled",
+        )
+    except ValueError:
+        fallback = _with_ocr_raw_evidence(result, f"【腾讯OCR原文·{service_labels}·" + "、".join(f"P{page}" for page in pages) + "】", ocr_text)
+        return _with_vision_execution(fallback, "ocr_applied_partial", pages, {}, f"{service_labels} 已识别文字并附入证据；OCR结论规范化失败，已保留原结论。")
+    if not isinstance(parsed, dict) or _ocr_response_coverage(parsed) != "covered":
+        fallback = _with_ocr_raw_evidence(result, f"【腾讯OCR原文·{service_labels}·" + "、".join(f"P{page}" for page in pages) + "】", ocr_text)
+        return _with_vision_execution(fallback, "ocr_uncovered", pages, {}, f"{service_labels} 已识别候选页，但未覆盖可形成结论的关键文字，已保留原结论。")
+    scope = _ocr_response_scope(parsed)
+    prefix = f"【腾讯OCR·{service_labels}·" + "、".join(f"P{page}" for page in pages) + "】"
+    evidence = _clean_model_text(parsed.get("evidence"))[:1600]
+    reason = _clean_model_text(parsed.get("reason"))[:1200]
+    status = "ocr_applied" if scope == "full" else "ocr_applied_partial"
+    if component == "review":
+        selected_status = str(parsed.get("status") or result.get("status") or "manual") if scope == "full" else str(result.get("status") or "manual")
+        if selected_status not in {"satisfied", "not_satisfied", "partial", "not_found", "manual"}:
+            selected_status = "manual"
+        merged = _review_result_from_model({
+            "evidence": "\n".join(value for value in (result.get("evidence"), f"{prefix}{evidence}" if evidence else "") if value),
+            "page_hint": "P" + "、P".join(str(page) for page in pages),
+            "reason": "\n".join(value for value in (result.get("reason"), f"{prefix}{reason}" if reason else "") if value),
+            "risk_level": parsed.get("risk_level") if scope == "full" else result.get("risk_level"),
+            "confidence": parsed.get("confidence") if scope == "full" else result.get("confidence"),
+            "evidence_quality": "sufficient" if scope == "full" and evidence else result.get("evidence_quality"),
+        }, rule["rule_id"], selected_status)
+    else:
+        max_score = float(_rule_scoring(rule).get("max_score") or result.get("max_score") or 0)
+        suggested = _bounded_model_score(parsed.get("suggested_score"), max_score) if scope == "full" and max_score > 0 else result.get("suggested_score")
+        merged = {**result, "suggested_score": suggested,
+                  "evidence": "\n".join(value for value in (result.get("evidence"), f"{prefix}{evidence}" if evidence else "") if value)[:2000],
+                  "reason": "\n".join(value for value in (result.get("reason"), f"{prefix}{reason}" if reason else "") if value)[:2000],
+                  "confidence": parsed.get("confidence") if scope == "full" and parsed.get("confidence") in {"high", "medium", "low"} else result.get("confidence"),
+                  "requires_review": True, "automation_status": "needs_review", "review_reason": "腾讯 OCR 结果已补充，需人工复核。"}
+    return _with_vision_execution(merged, status, pages, {"display_name": service_labels},
+                                  f"{service_labels} 已识别候选页并{'采纳到规则结论' if scope == 'full' else '补充部分文字事实'}。")
+
 
 def _rule_vision_policy(rule: dict) -> tuple[str, str]:
     """读取可向后兼容的图片识别执行策略。"""
@@ -3818,6 +3988,9 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
     if trigger == "off" or level == "off":
         return result
     if trigger == "text_fallback" and not _needs_visual_fallback(component, result):
+        if str(result.get("vision_status") or "").startswith("ocr_"):
+            # OCR 已把文字性关键事实补足时，无需再覆盖其状态为“未调用图片”。
+            return result
         return _with_vision_execution(
             result, "skipped_text_sufficient", [], vision_profile, "文字证据已足够，本次无需调用图片模型。",
         )
@@ -3896,7 +4069,9 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
     if conflict_text:
         visual_reason = "\n".join(value for value in (visual_reason, f"图片与文字候选字段疑似不一致：{conflict_text}") if value)[:1200]
     prefix = f"【图片识别·{level}·{page_hint}】"
-    vision_status = "conflict" if has_conflict else ("applied" if conclusion_scope == "full" else "applied_partial")
+    ocr_preceded = str(result.get("vision_status") or "").startswith("ocr_")
+    visual_status = "conflict" if has_conflict else ("applied" if conclusion_scope == "full" else "applied_partial")
+    vision_status = f"ocr_vision_{visual_status}" if ocr_preceded else visual_status
     vision_message = (
         "图片检查发现文字层与图片层关键字段疑似不一致，已保留原结论并标记人工重点复核。"
         if has_conflict else (
@@ -3904,6 +4079,8 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
             else "图片识别已补充可见事实；因材料覆盖不完整，原文字结论和建议分保持不变。"
         )
     )
+    if ocr_preceded:
+        vision_message = f"已先完成腾讯 OCR 文字核验；{vision_message}"
     if component == "review":
         status = str(parsed.get("status") or "manual") if conclusion_scope == "full" else str(result.get("status") or "manual")
         if status not in {"satisfied", "not_satisfied", "partial", "not_found", "manual"}:
@@ -4472,44 +4649,36 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
         ("objective", objective_rules, objective_run),
         ("subjective", subjective_rules, subjective_run),
     )
-    if vision_profile:
-        for component, component_rules, run in visual_components:
-            for rule in component_rules:
-                trigger, level = _rule_vision_policy(rule)
-                if trigger == "off" or level == "off":
-                    continue
-                base = completed_results[component].get(rule["rule_id"])
-                if not base:
-                    progress.advance(f"跳过未产生文字结果的图片识别：{bidder_name}")
-                    continue
-                progress.message(f"正在图片识别：{bidder_name} · {rule.get('title') or rule.get('check_rule')}")
-                merged = _run_visual_supplement(app, task, document, component, rule, base, vision_profile)
-                completed_results[component][rule["rule_id"]] = merged
-                if component == "review" and run:
-                    storage.save_review_results(app, run["review_run_id"], document["document_id"], [merged])
-                elif run:
-                    storage.save_score_results(app, run["score_run_id"], document["document_id"], [merged])
+    # 全系统图片识别开关是总闸：关闭时必须与此前的纯文字流程完全一致。
+    ocr_enabled = bool(vision_profile and storage.ocr_configuration(app).get("enabled"))
+    for component, component_rules, run in visual_components:
+        for rule in component_rules:
+            trigger, level = _rule_vision_policy(rule)
+            if trigger == "off" or level == "off":
+                continue
+            base = completed_results[component].get(rule["rule_id"])
+            if not base:
+                progress.advance(f"跳过未产生文字结果的图片识别：{bidder_name}")
+                continue
+            label = rule.get("title") or rule.get("check_rule")
+            merged = base
+            if ocr_enabled:
+                progress.message(f"正在腾讯 OCR 识别：{bidder_name} · {label}")
+                merged = _run_ocr_supplement(app, task, document, component, rule, merged, profile)
                 values["batch_count"] += 1
-                progress.advance(f"已完成图片识别：{bidder_name} · {rule.get('title') or rule.get('check_rule')}")
-    else:
-        # 规则已启用识图但全局开关关闭、默认模型不可用或模型未标记为多模态时，
-        # 仍把“为何未执行”写入结果，避免用户把纯文字结论误认为图片结论。
-        for component, component_rules, run in visual_components:
-            for rule in component_rules:
-                trigger, level = _rule_vision_policy(rule)
-                if trigger == "off" or level == "off":
-                    continue
-                base = completed_results[component].get(rule["rule_id"])
-                if not base:
-                    continue
-                marked = _with_vision_execution(
-                    base, "unavailable", [], {}, "本次未获得可用的多模态模型，未执行图片识别。",
-                )
-                completed_results[component][rule["rule_id"]] = marked
-                if component == "review" and run:
-                    storage.save_review_results(app, run["review_run_id"], document["document_id"], [marked])
-                elif run:
-                    storage.save_score_results(app, run["score_run_id"], document["document_id"], [marked])
+            if vision_profile:
+                progress.message(f"正在图片识别：{bidder_name} · {label}")
+                merged = _run_visual_supplement(app, task, document, component, rule, merged, vision_profile)
+                values["batch_count"] += 1
+            elif not ocr_enabled:
+                # 保持旧行为：未启用腾讯 OCR 且没有多模态模型时，显式说明未执行图片检查。
+                merged = _with_vision_execution(merged, "unavailable", [], {}, "本次未获得可用的多模态模型，未执行图片识别。")
+            completed_results[component][rule["rule_id"]] = merged
+            if component == "review" and run:
+                storage.save_review_results(app, run["review_run_id"], document["document_id"], [merged])
+            elif run:
+                storage.save_score_results(app, run["score_run_id"], document["document_id"], [merged])
+            progress.advance(f"已完成图片识别：{bidder_name} · {label}")
     progress.document_completed(document)
     return values
 

@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -1186,6 +1187,29 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         storage.update_model_profile(self.app, profile["profile_id"], {"supports_vision": False})
         self.assertEqual(storage.vision_configuration(self.app), {"enabled": False, "default_profile_id": None})
+
+    def test_tencent_ocr_configuration_uses_hidden_credentials_and_conservative_monthly_limit(self):
+        with patch.dict(os.environ, {"TENCENTCLOUD_SECRET_ID": "", "TENCENTCLOUD_SECRET_KEY": ""}, clear=False):
+            configured = storage.update_ocr_configuration(self.app, {
+                "enabled": True, "secret_id": "AKID-example", "secret_key": "secret-example", "region": "ap-guangzhou",
+                "services": {"basic": {"enabled": True, "monthly_limit": 1}},
+            })
+        self.assertTrue(configured["enabled"])
+        self.assertTrue(configured["credentials_configured"])
+        self.assertEqual(configured["credentials_source"], "manual")
+        self.assertNotIn("secret-example", json.dumps(configured, ensure_ascii=False))
+        task = storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        usage = storage.reserve_ocr_request(self.app, task, "basic")
+        self.assertTrue(usage)
+        self.assertIsNone(storage.reserve_ocr_request(self.app, task, "basic"))
+        storage.complete_ocr_request(self.app, usage, status="error", detail="模拟失败仍保守计入额度")
+
+    def test_tencent_ocr_page_cache_is_page_and_service_scoped(self):
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "扫描件候选页")
+        storage.save_ocr_page_cache(self.app, document["document_id"], 1, "page-hash", "accurate", {"text": "证书编号A", "confidence": 98})
+        cached = storage.get_ocr_page_cache(self.app, document["document_id"], 1, "page-hash", "accurate")
+        self.assertEqual(cached["text"], "证书编号A")
+        self.assertIsNone(storage.get_ocr_page_cache(self.app, document["document_id"], 1, "page-hash", "basic"))
 
     def test_rule_vision_policy_round_trip_keeps_existing_ocr_rule_disabled_until_strength_selected(self):
         rule = storage.add_rule(self.app, self.project["project_id"], {

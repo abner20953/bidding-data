@@ -185,6 +185,21 @@ PROMPT_TEMPLATES["evaluate_all_visual_user"] = _template(
     "图片识别条件：{{vision_trigger}}；识图强度：{{vision_level}}。\n已有文字结论（仅作辅助，不得照抄）：{{text_result}}",
     "rule", "document_name", "bidder_name", "vision_trigger", "vision_level", "text_result",
 )
+PROMPT_TEMPLATES["evaluate_all_ocr_user"] = _template(
+    "综合评审 · OCR 证据补充",
+    "仅依据腾讯OCR已识别文字，为单条规则补充可追溯的文字结论；不替代图片外观核验。",
+    "你正在根据专用 OCR 已识别的页面文字，对一条招投标规则补充审查。只能引用给出的 OCR 文字和已有文字结论，"
+    "不得把 OCR 未识别到的内容当作材料缺失；签字、盖章、勾选、证件外观、图片真实性或版式完整性仍需要图片核验。"
+    "只返回合法 JSON：{\"status\":\"satisfied|not_satisfied|partial|not_found|manual\",\"suggested_score\":数字或null,"
+    "\"evidence\":\"OCR中可直接引用的关键事实\",\"reason\":\"简洁判断理由\","
+    "\"risk_level\":\"low|medium|high\",\"confidence\":\"high|medium|low\","
+    "\"conclusion_scope\":\"full|partial|none\",\"coverage\":\"covered|not_covered|uncertain\"}。"
+    "coverage=covered 仅表示OCR文字覆盖到规则相关材料；只有OCR文字足以完成整条文字性规则判断时 conclusion_scope 才可为 full。"
+    "若规则关键事实仍取决于签章、勾选、图片外观或表格版式，必须使用 partial，不得直接改写已有结论或建议分。"
+    "证据与理由不得复述规则。\n规则：{{rule}}\n投标文件：{{document_name}}；投标人：{{bidder_name}}\n"
+    "已有文字结论：{{text_result}}\nOCR接口：{{ocr_service}}；已识别页：{{ocr_pages}}\nOCR文字：\n{{ocr_text}}",
+    "rule", "document_name", "bidder_name", "text_result", "ocr_service", "ocr_pages", "ocr_text",
+)
 PROMPT_TEMPLATES["evaluate_all_visual_locator_user"] = _template(
     "综合评审 · 扫描件图片找页",
     "仅在精细识图且文字流程未定位证据页时，先从低清联系表定位可能相关的页面。",
@@ -244,7 +259,8 @@ PROMPT_TEMPLATE_PRESENTATION = {
     "evaluate_all_cross_bid_price_user": ("workflow", "综合评审", 135, "careful"),
     "evaluate_all_highlights_user": ("workflow", "综合评审", 136, "careful"),
     "evaluate_all_visual_user": ("workflow", "综合评审", 137, "careful"),
-    "evaluate_all_visual_locator_user": ("workflow", "综合评审", 138, "careful"),
+    "evaluate_all_ocr_user": ("workflow", "综合评审", 138, "careful"),
+    "evaluate_all_visual_locator_user": ("workflow", "综合评审", 139, "careful"),
 
     # 系统角色、格式修复和旧接口兼容模板；保留编辑能力但默认收起。
     "model_connection_test": ("system", "连接与修复", 210, "advanced"),

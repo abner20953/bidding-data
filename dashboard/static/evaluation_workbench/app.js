@@ -8,6 +8,7 @@
   let lastPartialDocumentsKey = '';
   let globalRules = [];
   let visionConfiguration = {enabled:false, default_profile_id:null};
+  let ocrConfiguration = {enabled:false, services:[]};
   let hasCurrentRules = false;
   const defaultDocumentTitle = document.title;
   let completionTicker = null;
@@ -86,8 +87,15 @@
   function thinkingLabel(profile) { return {default:'默认', enabled:'启用', adaptive:'自适应', disabled:'禁用'}[normalizedThinkingMode(profile.model_name, profile.thinking_mode)] || profile.thinking_mode; }
   function resetModelForm() { $('model-profile-id').value = ''; $('model-form-title').textContent = '新增 OpenAI-compatible 模型'; for (const id of ['model-display-name','model-base-url','model-name','model-api-key']) $(id).value = ''; $('model-preset').value = ''; $('model-json-mode').value = 'true'; $('model-thinking').value = 'default'; $('model-supports-vision').checked = false; }
   function applyModelPreset() { const preset = modelPresets[$('model-preset').value]; if (!preset) return; $('model-display-name').value = preset.displayName; $('model-base-url').value = preset.baseUrl; $('model-name').value = preset.modelName; $('model-json-mode').value = preset.jsonMode; $('model-thinking').value = preset.thinking; $('model-supports-vision').checked = Boolean(preset.supportsVision); }
+  function renderOcrConfiguration() {
+    $('ocr-enabled').checked = Boolean(ocrConfiguration.enabled); $('ocr-region').value = ocrConfiguration.region || 'ap-guangzhou';
+    const source = {manual:'手动保存', environment:'运行环境变量', none:'未配置'}[ocrConfiguration.credentials_source] || '未配置';
+    const imageGate = visionConfiguration.enabled ? '全系统图片识别已开启。' : '提示：全系统图片识别总开关当前关闭，OCR 不会在评审中运行。';
+    $('ocr-configuration-hint').textContent = `凭据：${source}。本月 ${ocrConfiguration.month_key || '-'}；系统每次真实请求保守计入一次，缓存命中不消耗额度。${imageGate}`;
+    $('ocr-services').innerHTML = (ocrConfiguration.services || []).map((item) => `<div class="ocr-service-row"><label class="inline-check"><input class="ocr-service-enabled" data-service="${escapeHtml(item.service)}" type="checkbox" ${item.enabled ? 'checked' : ''}> ${escapeHtml(item.label)}${item.legacy ? '（仅账号支持时启用）' : ''}</label><label>安全上限<input class="ocr-service-limit" data-service="${escapeHtml(item.service)}" type="number" min="1" max="1000" value="${Number(item.monthly_limit) || 900}"></label><small>本月已用 ${Number(item.used) || 0} · 预计可用 ${Number(item.remaining) || 0}</small></div>`).join('') || '<p class="muted">暂无 OCR 接口设置。</p>';
+  }
   async function loadProfiles() {
-    const [data, visionData] = await Promise.all([request('/model-profiles'), request('/vision-configuration')]); modelProfiles = data.profiles; visionConfiguration = visionData.configuration || visionConfiguration;
+    const [data, visionData, ocrData] = await Promise.all([request('/model-profiles'), request('/vision-configuration'), request('/tencent-ocr-configuration')]); modelProfiles = data.profiles; visionConfiguration = visionData.configuration || visionConfiguration; ocrConfiguration = ocrData.configuration || ocrConfiguration; renderOcrConfiguration();
     const active = data.profiles.filter((p) => p.enabled);
     const options = active.map((p) => `<option value="${p.profile_id}">${escapeHtml(p.display_name)} · ${escapeHtml(p.model_name)}${p.api_key_configured ? '' : '（未配置密钥）'}</option>`).join('') || '<option value="">暂无可用模型档案</option>';
     for (const id of ['rule-profile','all-profile']) $(id).innerHTML = options;
@@ -113,7 +121,11 @@
   }
   function categoryLabel(value) { return {qualification:'资格性', compliance:'符合性', substantive:'实质性/废标项', rejection:'实质性/废标项', other:'其他规则', objective:'客观分', subjective:'主观分'}[value] || value; }
   async function refreshRules() {
-    if (!activeProject) return; const data = await request(`/projects/${activeProject}/rules`); const set = data.rule_set; const isDraft = set?.status === 'draft'; hasCurrentRules = data.rules.length > 0;
+    if (!activeProject) return;
+    const expandedRuleIds = new Set([...$('rules').querySelectorAll('details.rule-card[open]')]
+      .map((card) => card.dataset.rule || card.querySelector('[data-rule]')?.dataset.rule)
+      .filter(Boolean));
+    const data = await request(`/projects/${activeProject}/rules`); const set = data.rule_set; const isDraft = set?.status === 'draft'; hasCurrentRules = data.rules.length > 0;
     const enabledCount = data.rules.filter((r) => Boolean(r.enabled)).length; $('rule-set-meta').textContent = set ? `版本 ${set.version} · ${set.status === 'confirmed' ? '已确认' : set.status === 'draft' ? '待确认' : '已替换'} · 已启用 ${enabledCount}/${data.rules.length} 条${set.source_task_id ? ' · AI 提取结果' : ''}` : '尚未提取或添加规则。'; $('confirm-rules').disabled = !isDraft;
     $('rules').innerHTML = data.rules.length ? `<div class="rule-card-list">${data.rules.map((r) => {
       const checkContent = isDraft ? `<textarea class="rule-check-rule" data-rule="${r.rule_id}" rows="4">${escapeHtml(r.check_rule || r.title)}</textarea>` : `<div class="rule-text">${escapeHtml(r.check_rule || r.title)}</div>`;
@@ -125,6 +137,11 @@
       const visionControl = isDraft ? `<div class="rule-vision-controls"><label>图片识别条件<select class="rule-vision-trigger" data-rule="${r.rule_id}"><option value="off" ${r.vision_trigger === 'off' ? 'selected' : ''}>不使用图片</option><option value="text_fallback" ${r.vision_trigger === 'text_fallback' ? 'selected' : ''}>文字不足时识图</option><option value="required" ${r.vision_trigger === 'required' ? 'selected' : ''}>必须识图</option></select></label><label>识图强度<select class="rule-vision-level" data-rule="${r.rule_id}" ${r.vision_trigger === 'off' ? 'disabled' : ''}><option value="off" ${r.vision_level === 'off' ? 'selected' : ''}>暂不执行</option><option value="low" ${r.vision_level === 'low' ? 'selected' : ''}>快速（1个最强候选页）</option><option value="standard" ${r.vision_level === 'standard' ? 'selected' : ''}>标准（2页，未覆盖时补页）</option><option value="high" ${r.vision_level === 'high' ? 'selected' : ''}>精细（3页；扫描件先找页）</option></select></label><small>${visionConfiguration.enabled ? '已开启全系统图片识别；优先读取文字评审已定位的真实页码，未覆盖时才有限补页。精细模式可为纯扫描件先进行低清找页。' : '全系统图片识别当前关闭，保存后不会产生图片调用。'}</small></div>` : '';
       return `<details class="rule-card"><summary><span class="rule-card-summary">${enabledControl}<span class="tag">${categoryLabel(r.category)}</span><strong class="rule-card-title">${escapeHtml(r.title)}</strong><span class="tag">${sourceLabel}</span>${ocrCell}</span></summary><div class="rule-card-body"><div class="rule-card-grid"><label>检查规则${checkContent}</label><div class="rule-field"><span class="rule-field-label">招标原文依据</span><div class="rule-text">${escapeHtml(r.source_text || '未提供')}</div></div></div>${visionControl}${isDraft ? `<div class="actions rule-card-actions"><button class="save-check-rule primary" data-rule="${r.rule_id}">保存检查规则</button></div>` : ''}</div></details>`;
     }).join('')}</div>` : '<p class="muted">暂无规则。</p>';
+    $('rules').querySelectorAll('details.rule-card').forEach((card, index) => {
+      const ruleId = data.rules[index]?.rule_id;
+      card.dataset.rule = ruleId || '';
+      card.open = Boolean(ruleId && expandedRuleIds.has(ruleId));
+    });
     $('rules').querySelectorAll('.rule-enabled').forEach((input) => { input.onclick = (event) => event.stopPropagation(); input.onchange = async () => { try { await request(`/projects/${activeProject}/rules/${input.dataset.rule}`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled:input.checked})}); await refreshRules(); } catch (error) { alert(error.message); await refreshRules(); } }; });
     $('rules').querySelectorAll('.rule-vision-trigger').forEach((input) => { input.onchange = async () => { const level = $('rules').querySelector(`.rule-vision-level[data-rule="${input.dataset.rule}"]`)?.value || 'off'; try { await request(`/projects/${activeProject}/rules/${input.dataset.rule}`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vision_trigger:input.value, vision_level:input.value === 'off' ? 'off' : level})}); await refreshRules(); } catch (error) { alert(error.message); await refreshRules(); } }; });
     $('rules').querySelectorAll('.rule-vision-level').forEach((input) => { input.onchange = async () => { const trigger = $('rules').querySelector(`.rule-vision-trigger[data-rule="${input.dataset.rule}"]`)?.value || 'off'; try { await request(`/projects/${activeProject}/rules/${input.dataset.rule}`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({vision_trigger:trigger, vision_level:input.value})}); await refreshRules(); } catch (error) { alert(error.message); await refreshRules(); } }; });
@@ -148,6 +165,16 @@
       unavailable:'未获得可用的多模态模型',
       not_located:'未定位到可靠图片页',
       skipped_text_sufficient:'文字证据充分，未调用图片模型',
+      ocr_applied:'✓ 腾讯 OCR 已核验并采纳',
+      ocr_applied_partial:'✓ 腾讯 OCR 已补充部分文字事实',
+      ocr_uncovered:'腾讯 OCR 已执行，未覆盖关键材料',
+      ocr_failed:'腾讯 OCR 失败，已保留文字结论',
+      ocr_quota_exhausted:'腾讯 OCR 额度不足，已转图片识别',
+      ocr_not_located:'未定位到可靠 OCR 候选页',
+      ocr_skipped_text_sufficient:'文字证据充分，未调用腾讯 OCR',
+      ocr_vision_applied:'✓ 腾讯 OCR 与图片检查均已采纳',
+      ocr_vision_applied_partial:'✓ 腾讯 OCR 与图片检查已补充部分事实',
+      ocr_vision_conflict:'⚠ OCR后图片检查发现疑似字段冲突',
     };
     const label = labels[status] || '图片识别状态';
     const pages = Array.isArray(result?.vision_pages) ? result.vision_pages.filter((page) => Number.isInteger(page) && page > 0).map((page) => `P${page}`).join('、') : '';
@@ -163,6 +190,11 @@
       conflict:'⚠ 图片字段疑似冲突',
       uncovered:'已图片检查（未覆盖）',
       failed:'图片检查失败',
+      ocr_applied:'✓ 已腾讯 OCR 核验',
+      ocr_applied_partial:'✓ 已腾讯 OCR（部分）',
+      ocr_vision_applied:'✓ OCR＋图片检查',
+      ocr_vision_applied_partial:'✓ OCR＋图片检查（部分）',
+      ocr_vision_conflict:'⚠ OCR后图片字段疑似冲突',
     };
     return labels[status] ? `<strong class="vision-badge vision-badge-${escapeHtml(status)}">${escapeHtml(labels[status])}</strong>` : '';
   }
@@ -253,6 +285,8 @@
   $('model-preset').onchange = applyModelPreset;
   $('save-model-profile').onclick = async () => { try { const profileId = $('model-profile-id').value; const modelName = $('model-name').value; const payload = {display_name:$('model-display-name').value, base_url:$('model-base-url').value, model_name:modelName, api_key:$('model-api-key').value, json_mode:$('model-json-mode').value === 'true', thinking_mode:normalizedThinkingMode(modelName, $('model-thinking').value), supports_vision:$('model-supports-vision').checked}; await request(profileId ? `/model-profiles/${profileId}` : '/model-profiles', {method:profileId ? 'PATCH' : 'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}); resetModelForm(); await loadProfiles(); } catch (error) { alert(error.message); } };
   $('save-vision-configuration').onclick = async () => { try { await request('/vision-configuration', {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled:$('vision-enabled').checked, default_profile_id:$('vision-default-profile').value || null})}); await loadProfiles(); } catch (error) { alert(error.message); } };
+  $('save-ocr-configuration').onclick = async () => { try { const services = {}; $('ocr-services').querySelectorAll('.ocr-service-enabled').forEach((input) => { const limit = $('ocr-services').querySelector(`.ocr-service-limit[data-service="${input.dataset.service}"]`); services[input.dataset.service] = {enabled:input.checked, monthly_limit:Number(limit?.value || 900)}; }); await request('/tencent-ocr-configuration', {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled:$('ocr-enabled').checked, region:$('ocr-region').value, secret_id:$('ocr-secret-id').value, secret_key:$('ocr-secret-key').value, services})}); $('ocr-secret-id').value = ''; $('ocr-secret-key').value = ''; await loadProfiles(); } catch (error) { alert(error.message); } };
+  $('test-ocr-configuration').onclick = async () => { try { const data = await request('/tencent-ocr-configuration/test', {method:'POST'}); alert(data.message); } catch (error) { alert(error.message); } };
   $('open-report').onclick = () => window.open(`/pingbiao/projects/${activeProject}/report`, '_blank', 'noopener');
   $('export-score-csv').onclick = async () => { try { const [objective, subjective] = await Promise.all(['objective', 'subjective'].map((type) => request(`/projects/${activeProject}/score-results/${type}`))); const rows = [['评分类型','投标人','检查规则','AI建议得分','满分','置信度','证据','理由']]; for (const [type, data] of [['客观分', objective], ['主观分', subjective]]) for (const item of data.results) rows.push([type, item.bidder_name || item.original_name, item.check_rule || item.title, item.suggested_score ?? '', item.max_score ?? '', confidenceLabel(item.confidence), item.evidence || '', item.reason || '']); const csv = '\ufeff' + rows.map((row) => row.map((cell) => `"${String(cell).replaceAll('"', '""')}"`).join(',')).join('\r\n'); const link = document.createElement('a'); link.href = URL.createObjectURL(new Blob([csv], {type:'text/csv;charset=utf-8'})); link.download = '评标评分汇总.csv'; link.click(); URL.revokeObjectURL(link.href); } catch (error) { alert(error.message); } };
   document.querySelectorAll('[data-tab]').forEach((button) => button.onclick = () => { if (button.disabled) return; document.querySelectorAll('[data-tab]').forEach((item) => item.classList.toggle('active', item === button)); document.querySelectorAll('[data-pane]').forEach((item) => item.classList.toggle('active', item.dataset.pane === button.dataset.tab)); });

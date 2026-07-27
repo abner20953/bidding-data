@@ -29,6 +29,15 @@ MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 GLOBAL_RULE_CATEGORIES = {"qualification", "compliance", "substantive", "other"}
 VISION_ENABLED_SETTING = "evaluation_workbench_vision_enabled"
 DEFAULT_VISION_MODEL_SETTING = "default_vision_model_profile_id"
+TENCENT_OCR_CONFIGURATION_SETTING = "evaluation_workbench_tencent_ocr_configuration"
+TENCENT_OCR_SERVICES = {
+    "basic": {"label": "通用印刷体识别", "action": "GeneralBasicOCR", "default_limit": 900},
+    "accurate": {"label": "通用文字识别（高精度版）", "action": "GeneralAccurateOCR", "default_limit": 900},
+    "table": {"label": "表格识别 V3", "action": "RecognizeTableAccurateOCR", "default_limit": 900},
+    "biz_license": {"label": "营业执照识别", "action": "BizLicenseOCR", "default_limit": 900},
+    # 高速版在腾讯云当前文档中属于老客户续费接口；仅在管理员实际测试通过后启用。
+    "fast": {"label": "通用印刷体识别（高速版）", "action": "GeneralFastOCR", "default_limit": 900, "legacy": True},
+}
 
 _SCORE_TOTAL_PATTERN = re.compile(r"(?:总计|共计|合计|最高(?:得)?|最多(?:得)?|满分(?:为)?)\s*(\d+(?:\.\d+)?)\s*分")
 _SCORE_VALUE_PATTERN = re.compile(r"(?:得|扣)\s*(\d+(?:\.\d+)?)\s*分")
@@ -124,7 +133,7 @@ def task_prompt_template_fingerprint(app, task_type: str) -> str | None:
             "evaluate_all", "evaluate_all_guidance", "evaluate_all_highlights", "evaluate_all_scope_profile", "evaluate_all_scope_profile_user",
             "evaluate_all_full_scan_user", "evaluate_all_review_user", "evaluate_all_objective_user",
             "evaluate_all_subjective_user", "evaluate_all_cross_bid_price_user", "evaluate_all_highlights_user",
-            "evaluate_all_visual_user", "evaluate_all_visual_locator_user",
+            "evaluate_all_visual_user", "evaluate_all_ocr_user", "evaluate_all_visual_locator_user",
             "evaluate_all_output_contract",
             "json_repair", "json_repair_user",
         },
@@ -440,6 +449,31 @@ def init_database(app) -> None:
                 UNIQUE(score_run_id, document_id, rule_id)
             );
             CREATE INDEX IF NOT EXISTS idx_ew_score_results_run ON ew_score_results(score_run_id, document_id);
+            CREATE TABLE IF NOT EXISTS ew_ocr_page_cache (
+                cache_id TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL REFERENCES ew_documents(document_id) ON DELETE CASCADE,
+                page_number INTEGER NOT NULL,
+                image_hash TEXT NOT NULL,
+                service TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(document_id, page_number, image_hash, service)
+            );
+            CREATE INDEX IF NOT EXISTS idx_ew_ocr_page_cache_document ON ew_ocr_page_cache(document_id, page_number);
+            CREATE TABLE IF NOT EXISTS ew_ocr_usage_ledger (
+                usage_id TEXT PRIMARY KEY,
+                task_id TEXT REFERENCES ew_tasks(task_id) ON DELETE SET NULL,
+                project_id TEXT REFERENCES ew_projects(project_id) ON DELETE SET NULL,
+                service TEXT NOT NULL,
+                month_key TEXT NOT NULL,
+                request_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                billed_units INTEGER NOT NULL DEFAULT 1,
+                detail TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ew_ocr_usage_month ON ew_ocr_usage_ledger(month_key, service);
             """
         )
         _ensure_column(conn, "ew_review_results", "final_status", "TEXT")
@@ -601,6 +635,166 @@ def _decrypt_model_api_key(app, encrypted: str) -> str:
         return _model_fernet(app).decrypt(encrypted.encode("ascii")).decode("utf-8")
     except (InvalidToken, UnicodeDecodeError) as exc:
         raise ValueError("已保存的模型 API Key 无法解密，请重新配置该模型") from exc
+
+
+def _ocr_month_key() -> str:
+    """OCR 免费包按中国自然月发放；容器时区已固定为 Asia/Shanghai。"""
+    return time.strftime("%Y-%m", time.localtime())
+
+
+def _ocr_configuration_raw(app) -> dict:
+    with connection(app) as conn:
+        row = conn.execute("SELECT setting_value FROM ew_settings WHERE setting_key=?", (TENCENT_OCR_CONFIGURATION_SETTING,)).fetchone()
+    if not row:
+        return {}
+    try:
+        value = json.loads(row["setting_value"])
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _ocr_service_settings(value: object) -> dict:
+    raw = value if isinstance(value, dict) else {}
+    result = {}
+    for service, meta in TENCENT_OCR_SERVICES.items():
+        item = raw.get(service) if isinstance(raw.get(service), dict) else {}
+        default_enabled = service != "fast"
+        result[service] = {
+            "enabled": bool(item.get("enabled", default_enabled)),
+            "monthly_limit": max(1, min(1000, int(item.get("monthly_limit", meta["default_limit"]) or meta["default_limit"]))),
+        }
+    return result
+
+
+def ocr_configuration(app) -> dict:
+    """公开腾讯 OCR 配置；绝不返回 SecretId/SecretKey 明文或密文。"""
+    raw = _ocr_configuration_raw(app)
+    services = _ocr_service_settings(raw.get("services"))
+    month_key = _ocr_month_key()
+    with connection(app) as conn:
+        rows = conn.execute(
+            "SELECT service, COALESCE(SUM(billed_units), 0) AS used FROM ew_ocr_usage_ledger WHERE month_key=? GROUP BY service",
+            (month_key,),
+        ).fetchall()
+    used_by_service = {row["service"]: int(row["used"] or 0) for row in rows}
+    values = []
+    for service, meta in TENCENT_OCR_SERVICES.items():
+        setting = services[service]
+        used = used_by_service.get(service, 0)
+        values.append({
+            "service": service, "label": meta["label"], "action": meta["action"],
+            "legacy": bool(meta.get("legacy")), "enabled": setting["enabled"],
+            "monthly_limit": setting["monthly_limit"], "used": used,
+            "remaining": max(0, setting["monthly_limit"] - used),
+        })
+    manual_id = bool(raw.get("secret_id_encrypted"))
+    manual_key = bool(raw.get("secret_key_encrypted"))
+    env_ready = bool(os.environ.get("TENCENTCLOUD_SECRET_ID", "").strip() and os.environ.get("TENCENTCLOUD_SECRET_KEY", "").strip())
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "region": str(raw.get("region") or "ap-guangzhou"),
+        "credentials_configured": (manual_id and manual_key) or env_ready,
+        "credentials_source": "manual" if manual_id and manual_key else "environment" if env_ready else "none",
+        "month_key": month_key, "services": values,
+    }
+
+
+def update_ocr_configuration(app, payload: dict) -> dict:
+    existing = _ocr_configuration_raw(app)
+    enabled = payload.get("enabled", existing.get("enabled", False))
+    if not isinstance(enabled, bool):
+        raise ValueError("腾讯 OCR 总开关必须为布尔值")
+    region = str(payload.get("region", existing.get("region", "ap-guangzhou")) or "").strip()
+    if not re.fullmatch(r"[a-z0-9-]{2,40}", region):
+        raise ValueError("腾讯云地域格式不正确")
+    secret_id = str(payload.get("secret_id", "")).strip()
+    secret_key = str(payload.get("secret_key", "")).strip()
+    encrypted_id = existing.get("secret_id_encrypted")
+    encrypted_key = existing.get("secret_key_encrypted")
+    if secret_id:
+        _validate_api_key_characters(secret_id)
+        encrypted_id = _encrypt_model_api_key(app, secret_id)
+    if secret_key:
+        _validate_api_key_characters(secret_key)
+        encrypted_key = _encrypt_model_api_key(app, secret_key)
+    service_input = payload.get("services", existing.get("services", {}))
+    if not isinstance(service_input, dict):
+        raise ValueError("OCR 接口设置格式不正确")
+    services = _ocr_service_settings(service_input)
+    if enabled and not ((encrypted_id and encrypted_key) or (
+        os.environ.get("TENCENTCLOUD_SECRET_ID", "").strip() and os.environ.get("TENCENTCLOUD_SECRET_KEY", "").strip()
+    )):
+        raise ValueError("开启腾讯 OCR 前，请配置 SecretId 和 SecretKey，或在运行环境设置 TENCENTCLOUD_SECRET_ID/KEY")
+    value = {"enabled": enabled, "region": region, "secret_id_encrypted": encrypted_id,
+             "secret_key_encrypted": encrypted_key, "services": services}
+    with connection(app) as conn:
+        conn.execute(
+            "INSERT INTO ew_settings(setting_key, setting_value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value, updated_at=excluded.updated_at",
+            (TENCENT_OCR_CONFIGURATION_SETTING, json.dumps(value, ensure_ascii=False), now_iso()),
+        )
+    return ocr_configuration(app)
+
+
+def tencent_ocr_credentials(app) -> tuple[str, str, str] | None:
+    raw = _ocr_configuration_raw(app)
+    if not raw.get("enabled"):
+        return None
+    secret_id = _decrypt_model_api_key(app, raw["secret_id_encrypted"]) if raw.get("secret_id_encrypted") else os.environ.get("TENCENTCLOUD_SECRET_ID", "").strip()
+    secret_key = _decrypt_model_api_key(app, raw["secret_key_encrypted"]) if raw.get("secret_key_encrypted") else os.environ.get("TENCENTCLOUD_SECRET_KEY", "").strip()
+    if not secret_id or not secret_key:
+        return None
+    return secret_id, secret_key, str(raw.get("region") or "ap-guangzhou")
+
+
+def reserve_ocr_request(app, task: dict, service: str) -> str | None:
+    """每个真实外发请求先保守记为一次，避免失败/重试突破免费安全额度。"""
+    if service not in TENCENT_OCR_SERVICES:
+        return None
+    config = ocr_configuration(app)
+    item = next((value for value in config["services"] if value["service"] == service), None)
+    if not config["enabled"] or not config["credentials_configured"] or not item or not item["enabled"] or item["remaining"] <= 0:
+        return None
+    usage_id = str(uuid.uuid4())
+    with connection(app) as conn:
+        # SQLite 的立即写锁让并行文档任务在额度临界点也不能同时越过上限。
+        conn.execute("BEGIN IMMEDIATE")
+        used = conn.execute("SELECT COALESCE(SUM(billed_units), 0) AS value FROM ew_ocr_usage_ledger WHERE month_key=? AND service=?", (config["month_key"], service)).fetchone()["value"]
+        if int(used or 0) >= int(item["monthly_limit"]):
+            return None
+        conn.execute(
+            "INSERT INTO ew_ocr_usage_ledger(usage_id, task_id, project_id, service, month_key, status, billed_units, created_at) VALUES (?, ?, ?, ?, ?, 'requested', 1, ?)",
+            (usage_id, task.get("task_id"), task.get("project_id"), service, config["month_key"], now_iso()),
+        )
+    return usage_id
+
+
+def complete_ocr_request(app, usage_id: str, *, status: str, request_id: str = "", detail: str = "") -> None:
+    with connection(app) as conn:
+        conn.execute("UPDATE ew_ocr_usage_ledger SET status=?, request_id=?, detail=? WHERE usage_id=?", (status[:40], request_id[:120], detail[:500], usage_id))
+
+
+def get_ocr_page_cache(app, document_id: str, page_number: int, image_hash: str, service: str) -> dict | None:
+    with connection(app) as conn:
+        row = conn.execute("SELECT result_json FROM ew_ocr_page_cache WHERE document_id=? AND page_number=? AND image_hash=? AND service=?", (document_id, page_number, image_hash, service)).fetchone()
+    if not row:
+        return None
+    try:
+        value = json.loads(row["result_json"])
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def save_ocr_page_cache(app, document_id: str, page_number: int, image_hash: str, service: str, value: dict) -> None:
+    timestamp = now_iso()
+    with connection(app) as conn:
+        conn.execute(
+            "INSERT INTO ew_ocr_page_cache(cache_id, document_id, page_number, image_hash, service, result_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(document_id, page_number, image_hash, service) DO UPDATE SET result_json=excluded.result_json, updated_at=excluded.updated_at",
+            (str(uuid.uuid4()), document_id, page_number, image_hash, service, json.dumps(value, ensure_ascii=False), timestamp, timestamp),
+        )
 
 
 def create_project(app, name: str, project_number: str = "", section_name: str = "") -> dict:

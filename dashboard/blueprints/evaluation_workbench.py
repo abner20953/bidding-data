@@ -47,6 +47,16 @@ _REPORT_VISION_STATUS_LABELS = {
     "unavailable": "未获得可用的多模态模型",
     "not_located": "未定位到可靠图片页",
     "skipped_text_sufficient": "文字证据充分，未调用图片模型",
+    "ocr_applied": "腾讯 OCR 已核验并采纳",
+    "ocr_applied_partial": "腾讯 OCR 已补充部分文字事实",
+    "ocr_uncovered": "腾讯 OCR 已执行，未覆盖关键材料",
+    "ocr_failed": "腾讯 OCR 失败，已保留文字结论",
+    "ocr_quota_exhausted": "腾讯 OCR 额度不足，已转图片识别",
+    "ocr_not_located": "未定位到可靠 OCR 候选页",
+    "ocr_skipped_text_sufficient": "文字证据充分，未调用腾讯 OCR",
+    "ocr_vision_applied": "腾讯 OCR 与图片检查均已采纳",
+    "ocr_vision_applied_partial": "腾讯 OCR 与图片检查已补充部分事实",
+    "ocr_vision_conflict": "OCR后图片检查发现疑似字段冲突",
 }
 _REPORT_AI_DECISION_LABELS = {
     "pending_human_review": "待 AI 复核", "no_signal_detected": "未发现线索",
@@ -517,6 +527,43 @@ def vision_configuration_api():
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
     return jsonify({"configuration": storage.vision_configuration(current_app)})
+
+
+@evaluation_workbench_bp.route("/api/evaluation-workbench/tencent-ocr-configuration", methods=["GET", "PATCH"])
+def tencent_ocr_configuration_api():
+    _init()
+    if request.method == "PATCH":
+        access_error = _model_configuration_access_error()
+        if access_error:
+            return access_error
+        try:
+            return jsonify({"configuration": storage.update_ocr_configuration(current_app, _json_body())})
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+    return jsonify({"configuration": storage.ocr_configuration(current_app)})
+
+
+@evaluation_workbench_bp.route("/api/evaluation-workbench/tencent-ocr-configuration/test", methods=["POST"])
+def test_tencent_ocr_configuration_api():
+    """不发送业务文件的本地配置检查，避免测试本身消耗免费OCR额度。"""
+    _init()
+    access_error = _model_configuration_access_error()
+    if access_error:
+        return access_error
+    try:
+        import tencentcloud.ocr.v20181119  # noqa: F401
+    except ImportError:
+        return jsonify({"error": "腾讯 OCR SDK 未安装，请重新部署包含最新依赖的版本"}), 400
+    configuration = storage.ocr_configuration(current_app)
+    if not configuration["credentials_configured"]:
+        return jsonify({"error": "未配置腾讯 OCR SecretId/SecretKey"}), 400
+    try:
+        credentials = storage.tencent_ocr_credentials(current_app)
+    except ValueError:
+        return jsonify({"error": "已保存的腾讯 OCR 凭据无法解密，请重新配置 SecretId 和 SecretKey"}), 400
+    if not credentials:
+        return jsonify({"error": "腾讯 OCR 凭据不可用，请重新配置 SecretId 和 SecretKey"}), 400
+    return jsonify({"message": "腾讯 OCR SDK、凭据与接口配置已就绪。此检查不发送图片、不消耗免费额度；首个OCR任务会验证云端权限。"})
 
 
 @evaluation_workbench_bp.route("/api/evaluation-workbench/prompt-templates", methods=["GET"])
