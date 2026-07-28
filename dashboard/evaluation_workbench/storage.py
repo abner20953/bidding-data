@@ -1113,7 +1113,8 @@ def task_input_fingerprint(app, project_id: str, task_type: str, profile_id: str
         "rule_set": (rule_set or {}).get("rule_set_id") if uses_rules else None,
         "rule_set_updated_at": (rule_set or {}).get("updated_at") if uses_rules else None,
         "profile": (profile.get("profile_id"), profile.get("model_name"), profile.get("base_url"), profile.get("updated_at"), profile.get("json_mode"), profile.get("thinking_mode")),
-        "comparison_version": "cross-bid-signals-v3" if task_type == "compare_documents" else None,
+        # 共同删改的分段伪删除校验与编辑簇降权改变了查重结论，不能复用旧版本结果。
+        "comparison_version": "cross-bid-signals-v4" if task_type == "compare_documents" else None,
         "vision_configuration": vision_configuration(app) if task_type == "evaluate_all" else None,
         "vision_profile": (vision_profile.get("profile_id"), vision_profile.get("model_name"), vision_profile.get("base_url"), vision_profile.get("updated_at")) if vision_profile else None,
         "prompt_templates": task_prompt_template_fingerprint(app, task_type),

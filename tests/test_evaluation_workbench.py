@@ -23,6 +23,7 @@ from dashboard.evaluation_workbench.prompt_context import (
     split_full_text_chunks,
 )
 from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
+from dashboard.utils.comparator import CollusionDetector
 
 
 class EvaluationWorkbenchTests(unittest.TestCase):
@@ -433,6 +434,50 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual({item["dimension"] for item in analysis["signals"]}, {"person_name", "email", "address"})
         self.assertNotIn("address", {item["dimension"] for item in analysis["not_executed_dimensions"]})
         self.assertTrue(all(item["signal_type"] == "collusion_signal" for item in analysis["signals"]))
+
+    def test_voice_only_tender_edit_signal_is_downgraded(self):
+        left = {"document_id": "a", "bidder_name": "甲公司", "original_name": "a.pdf"}
+        right = {"document_id": "b", "bidder_name": "乙公司", "original_name": "b.pdf"}
+        detector = CollusionDetector()
+        tender_text = detector.normalize("项目实施完成后,实施方须向用户提交详细资料存档")
+        bid_text = detector.normalize("项目实施完成后,我方会向用户提交详细资料存档")
+        evidence = detector._shared_tender_edit_evidence(tender_text, bid_text, bid_text)
+        self.assertIsNotNone(evidence)
+        result = {"paragraphs": [
+            {"type": "tender_related", "text_a": "项目实施完成后,我方会向用户提交详细资料存档",
+             "text_b": "项目实施完成后,我方会向用户提交详细资料存档", "page_a": 489, "page_b": 308,
+             "shared_edits": evidence["changes"], "voice_adaptation_only": evidence["voice_adaptation_only"]},
+        ], "metadata": {}}
+
+        analysis = build_cross_bid_analysis("task-1", [(left, right, result)], tender_loaded=True)
+
+        signal = next(item for item in analysis["signals"] if item["dimension"] == "tender_common_edit")
+        self.assertEqual(signal["confidence"], "C1")
+        self.assertTrue(signal["voice_adaptation_only"])
+        self.assertIn("第一人称改写", signal["basis"])
+        self.assertEqual(analysis["pair_summaries"][0]["independent_dimension_count"], 0)
+        self.assertEqual(analysis["pair_summaries"][0]["review_priority"], "none")
+        self.assertEqual(analysis["pair_summaries"][0]["assessment_result"], "pending_human_review")
+
+    def test_mixed_tender_edit_signal_keeps_c2_and_priority(self):
+        left = {"document_id": "a", "bidder_name": "甲公司", "original_name": "a.pdf"}
+        right = {"document_id": "b", "bidder_name": "乙公司", "original_name": "b.pdf"}
+        result = {"paragraphs": [
+            {"type": "tender_related", "text_a": "质保3年,我方实施", "text_b": "质保3年,我方实施",
+             "page_a": 10, "page_b": 20,
+             "shared_edits": [
+                 {"original": "实施", "modified": "我", "voice_adaptation": True},
+                 {"original": "5年", "modified": "3年"},
+             ]},
+        ], "metadata": {}}
+
+        analysis = build_cross_bid_analysis("task-1", [(left, right, result)], tender_loaded=True)
+
+        signal = next(item for item in analysis["signals"] if item["dimension"] == "tender_common_edit")
+        self.assertEqual(signal["confidence"], "C2")
+        self.assertNotIn("voice_adaptation_only", signal)
+        self.assertEqual(analysis["pair_summaries"][0]["independent_dimension_count"], 1)
+        self.assertEqual(analysis["pair_summaries"][0]["review_priority"], "normal")
 
     def test_compare_ai_packet_is_limited_to_fixed_rule_evidence(self):
         packet = worker._compare_evidence_packet({

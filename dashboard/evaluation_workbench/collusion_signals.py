@@ -143,12 +143,37 @@ def analyze_pair(task_id: str, left: dict, right: dict, result: dict, *, tender_
 
     edit_items = [item for item in paragraphs if item.get("type") == "tender_related" and item.get("shared_edits")]
     if edit_items:
-        signals.append(_signal(
-            task_id, left, right, "tender_common_edit", "C2",
-            f"发现 {len(edit_items)} 处相对于招标原文的共同实质改动。",
-            [_page_evidence(item) for item in edit_items],
-            ["同一澄清文件、统一答疑或公开模板可能导致一致改动，须先核对招标补充材料。"],
-        ))
+        # 义务主体第一人称改写（如“实施方须”改为“我方会”）是每个投标人的必然
+        # 响应方式：全部为这类改动时仅降权为 C1，混入任何其他实质改动时维持 C2。
+        # 新版比较器给每个碰撞提供基于“全部共同编辑”的摘要；旧结果没有该字段
+        # 时仍按已展示证据兼容读取，避免破坏历史 API 结果。
+        voice_only = bool(edit_items) and all(
+            bool(item.get("voice_adaptation_only"))
+            if "voice_adaptation_only" in item
+            else bool(item.get("shared_edits")) and all(change.get("voice_adaptation") for change in item.get("shared_edits", []) if isinstance(change, dict))
+            for item in edit_items
+        )
+        if voice_only:
+            signal = _signal(
+                task_id, left, right, "tender_common_edit", "C1",
+                f"发现 {len(edit_items)} 处相对于招标原文的共同改动，"
+                "但均为义务主体第一人称改写（如“实施方须”改为“我方会”），嫌疑度较低。",
+                [_page_evidence(item) for item in edit_items],
+                [
+                    "第一人称改写是所有投标人响应招标要求的常规表述方式，不能单独作为异常线索。",
+                    "同一澄清文件、统一答疑或公开模板可能导致一致改动，须先核对招标补充材料。",
+                ],
+            )
+            # 降权标记：保留信号供人工查看，但不计入配对维度数与复核优先级。
+            signal["voice_adaptation_only"] = True
+            signals.append(signal)
+        else:
+            signals.append(_signal(
+                task_id, left, right, "tender_common_edit", "C2",
+                f"发现 {len(edit_items)} 处相对于招标原文的共同实质改动。",
+                [_page_evidence(item) for item in edit_items],
+                ["同一澄清文件、统一答疑或公开模板可能导致一致改动，须先核对招标补充材料。"],
+            ))
 
     auxiliary = ((result.get("metadata") or {}).get("auxiliary") or {})
     metadata_matches = [item for item in auxiliary.get("matches") or [] if not item.get("also_in_tender")]
@@ -193,7 +218,12 @@ def build_cross_bid_analysis(task_id: str, pairs: list[tuple[dict, dict, dict]],
     for left, right, result in pairs:
         pair_signals = analyze_pair(task_id, left, right, result, tender_loaded=tender_loaded)
         signals.extend(pair_signals)
-        dimensions = sorted({item["dimension"] for item in pair_signals})
+        # 纯第一人称改写的共同改动信号仅作展示，不抬高配对复核优先级；
+        # 其他维度（含混合实质改动的 tender_common_edit）计数逻辑不变。
+        dimensions = sorted({
+            item["dimension"] for item in pair_signals
+            if not item.get("voice_adaptation_only")
+        })
         if len(dimensions) >= 3:
             priority = "high"
         elif len(dimensions) == 2:

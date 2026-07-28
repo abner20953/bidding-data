@@ -11,7 +11,9 @@ from difflib import SequenceMatcher
 import fitz  # PyMuPDF
 
 
-ALGORITHM_VERSION = 8
+# 共同删改的全文锚点校验与义务主体改写簇识别已改变查重结论；同步失效旧解析
+# 缓存，避免历史结果与当前算法混用。
+ALGORITHM_VERSION = 9
 MIN_EXACT_LENGTH = 9
 MIN_EXACT_DISPLAY_LENGTH = 30
 MAX_EXACT_BLOCK_LENGTH = 1200
@@ -707,6 +709,112 @@ class CollusionDetector:
                 return True
         return False
 
+    @staticmethod
+    def _mark_voice_adaptation_clusters(source, target, edits):
+        """给“义务主体→第一人称”编辑簇打标，而非孤立地判断单个字符差异。
+
+        ``SequenceMatcher`` 会把“实施方须→我方会”拆成“实施→我”与“须→会”，
+        中间的“方”仍是 equal。若只标前一项，后一个语气词改动会使整条常规
+        响应误判为实质共同改动。这里仅把两侧都至多隔一个相同字符的连续编辑
+        合为簇，并要求整个簇严格符合“义务主体 + 可选义务语气”到“第一人称
+        + 可选承诺语气”的模式；数值、期限等相邻之外的改动不会被一并降权。
+        """
+        ordered = sorted(
+            edits.values(),
+            key=lambda item: (item["source_start"], item["source_end"], item["target_start"]),
+        )
+        if not ordered:
+            return
+        clusters = []
+        current = [ordered[0]]
+        source_end = ordered[0]["source_end"]
+        target_end = ordered[0]["target_end"]
+        for edit in ordered[1:]:
+            # “实施→我” 与 “须→会”之间仅隔同一个“方”；允许这种很短的
+            # 等值连接，但不跨越“提供”等实质文本去吞并下一处数值改动。
+            near_source = edit["source_start"] - source_end <= 1
+            near_target = edit["target_start"] - target_end <= 1
+            if near_source and near_target:
+                current.append(edit)
+            else:
+                clusters.append(current)
+                current = [edit]
+            source_end = edit["source_end"]
+            target_end = edit["target_end"]
+        clusters.append(current)
+
+        subject_terms = (
+            "服务提供", "实施", "供货", "服务", "承包", "施工", "中标", "成交",
+            "供应", "投标", "乙", "卖", "制造", "厂家",
+        )
+        subject_pattern = "|".join(map(re.escape, subject_terms))
+        source_pattern = re.compile(
+            rf"(?:{subject_pattern})(?:方|人|商|单位|企业)?(?:须|应|需|将|负责|承诺|保证)?$"
+        )
+        target_pattern = re.compile(
+            r"(?:我|本)(?:方|司|公司|单位)?(?:会|将|应|需|负责|承诺|保证)?$"
+        )
+        for cluster in clusters:
+            source_start = min(item["source_start"] for item in cluster)
+            source_end = max(item["source_end"] for item in cluster)
+            target_start = min(item["target_start"] for item in cluster)
+            target_end = max(item["target_end"] for item in cluster)
+            original = source[source_start:source_end]
+            modified = target[target_start:target_end]
+            if source_pattern.fullmatch(original) and target_pattern.fullmatch(modified):
+                for item in cluster:
+                    item["voice_adaptation"] = True
+
+    def _is_segment_artifact_deletion(self, edit, tender_text):
+        """排除换行/双栏分段造成的“删除”假象。
+
+        PDF 提取会按版式切行：投标人填入空项（如“90 天”）或双栏排版都会让
+        招标原文的一句话在投标文件中拆到相邻提取单元，对齐时被误判为整句删除。
+        只有该片段在投标全文中、且紧邻其在招标原文的前后文锚点时，才认为它是
+        被拆到相邻单元而非真实删除。不能仅因同一句在文件其他无关条款重复出现
+        就压掉共同删除线索。
+        """
+        if edit["modified"]:
+            return False
+        haystacks = getattr(self, "_fulltext_haystacks", None)
+        if not haystacks:
+            return False
+        needle = re.sub(r"\s+", "", edit["original"]).strip(
+            " ,，。；;：:、（）()【】《》\"'“”‘’"
+        )
+        if len(needle) < 4:
+            return False
+        try:
+            source_start, source_end = int(edit["source_start"]), int(edit["source_end"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        # 取删除点相邻的原文作为短锚点；优先使用左锚点，段首删除则使用右锚点。
+        # 6 个字符足够区分大多数条款，又能容忍 PDF 提取中很短的断行或空项填入。
+        left_anchor = tender_text[max(0, source_start - 14):source_start][-6:]
+        right_anchor = tender_text[source_end:source_end + 14][:6]
+        if len(left_anchor) < 4:
+            left_anchor = ""
+        if len(right_anchor) < 4:
+            right_anchor = ""
+        if not left_anchor and not right_anchor:
+            return False
+        for haystack in haystacks:
+            start = 0
+            while True:
+                position = haystack.find(needle, start)
+                if position < 0:
+                    break
+                # 锚点必须贴近该片段；较大的窗口会把前一个无关条款也误当作
+                # 同一上下文。16 个归一化字符足以覆盖断行、标点和短填空。
+                before = haystack[max(0, position - 16):position]
+                after = haystack[position + len(needle):position + len(needle) + 16]
+                # 左锚点只能出现在片段之前，右锚点只能出现在片段之后；否则
+                # “后续条款的前文”会误命中右锚点，反而掩盖真实删除。
+                if (left_anchor and left_anchor in before) or (right_anchor and right_anchor in after):
+                    return True
+                start = position + 1
+        return False
+
     def _shared_tender_edit_evidence(self, tender_text, text_a, text_b):
         """Prove that A and B made substantially the same edits to tender text."""
         if not tender_text or tender_text == text_a or tender_text == text_b:
@@ -726,13 +834,17 @@ class CollusionDetector:
             for signature, edit in edits_a.items()
             if not self._is_low_value_tender_edit(edit)
             and not self._is_leading_table_title_insertion(edit, tender_text)
+            and not self._is_segment_artifact_deletion(edit, tender_text)
         }
         edits_b = {
             signature: edit
             for signature, edit in edits_b.items()
             if not self._is_low_value_tender_edit(edit)
             and not self._is_leading_table_title_insertion(edit, tender_text)
+            and not self._is_segment_artifact_deletion(edit, tender_text)
         }
+        self._mark_voice_adaptation_clusters(tender_text, text_a, edits_a)
+        self._mark_voice_adaptation_clusters(tender_text, text_b, edits_b)
         shared_signatures = {
             signature
             for signature in set(edits_a) & set(edits_b)
@@ -754,10 +866,17 @@ class CollusionDetector:
                 "original": edit["original"] or "（此处新增）",
                 "modified": edit["modified"] or "（删除）",
             }
+            if edit.get("voice_adaptation"):
+                public_change["voice_adaptation"] = True
             evidence.append(public_change)
         return {
             "changes": evidence,
             "coverage": round(coverage * 100, 1),
+            # 这是基于全部共同编辑（而非仅展示的前三条）得到的语义摘要，供
+            # 信号层安全降权，避免显示截断掩盖后续实质改动。
+            "voice_adaptation_only": bool(shared_signatures) and all(
+                bool(edits_a[key].get("voice_adaptation")) for key in shared_signatures
+            ),
         }
 
     def _add_error_issue(self, issues, kind, label, detail, text, page):
@@ -1154,6 +1273,8 @@ class CollusionDetector:
             tender_derived_segments = 0
             tender_skeleton_segments = 0
             tender_shingle_segments = 0
+            tender_edit_voice_only = True
+            has_tender_edit = False
 
             for unit_a, _ in group:
                 skeleton = self.get_skeleton(unit_a["text"])
@@ -1183,6 +1304,10 @@ class CollusionDetector:
                     if tender_match["ratio"] >= TENDER_DERIVED_RATIO:
                         tender_derived_segments += 1
                     continue
+                has_tender_edit = True
+                tender_edit_voice_only = (
+                    tender_edit_voice_only and bool(edit_evidence.get("voice_adaptation_only"))
+                )
                 if tender_text not in tender_references:
                     tender_references.append(tender_text)
                 tender_similarities.append(tender_match["ratio"])
@@ -1228,6 +1353,7 @@ class CollusionDetector:
                     ),
                     "tender_text": "；".join(tender_references[:3]),
                     "shared_edits": shared_edits,
+                    "voice_adaptation_only": bool(shared_edits) and has_tender_edit and tender_edit_voice_only,
                     "error_kind": "",
                     "badges": badges,
                     "desc": desc,
@@ -1580,6 +1706,7 @@ class CollusionDetector:
             tender_b = self._best_tender_match(text_b, minimum_ratio=0.72)
             tender_text = ""
             shared_edits = []
+            voice_adaptation_only = False
             error_kind = ""
             verified_tender_edit = False
 
@@ -1612,6 +1739,7 @@ class CollusionDetector:
                 ):
                     tender_text = candidate_tender_text
                     shared_edits = edit_evidence["changes"]
+                    voice_adaptation_only = bool(edit_evidence.get("voice_adaptation_only"))
                     verified_tender_edit = True
                     result_type = "tender_related"
                     badges = ["招标原文关联", "已验证共同修改"]
@@ -1672,6 +1800,7 @@ class CollusionDetector:
                     "type": result_type,
                     "tender_text": tender_text,
                     "shared_edits": shared_edits,
+                    "voice_adaptation_only": voice_adaptation_only,
                     "error_kind": error_kind,
                     "badges": badges,
                     "desc": desc,
@@ -1796,6 +1925,9 @@ class CollusionDetector:
     ):
         raw_a, pages_a, metadata_a, stats_a = self.extract_text_with_pages(path_a)
         raw_b, pages_b, metadata_b, stats_b = self.extract_text_with_pages(path_b)
+        # 供“共同删改”校验判断整句删除是否为换行/双栏分段假象（见
+        # _is_segment_artifact_deletion）；与比较单元同样的归一化，内存占用与原文相当。
+        self._fulltext_haystacks = (self.normalize(raw_a), self.normalize(raw_b))
         _validate_total_character_budget(
             (
                 stats_a.get("extracted_chars", len(raw_a)),

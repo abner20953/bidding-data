@@ -686,6 +686,102 @@ class ComparatorTests(unittest.TestCase):
             {"original": "5", "modified": "3"}, collisions[0]["shared_edits"]
         )
 
+    def test_split_line_deletion_artifact_is_not_a_shared_edit(self):
+        """被“删除”的半句仍存在于两份投标文件全文时，属于换行分段假象。"""
+        detector = CollusionDetector()
+        tender_text = detector.normalize(
+            "同意在开标日起天遵守本投标文件中的承诺,且在期满之前均具有约束力"
+        )
+        bid_text = detector.normalize("同意在开标日起90天遵守本投标文件中的承诺,且")
+        # 两份投标文件都在相邻提取单元保留了“在期满之前均具有约束力”
+        detector._fulltext_haystacks = (
+            detector.normalize("同意在开标日起90天遵守本投标文件中的承诺,且 在期满之前均具有约束力。"),
+            detector.normalize("同意在开标日起90天遵守本投标文件中的承诺,且在期满之前均具有约束力。"),
+        )
+
+        evidence = detector._shared_tender_edit_evidence(tender_text, bid_text, bid_text)
+
+        self.assertIsNone(evidence)
+
+    def test_genuine_shared_deletion_is_preserved(self):
+        """两份投标文件全文都不含被删内容时，共同删除信号必须保留。"""
+        detector = CollusionDetector()
+        tender_text = detector.normalize(
+            "同意在开标日起天遵守本投标文件中的承诺,且在期满之前均具有约束力"
+        )
+        bid_text = detector.normalize("同意在开标日起90天遵守本投标文件中的承诺,且")
+        detector._fulltext_haystacks = (
+            detector.normalize("同意在开标日起90天遵守本投标文件中的承诺,且"),
+            detector.normalize("同意在开标日起90天遵守本投标文件中的承诺,且"),
+        )
+
+        evidence = detector._shared_tender_edit_evidence(tender_text, bid_text, bid_text)
+
+        self.assertIsNotNone(evidence)
+        self.assertIn(
+            {"original": "在期满之前均具有约束力", "modified": "（删除）"},
+            evidence["changes"],
+        )
+
+    def test_unrelated_repeated_phrase_does_not_hide_a_real_deletion(self):
+        """被删句只在其他无关条款出现时，不能误认为同一条款的换行续接。"""
+        detector = CollusionDetector()
+        tender_text = detector.normalize("本项承诺,且在期满之前均具有约束力,违约承担责任")
+        edit = {
+            "original": "在期满之前均具有约束力", "modified": "",
+            "source_start": tender_text.index("在期满之前均具有约束力"),
+            "source_end": tender_text.index("在期满之前均具有约束力") + len("在期满之前均具有约束力"),
+        }
+        detector._fulltext_haystacks = (
+            detector.normalize("本项承诺,且,违约承担责任。其他条款在期满之前均具有约束力。"),
+            detector.normalize("本项承诺,且,违约承担责任。其他条款在期满之前均具有约束力。"),
+        )
+
+        self.assertFalse(detector._is_segment_artifact_deletion(edit, tender_text))
+
+    def test_voice_adaptation_edit_is_tagged_not_removed(self):
+        """拆分出的“实施→我、须→会”必须作为同一常规响应编辑簇处理。"""
+        detector = CollusionDetector()
+        tender_text = detector.normalize("项目实施完成后,实施方须向用户提交详细资料存档")
+        bid_text = detector.normalize("项目实施完成后,我方会向用户提交详细资料存档")
+
+        evidence = detector._shared_tender_edit_evidence(tender_text, bid_text, bid_text)
+
+        self.assertIsNotNone(evidence)
+        self.assertIn(
+            {"original": "实施", "modified": "我", "voice_adaptation": True},
+            evidence["changes"],
+        )
+        self.assertIn(
+            {"original": "须", "modified": "会", "voice_adaptation": True},
+            evidence["changes"],
+        )
+        self.assertTrue(evidence["voice_adaptation_only"])
+
+    def test_voice_adaptation_cluster_does_not_hide_nearby_numeric_change(self):
+        detector = CollusionDetector()
+        tender_text = detector.normalize("供应商须提供5年服务")
+        bid_text = detector.normalize("我方会提供3年服务")
+
+        evidence = detector._shared_tender_edit_evidence(tender_text, bid_text, bid_text)
+
+        self.assertIsNotNone(evidence)
+        self.assertFalse(evidence["voice_adaptation_only"])
+        self.assertIn({"original": "5", "modified": "3"}, evidence["changes"])
+
+    def test_substantive_replacement_is_not_voice_tagged(self):
+        """数值等实质改动不得被误标为第一人称改写。"""
+        detector = CollusionDetector()
+        tender_text = detector.normalize("本项目所有家具质保期为5年并要求供应商24小时响应")
+        bid_text = detector.normalize("本项目所有家具质保期为3年并要求供应商12小时响应")
+
+        evidence = detector._shared_tender_edit_evidence(tender_text, bid_text, bid_text)
+
+        self.assertIsNotNone(evidence)
+        self.assertTrue(
+            all(not change.get("voice_adaptation") for change in evidence["changes"])
+        )
+
     def test_short_fragmented_tender_table_copy_is_suppressed(self):
         detector = CollusionDetector()
         tender_text = detector.normalize(
