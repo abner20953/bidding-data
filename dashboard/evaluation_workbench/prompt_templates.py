@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 PROMPT_TEMPLATE_SETTING = "evaluation_workbench_prompt_templates"
-EVALUATION_PROMPT_VERSION = "vision-crosscheck-routing-v22"
+EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v24"
 
 
 def _template(name: str, description: str, content: str, *placeholders: str) -> dict:
@@ -168,6 +168,7 @@ PROMPT_TEMPLATES["evaluate_all_visual_user"] = _template(
     "\"risk_level\":\"low|medium|high\",\"confidence\":\"high|medium|low\","
     "\"conclusion_scope\":\"full|partial|none\","
     "\"conflict_level\":\"none|possible|material\","
+    "\"evidence_pages\":[本次实际形成证据的PDF页码],"
     "\"field_checks\":[{\"field\":\"字段名\",\"text_value\":\"文字层候选值\",\"image_value\":\"图片逐字值\","
     "\"match\":\"match|conflict|uncertain\"}],"
     "\"coverage\":\"covered|not_covered|uncertain\",\"needs_more_image\":true|false,\"requested_pages\":[页码]}。"
@@ -182,10 +183,13 @@ PROMPT_TEMPLATES["evaluate_all_visual_user"] = _template(
     "请用 coverage、needs_more_image 或 requested_pages 表达；材料未覆盖、需要补看页、图片模糊或附件不齐"
     "都不是冲突，conflict_level 应保持 none，只有文字值与图片值均清晰可见且逐字符不同时才标 conflict。"
     "存在可能影响合规性或计分的字段冲突时 conflict_level=material，一般疑似冲突为 possible；没有冲突为 none。"
+    "conflict_level=material 时必须至少提供一项 match=conflict 且 text_value、image_value 均非空的 field_checks；"
+    "没有逐字对照值的疑点最多只能标 possible。"
     "发现冲突时不得用图片值直接覆盖文字值或直接改分，只把两值"
     "并列作为人工复核线索。field_checks 最多12项，只列与当前规则结论或计分直接相关的字段。requested_pages 只能填写"
     "与本次传入页相邻、且确有必要补看的页码；无法判断时返回空数组。证据和理由不得复述规则。\n规则：{{rule}}\n投标文件：{{document_name}}；投标人：{{bidder_name}}\n"
-    "图片识别条件：{{vision_trigger}}；识图强度：{{vision_level}}。\n已有文字结论（仅作辅助，不得照抄）：{{text_result}}",
+    "图片识别条件：{{vision_trigger}}；识图强度：{{vision_level}}。\n"
+    "已有文字、OCR及前序图片结论（仅作辅助，不得照抄；prior_image_batches 表示前一批已看图片）：{{text_result}}",
     "rule", "document_name", "bidder_name", "vision_trigger", "vision_level", "text_result",
 )
 PROMPT_TEMPLATES["evaluate_all_ocr_user"] = _template(
@@ -196,7 +200,8 @@ PROMPT_TEMPLATES["evaluate_all_ocr_user"] = _template(
     "只返回合法 JSON：{\"status\":\"satisfied|not_satisfied|partial|not_found|manual\",\"suggested_score\":数字或null,"
     "\"evidence\":\"OCR中可直接引用的关键事实\",\"reason\":\"简洁判断理由\","
     "\"risk_level\":\"low|medium|high\",\"confidence\":\"high|medium|low\","
-    "\"conclusion_scope\":\"full|partial|none\",\"coverage\":\"covered|not_covered|uncertain\"}。"
+    "\"conclusion_scope\":\"full|partial|none\",\"coverage\":\"covered|not_covered|uncertain\","
+    "\"evidence_pages\":[实际形成证据的PDF页码]}。"
     "coverage=covered 仅表示OCR文字覆盖到规则相关材料；只有OCR文字足以完成整条文字性规则判断时 conclusion_scope 才可为 full。"
     "若规则关键事实仍取决于签章、勾选、图片外观或表格版式，必须使用 partial，不得直接改写已有结论或建议分。"
     "证据与理由不得复述规则。\n规则：{{rule}}\n投标文件：{{document_name}}；投标人：{{bidder_name}}\n"
@@ -204,19 +209,44 @@ PROMPT_TEMPLATES["evaluate_all_ocr_user"] = _template(
     "rule", "document_name", "bidder_name", "text_result", "ocr_service", "ocr_pages", "ocr_text",
 )
 PROMPT_TEMPLATES["evaluate_all_visual_user"]["content"] += (
-    "\n\n找页与冲突约束：图片标签 Pn 是系统实际发送的 PDF 第 n 页；图片内部印刷页码、目录目标页码只可"
-    "作为可见字段，不得反向改写图片标签。若当前图片是目录、封面或与目标材料无关，应返回"
-    "coverage=not_covered，不得仅因它与已有文字结论描述不同而报告字段冲突。只有同一主体、同一材料、"
-    "同一字段在两层证据中明确出现不同值时才可报告 conflict。规则包含多张证书、多人证件或多个附件时，"
-    "必须逐项说明已覆盖与未覆盖材料；仅看清其中一部分时 conclusion_scope=partial、needs_more_image=true。"
-    "多模态结论可以积极给出最可能建议，但必须标明实际看过的页和仍缺的材料。"
+    "\n\n找页补充：图片标签 Pn 是系统实际发送的 PDF 页，不得以目录或印刷页码替代。"
+    "若 text_result 含 prior_image_batches，必须以文字证据与图片证据的合并覆盖给出最终建议，并重新给出整条规则的 suggested_score；多材料规则应明确已覆盖与未覆盖项。"
 )
 PROMPT_TEMPLATES["evaluate_all_ocr_user"]["content"] += (
-    "\n\nOCR覆盖约束：逐页区分已识别材料，规则包含多张证书、多人证件或多个附件时，必须列明已覆盖项"
-    "和未覆盖项；只识别到其中一部分时 conclusion_scope=partial。Pn 始终表示系统实际 PDF 页序号，OCR"
-    "文字中的目录页码或页面自印页码只能作为内容，不能替代 Pn。证书编号、主体、日期、金额、型号等"
-    "关键字段必须逐字符引用，模糊字不得按常见格式补全。OCR无法判断签章真假、勾选状态、版式完整性或"
-    "图片是否对应目标材料时，保留文字事实并交给多模态图片核验；不要输出泛泛的“需人工查看全文”。"
+    "\n\n补充：Pn 仅指系统实际 PDF 页；关键字段逐字引用，模糊字不得补全。"
+    "客观分只总结材料类别、数量、有效性和计分结论，不得逐行抄录OCR全文。"
+)
+PROMPT_TEMPLATES["evaluate_all_visual_contract"] = _template(
+    "综合评审 · 图片识别结果协议",
+    "图片识别任务的固定输出字段与证据边界；与可修改的业务指令分离。",
+    "只返回合法 JSON，不得使用 Markdown。必须包含 status、suggested_score、evidence、reason、risk_level、confidence、"
+    "coverage、conclusion_scope、evidence_pages、field_checks、conflict_level、needs_more_image、requested_pages。"
+    "coverage 只描述本次传入图片是否包含规则相关事实；conclusion_scope 描述文字、OCR、前序图片和本次图片合并后，"
+    "整条规则能否完成判断。evidence_pages 只能列本次实际看到且形成直接证据的 PDF 页，必须是传入页的子集；"
+    "若 text_result 中含 prior_image_batches，必须合并前序批次事实，不得只根据当前页重新判断。"
+    "未覆盖、模糊或未出现的字段不是冲突。只有同一主体、同一材料、同一字段在文字与图片中均清晰可见且逐字不同，"
+    "才可在 field_checks 中写 conflict；material 冲突必须提供双方非空的逐字值。证据和理由不复述规则。"
+)
+PROMPT_TEMPLATES["evaluate_all_ocr_contract"] = _template(
+    "综合评审 · OCR 结果协议",
+    "腾讯 OCR 任务的固定输出字段与证据边界；与可修改的业务指令分离。",
+    "只返回合法 JSON，不得使用 Markdown。必须包含 status、suggested_score、evidence、reason、risk_level、confidence、"
+    "coverage、conclusion_scope、evidence_pages。coverage 只表示本次 OCR 文字是否覆盖规则相关材料；"
+    "conclusion_scope 表示结合既有文字后整条规则是否足以完成判断。evidence_pages 只能列本次 OCR 实际识别页中直接形成证据的 PDF 页，"
+    "不得机械列出全部处理页。OCR 未识别到、字迹模糊、签章/勾选/版式无法判断时不得写不满足或不得分；"
+    "只保留可见文字事实并标记为 partial 或 none。证据和理由不复述规则。"
+)
+PROMPT_TEMPLATES["evaluate_all_visual_user"]["required_literals"] = (
+    '"coverage"', '"conclusion_scope"', '"evidence_pages"', '"field_checks"', '"conflict_level"', '"requested_pages"',
+)
+PROMPT_TEMPLATES["evaluate_all_ocr_user"]["required_literals"] = (
+    '"coverage"', '"conclusion_scope"', '"evidence_pages"',
+)
+PROMPT_TEMPLATES["evaluate_all_visual_contract"]["required_literals"] = (
+    "coverage", "conclusion_scope", "evidence_pages", "field_checks", "conflict_level",
+)
+PROMPT_TEMPLATES["evaluate_all_ocr_contract"]["required_literals"] = (
+    "coverage", "conclusion_scope", "evidence_pages",
 )
 PROMPT_TEMPLATES["evaluate_all_visual_locator_user"] = _template(
     "综合评审 · 扫描件图片找页",
@@ -286,6 +316,8 @@ PROMPT_TEMPLATE_PRESENTATION = {
     "extract_rules": ("system", "系统角色", 220, "advanced"),
     "evaluate_all": ("system", "系统角色", 221, "advanced"),
     "evaluate_all_output_contract": ("system", "系统与结果结构", 223, "advanced"),
+    "evaluate_all_visual_contract": ("system", "系统与结果结构", 224, "advanced"),
+    "evaluate_all_ocr_contract": ("system", "系统与结果结构", 225, "advanced"),
     "evaluate_all_scope_profile": ("system", "系统角色", 222, "advanced"),
     "json_repair": ("system", "连接与修复", 230, "advanced"),
     "json_repair_user": ("system", "连接与修复", 231, "advanced"),

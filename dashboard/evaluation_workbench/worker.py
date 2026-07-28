@@ -25,7 +25,7 @@ from dashboard.evaluation_workbench.ai_gateway import (
     InvalidJsonResponse, ModelResponseEnvelopeError, _recover_complete_json_array, model_capabilities, request_json,
 )
 from dashboard.evaluation_workbench.collusion_signals import build_cross_bid_analysis
-from dashboard.evaluation_workbench.ocr_gateway import request_tencent_ocr
+from dashboard.evaluation_workbench.ocr_gateway import OCR_PARSER_VERSION, request_tencent_ocr
 from dashboard.evaluation_workbench.prompt_context import (
     build_rule_context, select_rule_chunk_evidence_map, select_rule_chunk_map, select_rule_chunks,
     split_full_text_chunks,
@@ -2281,7 +2281,8 @@ def _score_visual_page_candidates(raw: dict) -> list[int]:
     if isinstance(items, list):
         for item in items:
             if isinstance(item, dict):
-                sources.extend((item.get("page_hint"), item.get("page")))
+                # 模型常把“（第144页）”写进证据名称而不是 page_hint 字段，一并解析。
+                sources.extend((item.get("page_hint"), item.get("page"), item.get("name"), item.get("project_name")))
     pages: list[int] = []
     for source in sources:
         for page in _explicit_page_references(source):
@@ -3503,7 +3504,21 @@ _VISION_FACT_TERMS = (
 
 
 def _rule_image_strategy(rule: dict) -> str:
-    """区分文字提取、纯视觉和混合规则；无法明确分类时直接交给多模态。"""
+    """优先使用规则提取出的证据类型；旧规则才回退到文本关键词。"""
+    try:
+        meta = storage.rule_execution_meta(rule)
+    except (TypeError, ValueError):
+        meta = {}
+    requirements = rule.get("evidence_requirements")
+    if not isinstance(requirements, list):
+        requirements = meta.get("evidence_requirements") or []
+    requirements = {str(value) for value in requirements if value}
+    if "visual" in requirements and "text" in requirements:
+        return "hybrid"
+    if "visual" in requirements:
+        return "vision"
+    if "text" in requirements:
+        return "ocr"
     text = f"{rule.get('title') or ''}\n{rule.get('check_rule') or ''}\n{rule.get('source_text') or ''}"
     needs_text = any(term in text for term in _OCR_TEXT_TERMS)
     needs_visual = any(term in text for term in _VISION_FACT_TERMS)
@@ -3547,7 +3562,19 @@ def _render_ocr_page(app, document: dict, page_number: int, service: str) -> tup
         with fitz.open(source) as pdf:
             if not 1 <= page_number <= pdf.page_count:
                 return None
-            content = pdf[page_number - 1].get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False).tobytes("jpeg", jpg_quality=quality)
+            page = pdf[page_number - 1]
+            content = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False).tobytes(
+                "jpeg", jpg_quality=quality,
+            )
+            # 腾讯接口限制的是 Base64 后大小：营业执照 7M、通用/表格通常 10M。
+            # 留出编码和协议余量，仅在超限时逐级降采样，避免白白消耗一次额度。
+            raw_limit = 5 * 1024 * 1024 if service == "biz_license" else 7 * 1024 * 1024
+            while len(content) > raw_limit and scale > 1.0:
+                scale = max(1.0, scale * 0.8)
+                quality = max(68, quality - 6)
+                content = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False).tobytes(
+                    "jpeg", jpg_quality=quality,
+                )
     except (OSError, RuntimeError, ValueError):
         return None
     return content, hashlib.sha256(content).hexdigest()
@@ -3593,12 +3620,18 @@ def _ocr_page_texts(app, task: dict, document: dict, rule: dict, result: dict, l
                 continue
             image, image_hash = rendered
             cached = storage.get_ocr_page_cache(app, document["document_id"], page, image_hash, service)
-            # v1 缓存可能来自旧的 SDK 响应层级解析错误；只复用已修复且确有文字的缓存。
-            if cached and cached.get("parser_version") == 2 and str(cached.get("text") or "").strip():
+            # 旧缓存可能来自 SDK 响应层级错误，或丢失了营业执照字段名/表格行列；
+            # 只复用当前解析版本且确有文字的缓存。
+            if cached and cached.get("parser_version") == OCR_PARSER_VERSION and str(cached.get("text") or "").strip():
                 values.append({**cached, "page": page, "cached": True})
                 preferred_service = service
                 break
             response, error = request_tencent_ocr(app, task, service, image)
+            error_info = error if isinstance(error, dict) else {"kind": "unknown", "message": str(error or "")}
+            # 临时网络/负载错误只在当前页做一次受控重试；不把整项服务永久排除。
+            if response is None and error_info.get("retryable"):
+                response, error = request_tencent_ocr(app, task, service, image)
+                error_info = error if isinstance(error, dict) else {"kind": "unknown", "message": str(error or "")}
             if response is not None:
                 text = str(response.get("text") or "").strip()
                 if text:
@@ -3610,13 +3643,122 @@ def _ocr_page_texts(app, task: dict, document: dict, rule: dict, result: dict, l
                     failure = "腾讯 OCR 未在候选页识别到文字"
                 # 接口成功但没有文字通常代表页面本身不适合OCR，直接交给多模态，不机械消耗其他额度。
                 break
-            failure = error or failure
-            unavailable_services.add(service)
+            error_kind = str(error_info.get("kind") or "unknown")
+            error_message = str(error_info.get("message") or "腾讯 OCR 调用失败")
+            failure = ("腾讯 OCR 额度不足：" + error_message) if error_kind == "quota" else error_message
+            # 鉴权、套餐额度和接口能力属于服务级问题；单页图像异常、临时故障和未知错误
+            # 仅影响当前页，下一页仍允许尝试原优先接口。
+            if error_kind in {"auth", "quota", "unsupported"}:
+                unavailable_services.add(service)
     return values, failure
+
+
+_OCR_CONTEXT_STOP_TERMS = {"投标", "文件", "规则", "检查", "要求", "是否", "提供", "相关", "材料", "内容", "本项目"}
+
+
+def _ocr_context_terms(rule: dict | None) -> list[str]:
+    """从当前规则提取本地检索词，不使用项目或行业特定补丁。"""
+    if not isinstance(rule, dict):
+        return []
+    raw = "\n".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text"))
+    terms: list[str] = []
+    for value in re.findall(r"[A-Za-z]{2,}[A-Za-z0-9._/-]*|\d{2,}|[\u4e00-\u9fff]{2,}", raw):
+        value = value.strip()
+        if value in _OCR_CONTEXT_STOP_TERMS or len(value) < 2:
+            continue
+        candidates = [value]
+        if len(value) > 8 and re.fullmatch(r"[\u4e00-\u9fff]+", value):
+            candidates.extend(value[index:index + 4] for index in range(0, len(value) - 3, 2))
+        for candidate in candidates:
+            if candidate not in terms:
+                terms.append(candidate)
+    return terms[:36]
+
+
+def _relevant_ocr_excerpt(text: str, budget: int, terms: list[str]) -> str:
+    """长 OCR 页保留命中行及邻行，再均匀补足上下文，避免中段关键表格行被截掉。"""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines or len(text) <= budget:
+        return text[:budget]
+    normalized_terms = [term.lower() for term in terms]
+    selected: set[int] = {0, len(lines) - 1}
+    for index, line in enumerate(lines):
+        lowered = line.lower()
+        if any(term in lowered for term in normalized_terms):
+            selected.update(candidate for candidate in (index - 1, index, index + 1) if 0 <= candidate < len(lines))
+    # 没有命中时仍均匀覆盖全文；有命中时也用稀疏锚点保留必要上下文。
+    sample_count = max(2, min(8, budget // 900))
+    for index in range(sample_count):
+        selected.add(round(index * (len(lines) - 1) / max(1, sample_count - 1)))
+    ordered = sorted(selected)
+    parts: list[str] = []
+    used = 0
+    previous = -2
+    for index in ordered:
+        if index > previous + 1 and parts:
+            marker = "…中段已压缩…"
+            if used + len(marker) + 1 > budget:
+                break
+            parts.append(marker)
+            used += len(marker) + 1
+        line = lines[index]
+        if used + len(line) + 1 > budget:
+            remaining = budget - used
+            if remaining > 24:
+                parts.append(line[:remaining - 1].rstrip() + "…")
+            break
+        parts.append(line)
+        used += len(line) + 1
+        previous = index
+    return "\n".join(parts)[:budget]
+
+
+def _pack_ocr_page_texts(values: list[dict], max_chars: int = 60_000, *, rule: dict | None = None) -> str:
+    """按页公平分配 OCR 上下文，并优先保留与当前规则有关的中段行。"""
+    usable = [value for value in values if str(value.get("text") or "").strip()]
+    if not usable:
+        return ""
+    headers = [
+        f"[第{value['page']}页·{_ocr_service_label(str(value.get('service') or ''))}]"
+        for value in usable
+    ]
+    fixed_chars = sum(len(header) + 2 for header in headers)
+    per_page = max(800, (max_chars - fixed_chars) // len(usable))
+    parts: list[str] = []
+    for header, value in zip(headers, usable):
+        text = _clean_model_text(value.get("text"))
+        if len(text) > per_page:
+            text = _relevant_ocr_excerpt(text, per_page, _ocr_context_terms(rule))
+        parts.append(f"{header}\n{text}")
+    return "\n\n".join(parts)[:max_chars]
 
 
 def _ocr_service_label(service: str) -> str:
     return storage.TENCENT_OCR_SERVICES.get(service, {}).get("label", "腾讯 OCR")
+
+
+def _merge_supplement_text(base: object, supplement: object, limit: int = 2000, *,
+                           supplement_first: bool = False) -> str:
+    """合并原结论与补充证据，并保证较新的 OCR/图片事实不会被旧长文本截掉。"""
+    base_text = _clean_model_text(base)
+    supplement_text = _clean_model_text(supplement)
+    if not base_text:
+        return supplement_text[:limit]
+    if not supplement_text:
+        return base_text[:limit]
+    separator = "\n"
+    if len(base_text) + len(separator) + len(supplement_text) <= limit:
+        return separator.join((supplement_text, base_text) if supplement_first else (base_text, supplement_text))
+    # 至少为原结论保留三分之一；剩余空间优先给最新补充，避免 OCR/图片已经识别正确
+    # 却在最终 evidence/reason 的 2000 字上限处被完整截掉。
+    supplement_budget = min(len(supplement_text), max(limit // 3, limit - limit // 3 - len(separator)))
+    base_budget = max(0, limit - supplement_budget - len(separator))
+    clipped_base = base_text[:base_budget].rstrip()
+    if len(base_text) > base_budget and clipped_base:
+        clipped_base = clipped_base[:-1].rstrip() + "…"
+    clipped_supplement = supplement_text[:supplement_budget].rstrip()
+    values = (clipped_supplement, clipped_base) if supplement_first else (clipped_base, clipped_supplement)
+    return separator.join(value for value in values if value)[:limit]
 
 
 def _with_ocr_raw_evidence(result: dict, prefix: str, text: str) -> dict:
@@ -3626,71 +3768,137 @@ def _with_ocr_raw_evidence(result: dict, prefix: str, text: str) -> dict:
         return result
     return {
         **result,
-        "evidence": "\n".join(value for value in (result.get("evidence"), f"{prefix}{excerpt}") if value)[:2000],
+        "evidence": _merge_supplement_text(result.get("evidence"), f"{prefix}{excerpt}"),
     }
 
 
+def _with_ocr_fallback_evidence(result: dict, component: str, service_labels: str,
+                                pages: list[int], text: str, *, uncovered: bool = False) -> dict:
+    """OCR归纳失败时，客观分只保留执行摘要；其他模块仍保留可人工核验的原文。"""
+    page_text = "、".join(f"P{page}" for page in pages)
+    if component == "objective":
+        outcome = "未覆盖可形成结论的关键文字" if uncovered else "未形成可采纳的结构化补充"
+        summary = (
+            f"【腾讯OCR摘要·{service_labels}·{page_text}】已完成{len(pages)}页候选材料文字识别，"
+            f"{outcome}，原AI建议得分保持不变。"
+        )
+        return {
+            **result,
+            "evidence": _merge_supplement_text(result.get("evidence"), summary),
+        }
+    return _with_ocr_raw_evidence(
+        result, f"【腾讯OCR原文·{service_labels}·{page_text}】", text,
+    )
+
+
 def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: dict, result: dict,
-                        profile: dict) -> dict:
+                        profile: dict, locator_profile: dict | None = None) -> dict:
     """OCR先补足可读文字；失败/额度不足只记录原因，后续仍可进入原多模态路径。"""
     trigger, level = _rule_vision_policy(rule)
     if trigger == "off" or level == "off":
         return result
     if trigger == "text_fallback" and not _needs_visual_fallback(component, result):
         return _with_vision_execution(result, "ocr_skipped_text_sufficient", [], {}, "文字证据已足够，本次无需调用腾讯 OCR。")
-    values, failure = _ocr_page_texts(app, task, document, rule, result, level)
+    working_result = result
+    if level == "high" and locator_profile and not _vision_page_candidates(document, rule, result):
+        located = _locate_visual_pages(app, task, document, rule, locator_profile)
+        if located:
+            # 一次低清找页结果同时交给腾讯 OCR 与后续高清图片复核；OCR失败时也要
+            # 保留候选，避免图片阶段再次调用找页模型。
+            working_result = {**result, "visual_page_candidates": located}
+    values, failure = _ocr_page_texts(app, task, document, rule, working_result, level)
     if not values:
         status = "ocr_quota_exhausted" if "额度" in failure else "ocr_not_located" if "定位" in failure else "ocr_failed"
-        return _with_vision_execution(result, status, [], {}, failure or "腾讯 OCR 未获得可用文字，已保留原文字结论。")
+        return _with_vision_execution(working_result, status, [], {}, failure or "腾讯 OCR 未获得可用文字，已保留原文字结论。")
     pages = [int(value["page"]) for value in values]
-    ocr_text = "\n\n".join(f"[第{value['page']}页·{_ocr_service_label(str(value.get('service') or ''))}]\n{value.get('text') or ''}" for value in values if value.get("text"))[:24000]
+    ocr_text = _pack_ocr_page_texts(values, rule=rule)
     if not ocr_text.strip():
-        return _with_vision_execution(result, "ocr_failed", pages, {}, "腾讯 OCR 未识别到可用文字，已保留原文字结论。")
+        return _with_vision_execution(working_result, "ocr_failed", pages, {}, "腾讯 OCR 未识别到可用文字，已保留原文字结论。")
     service_labels = "、".join(dict.fromkeys(_ocr_service_label(str(value.get("service") or "")) for value in values))
     prompt = storage.render_prompt_template(
         app, "evaluate_all_ocr_user", rule=json.dumps(_visual_rule_packet(rule), ensure_ascii=False, separators=(",", ":")),
         document_name=document.get("original_name") or "投标文件", bidder_name=document.get("bidder_name") or document.get("original_name") or "投标人",
-        text_result=json.dumps(result, ensure_ascii=False, separators=(",", ":")), ocr_service=service_labels,
+        text_result=json.dumps(working_result, ensure_ascii=False, separators=(",", ":")), ocr_service=service_labels,
         ocr_pages="、".join(f"P{page}" for page in pages), ocr_text=ocr_text,
     )
+    prompt += "\n\n【系统输出与证据协议】\n" + storage.render_prompt_template(app, "evaluate_all_ocr_contract")
     try:
         parsed = _request_task_json(
             app, task, profile, f"evaluate_all_{component}_ocr", _system_prompt(app, "evaluate_all"), prompt,
             document_id=document["document_id"], context_mode="tencent_ocr", max_tokens=_output_token_budget(profile, 1300), thinking_mode="disabled",
         )
     except ValueError:
-        fallback = _with_ocr_raw_evidence(result, f"【腾讯OCR原文·{service_labels}·" + "、".join(f"P{page}" for page in pages) + "】", ocr_text)
-        return _with_vision_execution(fallback, "ocr_applied_partial", pages, {}, f"{service_labels} 已识别文字并附入证据；OCR结论规范化失败，已保留原结论。")
+        fallback = _with_ocr_fallback_evidence(working_result, component, service_labels, pages, ocr_text)
+        message = (
+            f"{service_labels} 已完成文字识别；OCR结论规范化失败，客观分仅保留简短摘要和原建议。"
+            if component == "objective"
+            else f"{service_labels} 已识别文字并附入证据；OCR结论规范化失败，已保留原结论。"
+        )
+        return _with_vision_execution(fallback, "ocr_applied_partial", pages, {}, message)
     if not isinstance(parsed, dict) or _ocr_response_coverage(parsed) != "covered":
-        fallback = _with_ocr_raw_evidence(result, f"【腾讯OCR原文·{service_labels}·" + "、".join(f"P{page}" for page in pages) + "】", ocr_text)
+        fallback = _with_ocr_fallback_evidence(
+            working_result, component, service_labels, pages, ocr_text, uncovered=True,
+        )
         return _with_vision_execution(fallback, "ocr_uncovered", pages, {}, f"{service_labels} 已识别候选页，但未覆盖可形成结论的关键文字，已保留原结论。")
     scope = _ocr_response_scope(parsed)
-    prefix = f"【腾讯OCR·{service_labels}·" + "、".join(f"P{page}" for page in pages) + "】"
-    evidence = _clean_model_text(parsed.get("evidence"))[:1600]
-    reason = _clean_model_text(parsed.get("reason"))[:1200]
+    evidence_pages: list[int] = []
+    for value in parsed.get("evidence_pages") or []:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            page = int(value)
+            if page in pages and page not in evidence_pages:
+                evidence_pages.append(page)
+    if not evidence_pages:
+        for value in (parsed.get("evidence"), parsed.get("reason")):
+            for page in _explicit_page_references(value):
+                if page in pages and page not in evidence_pages:
+                    evidence_pages.append(page)
+    if not evidence_pages and len(pages) == 1:
+        evidence_pages = list(pages)
+    display_pages = evidence_pages or pages
+    prefix = f"【腾讯OCR·{service_labels}·" + "、".join(f"P{page}" for page in display_pages) + "】"
+    # 客观分已有文字层证据与计分过程，OCR只补充简短结论，避免重复展示整页识别字段。
+    evidence_limit = 500 if component == "objective" else 1600
+    reason_limit = 400 if component == "objective" else 1200
+    evidence = _clean_model_text(parsed.get("evidence"))[:evidence_limit]
+    reason = _clean_model_text(parsed.get("reason"))[:reason_limit]
     status = "ocr_applied" if scope == "full" else "ocr_applied_partial"
     if component == "review":
-        selected_status = str(parsed.get("status") or result.get("status") or "manual") if scope == "full" else str(result.get("status") or "manual")
+        selected_status = str(parsed.get("status") or working_result.get("status") or "manual") if scope == "full" else str(working_result.get("status") or "manual")
         if selected_status not in {"satisfied", "not_satisfied", "partial", "not_found", "manual"}:
             selected_status = "manual"
         merged = _review_result_from_model({
-            "evidence": "\n".join(value for value in (result.get("evidence"), f"{prefix}{evidence}" if evidence else "") if value),
-            "page_hint": "P" + "、P".join(str(page) for page in pages),
-            "reason": "\n".join(value for value in (result.get("reason"), f"{prefix}{reason}" if reason else "") if value),
-            "risk_level": parsed.get("risk_level") if scope == "full" else result.get("risk_level"),
-            "confidence": parsed.get("confidence") if scope == "full" else result.get("confidence"),
-            "evidence_quality": "sufficient" if scope == "full" and evidence else result.get("evidence_quality"),
+            "evidence": _merge_supplement_text(working_result.get("evidence"), f"{prefix}{evidence}" if evidence else ""),
+            "page_hint": "P" + "、P".join(str(page) for page in (evidence_pages or pages)),
+            "reason": _merge_supplement_text(working_result.get("reason"), f"{prefix}{reason}" if reason else ""),
+            "risk_level": parsed.get("risk_level") if scope == "full" else working_result.get("risk_level"),
+            "confidence": parsed.get("confidence") if scope == "full" else working_result.get("confidence"),
+            "evidence_quality": "sufficient" if scope == "full" and evidence else working_result.get("evidence_quality"),
         }, rule["rule_id"], selected_status)
+        # 标准化审查结果只保留业务字段，这些内部路由元数据需显式带到下一层图片识别。
+        merged = {
+            **merged,
+            "visual_page_candidates": list(working_result.get("visual_page_candidates") or []),
+            "ocr_candidate_pages": pages,
+            "ocr_evidence_pages": evidence_pages,
+        }
     else:
-        max_score = float(_rule_scoring(rule).get("max_score") or result.get("max_score") or 0)
-        suggested = _bounded_model_score(parsed.get("suggested_score"), max_score) if scope == "full" and max_score > 0 else result.get("suggested_score")
-        merged = {**result, "suggested_score": suggested,
-                  "evidence": "\n".join(value for value in (result.get("evidence"), f"{prefix}{evidence}" if evidence else "") if value)[:2000],
-                  "reason": "\n".join(value for value in (result.get("reason"), f"{prefix}{reason}" if reason else "") if value)[:2000],
-                  "confidence": _enum_text(parsed.get("confidence"), {"high", "medium", "low"}, result.get("confidence")) if scope == "full" else result.get("confidence"),
+        max_score = float(_rule_scoring(rule).get("max_score") or working_result.get("max_score") or 0)
+        suggested = _bounded_model_score(parsed.get("suggested_score"), max_score) if scope == "full" and max_score > 0 else working_result.get("suggested_score")
+        merged = {**working_result, "suggested_score": suggested,
+                  "evidence": _merge_supplement_text(working_result.get("evidence"), f"{prefix}{evidence}" if evidence else ""),
+                  "reason": _merge_supplement_text(working_result.get("reason"), f"{prefix}{reason}" if reason else ""),
+                  "confidence": _enum_text(parsed.get("confidence"), {"high", "medium", "low"}, working_result.get("confidence")) if scope == "full" else working_result.get("confidence"),
+                  "ocr_candidate_pages": pages, "ocr_evidence_pages": evidence_pages,
                   "requires_review": True, "automation_status": "needs_review", "review_reason": "腾讯 OCR 结果已补充，需人工复核。"}
-    return _with_vision_execution(merged, status, pages, {"display_name": service_labels},
-                                  f"{service_labels} 已识别候选页并{'采纳到规则结论' if scope == 'full' else '补充部分文字事实'}。")
+    merged = _append_evidence_layer(
+        merged, source="tencent_ocr", summary=evidence or reason, checked_pages=pages,
+        evidence_pages=evidence_pages, service=service_labels,
+    )
+    return _with_vision_execution(
+        merged, status, pages, {"display_name": service_labels},
+        f"{service_labels} 已识别候选页并{'采纳到规则结论' if scope == 'full' else '补充部分文字事实'}。",
+        evidence_pages=evidence_pages,
+    )
 
 
 def _rule_vision_policy(rule: dict) -> tuple[str, str]:
@@ -3831,28 +4039,24 @@ def _scan_like_pages(page_texts: dict[int, str]) -> set[int]:
 
 
 def _vision_page_candidates(document: dict, rule: dict, result: dict) -> list[int]:
-    """结构化实际页优先，叙述中的目录页码只作后备，避免把印刷页码当PDF序号。"""
+    """OCR已命中页、图片缺口语境、裸结构化页码按可靠度生成候选。"""
     if document.get("extension") != ".pdf" or not document.get("page_count"):
         return []
     page_count = int(document["page_count"])
-    pages: list[int] = []
-    structured_pages: list[int] = []
-    ordinary: list[int] = []
-    # score 的 evidence_items / review 的 scan ledger 保存的是系统实际 PDF 页序号，
-    # 可靠性高于模型理由中引用的目录目标页或文内印刷页码。
-    for source in result.get("visual_page_candidates") or []:
-        _append_unique_pages(structured_pages, source, page_count)
-    _append_unique_pages(structured_pages, result.get("page_hint"), page_count)
-    pages.extend(structured_pages)
-    # 全文扫描可能命中同组附件的首尾页而漏掉中间纯扫描页；密集、稳定间隔序列可安全补齐。
-    pages.extend(_complete_repeated_page_sequence(structured_pages, page_count))
     # 本地解析文本提供两项零成本定位能力：估计“印刷页码→PDF页序”的固定偏移，
     # 以及识别纯扫描/图片页。两者都只读解析缓存文件，不增加任何外部调用。
     page_texts = _document_page_texts(document)
     printed_offset = _estimate_printed_page_offset(page_texts, page_count) if page_texts else 0
-    # “扫描件待核验”“签章不可读”等语句直接描述当前图片缺口，应先于纯文字明细页。
+    # “扫描件待核验”“签章不可读”等语句直接描述当前图片缺口，且目录语境引用会
+    # 按印刷页码偏移换算为 PDF 页序，是可靠性最高的候选来源，排在最前。
     # 先剥掉【腾讯OCR·…·P…】【图片识别·…·P…】等系统前缀：其中的页码是“已处理页清单”，
-    # 不是“材料所在页”，混进候选会把 OCR 实际命中页（如正文“证书在P144明确”）挤出预算。
+    # 不是“材料所在页”，混入候选会把 OCR 实际命中页（如正文“证书在P144明确”）挤出预算。
+    pages: list[int] = []
+    # 腾讯 OCR 归纳模型明确标出的命中页，是后续核对签章、勾选、版式和图片字段的
+    # 最可靠入口；与仅表示“处理过哪些页”的 ocr_candidate_pages 严格分开。
+    for source in result.get("ocr_evidence_pages") or []:
+        _append_unique_pages(pages, source, page_count)
+    ordinary: list[int] = []
     for source in (result.get("evidence"), result.get("reason")):
         clean_source = re.sub(r"【(?:腾讯OCR|图片识别)[^】]*】", " ", str(source or ""))
         priority_values, ordinary_values = _visual_context_candidates(clean_source, page_count, printed_offset)
@@ -3862,6 +4066,21 @@ def _vision_page_candidates(document: dict, rule: dict, result: dict) -> list[in
         for page in ordinary_values:
             if page not in ordinary:
                 ordinary.append(page)
+    # 评分 evidence_items / 扫描台账保留的裸页码同属模型引用，但缺少语句语境，
+    # 无法做目录纠偏，可靠性低于上面的证据语句，作为第二梯队候选。
+    structured_pages: list[int] = []
+    for source in result.get("visual_page_candidates") or []:
+        _append_unique_pages(structured_pages, source, page_count)
+    if not str(result.get("vision_status") or "").startswith("ocr_"):
+        # OCR 合并后 page_hint 记录的是“OCR 已处理页清单”而非材料所在页，不作为候选。
+        _append_unique_pages(structured_pages, result.get("page_hint"), page_count)
+    for page in structured_pages:
+        if page not in pages:
+            pages.append(page)
+    # 全文扫描可能命中同组附件的首尾页而漏掉中间纯扫描页；密集、稳定间隔序列可安全补齐。
+    for page in _complete_repeated_page_sequence(structured_pages, page_count):
+        if page not in pages:
+            pages.append(page)
     # 文字证据页（证书汇总表、签章说明页等）的相邻纯扫描页往往就是证书/签章附件
     # 本体。每个锚点最多补一个相邻扫描页，并紧跟其锚点，不打乱既有优先级。
     anchors = pages + [page for page in ordinary if page not in pages]
@@ -3881,16 +4100,19 @@ def _vision_page_candidates(document: dict, rule: dict, result: dict) -> list[in
 
 
 def _scan_visual_page_candidates(scan_index: dict | None, rule_id: str, page_count: int) -> list[int]:
-    """从全文扫描台账补充候选页，供没有评分 evidence_items 的规则使用。"""
+    """从全文扫描台账补充候选页，供没有评分 evidence_items 的规则使用。
+    优先只取精确 page_hint；若整条规则一个精确页都没有，才采样粗页块兜底，
+    避免粗区间稀释预算，也避免完全丢失没有精确页码的规则。"""
     if not isinstance(scan_index, dict):
         return []
     pages: list[int] = []
+    fallback_pages: list[int] = []
     for finding in scan_index.get("findings") or []:
         if not isinstance(finding, dict) or finding.get("rule_id") != rule_id:
             continue
         _append_unique_pages(pages, finding.get("page_hint"), page_count)
-        _append_unique_pages(pages, finding.get("page_range"), page_count)
-    return pages
+        _append_unique_pages(fallback_pages, finding.get("page_range"), page_count)
+    return pages or fallback_pages
 
 
 def _with_scan_visual_candidates(results: list[dict], scan_index: dict | None, document: dict) -> list[dict]:
@@ -3977,10 +4199,13 @@ def _is_field_value_conflict(item: object) -> bool:
 
 def _visual_response_conflict_level(parsed: dict) -> str:
     level = str(parsed.get("conflict_level") or "").lower()
-    if level in {"possible", "material"}:
-        return level
     checks = parsed.get("field_checks")
-    if isinstance(checks, list) and any(_is_field_value_conflict(item) for item in checks):
+    has_concrete_conflict = isinstance(checks, list) and any(_is_field_value_conflict(item) for item in checks)
+    # material 会冻结原结论和建议分，必须有“文字值/图片值均可见且明确不同”的字段证据；
+    # 模型只给一个枚举但没有对照值时降为 possible，防止无依据地阻断已形成的结论。
+    if level == "material":
+        return "material" if has_concrete_conflict else "possible"
+    if level == "possible" or has_concrete_conflict:
         return "possible"
     return "none"
 
@@ -3997,24 +4222,30 @@ def _visual_field_conflict_text(parsed: dict) -> str:
     return "；".join(values)[:800]
 
 
-def _merge_usable_visual_responses(responses: list[tuple[list[int], dict]]) -> tuple[dict | None, str, list[int]]:
-    """保留各轮已看见的有效事实；后续页未覆盖时也不丢弃前一轮的部分图片证据。"""
+def _merge_usable_visual_responses(responses: list[tuple[list[int], dict]]) -> tuple[dict | None, str, list[int], list[int]]:
+    """合并多批图片事实，并严格区分已检查页和模型实际形成证据的页。"""
     usable = [(pages, parsed) for pages, parsed in responses if _visual_response_scope(parsed) in {"full", "partial"}]
     if not usable:
-        return None, "none", []
+        return None, "none", [], []
     full = [(pages, parsed) for pages, parsed in usable if _visual_response_scope(parsed) == "full"]
     selected_pages, selected = (full or usable)[-1]
     merged = dict(selected)
     evidence_values: list[str] = []
     reason_values: list[str] = []
-    applied_pages: list[int] = []
+    checked_pages: list[int] = []
+    evidence_pages: list[int] = []
     field_checks: list[dict] = []
     conflict_level = "none"
     conflict_rank = {"none": 0, "possible": 1, "material": 2}
     for pages, parsed in usable:
         for page in pages:
-            if page not in applied_pages:
-                applied_pages.append(page)
+            if page not in checked_pages:
+                checked_pages.append(page)
+        # evidence_pages 必须是本批实际发送页的子集。模型没给出时不能把全批检查页伪装成证据页。
+        reported_evidence = _normalise_result_pages(parsed.get("evidence_pages"))
+        for page in reported_evidence:
+            if page in pages and page not in evidence_pages:
+                evidence_pages.append(page)
         evidence = _clean_model_text(parsed.get("evidence"))
         reason = _clean_model_text(parsed.get("reason"))
         if evidence and evidence not in evidence_values:
@@ -4031,7 +4262,7 @@ def _merge_usable_visual_responses(responses: list[tuple[list[int], dict]]) -> t
     merged["reason"] = "\n".join(reason_values)
     merged["field_checks"] = field_checks
     merged["conflict_level"] = conflict_level
-    return merged, "full" if full else "partial", applied_pages or selected_pages
+    return merged, "full" if full else "partial", checked_pages or selected_pages, evidence_pages
 
 
 def _vision_render_setting(rule: dict, level: str) -> dict:
@@ -4174,18 +4405,50 @@ def _visual_rule_packet(rule: dict) -> dict:
     }
 
 
-def _with_vision_execution(result: dict, status: str, pages: list[int], profile: dict, message: str) -> dict:
-    """记录图片流程本身的结果，和业务结论分离，便于页面与报告准确说明。"""
+def _normalise_result_pages(values: object) -> list[int]:
+    if not isinstance(values, list):
+        return []
     unique_pages: list[int] = []
-    for value in pages:
+    for value in values:
         if isinstance(value, (int, float)) and not isinstance(value, bool) and int(value) > 0:
             page = int(value)
             if page not in unique_pages:
                 unique_pages.append(page)
+    return unique_pages
+
+
+def _append_evidence_layer(result: dict, *, source: str, summary: object, checked_pages: object,
+                           evidence_pages: object, service: str = "", model: str = "") -> dict:
+    """以结构化方式保留 OCR/图片证据，旧 evidence/reason 字段仍完整兼容。"""
+    current = result.get("evidence_layers")
+    layers = [dict(value) for value in current if isinstance(value, dict)] if isinstance(current, list) else []
+    layer = {
+        "source": source,
+        "summary": _clean_model_text(summary)[:1600],
+        "checked_pages": _normalise_result_pages(checked_pages),
+        "evidence_pages": _normalise_result_pages(evidence_pages),
+        "service": str(service or "")[:160],
+        "model": str(model or "")[:160],
+    }
+    # 同一来源的本次补充替换旧层，避免重试或二次合并反复堆叠。
+    layers = [value for value in layers if value.get("source") != source]
+    layers.append(layer)
+    return {**result, "evidence_layers": layers}
+
+
+def _with_vision_execution(result: dict, status: str, pages: list[int], profile: dict, message: str,
+                           *, evidence_pages: object | None = None) -> dict:
+    """记录图片流程本身的结果，区分实际检查页与真正形成证据的页。"""
+    unique_pages = _normalise_result_pages(pages)
+    if evidence_pages is None:
+        unique_evidence_pages = _normalise_result_pages(result.get("vision_evidence_pages"))
+    else:
+        unique_evidence_pages = _normalise_result_pages(evidence_pages)
     return {
         **result,
         "vision_status": status,
         "vision_pages": unique_pages,
+        "vision_evidence_pages": unique_evidence_pages,
         "vision_model": str(profile.get("display_name") or profile.get("model_name") or ""),
         "vision_message": message,
     }
@@ -4213,11 +4476,6 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
         return _with_vision_execution(
             result, "not_located", [], vision_profile, "未定位到可靠候选页，未发送图片，保留文字结论。",
         )
-    prompt = storage.render_prompt_template(
-        app, "evaluate_all_visual_user", rule=json.dumps(_visual_rule_packet(rule), ensure_ascii=False, separators=(",", ":")),
-        document_name=document.get("original_name") or "投标文件", bidder_name=document.get("bidder_name") or document.get("original_name") or "投标人",
-        vision_trigger=trigger, vision_level=level, text_result=json.dumps(result, ensure_ascii=False, separators=(",", ":")),
-    )
     attempted_pages: list[int] = []
     responses: list[tuple[list[int], dict]] = []
 
@@ -4229,6 +4487,23 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
             page = int(image["page"])
             if page not in attempted_pages:
                 attempted_pages.append(page)
+        # 第二批必须看到第一批已识别事实，否则两批页面永远无法形成一个完整结论。
+        # 复用既有 text_result 占位符，兼容用户已保存的自定义提示词。
+        prior_context = dict(result)
+        if responses:
+            prior_context["prior_image_batches"] = [
+                {"pages": batch_pages, "result": parsed_value}
+                for batch_pages, parsed_value in responses
+            ]
+        prompt = storage.render_prompt_template(
+            app, "evaluate_all_visual_user",
+            rule=json.dumps(_visual_rule_packet(rule), ensure_ascii=False, separators=(",", ":")),
+            document_name=document.get("original_name") or "投标文件",
+            bidder_name=document.get("bidder_name") or document.get("original_name") or "投标人",
+            vision_trigger=trigger, vision_level=level,
+            text_result=json.dumps(prior_context, ensure_ascii=False, separators=(",", ":")),
+        )
+        prompt += "\n\n【系统输出与证据协议】\n" + storage.render_prompt_template(app, "evaluate_all_visual_contract")
         try:
             with _VISION_REQUEST_GATE:
                 parsed_value = _request_task_json(
@@ -4266,7 +4541,7 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
                 pages = followup
                 parsed = retry
                 responses.append((list(followup), retry))
-    parsed, conclusion_scope, applied_pages = _merge_usable_visual_responses(responses)
+    parsed, conclusion_scope, checked_pages, visual_evidence_pages = _merge_usable_visual_responses(responses)
     # 若所有图片都未覆盖目标材料，不能把“未看到”当成规则的负面证据，也不要把无效提示
     # 混入最终理由。原有文字结论和“需 OCR”提示会完整保留。
     if not parsed:
@@ -4283,8 +4558,15 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
     if has_conflict:
         # 图片层与文字层字段不一致时，图片结果只能作为待复核线索，不能覆盖原结论或建议分。
         conclusion_scope = "partial"
-    # 页码必须以系统实际发送的图片为准，模型返回的 page_hint 仅作内部参考，不能覆盖它。
-    page_hint = "P" + "、P".join(str(page) for page in applied_pages)
+    # 页面和报告分别展示检查页/证据页；业务页码提示优先使用真正形成证据的页。
+    all_evidence_pages = _normalise_result_pages(result.get("vision_evidence_pages"))
+    for page in _normalise_result_pages(result.get("ocr_evidence_pages")):
+        if page not in all_evidence_pages:
+            all_evidence_pages.append(page)
+    for page in visual_evidence_pages:
+        if page not in all_evidence_pages:
+            all_evidence_pages.append(page)
+    page_hint = "P" + "、P".join(str(page) for page in (visual_evidence_pages or checked_pages))
     visual_evidence = _clean_model_text(parsed.get("evidence"))[:1600]
     visual_reason = _clean_model_text(parsed.get("reason"))[:1200]
     conflict_text = _visual_field_conflict_text(parsed)
@@ -4312,18 +4594,23 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
         if status not in {"satisfied", "not_satisfied", "partial", "not_found", "manual"}:
             status = "manual"
         merged = _review_result_from_model({
-            "evidence": "\n".join(value for value in (result.get("evidence"), f"{prefix}{visual_evidence}" if visual_evidence else "") if value),
+            "evidence": _merge_supplement_text(result.get("evidence"), f"{prefix}{visual_evidence}" if visual_evidence else ""),
             "page_hint": page_hint,
-            "reason": "\n".join(value for value in (
-                (f"{prefix}{visual_reason}" if visual_reason else "", result.get("reason"))
-                if has_conflict else (result.get("reason"), f"{prefix}{visual_reason}" if visual_reason else "")
-            ) if value),
+            "reason": _merge_supplement_text(
+                result.get("reason"), f"{prefix}{visual_reason}" if visual_reason else "",
+                supplement_first=has_conflict,
+            ),
             "risk_level": parsed.get("risk_level") if conclusion_scope == "full" else result.get("risk_level"),
             "confidence": "low" if has_conflict else (parsed.get("confidence") if conclusion_scope == "full" else result.get("confidence")),
             "evidence_quality": "sufficient" if conclusion_scope == "full" and visual_evidence else result.get("evidence_quality"),
         }, rule["rule_id"], status)
+        merged = _append_evidence_layer(
+            merged, source="vision", summary=visual_evidence or visual_reason, checked_pages=checked_pages,
+            evidence_pages=visual_evidence_pages, model=str(vision_profile.get("display_name") or vision_profile.get("model_name") or ""),
+        )
         return _with_vision_execution(
             merged, vision_status, attempted_pages, vision_profile, vision_message,
+            evidence_pages=all_evidence_pages,
         )
     max_score = float(_rule_scoring(rule).get("max_score") or result.get("max_score") or 0)
     suggested = _bounded_model_score(parsed.get("suggested_score"), max_score) if max_score > 0 and conclusion_scope == "full" else None
@@ -4332,11 +4619,11 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
     merged = {
         **result,
         "suggested_score": suggested,
-        "evidence": "\n".join(value for value in (result.get("evidence"), f"{prefix}{visual_evidence}" if visual_evidence else "") if value)[:2000],
-        "reason": "\n".join(value for value in (
-            (f"{prefix}{visual_reason}" if visual_reason else "", result.get("reason"))
-            if has_conflict else (result.get("reason"), f"{prefix}{visual_reason}" if visual_reason else "")
-        ) if value)[:2000],
+        "evidence": _merge_supplement_text(result.get("evidence"), f"{prefix}{visual_evidence}" if visual_evidence else ""),
+        "reason": _merge_supplement_text(
+            result.get("reason"), f"{prefix}{visual_reason}" if visual_reason else "",
+            supplement_first=has_conflict,
+        ),
         "confidence": "low" if has_conflict else (
             _enum_text(parsed.get("confidence"), {"high", "medium", "low"}, result.get("confidence"))
             if conclusion_scope == "full" else result.get("confidence")
@@ -4345,8 +4632,13 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
         "automation_status": "needs_review",
         "review_reason": "图片与文字候选字段疑似冲突，需人工重点复核。" if has_conflict else "图片识别结果已补充，需人工复核。",
     }
+    merged = _append_evidence_layer(
+        merged, source="vision", summary=visual_evidence or visual_reason, checked_pages=checked_pages,
+        evidence_pages=visual_evidence_pages, model=str(vision_profile.get("display_name") or vision_profile.get("model_name") or ""),
+    )
     return _with_vision_execution(
         merged, vision_status, attempted_pages, vision_profile, vision_message,
+        evidence_pages=all_evidence_pages,
     )
 
 
@@ -4891,7 +5183,10 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
             image_strategy = _rule_image_strategy(rule)
             if ocr_enabled and image_strategy in {"ocr", "hybrid"}:
                 progress.message(f"正在腾讯 OCR 识别：{bidder_name} · {label}")
-                merged = _run_ocr_supplement(app, task, document, component, rule, merged, profile)
+                merged = _run_ocr_supplement(
+                    app, task, document, component, rule, merged, profile,
+                    locator_profile=vision_profile,
+                )
                 values["batch_count"] += 1
             skip_note = _multimodal_skip_note(image_strategy, merged, rule, trigger)
             if vision_profile and not skip_note and _should_run_multimodal_after_ocr(image_strategy, merged):

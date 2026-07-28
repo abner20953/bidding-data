@@ -106,6 +106,26 @@ def _project_display_name(project: dict) -> str:
     return f"{name} · {section}" if section else name
 
 
+def _report_compact_objective_ocr_text(value: object) -> str:
+    """兼容旧结果：打印客观分时只保留 OCR 结论摘要，不展示整页识别原文。"""
+    text = str(value or "")
+    text = re.sub(
+        r"【腾讯OCR原文·([^】]+)】[\s\S]*?(?=【(?:图片识别|腾讯OCR)|$)",
+        r"【腾讯OCR摘要·\1】已完成候选页文字识别；原始识别明细已省略。",
+        text,
+    )
+
+    def compact(match: re.Match) -> str:
+        body = re.sub(r"\s+", " ", match.group(2) or "").strip()
+        return f"【腾讯OCR摘要·{match.group(1)}】{body[:220]}{'…' if len(body) > 220 else ''}"
+
+    return re.sub(
+        r"【腾讯OCR·([^】]+)】([\s\S]*?)(?=【(?:图片识别|腾讯OCR)|$)",
+        compact,
+        text,
+    ).strip()
+
+
 def _report_presentation(documents: list[dict], rule_set: dict | None, rules: list[dict],
                          compare_task: dict | None, compare_pairs: list[dict], reviews: list[dict],
                          objective_scores: list[dict], subjective_scores: list[dict]) -> dict:
@@ -121,19 +141,30 @@ def _report_presentation(documents: list[dict], rule_set: dict | None, rules: li
         "source_text_brief": _report_compact_text(item.get("source_text"), 160),
     } for item in rules]
 
-    def present_result(item: dict, *, score: bool = False) -> dict:
+    def present_result(item: dict, *, score: bool = False, objective: bool = False) -> dict:
         value = dict(item)
         value["title_brief"] = _report_compact_text(value.get("title") or value.get("check_rule"), 72)
-        value["evidence_brief"] = _report_compact_text(_report_result_explanation(value.get("evidence"), value), 200)
-        value["reason_brief"] = _report_compact_text(_report_result_explanation(value.get("reason"), value), 200)
+        evidence = _report_compact_objective_ocr_text(value.get("evidence")) if objective else value.get("evidence")
+        reason = _report_compact_objective_ocr_text(value.get("reason")) if objective else value.get("reason")
+        layers = value.get("evidence_layers") if isinstance(value.get("evidence_layers"), list) else []
+        layer_summaries = [
+            _report_compact_text(layer.get("summary"), 140) for layer in layers
+            if isinstance(layer, dict) and str(layer.get("summary") or "").strip()
+        ]
+        # 新增的 OCR/图片补充通常位于原字符串尾部；报告优先呈现结构化补充，避免截断后丢失。
+        evidence_parts = layer_summaries[-2:] + [_report_result_explanation(evidence, value)]
+        value["evidence_brief"] = _report_compact_text("；".join(part for part in evidence_parts if part), 260)
+        value["reason_brief"] = _report_compact_text(_report_result_explanation(reason, value), 200)
         value["confidence_label"] = _report_label(_REPORT_CONFIDENCE_LABELS, value.get("confidence"))
         vision_status = str(value.get("vision_status") or "not_requested")
         if vision_status != "not_requested":
-            page_text = "、".join(f"P{page}" for page in value.get("vision_pages") or [])
+            checked_pages = "、".join(f"P{page}" for page in value.get("vision_pages") or [])
+            evidence_pages = "、".join(f"P{page}" for page in value.get("vision_evidence_pages") or [])
             value["vision_summary"] = " · ".join(part for part in (
                 _report_label(_REPORT_VISION_STATUS_LABELS, vision_status),
                 str(value.get("vision_model") or "").strip(),
-                page_text,
+                f"检查页：{checked_pages}" if checked_pages else "",
+                f"证据页：{evidence_pages}" if evidence_pages else "",
             ) if part and part != "-")
         else:
             value["vision_summary"] = ""
@@ -186,7 +217,7 @@ def _report_presentation(documents: list[dict], rule_set: dict | None, rules: li
         "rule_set_status_label": _report_label(_REPORT_RULE_SET_STATUS_LABELS, (rule_set or {}).get("status")),
         "rules": displayed_rules,
         "reviews": [present_result(item) for item in reviews],
-        "objective_scores": [present_result(item, score=True) for item in objective_scores],
+        "objective_scores": [present_result(item, score=True, objective=True) for item in objective_scores],
         "subjective_scores": [present_result(item, score=True) for item in subjective_scores],
         "cross_analysis": cross_analysis if isinstance(cross_analysis, dict) else None,
         "compare_summary_rows": compare_summary_rows,
@@ -271,6 +302,19 @@ def _worker_lock_path() -> Path:
     return storage.data_dir(current_app) / "worker.lock"
 
 
+def _worker_log_stream():
+    """保留小体积 worker 诊断日志；只留当前文件和一份备份，避免长期占用磁盘。"""
+    path = storage.data_dir(current_app) / "worker.log"
+    backup = storage.data_dir(current_app) / "worker.log.1"
+    try:
+        if path.exists() and path.stat().st_size >= 2 * 1024 * 1024:
+            backup.unlink(missing_ok=True)
+            path.replace(backup)
+        return path.open("a", encoding="utf-8", buffering=1)
+    except OSError:
+        return None
+
+
 def _start_worker_if_needed() -> None:
     has_queued = storage.has_queued_tasks(current_app)
     has_running = storage.has_running_tasks(current_app)
@@ -304,19 +348,23 @@ def _start_worker_if_needed() -> None:
         return
     env = os.environ.copy()
     env["EVALUATION_WORKBENCH_DATA_DIR"] = str(storage.data_dir(current_app))
+    log_stream = _worker_log_stream()
     try:
         subprocess.Popen(
             [sys.executable, "-m", "dashboard.evaluation_workbench.worker"],
             cwd=str(Path(current_app.root_path).parent),
             env=env,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=log_stream or subprocess.DEVNULL,
+            stderr=subprocess.STDOUT if log_stream else subprocess.DEVNULL,
             start_new_session=True,
         )
     except Exception:
         lock_path.unlink(missing_ok=True)
         raise
+    finally:
+        if log_stream:
+            log_stream.close()
 
 
 @evaluation_workbench_bp.route("/pingbiao")

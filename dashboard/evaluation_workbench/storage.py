@@ -140,7 +140,8 @@ def task_prompt_template_fingerprint(app, task_type: str) -> str | None:
             "evaluate_all", "evaluate_all_guidance", "evaluate_all_highlights", "evaluate_all_scope_profile", "evaluate_all_scope_profile_user",
             "evaluate_all_full_scan_user", "evaluate_all_review_user", "evaluate_all_objective_user",
             "evaluate_all_subjective_user", "evaluate_all_cross_bid_price_user", "evaluate_all_highlights_user",
-            "evaluate_all_visual_user", "evaluate_all_ocr_user", "evaluate_all_visual_locator_user",
+            "evaluate_all_visual_user", "evaluate_all_ocr_user", "evaluate_all_visual_contract", "evaluate_all_ocr_contract",
+            "evaluate_all_visual_locator_user",
             "evaluate_all_output_contract",
             "json_repair", "json_repair_user",
         },
@@ -158,6 +159,10 @@ def update_prompt_template(app, template_id: str, content: object) -> dict:
     missing = [name for name in PROMPT_TEMPLATES[template_id].get("placeholders", ()) if f"{{{{{name}}}}}" not in value]
     if missing:
         raise ValueError(f"提示词不能删除运行时变量：{', '.join('{{' + name + '}}' for name in missing)}")
+    required_literals = PROMPT_TEMPLATES[template_id].get("required_literals", ())
+    absent = [literal for literal in required_literals if literal not in value]
+    if absent:
+        raise ValueError(f"提示词不能删除系统结果字段或证据约束：{', '.join(absent)}")
     overrides = _prompt_template_overrides(app)
     overrides[template_id] = value
     with connection(app) as conn:
@@ -420,6 +425,8 @@ def init_database(app) -> None:
                 risk_level TEXT NOT NULL DEFAULT 'medium',
                 vision_status TEXT NOT NULL DEFAULT 'not_requested',
                 vision_pages_json TEXT NOT NULL DEFAULT '[]',
+                vision_evidence_pages_json TEXT NOT NULL DEFAULT '[]',
+                evidence_layers_json TEXT NOT NULL DEFAULT '[]',
                 vision_model TEXT NOT NULL DEFAULT '',
                 vision_message TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
@@ -449,6 +456,8 @@ def init_database(app) -> None:
                 confidence TEXT,
                 vision_status TEXT NOT NULL DEFAULT 'not_requested',
                 vision_pages_json TEXT NOT NULL DEFAULT '[]',
+                vision_evidence_pages_json TEXT NOT NULL DEFAULT '[]',
+                evidence_layers_json TEXT NOT NULL DEFAULT '[]',
                 vision_model TEXT NOT NULL DEFAULT '',
                 vision_message TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
@@ -495,6 +504,8 @@ def init_database(app) -> None:
         _ensure_column(conn, "ew_review_results", "review_reason", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "ew_review_results", "vision_status", "TEXT NOT NULL DEFAULT 'not_requested'")
         _ensure_column(conn, "ew_review_results", "vision_pages_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "ew_review_results", "vision_evidence_pages_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "ew_review_results", "evidence_layers_json", "TEXT NOT NULL DEFAULT '[]'")
         _ensure_column(conn, "ew_review_results", "vision_model", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "ew_review_results", "vision_message", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "ew_score_results", "effective_score", "REAL")
@@ -503,6 +514,8 @@ def init_database(app) -> None:
         _ensure_column(conn, "ew_score_results", "review_reason", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "ew_score_results", "vision_status", "TEXT NOT NULL DEFAULT 'not_requested'")
         _ensure_column(conn, "ew_score_results", "vision_pages_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "ew_score_results", "vision_evidence_pages_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "ew_score_results", "evidence_layers_json", "TEXT NOT NULL DEFAULT '[]'")
         _ensure_column(conn, "ew_score_results", "vision_model", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "ew_score_results", "vision_message", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "ew_rules", "source_type", "TEXT")
@@ -2242,11 +2255,11 @@ def create_review_run(app, project_id: str, task_id: str, profile_id: str | None
     return value
 
 
-def _vision_pages_json(item: dict) -> str:
-    """兼容内存中的页码列表和数据库复用结果中的 JSON 字段。"""
-    values = item.get("vision_pages")
+def _pages_json(item: dict, public_key: str, storage_key: str) -> str:
+    """兼容内存页码列表和数据库 JSON 字段，统一去重并过滤非法页码。"""
+    values = item.get(public_key)
     if values is None:
-        values = item.get("vision_pages_json")
+        values = item.get(storage_key)
     if isinstance(values, str):
         try:
             values = json.loads(values)
@@ -2262,17 +2275,64 @@ def _vision_pages_json(item: dict) -> str:
     return json.dumps(pages, ensure_ascii=False, separators=(",", ":"))
 
 
+def _vision_pages_json(item: dict) -> str:
+    return _pages_json(item, "vision_pages", "vision_pages_json")
+
+
+def _vision_evidence_pages_json(item: dict) -> str:
+    return _pages_json(item, "vision_evidence_pages", "vision_evidence_pages_json")
+
+
+def _evidence_layers_json(item: dict) -> str:
+    """持久化可展示的证据层；异常输入退化为空数组，不能影响评审主流程。"""
+    values = item.get("evidence_layers")
+    if values is None:
+        values = item.get("evidence_layers_json")
+    if isinstance(values, str):
+        try:
+            values = json.loads(values)
+        except (TypeError, json.JSONDecodeError):
+            values = []
+    if not isinstance(values, list):
+        values = []
+    normalized: list[dict] = []
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        source = str(value.get("source") or "").strip()
+        if source not in {"text", "tencent_ocr", "vision"}:
+            continue
+        checked = json.loads(_pages_json(value, "checked_pages", "checked_pages_json"))
+        evidence = json.loads(_pages_json(value, "evidence_pages", "evidence_pages_json"))
+        normalized.append({
+            "source": source,
+            "summary": str(value.get("summary") or "").strip()[:1600],
+            "checked_pages": checked,
+            "evidence_pages": evidence,
+            "service": str(value.get("service") or "").strip()[:160],
+            "model": str(value.get("model") or "").strip()[:160],
+        })
+    return json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+
+
 def _public_vision_result(value: dict) -> dict:
     """将内部 JSON 列转换为向后兼容的新增公开字段。"""
-    raw = value.pop("vision_pages_json", "[]")
+    def public_pages(storage_key: str) -> list[int]:
+        raw = value.pop(storage_key, "[]")
+        try:
+            pages = json.loads(raw or "[]")
+        except (TypeError, json.JSONDecodeError):
+            pages = []
+        return [int(page) for page in pages if isinstance(page, (int, float)) and not isinstance(page, bool) and int(page) > 0] if isinstance(pages, list) else []
+
+    value["vision_pages"] = public_pages("vision_pages_json")
+    value["vision_evidence_pages"] = public_pages("vision_evidence_pages_json")
+    raw_layers = value.pop("evidence_layers_json", "[]")
     try:
-        pages = json.loads(raw or "[]")
+        layers = json.loads(raw_layers or "[]")
     except (TypeError, json.JSONDecodeError):
-        pages = []
-    value["vision_pages"] = [
-        int(page) for page in pages
-        if isinstance(page, (int, float)) and not isinstance(page, bool) and int(page) > 0
-    ] if isinstance(pages, list) else []
+        layers = []
+    value["evidence_layers"] = layers if isinstance(layers, list) else []
     return value
 
 
@@ -2283,20 +2343,21 @@ def save_review_results(app, review_run_id: str, document_id: str, results: list
             conn.execute(
                 """INSERT INTO ew_review_results(review_result_id, review_run_id, document_id, rule_id, status, evidence, page_hint, reason, risk_level,
                    confidence, evidence_quality, automation_status, requires_review, review_reason,
-                   vision_status, vision_pages_json, vision_model, vision_message, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   vision_status, vision_pages_json, vision_evidence_pages_json, evidence_layers_json, vision_model, vision_message, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(review_run_id, document_id, rule_id) DO UPDATE SET
                 status=excluded.status, evidence=excluded.evidence, page_hint=excluded.page_hint, reason=excluded.reason,
                 risk_level=excluded.risk_level, confidence=excluded.confidence, evidence_quality=excluded.evidence_quality,
                 automation_status=excluded.automation_status, requires_review=excluded.requires_review,
                 review_reason=excluded.review_reason, vision_status=excluded.vision_status,
-                vision_pages_json=excluded.vision_pages_json, vision_model=excluded.vision_model,
+                vision_pages_json=excluded.vision_pages_json, vision_evidence_pages_json=excluded.vision_evidence_pages_json,
+                evidence_layers_json=excluded.evidence_layers_json, vision_model=excluded.vision_model,
                 vision_message=excluded.vision_message, final_status=NULL, confirmed_at=NULL, created_at=excluded.created_at""",
                 (str(uuid.uuid4()), review_run_id, document_id, item["rule_id"], item["status"], item.get("evidence", ""),
                  item.get("page_hint"), item.get("reason", ""), item.get("risk_level", "medium"), item.get("confidence", "medium"),
                  item.get("evidence_quality", "limited"), item.get("automation_status", "needs_review"),
                  1 if item.get("requires_review", True) else 0, item.get("review_reason", ""),
-                 item.get("vision_status", "not_requested"), _vision_pages_json(item),
+                 item.get("vision_status", "not_requested"), _vision_pages_json(item), _vision_evidence_pages_json(item), _evidence_layers_json(item),
                  item.get("vision_model", ""), item.get("vision_message", ""), timestamp),
             )
 
@@ -2396,6 +2457,7 @@ def reusable_evaluation_document_results(app, project_id: str, rule_set_id: str,
                     rows = conn.execute(
                         """SELECT rule_id, status, evidence, page_hint, reason, risk_level, confidence, evidence_quality,
                            automation_status, requires_review, review_reason, vision_status, vision_pages_json,
+                           vision_evidence_pages_json, evidence_layers_json,
                            vision_model, vision_message FROM ew_review_results
                            WHERE review_run_id=? AND document_id=?""",
                         (run["review_run_id"], document_id),
@@ -2411,6 +2473,7 @@ def reusable_evaluation_document_results(app, project_id: str, rule_set_id: str,
                     rows = conn.execute(
                         """SELECT rule_id, suggested_score, effective_score, max_score, evidence, reason, confidence,
                            automation_status, requires_review, review_reason, vision_status, vision_pages_json,
+                           vision_evidence_pages_json, evidence_layers_json,
                            vision_model, vision_message FROM ew_score_results
                            WHERE score_run_id=? AND document_id=?""",
                         (run["score_run_id"], document_id),
@@ -2474,19 +2537,20 @@ def save_score_results(app, score_run_id: str, document_id: str, results: list[d
             conn.execute(
                 """INSERT INTO ew_score_results(score_result_id, score_run_id, document_id, rule_id, suggested_score, final_score, effective_score, max_score,
                    evidence, reason, confidence, automation_status, requires_review, review_reason,
-                   vision_status, vision_pages_json, vision_model, vision_message, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   vision_status, vision_pages_json, vision_evidence_pages_json, evidence_layers_json, vision_model, vision_message, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(score_run_id, document_id, rule_id) DO UPDATE SET
                 suggested_score=excluded.suggested_score, final_score=excluded.final_score, effective_score=excluded.effective_score,
                 max_score=excluded.max_score, evidence=excluded.evidence, reason=excluded.reason, confidence=excluded.confidence,
                 automation_status=excluded.automation_status, requires_review=excluded.requires_review,
                 review_reason=excluded.review_reason, vision_status=excluded.vision_status,
-                vision_pages_json=excluded.vision_pages_json, vision_model=excluded.vision_model,
+                vision_pages_json=excluded.vision_pages_json, vision_evidence_pages_json=excluded.vision_evidence_pages_json,
+                evidence_layers_json=excluded.evidence_layers_json, vision_model=excluded.vision_model,
                 vision_message=excluded.vision_message, updated_at=excluded.updated_at""",
                 (str(uuid.uuid4()), score_run_id, document_id, item["rule_id"], item.get("suggested_score"), item.get("final_score"),
                  item.get("effective_score"), item.get("max_score"), item.get("evidence", ""), item.get("reason", ""), item.get("confidence"),
                  item.get("automation_status", "needs_review"), 1 if item.get("requires_review", True) else 0,
-                 item.get("review_reason", ""), item.get("vision_status", "not_requested"), _vision_pages_json(item),
+                 item.get("review_reason", ""), item.get("vision_status", "not_requested"), _vision_pages_json(item), _vision_evidence_pages_json(item), _evidence_layers_json(item),
                  item.get("vision_model", ""), item.get("vision_message", ""), timestamp, timestamp),
             )
 
