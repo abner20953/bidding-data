@@ -31,12 +31,19 @@ VISION_ENABLED_SETTING = "evaluation_workbench_vision_enabled"
 DEFAULT_VISION_MODEL_SETTING = "default_vision_model_profile_id"
 TENCENT_OCR_CONFIGURATION_SETTING = "evaluation_workbench_tencent_ocr_configuration"
 TENCENT_OCR_SERVICES = {
-    "basic": {"label": "通用印刷体识别", "action": "GeneralBasicOCR", "default_limit": 900},
-    "accurate": {"label": "通用文字识别（高精度版）", "action": "GeneralAccurateOCR", "default_limit": 900},
-    "table": {"label": "表格识别 V3", "action": "RecognizeTableAccurateOCR", "default_limit": 900},
-    "biz_license": {"label": "营业执照识别", "action": "BizLicenseOCR", "default_limit": 900},
-    # 高速版在腾讯云当前文档中属于老客户续费接口；仅在管理员实际测试通过后启用。
-    "fast": {"label": "通用印刷体识别（高速版）", "action": "GeneralFastOCR", "default_limit": 900, "legacy": True},
+    "accurate": {"label": "通用文字识别（高精度版）", "action": "GeneralAccurateOCR", "default_limit": 900,
+                 "usage": "证书编号、小字、复杂背景及关键字段"},
+    "basic": {"label": "通用印刷体识别", "action": "GeneralBasicOCR", "default_limit": 900,
+              "usage": "清晰的普通印刷文字"},
+    # 两个旧接口仍可能向老账号分别发放月度免费包；新账号默认关闭，实际可用时再启用。
+    "fast": {"label": "通用印刷体识别（高速版）", "action": "GeneralFastOCR", "default_limit": 900,
+             "legacy": True, "usage": "清晰且批量的普通印刷文字"},
+    "efficient": {"label": "通用印刷体识别（精简版）", "action": "GeneralEfficientOCR", "default_limit": 900,
+                  "legacy": True, "usage": "低强度、版面简单的清晰文字"},
+    "table": {"label": "表格识别 V3", "action": "RecognizeTableAccurateOCR", "default_limit": 900,
+              "usage": "评分表、参数表、明细表及清单"},
+    "biz_license": {"label": "营业执照识别", "action": "BizLicenseOCR", "default_limit": 900,
+                    "usage": "营业执照结构化字段"},
 }
 
 _SCORE_TOTAL_PATTERN = re.compile(r"(?:总计|共计|合计|最高(?:得)?|最多(?:得)?|满分(?:为)?)\s*(\d+(?:\.\d+)?)\s*分")
@@ -659,7 +666,7 @@ def _ocr_service_settings(value: object) -> dict:
     result = {}
     for service, meta in TENCENT_OCR_SERVICES.items():
         item = raw.get(service) if isinstance(raw.get(service), dict) else {}
-        default_enabled = service != "fast"
+        default_enabled = not meta.get("legacy")
         result[service] = {
             "enabled": bool(item.get("enabled", default_enabled)),
             "monthly_limit": max(1, min(1000, int(item.get("monthly_limit", meta["default_limit"]) or meta["default_limit"]))),
@@ -684,6 +691,7 @@ def ocr_configuration(app) -> dict:
         used = used_by_service.get(service, 0)
         values.append({
             "service": service, "label": meta["label"], "action": meta["action"],
+            "usage": meta.get("usage", ""),
             "legacy": bool(meta.get("legacy")), "enabled": setting["enabled"],
             "monthly_limit": setting["monthly_limit"], "used": used,
             "remaining": max(0, setting["monthly_limit"] - used),

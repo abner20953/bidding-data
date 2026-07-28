@@ -36,7 +36,9 @@ def _result_from_response(service: str, response: object) -> dict:
         payload = json.loads(response.to_json_string())
     except (AttributeError, TypeError, ValueError) as exc:
         raise ValueError("腾讯 OCR 未返回可解析结果") from exc
-    body = payload.get("Response") if isinstance(payload, dict) else {}
+    # SDK 的 response.to_json_string() 通常直接返回业务字段；API Explorer/HTTP 示例
+    # 才常见 {"Response": {...}} 外层。两种结构都必须兼容。
+    body = payload.get("Response") if isinstance(payload, dict) and isinstance(payload.get("Response"), dict) else payload
     body = body if isinstance(body, dict) else {}
     lines: list[str] = []
     confidences: list[float] = []
@@ -59,6 +61,7 @@ def _result_from_response(service: str, response: object) -> dict:
         "line_count": len(lines),
         "confidence": round(sum(confidences) / len(confidences), 1) if confidences else None,
         "request_id": str(body.get("RequestId") or ""),
+        "parser_version": 2,
     }
 
 

@@ -200,6 +200,21 @@ PROMPT_TEMPLATES["evaluate_all_ocr_user"] = _template(
     "已有文字结论：{{text_result}}\nOCR接口：{{ocr_service}}；已识别页：{{ocr_pages}}\nOCR文字：\n{{ocr_text}}",
     "rule", "document_name", "bidder_name", "text_result", "ocr_service", "ocr_pages", "ocr_text",
 )
+PROMPT_TEMPLATES["evaluate_all_visual_user"]["content"] += (
+    "\n\n找页与冲突约束：图片标签 Pn 是系统实际发送的 PDF 第 n 页；图片内部印刷页码、目录目标页码只可"
+    "作为可见字段，不得反向改写图片标签。若当前图片是目录、封面或与目标材料无关，应返回"
+    "coverage=not_covered，不得仅因它与已有文字结论描述不同而报告字段冲突。只有同一主体、同一材料、"
+    "同一字段在两层证据中明确出现不同值时才可报告 conflict。规则包含多张证书、多人证件或多个附件时，"
+    "必须逐项说明已覆盖与未覆盖材料；仅看清其中一部分时 conclusion_scope=partial、needs_more_image=true。"
+    "多模态结论可以积极给出最可能建议，但必须标明实际看过的页和仍缺的材料。"
+)
+PROMPT_TEMPLATES["evaluate_all_ocr_user"]["content"] += (
+    "\n\nOCR覆盖约束：逐页区分已识别材料，规则包含多张证书、多人证件或多个附件时，必须列明已覆盖项"
+    "和未覆盖项；只识别到其中一部分时 conclusion_scope=partial。Pn 始终表示系统实际 PDF 页序号，OCR"
+    "文字中的目录页码或页面自印页码只能作为内容，不能替代 Pn。证书编号、主体、日期、金额、型号等"
+    "关键字段必须逐字符引用，模糊字不得按常见格式补全。OCR无法判断签章真假、勾选状态、版式完整性或"
+    "图片是否对应目标材料时，保留文字事实并交给多模态图片核验；不要输出泛泛的“需人工查看全文”。"
+)
 PROMPT_TEMPLATES["evaluate_all_visual_locator_user"] = _template(
     "综合评审 · 扫描件图片找页",
     "仅在精细识图且文字流程未定位证据页时，先从低清联系表定位可能相关的页面。",

@@ -15,7 +15,7 @@ from werkzeug.datastructures import FileStorage
 from werkzeug.security import generate_password_hash
 
 from dashboard.blueprints.evaluation_workbench import create_worker_app, evaluation_workbench_bp
-from dashboard.evaluation_workbench import storage, worker
+from dashboard.evaluation_workbench import ocr_gateway, storage, worker
 from dashboard.evaluation_workbench.collusion_signals import build_cross_bid_analysis
 from dashboard.evaluation_workbench.prompt_context import (
     _anchors, build_rule_context, select_rule_chunk_evidence_map, select_rule_chunk_map, select_rule_chunks,
@@ -1203,6 +1203,43 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertTrue(usage)
         self.assertIsNone(storage.reserve_ocr_request(self.app, task, "basic"))
         storage.complete_ocr_request(self.app, usage, status="error", detail="模拟失败仍保守计入额度")
+        services = {item["service"]: item for item in configured["services"]}
+        self.assertIn("efficient", services)
+        self.assertFalse(services["fast"]["enabled"])
+        self.assertFalse(services["efficient"]["enabled"])
+
+    def test_tencent_ocr_sdk_top_level_response_is_parsed(self):
+        class FakeResponse:
+            @staticmethod
+            def to_json_string():
+                return json.dumps({
+                    "TextDetections": [
+                        {"DetectedText": "证书编号 A123", "Confidence": 98.5},
+                        {"DetectedText": "有效期 2028-12-31", "Confidence": 97},
+                    ],
+                    "RequestId": "request-1",
+                }, ensure_ascii=False)
+
+        result = ocr_gateway._result_from_response("accurate", FakeResponse())
+
+        self.assertEqual(result["line_count"], 2)
+        self.assertIn("证书编号 A123", result["text"])
+        self.assertEqual(result["request_id"], "request-1")
+        self.assertEqual(result["parser_version"], 2)
+
+    def test_tencent_ocr_api_explorer_nested_response_remains_compatible(self):
+        class FakeResponse:
+            @staticmethod
+            def to_json_string():
+                return json.dumps({"Response": {
+                    "TextDetections": [{"DetectedText": "投标人名称", "Confidence": 96}],
+                    "RequestId": "request-2",
+                }}, ensure_ascii=False)
+
+        result = ocr_gateway._result_from_response("basic", FakeResponse())
+
+        self.assertEqual(result["text"], "投标人名称")
+        self.assertEqual(result["request_id"], "request-2")
 
     def test_tencent_ocr_page_cache_is_page_and_service_scoped(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "扫描件候选页")
@@ -2099,7 +2136,17 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         legacy = {"evidence": result["evidence"], "reason": result["reason"]}
         self.assertEqual(worker._vision_page_candidates(document, {}, legacy), [224, 227])
 
-    def test_visual_page_candidates_prioritise_unresolved_visual_ranges_and_sample_across_bands(self):
+    def test_visual_page_candidates_complete_dense_repeated_attachment_sequence(self):
+        document = {"extension": ".pdf", "page_count": 300}
+        result = {"visual_page_candidates": [150, 152, 144, 146]}
+
+        candidates = worker._vision_page_candidates(document, {}, result)
+
+        self.assertEqual(candidates[:4], [150, 152, 144, 146])
+        self.assertIn(148, candidates[:6])
+        self.assertEqual(worker._complete_repeated_page_sequence([10, 40, 42], 300), [])
+
+    def test_visual_page_candidates_prioritise_structured_pdf_pages_over_printed_page_ranges(self):
         document = {"extension": ".pdf", "page_count": 300}
         result = {
             "visual_page_candidates": [224, 227],
@@ -2110,10 +2157,10 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             "reason": "文字层尚未确认扫描件外观。",
         }
         candidates = worker._vision_page_candidates(document, {}, result)
-        # 标准模式的四页预算会先跨两个待核验页段取样，不再被文字明细页耗尽。
-        self.assertEqual(candidates[:4], [195, 200, 197, 208])
-        self.assertLess(candidates.index(224), len(candidates))
-        self.assertLess(candidates.index(227), len(candidates))
+        # 结构化字段记录的是系统实际 PDF 页序号；理由中的区间可能是目录或印刷页码，只作后备。
+        self.assertEqual(candidates[:2], [224, 227])
+        self.assertLess(candidates.index(195), len(candidates))
+        self.assertLess(candidates.index(200), len(candidates))
 
     def test_score_results_preserve_structured_evidence_pages_for_visual_routing(self):
         payload = [{"rule_id": "cert", "scoring": {"max_score": 2}, "ocr_required": True}]
@@ -2129,7 +2176,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         followup = worker._visual_followup_pages(
             document, [224, 227], [224, 227], {"coverage": "not_covered", "requested_pages": []}, "standard",
         )
-        self.assertEqual(followup, [225, 228])
+        self.assertEqual(followup, [225, 228, 223, 226])
 
     def test_visual_followup_does_not_let_one_anchor_consume_all_requested_pages(self):
         document = {"page_count": 300}
@@ -2138,7 +2185,83 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             {"coverage": "not_covered", "requested_pages": [225, 226]}, "standard",
         )
         # 即使模型连续请求第一处附近页面，系统也给第二个独立证据锚点保留一页。
-        self.assertEqual(followup, [225, 228])
+        self.assertEqual(followup, [225, 228, 223, 226])
+
+    def test_standard_visual_strength_sends_three_parallel_material_pages_together(self):
+        document = {"document_id": "doc", "extension": ".pdf", "page_count": 30,
+                    "original_name": "投标.pdf", "bidder_name": "甲"}
+        rule = {"rule_id": "cert", "title": "三项认证证书", "check_rule": "逐项核验三项认证证书",
+                "vision_trigger": "required", "vision_level": "standard", "scoring": {"max_score": 3}}
+        original = {"rule_id": "cert", "suggested_score": 0, "max_score": 3, "evidence": "文字层待核验",
+                    "reason": "三项证书扫描件待核验", "confidence": "low",
+                    "visual_page_candidates": [10, 11, 12]}
+        sent_pages = []
+
+        def render_images(app, document, pages, level):
+            sent_pages.extend(pages)
+            return [{"page": page, "type": "image_url",
+                     "image_url": {"url": "data:image/jpeg;base64,AA==", "detail": "default"}} for page in pages]
+
+        with patch("dashboard.evaluation_workbench.worker._render_vision_images", side_effect=render_images), \
+             patch("dashboard.evaluation_workbench.worker._request_task_json", return_value={
+                 "coverage": "covered", "conclusion_scope": "full", "needs_more_image": False,
+                 "evidence": "P10、P11、P12分别可见三项证书", "reason": "三项材料均已覆盖",
+                 "suggested_score": 3, "confidence": "high",
+             }):
+            worker._run_visual_supplement(
+                self.app, {"task_id": "task"}, document, "objective", rule, original,
+                {"profile_id": "vision", "display_name": "图片模型"},
+            )
+
+        self.assertEqual(sent_pages, [10, 11, 12])
+
+    def test_standard_visual_strength_proactively_covers_remaining_candidate_branch(self):
+        document = {"document_id": "doc", "extension": ".pdf", "page_count": 30,
+                    "original_name": "投标.pdf", "bidder_name": "甲"}
+        rule = {"rule_id": "cert", "title": "多项认证证书", "check_rule": "逐项核验多项认证证书",
+                "vision_trigger": "required", "vision_level": "standard", "scoring": {"max_score": 5}}
+        original = {"rule_id": "cert", "suggested_score": 0, "max_score": 5, "evidence": "文字层待核验",
+                    "reason": "多项证书扫描件待核验", "confidence": "low",
+                    "visual_page_candidates": [10, 11, 12, 13, 14]}
+        sent_batches = []
+
+        def render_images(app, document, pages, level):
+            sent_batches.append(list(pages))
+            return [{"page": page, "type": "image_url",
+                     "image_url": {"url": "data:image/jpeg;base64,AA==", "detail": "default"}} for page in pages]
+
+        responses = [
+            {"coverage": "covered", "conclusion_scope": "full", "needs_more_image": False,
+             "evidence": "P10-P13可见四项材料", "reason": "首批材料清晰", "suggested_score": 4, "confidence": "high"},
+            {"coverage": "covered", "conclusion_scope": "partial", "needs_more_image": False,
+             "evidence": "P14可见第五项材料", "reason": "补充分支", "suggested_score": 1, "confidence": "high"},
+        ]
+        with patch("dashboard.evaluation_workbench.worker._render_vision_images", side_effect=render_images), \
+             patch("dashboard.evaluation_workbench.worker._request_task_json", side_effect=responses):
+            result = worker._run_visual_supplement(
+                self.app, {"task_id": "task"}, document, "objective", rule, original,
+                {"profile_id": "vision", "display_name": "图片模型"},
+            )
+
+        self.assertEqual(sent_batches, [[10, 11, 12, 13], [14]])
+        self.assertEqual(result["vision_pages"], [10, 11, 12, 13, 14])
+        self.assertIn("P14可见第五项材料", result["evidence"])
+
+    def test_rule_image_strategy_and_ocr_service_routing_are_generic(self):
+        self.assertEqual(worker._rule_image_strategy({
+            "title": "证书复印件", "check_rule": "核验证书编号及扫描件完整性",
+        }), "hybrid")
+        self.assertEqual(worker._rule_image_strategy({
+            "title": "签字盖章", "check_rule": "核验响应函是否签字并加盖公章",
+        }), "vision")
+        self.assertEqual(worker._rule_image_strategy({
+            "title": "声明函", "check_rule": "核对声明函填写内容与所属行业",
+        }), "ocr")
+        self.assertEqual(worker._ocr_service_candidates({"title": "资格证书"}, "standard")[0], "accurate")
+        self.assertEqual(worker._ocr_service_candidates({"title": "普通印刷文字"}, "standard")[:3],
+                         ["fast", "basic", "efficient"])
+        self.assertEqual(worker._ocr_service_candidates({"title": "普通印刷文字"}, "low")[:3],
+                         ["efficient", "fast", "basic"])
 
     def test_high_vision_locator_groups_cover_scanned_document_without_persistent_cache(self):
         groups = worker._vision_locator_groups(25)
@@ -2198,7 +2321,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(result["suggested_score"], 0)
         self.assertEqual(result["confidence"], "low")
         self.assertIn("P195 可见证书编号", result["evidence"])
-        self.assertEqual(result["vision_pages"], [195, 200, 197, 208])
+        self.assertEqual(result["vision_pages"], [195, 200, 197, 208, 196, 201, 198, 209])
 
     def test_visual_field_conflict_is_highlighted_without_overriding_score(self):
         document = {"document_id": "doc", "extension": ".pdf", "page_count": 300, "original_name": "投标.pdf", "bidder_name": "甲"}
