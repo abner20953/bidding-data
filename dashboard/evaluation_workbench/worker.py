@@ -3905,34 +3905,34 @@ def _with_scan_visual_candidates(results: list[dict], scan_index: dict | None, d
 
 
 def _visual_followup_pages(document: dict, primary: list[int], all_candidates: list[int], parsed: dict, level: str) -> list[int]:
-    """仅当首轮未覆盖时，优先均衡覆盖证据页段，再参考模型请求追加识别。"""
+    """仅当首轮未覆盖时，优先满足模型点名的相邻补页，再用既有候选补满名额。"""
     setting = _VISION_LEVEL_SETTINGS[level]
     remaining = setting["followup_pages"]
     if remaining <= 0:
         return []
     page_count = int(document.get("page_count") or 0)
     pages: list[int] = []
-    # 候选列表已按“图片缺口 + 跨页段取样”排好优先级；先使用尚未发送的候选，
-    # 避免模型的一组补页请求把所有名额集中到同一个证书或附件附近。
-    for page in all_candidates:
-        if page not in primary and page not in pages:
-            pages.append(page)
     if _visual_response_needs_more(parsed):
-        # 只有模型明确报告未覆盖时才扩展相邻页；若只是系统主动覆盖剩余明确候选，不额外猜页。
-        for offset in (1, -1):
-            for page in primary:
-                adjacent = page + offset
-                if 1 <= adjacent <= page_count and adjacent not in primary and adjacent not in pages:
-                    pages.append(adjacent)
+        # 模型已看过首轮图片，它明确请求的页码比静态候选更接近目标材料；
+        # 仍限制在已发页±2以内，避免模型凭空要求远处页面造成无边界调用。
         requested = parsed.get("requested_pages") if isinstance(parsed, dict) else []
         if isinstance(requested, list):
             for item in requested:
                 if isinstance(item, (int, float)) and not isinstance(item, bool):
                     page = int(item)
-                    # 仅接受与首轮图片相邻的请求，避免模型凭空要求远处页面造成无边界调用。
                     if 1 <= page <= page_count and page not in primary and any(abs(page - sent) <= 2 for sent in primary):
                         if page not in pages:
                             pages.append(page)
+        # 其次扩展首轮已发页的相邻页；若只是系统主动覆盖剩余明确候选，不额外猜页。
+        for offset in (1, -1):
+            for page in primary:
+                adjacent = page + offset
+                if 1 <= adjacent <= page_count and adjacent not in primary and adjacent not in pages:
+                    pages.append(adjacent)
+    # 候选列表已按“图片缺口 + 跨页段取样”排好优先级；最后用它补满剩余名额。
+    for page in all_candidates:
+        if page not in primary and page not in pages:
+            pages.append(page)
     return pages[:remaining]
 
 
@@ -3961,15 +3961,23 @@ def _visual_response_scope(parsed: dict) -> str:
     return "partial" if parsed.get("needs_more_image") is True else "full"
 
 
+def _is_field_value_conflict(item: object) -> bool:
+    """只有文字值与图片值都实际可见且明确不同，才算字段级冲突。
+    图片中未出现或看不清的字段属于覆盖不足（由 coverage/needs_more_image 表达），
+    模型习惯把它们标成 "no"/"mismatch" 或留空值，不能据此升级为冲突。"""
+    if not isinstance(item, dict):
+        return False
+    if str(item.get("match") or "").lower() not in {"conflict", "mismatch"}:
+        return False
+    return bool(_clean_model_text(item.get("text_value")) and _clean_model_text(item.get("image_value")))
+
+
 def _visual_response_conflict_level(parsed: dict) -> str:
     level = str(parsed.get("conflict_level") or "").lower()
     if level in {"possible", "material"}:
         return level
     checks = parsed.get("field_checks")
-    if isinstance(checks, list) and any(
-        isinstance(item, dict) and str(item.get("match") or "").lower() in {"conflict", "mismatch", "no"}
-        for item in checks
-    ):
+    if isinstance(checks, list) and any(_is_field_value_conflict(item) for item in checks):
         return "possible"
     return "none"
 
@@ -3977,11 +3985,11 @@ def _visual_response_conflict_level(parsed: dict) -> str:
 def _visual_field_conflict_text(parsed: dict) -> str:
     values: list[str] = []
     for item in parsed.get("field_checks") or []:
-        if not isinstance(item, dict) or str(item.get("match") or "").lower() not in {"conflict", "mismatch", "no"}:
+        if not _is_field_value_conflict(item):
             continue
         field = _clean_model_text(item.get("field")) or "关键字段"
-        text_value = _clean_model_text(item.get("text_value")) or "未提供"
-        image_value = _clean_model_text(item.get("image_value")) or "无法辨认"
+        text_value = _clean_model_text(item.get("text_value"))
+        image_value = _clean_model_text(item.get("image_value"))
         values.append(f"{field}：文字层“{text_value}”/ 图片“{image_value}”")
     return "；".join(values)[:800]
 
@@ -4265,7 +4273,10 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
             f"已识别{page_text or '候选页'}，但尚未覆盖可形成结论的关键材料，已保留文字结论。",
         )
     conflict_level = _visual_response_conflict_level(parsed)
-    has_conflict = conflict_level in {"possible", "material"}
+    # 仅 material（影响合规/计分的实质字段冲突）才升级为 conflict 状态并冻结结论；
+    # possible 是一般疑似线索，保留图片补充成果，仅以文字形式提示人工留意，
+    # 避免“正面确认”或“覆盖不足”被误标成冲突而丢弃图片层的工作。
+    has_conflict = conflict_level == "material"
     if has_conflict:
         # 图片层与文字层字段不一致时，图片结果只能作为待复核线索，不能覆盖原结论或建议分。
         conclusion_scope = "partial"
@@ -4289,6 +4300,8 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
             else "图片识别已补充可见事实；因材料覆盖不完整，原文字结论和建议分保持不变。"
         )
     )
+    if conflict_level == "possible":
+        vision_message += "另有一般疑似字段差异，已并列写入理由供人工留意。"
     if ocr_preceded:
         vision_message = f"已先完成腾讯 OCR 文字核验；{vision_message}"
     if component == "review":

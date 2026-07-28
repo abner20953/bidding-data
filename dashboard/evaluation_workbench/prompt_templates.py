@@ -178,8 +178,11 @@ PROMPT_TEMPLATES["evaluate_all_visual_user"] = _template(
     "needs_more_image=true；图片疑似包含但模糊不可读时返回 uncertain。不得因未覆盖作出不满足、不得分或负面"
     "风险结论。对已有文字结论中的主体名称、证书/许可/合同编号、型号、日期、金额、数量等关键字段，必须与"
     "图片逐字符核对后写入 field_checks：完全一致才用 match；任何字符不同用 conflict；看不清用 uncertain，"
-    "严禁凭相似字形、上下文或常见格式补全。存在可能影响合规性或计分的字段冲突时 conflict_level=material，"
-    "一般疑似冲突为 possible；没有冲突为 none。发现冲突时不得用图片值直接覆盖文字值或直接改分，只把两值"
+    "严禁凭相似字形、上下文或常见格式补全。字段在图片中未出现时不要写入 field_checks，它属于覆盖不足，"
+    "请用 coverage、needs_more_image 或 requested_pages 表达；材料未覆盖、需要补看页、图片模糊或附件不齐"
+    "都不是冲突，conflict_level 应保持 none，只有文字值与图片值均清晰可见且逐字符不同时才标 conflict。"
+    "存在可能影响合规性或计分的字段冲突时 conflict_level=material，一般疑似冲突为 possible；没有冲突为 none。"
+    "发现冲突时不得用图片值直接覆盖文字值或直接改分，只把两值"
     "并列作为人工复核线索。field_checks 最多12项，只列与当前规则结论或计分直接相关的字段。requested_pages 只能填写"
     "与本次传入页相邻、且确有必要补看的页码；无法判断时返回空数组。证据和理由不得复述规则。\n规则：{{rule}}\n投标文件：{{document_name}}；投标人：{{bidder_name}}\n"
     "图片识别条件：{{vision_trigger}}；识图强度：{{vision_level}}。\n已有文字结论（仅作辅助，不得照抄）：{{text_result}}",

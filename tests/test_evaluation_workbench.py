@@ -2240,14 +2240,14 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         )
         self.assertEqual(followup, [225, 228, 223, 226])
 
-    def test_visual_followup_does_not_let_one_anchor_consume_all_requested_pages(self):
+    def test_visual_followup_honours_model_requested_pages_before_static_candidates(self):
         document = {"page_count": 300}
         followup = worker._visual_followup_pages(
             document, [224, 227], [224, 227],
             {"coverage": "not_covered", "requested_pages": [225, 226]}, "standard",
         )
-        # 即使模型连续请求第一处附近页面，系统也给第二个独立证据锚点保留一页。
-        self.assertEqual(followup, [225, 228, 223, 226])
+        # 模型看过首轮图片后点名的相邻页优先级最高，其次才是首轮页的其他相邻页。
+        self.assertEqual(followup, [225, 226, 228, 223])
 
     def test_standard_visual_strength_sends_three_parallel_material_pages_together(self):
         document = {"document_id": "doc", "extension": ".pdf", "page_count": 30,
@@ -2517,8 +2517,37 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("重点复核", result["vision_message"])
         self.assertEqual(worker._visual_response_conflict_level({
             "conflict_level": "none",
-            "field_checks": [{"match": "conflict"}],
+            "field_checks": [{"match": "conflict", "text_value": "A123", "image_value": "A128"}],
         }), "possible")
+        # 字段未在图片出现（无图片值）属于覆盖不足，不升级为冲突。
+        self.assertEqual(worker._visual_response_conflict_level({
+            "conflict_level": "none",
+            "field_checks": [{"match": "no", "text_value": "A123"}, {"match": "mismatch", "text_value": "A123"}],
+        }), "none")
+
+    def test_possible_visual_suspicion_keeps_applied_status_instead_of_conflict(self):
+        # 模型自评 possible（一般疑似）时保留图片补充成果，只在提示中告知人工留意。
+        document = {"document_id": "doc", "extension": ".pdf", "page_count": 300, "original_name": "投标.pdf", "bidder_name": "甲"}
+        rule = {"rule_id": "cert", "title": "认证证书", "check_rule": "核验证书", "vision_trigger": "required",
+                "vision_level": "low", "scoring": {"max_score": 2}}
+        original = {"rule_id": "cert", "suggested_score": 1, "max_score": 2, "evidence": "文字层待核验",
+                    "reason": "文字层建议1分", "confidence": "low", "visual_page_candidates": [10]}
+        task = {"task_id": "task"}
+        profile = {"profile_id": "vision", "display_name": "图片模型"}
+        response = {
+            "coverage": "covered", "conclusion_scope": "full", "needs_more_image": False,
+            "conflict_level": "possible", "field_checks": [],
+            "suggested_score": 2, "confidence": "high", "evidence": "图片可见证书齐全", "reason": "编号拼写疑似笔误",
+        }
+        with patch("dashboard.evaluation_workbench.worker._render_vision_images", return_value=[{
+            "page": 10, "type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AA==", "detail": "low"},
+        }]), patch("dashboard.evaluation_workbench.worker._request_task_json", return_value=response):
+            result = worker._run_visual_supplement(self.app, task, document, "objective", rule, original, profile)
+
+        self.assertEqual(result["vision_status"], "applied")
+        self.assertEqual(result["suggested_score"], 2)
+        self.assertEqual(result["confidence"], "high")
+        self.assertIn("一般疑似字段差异", result["vision_message"])
 
     def test_review_normalisation_reconciles_positive_reason_and_negative_status(self):
         result = worker._normalise_review_results([{
