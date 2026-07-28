@@ -189,6 +189,31 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         usage = storage.project_token_usage(self.app, self.project["project_id"])
         self.assertEqual(usage["cache_hit_tokens"], 80)
 
+    def test_token_usage_breaks_down_vision_and_ocr_families(self):
+        task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        storage.record_model_call(self.app, task["task_id"], self.project["project_id"], "evaluate_all_review_batch", None,
+                                  usage={"total_tokens": 100})
+        storage.record_model_call(self.app, task["task_id"], self.project["project_id"], "evaluate_all_review_vision_1", None,
+                                  context_mode="vision_standard_1", usage={"total_tokens": 40})
+        storage.record_model_call(self.app, task["task_id"], self.project["project_id"], "evaluate_all_review_ocr", None,
+                                  context_mode="tencent_ocr", usage={"total_tokens": 20})
+        with storage.connection(self.app) as conn:
+            conn.execute(
+                "INSERT INTO ew_ocr_usage_ledger(usage_id, task_id, project_id, service, month_key, status, billed_units, created_at)"
+                " VALUES('u-test-1', ?, ?, 'basic', '2026-07', 'success', 2, ?)",
+                (task["task_id"], self.project["project_id"], storage.now_iso()),
+            )
+
+        usage = storage.project_token_usage(self.app, self.project["project_id"])
+
+        self.assertEqual(usage["families"]["text"]["call_count"], 1)
+        self.assertEqual(usage["families"]["vision"]["call_count"], 1)
+        self.assertEqual(usage["families"]["vision"]["total_tokens"], 40)
+        self.assertEqual(usage["families"]["tencent_ocr"]["call_count"], 1)
+        self.assertEqual(usage["ocr_requests"], 2)
+        # 汇总口径保持不变，新增字段不影响既有调用方。
+        self.assertEqual(usage["call_count"], 3)
+
     def test_document_evidence_manifest_is_reusable_without_storing_document_text(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案：稳定运行。")
         manifest = [{"chunk_id": "chunk_1", "start_page": 1, "end_page": 1, "chars": 12, "text_hash": "abc"}]
@@ -2197,7 +2222,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
                     "visual_page_candidates": [10, 11, 12]}
         sent_pages = []
 
-        def render_images(app, document, pages, level):
+        def render_images(app, document, pages, level, **_kwargs):
             sent_pages.extend(pages)
             return [{"page": page, "type": "image_url",
                      "image_url": {"url": "data:image/jpeg;base64,AA==", "detail": "default"}} for page in pages]
@@ -2225,13 +2250,14 @@ class EvaluationWorkbenchTests(unittest.TestCase):
                     "visual_page_candidates": [10, 11, 12, 13, 14]}
         sent_batches = []
 
-        def render_images(app, document, pages, level):
+        def render_images(app, document, pages, level, **_kwargs):
             sent_batches.append(list(pages))
             return [{"page": page, "type": "image_url",
                      "image_url": {"url": "data:image/jpeg;base64,AA==", "detail": "default"}} for page in pages]
 
         responses = [
-            {"coverage": "covered", "conclusion_scope": "full", "needs_more_image": False,
+            # 首轮结论不完整（partial）：系统仍应主动覆盖剩余候选分支。
+            {"coverage": "covered", "conclusion_scope": "partial", "needs_more_image": False,
              "evidence": "P10-P13可见四项材料", "reason": "首批材料清晰", "suggested_score": 4, "confidence": "high"},
             {"coverage": "covered", "conclusion_scope": "partial", "needs_more_image": False,
              "evidence": "P14可见第五项材料", "reason": "补充分支", "suggested_score": 1, "confidence": "high"},
@@ -2246,6 +2272,110 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(sent_batches, [[10, 11, 12, 13], [14]])
         self.assertEqual(result["vision_pages"], [10, 11, 12, 13, 14])
         self.assertIn("P14可见第五项材料", result["evidence"])
+
+    def test_visual_supplement_stops_early_when_first_batch_is_conclusive(self):
+        document = {"document_id": "doc", "extension": ".pdf", "page_count": 30,
+                    "original_name": "投标.pdf", "bidder_name": "甲"}
+        rule = {"rule_id": "cert", "title": "多项认证证书", "check_rule": "逐项核验多项认证证书",
+                "vision_trigger": "required", "vision_level": "standard", "scoring": {"max_score": 5}}
+        original = {"rule_id": "cert", "suggested_score": 0, "max_score": 5, "evidence": "文字层待核验",
+                    "reason": "多项证书扫描件待核验", "confidence": "low",
+                    "visual_page_candidates": [10, 11, 12, 13, 14]}
+        sent_batches = []
+
+        def render_images(app, document, pages, level, **_kwargs):
+            sent_batches.append(list(pages))
+            return [{"page": page, "type": "image_url",
+                     "image_url": {"url": "data:image/jpeg;base64,AA==", "detail": "default"}} for page in pages]
+
+        with patch("dashboard.evaluation_workbench.worker._render_vision_images", side_effect=render_images), \
+             patch("dashboard.evaluation_workbench.worker._request_task_json", return_value={
+                 "coverage": "covered", "conclusion_scope": "full", "needs_more_image": False,
+                 "conflict_level": "none",
+                 "evidence": "P10-P13可见全部五项材料", "reason": "材料齐备", "suggested_score": 5, "confidence": "high",
+             }):
+            result = worker._run_visual_supplement(
+                self.app, {"task_id": "task"}, document, "objective", rule, original,
+                {"profile_id": "vision", "display_name": "图片模型"},
+            )
+
+        # 首轮已完整覆盖且无冲突：不为剩余候选页消耗第二批多模态调用。
+        self.assertEqual(sent_batches, [[10, 11, 12, 13]])
+        self.assertEqual(result["vision_pages"], [10, 11, 12, 13])
+        self.assertEqual(result["vision_status"], "applied")
+        self.assertEqual(result["suggested_score"], 5)
+
+    def test_printed_page_offset_requires_consistent_footer_evidence(self):
+        page_texts = {page: f"这是第{page}页的正文内容。\n{page - 2}\n" for page in range(3, 31)}
+        self.assertEqual(worker._estimate_printed_page_offset(page_texts, 30), 2)
+        # 样本不足时不纠偏。
+        self.assertEqual(worker._estimate_printed_page_offset({3: "正文\n1\n", 4: "正文\n2\n"}, 30), 0)
+        # 报价表等数字密集页的零散数字不能形成多数一致的偏移。
+        scattered = {page: f"正文\n{page - (page % 5)}\n" for page in range(3, 31)}
+        self.assertEqual(worker._estimate_printed_page_offset(scattered, 30), 0)
+
+    def test_visual_candidates_correct_toc_printed_pages_to_pdf_order(self):
+        parsed = self.temp_dir / "parsed_toc.txt"
+        parts = []
+        for page in range(1, 31):
+            if page in {12, 13}:
+                parts.append(f"[第{page}页]\n\n")  # 纯扫描页：解析文本为空
+            else:
+                parts.append(f"[第{page}页]\n这是第{page}页的正文内容。\n{page - 2}\n")
+        parsed.write_text("".join(parts), encoding="utf-8")
+        document = {"document_id": "doc-toc", "extension": ".pdf", "page_count": 30,
+                    "parsed_path": str(parsed)}
+        result = {"evidence": "目录标注的证书扫描件（P10、P11）待 OCR 核验", "reason": ""}
+
+        candidates = worker._vision_page_candidates(document, {}, result)
+
+        # 目录语境的印刷页码 P10、P11 按估计偏移 +2 纠偏为 PDF 第 12、13 页。
+        self.assertEqual(candidates[:2], [12, 13])
+
+    def test_visual_candidates_append_scan_neighbor_after_text_anchor(self):
+        parsed = self.temp_dir / "parsed_anchor.txt"
+        parts = []
+        for page in range(1, 21):
+            text = "" if page == 11 else f"这是第{page}页的正文内容。" * 12
+            parts.append(f"[第{page}页]\n{text}\n")
+        parsed.write_text("".join(parts), encoding="utf-8")
+        document = {"document_id": "doc-anchor", "extension": ".pdf", "page_count": 20,
+                    "parsed_path": str(parsed)}
+        result = {"evidence": "证书明细（P10）", "reason": ""}
+
+        candidates = worker._vision_page_candidates(document, {}, result)
+
+        # 文字锚点 P10 之后紧跟其相邻纯扫描页 P11（证书附件本体）。
+        self.assertEqual(candidates[:2], [10, 11])
+
+    def test_multimodal_is_skipped_when_hybrid_rule_is_fully_covered_by_ocr(self):
+        rule = {"rule_id": "social", "title": "社保缴纳证明", "check_rule": "核验社保缴纳证明编号与所属单位",
+                "vision_trigger": "text_fallback", "vision_level": "standard"}
+        # 混合规则无纯视觉核验目标且 OCR 完整覆盖：跳过图片模型并说明原因。
+        note = worker._multimodal_skip_note("hybrid", {"vision_status": "ocr_applied"}, rule, "text_fallback")
+        self.assertIn("未再调用图片模型", note)
+        # 含签章等纯视觉核验目标的规则不能跳过。
+        visual_rule = {**rule, "check_rule": "核验社保缴纳证明是否加盖公章"}
+        self.assertEqual(worker._multimodal_skip_note("hybrid", {"vision_status": "ocr_applied"}, visual_rule, "text_fallback"), "")
+        # required 触发尊重人工显式要求，不跳过。
+        self.assertEqual(worker._multimodal_skip_note("hybrid", {"vision_status": "ocr_applied"}, rule, "required"), "")
+        # OCR 未完整覆盖时不跳过。
+        self.assertEqual(worker._multimodal_skip_note("hybrid", {"vision_status": "ocr_applied_partial"}, rule, "text_fallback"), "")
+        # 纯视觉规则不适用跳过逻辑。
+        self.assertEqual(worker._multimodal_skip_note("vision", {"vision_status": "ocr_applied"}, rule, "text_fallback"), "")
+
+    def test_pure_visual_rule_gets_legible_render_floor_on_low_level(self):
+        seal_rule = {"title": "签字盖章", "check_rule": "核验响应函是否签字并加盖公章"}
+        setting = worker._vision_render_setting(seal_rule, "low")
+        self.assertEqual(setting["scale"], 1.8)
+        self.assertEqual(setting["detail"], "default")
+        # 页数预算仍由人工选择的档位决定。
+        self.assertEqual(setting["max_pages"], 2)
+        # 混合规则不提高清晰度。
+        cert_rule = {"title": "认证证书", "check_rule": "核验证书编号及扫描件完整性"}
+        self.assertEqual(worker._vision_render_setting(cert_rule, "low")["scale"], 1.15)
+        # 已有高清档位不被改动。
+        self.assertEqual(worker._vision_render_setting(seal_rule, "high")["scale"], 2.0)
 
     def test_rule_image_strategy_and_ocr_service_routing_are_generic(self):
         self.assertEqual(worker._rule_image_strategy({
@@ -2303,7 +2433,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         task = {"task_id": "task"}
         profile = {"profile_id": "vision", "display_name": "图片模型"}
 
-        def render_images(app, document, pages, level):
+        def render_images(app, document, pages, level, **_kwargs):
             return [{"page": page, "type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AA==", "detail": "low"}} for page in pages]
 
         responses = [

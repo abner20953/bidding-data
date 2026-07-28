@@ -1383,7 +1383,34 @@ def project_token_usage(app, project_id: str) -> dict:
                SUM(CASE WHEN total_tokens IS NOT NULL THEN 1 ELSE 0 END) AS metered_calls
                FROM ew_model_calls WHERE project_id = ?""", (project_id,)
         ).fetchone()
-    return dict(row)
+        family_rows = conn.execute(
+            """SELECT CASE
+                        WHEN context_mode LIKE 'vision%' THEN 'vision'
+                        WHEN context_mode = 'tencent_ocr' THEN 'tencent_ocr'
+                        ELSE 'text' END AS family,
+                      COUNT(*) AS call_count,
+                      COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                      COALESCE(SUM(input_chars), 0) AS input_chars
+               FROM ew_model_calls WHERE project_id = ?
+               GROUP BY family""", (project_id,),
+        ).fetchall()
+        ocr_row = conn.execute(
+            "SELECT COALESCE(SUM(billed_units), 0) AS ocr_requests FROM ew_ocr_usage_ledger WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+    usage = dict(row)
+    # 图片识别与腾讯 OCR 的独立消耗分项，帮助用户评估识图预算；OCR 页数来自
+    # 额度台账，不计入模型 token。
+    usage["families"] = {
+        str(item["family"]): {
+            "call_count": item["call_count"],
+            "total_tokens": item["total_tokens"],
+            "input_chars": item["input_chars"],
+        }
+        for item in family_rows
+    }
+    usage["ocr_requests"] = int(ocr_row["ocr_requests"] or 0) if ocr_row else 0
+    return usage
 
 
 def task_recovery_summary(app, task_id: str) -> dict[str, int]:

@@ -2291,6 +2291,8 @@ _VISUAL_GAP_CONTEXT_PATTERN = re.compile(
     r"不可读|未呈现|空白页|页面不完整",
     re.IGNORECASE,
 )
+# 出现在“目录”语境中的页码是投标文件的印刷页码，不是 PDF 页序，需要先纠偏再使用。
+_VISUAL_TOC_CONTEXT_PATTERN = re.compile(r"目\s*录")
 
 
 def _sample_visual_page_range(start: int, end: int, page_count: int) -> list[int]:
@@ -2348,13 +2350,20 @@ def _round_robin_visual_pages(groups: list[list[int]]) -> list[int]:
     return pages
 
 
-def _visual_context_candidates(value: object, page_count: int) -> tuple[list[int], list[int]]:
+def _visual_context_candidates(value: object, page_count: int, printed_offset: int = 0) -> tuple[list[int], list[int]]:
     """按“图片属性 + 尚待核验”对证据语句排序，返回高优先和普通候选页。"""
     ranked: list[tuple[int, int, list[int]]] = []
     for order, clause in enumerate(re.split(r"[\n。；;]+", str(value or ""))):
         groups = _visual_page_groups(clause, page_count)
         if not groups:
             continue
+        if printed_offset and _VISUAL_TOC_CONTEXT_PATTERN.search(clause):
+            # 目录语境引用的是印刷页码；按解析文本估计的固定偏移换算为 PDF 页序，
+            # 换算出界时保留原值，避免静默丢弃候选。
+            groups = [
+                [page + printed_offset if 1 <= page + printed_offset <= page_count else page for page in group]
+                for group in groups
+            ]
         score = 0
         if _VISUAL_PAGE_CONTEXT_PATTERN.search(clause):
             score += 20
@@ -3699,6 +3708,27 @@ def _should_run_multimodal_after_ocr(strategy: str, result: dict) -> bool:
     return str(result.get("vision_status") or "") not in {"ocr_applied", "ocr_skipped_text_sufficient"}
 
 
+def _rule_has_visual_only_terms(rule: dict) -> bool:
+    """规则文本明确提及签章、外观、截图样式等纯视觉核验目标。"""
+    text = f"{rule.get('title') or ''}\n{rule.get('check_rule') or ''}\n{rule.get('source_text') or ''}"
+    return any(term in text for term in _VISION_FACT_TERMS)
+
+
+def _multimodal_skip_note(strategy: str, result: dict, rule: dict, trigger: str) -> str:
+    """混合规则无纯视觉核验目标且 OCR 已完整覆盖时，跳过本次多模态调用并说明原因。
+
+    仅对人工选择的 text_fallback 触发生效；required 规则尊重人工显式要求，
+    始终执行图片识别，不因 OCR 结果省略。
+    """
+    if strategy != "hybrid" or trigger != "text_fallback":
+        return ""
+    if str(result.get("vision_status") or "") != "ocr_applied":
+        return ""
+    if _rule_has_visual_only_terms(rule):
+        return ""
+    return "规则无签章、外观等纯视觉核验目标，腾讯 OCR 已完整覆盖文字事实，本次未再调用图片模型。"
+
+
 def _append_unique_pages(target: list[int], values: object, page_count: int) -> None:
     """将明确页码安全并入候选列表，绝不接受裸数字。"""
     if isinstance(values, (int, float)) and not isinstance(values, bool):
@@ -3724,6 +3754,72 @@ def _complete_repeated_page_sequence(pages: list[int], page_count: int) -> list[
     return [page for page in range(ordered[0], ordered[-1] + 1, step) if page not in ordered]
 
 
+# 按 PDF 页序缓存解析文本拆分结果；worker 为单进程按需运行，缓存只覆盖当前
+# 评审批次涉及的少量文件，任务结束随进程释放，不常驻内存。
+_PAGE_TEXTS_CACHE: dict[tuple[str, str], dict[int, str]] = {}
+_SCAN_PAGE_TEXT_LIMIT = 80
+# 页眉/页脚中独立成行的数字或“第N页”视为印刷页码；行内还有其他内容的数字不算。
+_PRINTED_FOOTER_PATTERN = re.compile(r"^[-—–_\s]*(\d{1,4})[-—–_\s]*$")
+_PRINTED_PAGE_LABEL_PATTERN = re.compile(r"^第\s*(\d{1,4})\s*页(?:\s*[/共]\s*\d+\s*页?)?$")
+
+
+def _document_page_texts(document: dict) -> dict[int, str]:
+    """按 PDF 页序拆分本地解析文本；只读解析缓存文件，不调用任何外部服务。"""
+    path = str(document.get("parsed_path") or "")
+    if not path or not Path(path).is_file():
+        return {}
+    key = (str(document.get("document_id") or ""), path)
+    cached = _PAGE_TEXTS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    text = Path(path).read_text(encoding="utf-8", errors="ignore")
+    parts = re.split(r"\[第(\d+)页\]\n", text)
+    pages: dict[int, str] = {}
+    for index in range(1, len(parts) - 1, 2):
+        pages[int(parts[index])] = parts[index + 1]
+    if len(_PAGE_TEXTS_CACHE) >= 12:
+        _PAGE_TEXTS_CACHE.clear()
+    _PAGE_TEXTS_CACHE[key] = pages
+    return pages
+
+
+def _estimate_printed_page_offset(page_texts: dict[int, str], page_count: int) -> int:
+    """用页眉/页脚的独立印刷页码估计“印刷页码→PDF页序”的固定偏移；证据不足不纠偏。"""
+    offsets: list[int] = []
+    for pdf_page in sorted(page_texts):
+        lines = [line.strip() for line in str(page_texts[pdf_page]).splitlines() if line.strip()]
+        if not lines:
+            continue
+        printed: int | None = None
+        # 页脚比页眉更常见，后检查页脚让其优先生效。
+        for line in [*lines[:2], *lines[-2:]]:
+            match = _PRINTED_PAGE_LABEL_PATTERN.match(line) or _PRINTED_FOOTER_PATTERN.match(line)
+            if match:
+                value = int(match.group(1))
+                if 1 <= value <= page_count:
+                    printed = value
+        if printed is not None:
+            offsets.append(pdf_page - printed)
+    if len(offsets) < 8:
+        return 0
+    frequencies: dict[int, int] = {}
+    for offset in offsets:
+        frequencies[offset] = frequencies.get(offset, 0) + 1
+    offset, count = max(frequencies.items(), key=lambda item: item[1])
+    # 报价表等数字密集页会产生零散伪命中；要求足够样本且明显多数一致才采信。
+    if offset == 0 or count < max(8, int(len(offsets) * 0.6)):
+        return 0
+    return offset
+
+
+def _scan_like_pages(page_texts: dict[int, str]) -> set[int]:
+    """解析文本几乎为空的页通常是纯扫描/图片页，正是图片识别的主要目标。"""
+    return {
+        page for page, text in page_texts.items()
+        if len(re.sub(r"\s+", "", str(text))) < _SCAN_PAGE_TEXT_LIMIT
+    }
+
+
 def _vision_page_candidates(document: dict, rule: dict, result: dict) -> list[int]:
     """结构化实际页优先，叙述中的目录页码只作后备，避免把印刷页码当PDF序号。"""
     if document.get("extension") != ".pdf" or not document.get("page_count"):
@@ -3740,19 +3836,35 @@ def _vision_page_candidates(document: dict, rule: dict, result: dict) -> list[in
     pages.extend(structured_pages)
     # 全文扫描可能命中同组附件的首尾页而漏掉中间纯扫描页；密集、稳定间隔序列可安全补齐。
     pages.extend(_complete_repeated_page_sequence(structured_pages, page_count))
+    # 本地解析文本提供两项零成本定位能力：估计“印刷页码→PDF页序”的固定偏移，
+    # 以及识别纯扫描/图片页。两者都只读解析缓存文件，不增加任何外部调用。
+    page_texts = _document_page_texts(document)
+    printed_offset = _estimate_printed_page_offset(page_texts, page_count) if page_texts else 0
     # “扫描件待核验”“签章不可读”等语句直接描述当前图片缺口，应先于纯文字明细页。
     for source in (result.get("evidence"), result.get("reason")):
-        priority_values, ordinary_values = _visual_context_candidates(source, page_count)
+        priority_values, ordinary_values = _visual_context_candidates(source, page_count, printed_offset)
         for page in priority_values:
             if page not in pages:
                 pages.append(page)
         for page in ordinary_values:
             if page not in ordinary:
                 ordinary.append(page)
-    for page in ordinary:
-        if page not in pages:
-            pages.append(page)
-    return pages
+    # 文字证据页（证书汇总表、签章说明页等）的相邻纯扫描页往往就是证书/签章附件
+    # 本体。每个锚点最多补一个相邻扫描页，并紧跟其锚点，不打乱既有优先级。
+    anchors = pages + [page for page in ordinary if page not in pages]
+    if page_texts:
+        scan_pages = _scan_like_pages(page_texts)
+        expanded: list[int] = []
+        for anchor in anchors:
+            expanded.append(anchor)
+            if anchor in scan_pages:
+                continue
+            for neighbor in (anchor + 1, anchor - 1, anchor + 2, anchor - 2):
+                if neighbor in scan_pages and 1 <= neighbor <= page_count and neighbor not in anchors and neighbor not in expanded:
+                    expanded.append(neighbor)
+                    break
+        return expanded
+    return anchors
 
 
 def _scan_visual_page_candidates(scan_index: dict | None, rule_id: str, page_count: int) -> list[int]:
@@ -3901,8 +4013,22 @@ def _merge_usable_visual_responses(responses: list[tuple[list[int], dict]]) -> t
     return merged, "full" if full else "partial", applied_pages or selected_pages
 
 
-def _render_vision_images(app, document: dict, pages: list[int], level: str) -> list[dict]:
-    setting = _VISION_LEVEL_SETTINGS[level]
+def _vision_render_setting(rule: dict, level: str) -> dict:
+    """纯视觉规则（签章/外观类）即使用户选择快速档，也保证足以辨认签章的清晰度。
+
+    页数预算仍由人工选择的档位决定；这里只提高单页渲染质量，不增加页数。
+    """
+    setting = dict(_VISION_LEVEL_SETTINGS[level])
+    if _rule_image_strategy(rule) == "vision" and float(setting["scale"]) < 1.8:
+        setting["scale"] = 1.8
+        setting["quality"] = max(int(setting["quality"]), 80)
+        if setting["detail"] == "low":
+            setting["detail"] = "default"
+    return setting
+
+
+def _render_vision_images(app, document: dict, pages: list[int], level: str, setting: dict | None = None) -> list[dict]:
+    setting = dict(setting or _VISION_LEVEL_SETTINGS[level])
     source = storage.document_path(app, document)
     images: list[dict] = []
     with fitz.open(source) as pdf:
@@ -4075,7 +4201,7 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
     responses: list[tuple[list[int], dict]] = []
 
     def request_pages(selected_pages: list[int], *, attempt: int) -> dict | None:
-        images = _render_vision_images(app, document, selected_pages, level)
+        images = _render_vision_images(app, document, selected_pages, level, setting=_vision_render_setting(rule, level))
         if not images:
             return None
         for image in images:
@@ -4101,9 +4227,17 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
             result, "failed", attempted_pages, vision_profile, "图片模型调用或结果解析失败，已保留文字结论。",
         )
     responses.append((list(pages), parsed))
-    # 只要仍有系统明确定位的候选页，就主动覆盖下一批；不能完全依赖模型在首轮自行意识到遗漏。
+    # 首轮已完整覆盖且无冲突时提前结束，不再为剩余候选页消耗多模态额度；
+    # 结论不完整（partial/none）或模型主动报告未覆盖时，仍主动覆盖下一批。
     # 每批保持较少图片，避免把标准档的全部预算一次压给多模态服务造成超载。
-    if _visual_response_needs_more(parsed) or any(page not in pages for page in all_pages):
+    first_batch_conclusive = (
+        _visual_response_coverage(parsed) == "covered"
+        and _visual_response_scope(parsed) == "full"
+        and _visual_response_conflict_level(parsed) == "none"
+    )
+    if _visual_response_needs_more(parsed) or (
+        any(page not in pages for page in all_pages) and not first_batch_conclusive
+    ):
         followup = _visual_followup_pages(document, pages, all_pages, parsed, level)
         if followup:
             retry = request_pages(followup, attempt=2)
@@ -4733,10 +4867,18 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
                 progress.message(f"正在腾讯 OCR 识别：{bidder_name} · {label}")
                 merged = _run_ocr_supplement(app, task, document, component, rule, merged, profile)
                 values["batch_count"] += 1
-            if vision_profile and _should_run_multimodal_after_ocr(image_strategy, merged):
+            skip_note = _multimodal_skip_note(image_strategy, merged, rule, trigger)
+            if vision_profile and not skip_note and _should_run_multimodal_after_ocr(image_strategy, merged):
                 progress.message(f"正在图片识别：{bidder_name} · {label}")
                 merged = _run_visual_supplement(app, task, document, component, rule, merged, vision_profile)
                 values["batch_count"] += 1
+            elif skip_note:
+                # 保留 OCR 已采纳的状态与页码，仅补充说明未调用图片模型的原因。
+                merged = _with_vision_execution(
+                    merged, str(merged.get("vision_status") or "ocr_applied"),
+                    [page for page in merged.get("vision_pages") or []],
+                    {"display_name": merged.get("vision_model") or ""}, skip_note,
+                )
             elif not ocr_enabled:
                 # 保持旧行为：未启用腾讯 OCR 且没有多模态模型时，显式说明未执行图片检查。
                 merged = _with_vision_execution(merged, "unavailable", [], {}, "本次未获得可用的多模态模型，未执行图片识别。")
