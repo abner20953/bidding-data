@@ -392,16 +392,16 @@ def _assess_compare_signals_with_ai(app, task: dict, analysis: dict) -> None:
         """只接收当前批次内、字段完整的结论，模型漏回的 ID 留给局部重试。"""
         allowed_ids = {item["signal_id"] for item in batch}
         for value in values if isinstance(values, list) else []:
-            if not isinstance(value, dict) or value.get("signal_id") not in allowed_ids:
+            if not isinstance(value, dict) or not isinstance(value.get("signal_id"), str) or value.get("signal_id") not in allowed_ids:
                 continue
             decision = value.get("decision")
-            if decision not in {"confirmed_clue", "suspected_clue", "excluded", "unassessable"}:
+            if not isinstance(decision, str) or decision not in {"confirmed_clue", "suspected_clue", "excluded", "unassessable"}:
                 decision = "unassessable"
             signal = by_id[value["signal_id"]]
             signal["ai_assessment"] = {
                 "decision": decision,
-                "risk_level": value.get("risk_level") if value.get("risk_level") in {"low", "medium", "high"} else "medium",
-                "confidence": value.get("confidence") if value.get("confidence") in {"high", "medium", "low"} else "medium",
+                "risk_level": _enum_text(value.get("risk_level"), {"low", "medium", "high"}, "medium"),
+                "confidence": _enum_text(value.get("confidence"), {"high", "medium", "low"}, "medium"),
                 "reason": str(value.get("reason", ""))[:1000],
                 "suggested_check": str(value.get("suggested_check", ""))[:700],
             }
@@ -1720,7 +1720,7 @@ def _finalise_rule_operations_pass(app, task: dict, profile: dict, system_prompt
         allowed_drop_reasons = {"duplicate", "not_file_verifiable", "procedural", "umbrella"}
 
         for operation in operations["rewrites"]:
-            if not isinstance(operation, dict) or operation.get("reason") not in {"partial_boundary", "umbrella"}:
+            if not isinstance(operation, dict) or not isinstance(operation.get("reason"), str) or operation.get("reason") not in {"partial_boundary", "umbrella"}:
                 continue
             index = id_to_index.get(str(operation.get("rule_id") or ""))
             if index is None or rules[index].get("category") in {"objective", "subjective"}:
@@ -1779,7 +1779,7 @@ def _finalise_rule_operations_pass(app, task: dict, profile: dict, system_prompt
             merged_groups += 1
 
         for operation in operations["drops"]:
-            if not isinstance(operation, dict) or operation.get("reason") not in allowed_drop_reasons:
+            if not isinstance(operation, dict) or not isinstance(operation.get("reason"), str) or operation.get("reason") not in allowed_drop_reasons:
                 continue
             index = id_to_index.get(str(operation.get("rule_id") or ""))
             if index is None or index in used_merge_indexes or rules[index].get("category") in {"objective", "subjective"}:
@@ -1955,6 +1955,7 @@ def _extract_rules(app, task: dict) -> dict:
             storage.update_task(app, task["task_id"], message=f"部分资格条款补充未完成：{exc}")
     mapped_candidates = [
         item for item in raw_rules if isinstance(item, dict) and str(item.get("title", "")).strip()
+        and isinstance(item.get("category"), str)
         and item.get("category") in {"qualification", "compliance", "substantive", "rejection", "objective", "subjective"}
     ]
     mapped_candidates = _filter_rules_for_package(mapped_candidates, package_number)
@@ -2146,10 +2147,10 @@ def _normalise_review_results(output: object, rules: list[dict]) -> list[dict]:
     normalized = []
     for item in output if isinstance(output, list) else []:
         rule_id = item.get("rule_id") if isinstance(item, dict) else None
-        if rule_id not in by_id:
+        if not isinstance(rule_id, str) or rule_id not in by_id:
             continue
         status = item.get("status")
-        if status not in {"satisfied", "not_satisfied", "partial", "not_found", "manual", "ocr_required"}:
+        if not isinstance(status, str) or status not in {"satisfied", "not_satisfied", "partial", "not_found", "manual", "ocr_required"}:
             status = "manual"
         original_status = status
         if _status_conflicts_with_positive_reason(status, item.get("reason")):
@@ -2182,9 +2183,12 @@ def _normalise_review_results(output: object, rules: list[dict]) -> list[dict]:
 
 
 def _review_result_from_model(item: dict, rule_id: str, status: str) -> dict:
-    confidence = item.get("confidence") if item.get("confidence") in {"high", "medium", "low"} else "medium"
-    evidence_quality = item.get("evidence_quality") if item.get("evidence_quality") in {"sufficient", "limited", "missing"} else ("sufficient" if str(item.get("evidence", "")).strip() else "missing")
-    risk = item.get("risk_level") if item.get("risk_level") in {"low", "medium", "high"} else "medium"
+    confidence = _enum_text(item.get("confidence"), {"high", "medium", "low"}, "medium")
+    evidence_quality = _enum_text(
+        item.get("evidence_quality"), {"sufficient", "limited", "missing"},
+        "sufficient" if str(item.get("evidence", "")).strip() else "missing",
+    )
+    risk = _enum_text(item.get("risk_level"), {"low", "medium", "high"}, "medium")
     # 仅对正向、低风险、证据充分的结论自动进入批量确认；否定/废标类风险不自动放行。
     if status == "ocr_required":
         # OCR 缺失仅说明当前无法读取图像证据，并非投标文件本身存在风险。
@@ -2223,6 +2227,12 @@ def _clean_model_text(value: object) -> str:
     text = str(value or "")
     text = re.sub(r"\bcontext_unmatched\s*=\s*true\b[，,。；;：:\s]*", "", text, flags=re.IGNORECASE)
     return text.strip()
+
+
+def _enum_text(value: object, allowed: set[str], default: str) -> str:
+    """模型偶尔会把枚举字段返回成数组或对象；非字符串一律回落默认值，
+    避免 ``value in {...}`` 成员判断对 list/dict 抛出 ``unhashable type`` 而中断整份评审。"""
+    return value if isinstance(value, str) and value in allowed else default
 
 
 # 页码只能从明确的页码表达取得，绝不能把“2 项”“3 分”“2029 年”等普通数字当成页码。
@@ -2485,7 +2495,7 @@ def _score_result_from_model(rule_id: str, suggested: float | None, max_score: f
                              *, force_needs_ocr: bool = False) -> dict:
     if force_needs_ocr and raw.get("needs_ocr") is not True:
         raw = {**raw, "needs_ocr": True}
-    confidence = raw.get("confidence") if raw.get("confidence") in {"high", "medium", "low"} else "medium"
+    confidence = _enum_text(raw.get("confidence"), {"high", "medium", "low"}, "medium")
     needs_ocr = raw.get("needs_ocr") is True
     evidence = _score_evidence_text(raw)
     has_evidence = bool(evidence)
@@ -2794,12 +2804,12 @@ def _normalise_scan_findings(output: object, allowed_ids: set[str], chunk: dict)
             evidence_priority = raw.get("evidence_priority") or raw.get("priority")
         else:
             continue
-        if rule_id not in allowed_ids:
+        if not isinstance(rule_id, str) or rule_id not in allowed_ids:
             continue
-        if status not in {"supports", "contradicts", "partial", "suspected"}:
+        if not isinstance(status, str) or status not in {"supports", "contradicts", "partial", "suspected"}:
             status = {"support": "supports", "contradict": "contradicts", "suspect": "suspected"}.get(str(status).lower(), "suspected")
-        confidence = confidence if confidence in {"high", "medium", "low"} else "medium"
-        evidence_priority = evidence_priority if evidence_priority in {"high", "medium", "low"} else "medium"
+        confidence = _enum_text(confidence, {"high", "medium", "low"}, "medium")
+        evidence_priority = _enum_text(evidence_priority, {"high", "medium", "low"}, "medium")
         findings.append({
             "rule_id": rule_id,
             "chunk_id": chunk["chunk_id"],
@@ -3677,7 +3687,7 @@ def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: d
         merged = {**result, "suggested_score": suggested,
                   "evidence": "\n".join(value for value in (result.get("evidence"), f"{prefix}{evidence}" if evidence else "") if value)[:2000],
                   "reason": "\n".join(value for value in (result.get("reason"), f"{prefix}{reason}" if reason else "") if value)[:2000],
-                  "confidence": parsed.get("confidence") if scope == "full" and parsed.get("confidence") in {"high", "medium", "low"} else result.get("confidence"),
+                  "confidence": _enum_text(parsed.get("confidence"), {"high", "medium", "low"}, result.get("confidence")) if scope == "full" else result.get("confidence"),
                   "requires_review": True, "automation_status": "needs_review", "review_reason": "腾讯 OCR 结果已补充，需人工复核。"}
     return _with_vision_execution(merged, status, pages, {"display_name": service_labels},
                                   f"{service_labels} 已识别候选页并{'采纳到规则结论' if scope == 'full' else '补充部分文字事实'}。")
@@ -4312,8 +4322,8 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
             if has_conflict else (result.get("reason"), f"{prefix}{visual_reason}" if visual_reason else "")
         ) if value)[:2000],
         "confidence": "low" if has_conflict else (
-            parsed.get("confidence") if conclusion_scope == "full" and parsed.get("confidence") in {"high", "medium", "low"}
-            else result.get("confidence")
+            _enum_text(parsed.get("confidence"), {"high", "medium", "low"}, result.get("confidence"))
+            if conclusion_scope == "full" else result.get("confidence")
         ),
         "requires_review": True,
         "automation_status": "needs_review",

@@ -253,6 +253,43 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         self.assertEqual(findings[0]["observation"], "bidder_design")
 
+    def test_model_enum_fields_returned_as_lists_do_not_crash_normalisers(self):
+        # MiniMax 偶尔把枚举/ID 字段返回成数组；必须静默回落而不是以
+        # "unhashable type: 'list'" 中断整份评审任务。
+        chunk = {"chunk_id": "chunk_1", "start_page": 7, "end_page": 7}
+        findings = worker._normalise_scan_findings(
+            [
+                [["rule-1"], "7", "证据", "supports"],  # rule_id 为数组：整条跳过
+                ["rule-1", "7", "证据", ["supports"], ["high"], "bidder_text"],
+                {"rule_id": "rule-1", "status": ["partial"], "confidence": ["high"],
+                 "evidence_priority": {"level": "high"}, "evidence": "证据"},
+            ],
+            {"rule-1"}, chunk,
+        )
+        self.assertEqual(len(findings), 2)
+        self.assertEqual(findings[0]["tentative_status"], "suspected")
+        self.assertEqual(findings[0]["confidence"], "medium")
+        self.assertEqual(findings[0]["evidence_priority"], "medium")
+        self.assertEqual(findings[1]["tentative_status"], "suspected")
+
+        rules = [{"rule_id": "procedure", "check_mode": "auto"}]
+        results = worker._normalise_review_results(
+            [
+                {"rule_id": ["procedure"], "status": "satisfied"},  # rule_id 为数组：跳过
+                {"rule_id": "procedure", "status": ["satisfied"], "confidence": ["high"],
+                 "risk_level": {"level": "low"}, "evidence_quality": ["sufficient"],
+                 "reason": "文本已核验"},
+            ],
+            rules,
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "manual")
+        self.assertEqual(results[0]["confidence"], "medium")
+        self.assertEqual(results[0]["risk_level"], "medium")
+
+        score = worker._score_result_from_model("rule-1", 1.0, 2.0, {"confidence": ["high"], "evidence": "证据"})
+        self.assertEqual(score["confidence"], "medium")
+
     def test_subjective_full_scan_catalog_keeps_long_scoring_rule(self):
         rules = [{
             "rule_id": "subjective-1", "category": "subjective", "title": "系统功能模块设计",
