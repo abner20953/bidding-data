@@ -2224,6 +2224,20 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertLess(candidates.index(195), len(candidates))
         self.assertLess(candidates.index(200), len(candidates))
 
+    def test_visual_page_candidates_ignore_ocr_prefix_page_lists(self):
+        # 【腾讯OCR·…·P…】前缀里的页码是“已处理页清单”，不是材料所在页；
+        # 只有正文叙述中的命中页（如“证书在P144明确”）才应进入候选。
+        document = {"extension": ".pdf", "page_count": 600}
+        result = {
+            "evidence": (
+                "【腾讯OCR·通用文字识别（高精度版）·P118、P200、P201、P360、P483、P144】"
+                "质量管理体系证书编号、有效期、主体、颁证机构已在P144文字层明确；"
+                "CCID/CCRC在OCR覆盖页未见。"
+            ),
+            "reason": "证书真实性与平台截图待核验。",
+        }
+        self.assertEqual(worker._vision_page_candidates(document, {}, result), [144])
+
     def test_score_results_preserve_structured_evidence_pages_for_visual_routing(self):
         payload = [{"rule_id": "cert", "scoring": {"max_score": 2}, "ocr_required": True}]
         output = [{"rule_id": "cert", "suggested_score": 2, "needs_ocr": True, "evidence_items": [

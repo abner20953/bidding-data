@@ -3851,8 +3851,11 @@ def _vision_page_candidates(document: dict, rule: dict, result: dict) -> list[in
     page_texts = _document_page_texts(document)
     printed_offset = _estimate_printed_page_offset(page_texts, page_count) if page_texts else 0
     # “扫描件待核验”“签章不可读”等语句直接描述当前图片缺口，应先于纯文字明细页。
+    # 先剥掉【腾讯OCR·…·P…】【图片识别·…·P…】等系统前缀：其中的页码是“已处理页清单”，
+    # 不是“材料所在页”，混进候选会把 OCR 实际命中页（如正文“证书在P144明确”）挤出预算。
     for source in (result.get("evidence"), result.get("reason")):
-        priority_values, ordinary_values = _visual_context_candidates(source, page_count, printed_offset)
+        clean_source = re.sub(r"【(?:腾讯OCR|图片识别)[^】]*】", " ", str(source or ""))
+        priority_values, ordinary_values = _visual_context_candidates(clean_source, page_count, printed_offset)
         for page in priority_values:
             if page not in pages:
                 pages.append(page)
