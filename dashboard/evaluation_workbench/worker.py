@@ -3178,6 +3178,139 @@ def _scan_strategy(rules: list[dict]) -> str:
     return "point"
 
 
+_EVIDENCE_PACK_VERSION = "shadow-v1"
+
+
+def _shadow_rule_fingerprint(rule: dict) -> str:
+    """规则内容变化时让未来页级复用自然失效；当前影子包不参与任何决策。"""
+    value = {
+        "rule_id": rule.get("rule_id"), "title": rule.get("title"), "check_rule": rule.get("check_rule"),
+        "source_text": rule.get("source_text"), "scoring": _rule_scoring(rule),
+        "execution": storage.rule_execution_meta(rule),
+    }
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _shadow_material_checklist(rule: dict) -> list[dict]:
+    """从既有规则结构生成观察清单，不让模型自由生成材料需求并反向影响评审。"""
+    scoring = _rule_scoring(rule)
+    items = scoring.get("items") if isinstance(scoring.get("items"), list) else []
+    values: list[dict] = []
+    for index, item in enumerate(items, start=1):
+        if not isinstance(item, dict) or not str(item.get("name") or "").strip():
+            continue
+        values.append({
+            "material_id": f"score_item_{index}", "name": str(item.get("name") or "").strip()[:240],
+            "criterion": str(item.get("criterion") or "").strip()[:500], "status": "unassessed",
+        })
+    if not values:
+        values.append({
+            "material_id": "rule_requirement", "name": str(rule.get("check_rule") or rule.get("title") or "规则要求")[:500],
+            "criterion": "", "status": "unassessed",
+        })
+    return values[:24]
+
+
+def _shadow_pages(values: object) -> list[int]:
+    if not isinstance(values, list):
+        return []
+    pages: list[int] = []
+    for value in values:
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and int(value) > 0:
+            page = int(value)
+            if page not in pages:
+                pages.append(page)
+    return pages
+
+
+def _build_shadow_evidence_pack(task: dict, document: dict, component: str, rule: dict,
+                                result: dict, scan_index: dict | None) -> dict:
+    """构造只读 EvidencePack：完整记录当前路径，却绝不改变当前路径。"""
+    scan = scan_index if isinstance(scan_index, dict) else {}
+    rule_id = str(rule.get("rule_id") or "")
+    chunks = {str(item.get("chunk_id") or ""): item for item in scan.get("chunks", []) if isinstance(item, dict)}
+    findings: list[dict] = []
+    for item in scan.get("findings", []) if isinstance(scan.get("findings"), list) else []:
+        if not isinstance(item, dict) or str(item.get("rule_id") or "") != rule_id:
+            continue
+        chunk_id = str(item.get("chunk_id") or "").split(".", 1)[0]
+        chunk = chunks.get(chunk_id, {})
+        findings.append({
+            "chunk_id": chunk_id,
+            "page_range": [chunk.get("start_page"), chunk.get("end_page")],
+            "evidence": _clean_model_text(item.get("evidence"))[:600],
+            "tentative_status": str(item.get("tentative_status") or "")[:40],
+            "priority": str(item.get("evidence_priority") or "")[:24],
+            "confidence": str(item.get("confidence") or "")[:24],
+        })
+    findings = findings[:12]
+    provenance: list[dict] = []
+    seen_provenance: set[tuple[str, int | None, str]] = set()
+
+    def add_page(source: str, page: int | None = None, *, detail: str = "", page_range: list | None = None) -> None:
+        key = (source, page, detail)
+        if key in seen_provenance:
+            return
+        seen_provenance.add(key)
+        item = {"source": source}
+        if page is not None:
+            item["page"] = page
+        if page_range:
+            item["page_range"] = page_range
+        if detail:
+            item["detail"] = detail[:360]
+        provenance.append(item)
+
+    ledger = scan.get("evidence_ledger", {}) if isinstance(scan.get("evidence_ledger"), dict) else {}
+    for candidate in (ledger.get(rule_id) or {}).get("candidates", [])[:8]:
+        if not isinstance(candidate, dict):
+            continue
+        chunk = chunks.get(str(candidate.get("chunk_id") or ""), {})
+        add_page(
+            f"fulltext_{str(candidate.get('source') or 'scan')}", detail=str(candidate.get("anchor") or candidate.get("evidence") or ""),
+            page_range=[chunk.get("start_page"), chunk.get("end_page")],
+        )
+    for field, source in (
+        ("visual_page_candidates", "runtime_candidate"),
+        ("ocr_candidate_pages", "ocr_candidate"),
+        ("ocr_evidence_pages", "ocr_evidence"),
+        ("vision_pages", "image_checked"),
+        ("vision_evidence_pages", "image_evidence"),
+    ):
+        for page in _shadow_pages(result.get(field)):
+            add_page(source, page)
+    ocr_findings: list[dict] = []
+    vision_findings: list[dict] = []
+    for layer in result.get("evidence_layers") if isinstance(result.get("evidence_layers"), list) else []:
+        if not isinstance(layer, dict):
+            continue
+        source = str(layer.get("source") or "")
+        target = ocr_findings if source == "tencent_ocr" else vision_findings if source == "vision" else None
+        if target is None:
+            continue
+        target.append({
+            "summary": _clean_model_text(layer.get("summary"))[:800],
+            "checked_pages": _shadow_pages(layer.get("checked_pages")),
+            "evidence_pages": _shadow_pages(layer.get("evidence_pages")),
+            "service": str(layer.get("service") or "")[:160], "model": str(layer.get("model") or "")[:160],
+        })
+    snapshot = {
+        "status": result.get("status"), "suggested_score": result.get("suggested_score"),
+        "max_score": result.get("max_score"), "risk_level": result.get("risk_level"),
+        "confidence": result.get("confidence"), "vision_status": result.get("vision_status"),
+        "page_hint": result.get("page_hint"), "evidence": _clean_model_text(result.get("evidence"))[:900],
+        "reason": _clean_model_text(result.get("reason"))[:700],
+    }
+    payload = {
+        "pack_version": _EVIDENCE_PACK_VERSION, "mode": "shadow_only", "decision_participation": False,
+        "document_sha256": str(document.get("sha256") or ""), "rule_id": rule_id, "component": component,
+        "text_findings": findings, "ocr_findings": ocr_findings[:4], "vision_findings": vision_findings[:4],
+        "material_checklist": _shadow_material_checklist(rule), "page_provenance": provenance[:80],
+        "result_snapshot": snapshot,
+    }
+    return {"rule_id": rule_id, "component": component, "rule_fingerprint": _shadow_rule_fingerprint(rule), "payload": payload}
+
+
 def _build_rule_evidence_ledger(scan: dict, rules: list[dict]) -> dict[str, dict]:
     """将全文扫描和本地召回合成为逐规则证据账本。
 
@@ -5209,6 +5342,33 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
             elif run:
                 storage.save_score_results(app, run["score_run_id"], document["document_id"], [merged])
             progress.advance(f"已完成图片识别：{bidder_name} · {label}")
+    # EvidencePack 当前仅作影子记录：它观察现有文字/OCR/图片链路和候选页来源，
+    # 不参与任何选页、调用、合并、评分或对外 API，确保现有稳定结果不受影响。
+    # 影子记录绝不能影响主流程：构造或保存失败仅记录日志，文档仍正常标记完成。
+    try:
+        rules_by_component = {
+            "review": review_rules, "objective": objective_rules, "subjective": subjective_rules,
+        }
+        shadow_packs: list[dict] = []
+        for component, component_rules in rules_by_component.items():
+            rule_map = {str(rule.get("rule_id") or ""): rule for rule in component_rules}
+            for rule_id, result in completed_results[component].items():
+                rule = rule_map.get(str(rule_id))
+                if not rule or not isinstance(result, dict):
+                    continue
+                try:
+                    shadow_packs.append(_build_shadow_evidence_pack(task, document, component, rule, result, scan_index))
+                except Exception:
+                    # 单条规则的影子构造失败不影响其他规则和文档完成状态。
+                    traceback.print_exc()
+        if shadow_packs:
+            storage.save_evidence_packs(
+                app, task["project_id"], task["task_id"], document["document_id"],
+                str(document.get("sha256") or ""), shadow_packs,
+            )
+    except Exception:
+        # 影子保存失败（磁盘满、DB 锁定等）仅记录日志，真实评审结果已保存，不影响完成状态。
+        traceback.print_exc()
     progress.document_completed(document)
     return values
 

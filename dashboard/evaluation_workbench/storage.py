@@ -314,6 +314,22 @@ def init_database(app) -> None:
                 UNIQUE(document_id, document_sha256, parser_version)
             );
             CREATE INDEX IF NOT EXISTS idx_ew_evidence_manifest_document ON ew_document_evidence_manifests(document_id, updated_at);
+            CREATE TABLE IF NOT EXISTS ew_evidence_packs (
+                evidence_pack_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES ew_projects(project_id) ON DELETE CASCADE,
+                task_id TEXT NOT NULL REFERENCES ew_tasks(task_id) ON DELETE CASCADE,
+                document_id TEXT NOT NULL REFERENCES ew_documents(document_id) ON DELETE CASCADE,
+                rule_id TEXT NOT NULL REFERENCES ew_rules(rule_id) ON DELETE CASCADE,
+                component TEXT NOT NULL CHECK(component IN ('review', 'objective', 'subjective')),
+                document_sha256 TEXT NOT NULL,
+                rule_fingerprint TEXT NOT NULL,
+                pack_version TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(task_id, document_id, rule_id, component)
+            );
+            CREATE INDEX IF NOT EXISTS idx_ew_evidence_packs_document ON ew_evidence_packs(document_id, rule_id, updated_at);
             CREATE TABLE IF NOT EXISTS ew_project_scope_cache (
                 scope_cache_id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL REFERENCES ew_projects(project_id) ON DELETE CASCADE,
@@ -1158,6 +1174,40 @@ def list_task_summaries(app, project_id: str) -> list[dict]:
     return values
 
 
+def task_queue_contexts(app, project_id: str) -> dict[str, dict]:
+    """返回当前项目排队任务的全局队列说明。
+
+    工作台只有一个按需 worker，会从全局 FIFO 队列逐个取任务。这里刻意只暴露
+    正在运行任务的项目名称、阶段和进度，不携带文件名、评审结论或模型输出；前端
+    可据此说明“为什么还在排队”，而不改变既有 tasks 字段的兼容语义。
+    """
+    with connection(app) as conn:
+        running = conn.execute(
+            """SELECT t.task_id, t.project_id, t.task_type, t.progress, t.message, t.started_at,
+                      p.name AS project_name, p.section_name
+               FROM ew_tasks t JOIN ew_projects p ON p.project_id = t.project_id
+               WHERE t.status = 'running'
+               ORDER BY t.started_at, t.created_at LIMIT 1"""
+        ).fetchone()
+        queued = conn.execute(
+            """SELECT task_id, project_id FROM ew_tasks
+               WHERE status = 'queued' ORDER BY created_at, task_id"""
+        ).fetchall()
+    active = dict(running) if running else None
+    contexts: dict[str, dict] = {}
+    running_count = 1 if active else 0
+    for queue_index, row in enumerate(queued):
+        if row["project_id"] != project_id:
+            continue
+        contexts[row["task_id"]] = {
+            # waiting_count 把正在运行的任务也计入“前方”，更符合用户直觉。
+            "waiting_count": running_count + queue_index,
+            "queue_position": running_count + queue_index + 1,
+            "active_task": active,
+        }
+    return contexts
+
+
 def has_queued_tasks(app) -> bool:
     with connection(app) as conn:
         return conn.execute("SELECT 1 FROM ew_tasks WHERE status = 'queued' LIMIT 1").fetchone() is not None
@@ -1357,6 +1407,60 @@ def save_document_evidence_manifest(app, document_id: str, document_sha256: str,
             (str(uuid.uuid4()), document_id, document_sha256, parser_version,
              json.dumps(manifest, ensure_ascii=False, separators=(",", ":")), timestamp, timestamp),
         )
+
+
+def save_evidence_packs(app, project_id: str, task_id: str, document_id: str, document_sha256: str,
+                        packs: list[dict]) -> None:
+    """仅保存 EvidencePack 影子记录，不参与候选页、模型调用或最终结论。"""
+    timestamp = now_iso()
+    with connection(app) as conn:
+        for pack in packs:
+            if not isinstance(pack, dict):
+                continue
+            rule_id = str(pack.get("rule_id") or "")
+            component = str(pack.get("component") or "")
+            fingerprint = str(pack.get("rule_fingerprint") or "")
+            payload = pack.get("payload")
+            if not rule_id or component not in {"review", "objective", "subjective"} or not fingerprint or not isinstance(payload, dict):
+                continue
+            encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            # EvidencePack 是诊断和未来灰度依据，不保存 OCR 原文；限制单条大小以保护小规格服务器磁盘。
+            if len(encoded) > 96_000:
+                encoded = json.dumps({
+                    "pack_version": payload.get("pack_version"), "mode": "shadow_only",
+                    "truncated": True, "rule_id": rule_id, "component": component,
+                    "page_provenance": payload.get("page_provenance", [])[:80],
+                    "result_snapshot": payload.get("result_snapshot", {}),
+                }, ensure_ascii=False, separators=(",", ":"))
+            conn.execute(
+                """INSERT INTO ew_evidence_packs
+                   (evidence_pack_id, project_id, task_id, document_id, rule_id, component, document_sha256,
+                    rule_fingerprint, pack_version, payload_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(task_id, document_id, rule_id, component) DO UPDATE SET
+                   document_sha256=excluded.document_sha256, rule_fingerprint=excluded.rule_fingerprint,
+                   pack_version=excluded.pack_version, payload_json=excluded.payload_json, updated_at=excluded.updated_at""",
+                (str(uuid.uuid4()), project_id, task_id, document_id, rule_id, component, document_sha256,
+                 fingerprint, str(payload.get("pack_version") or "shadow-v1"), encoded, timestamp, timestamp),
+            )
+
+
+def list_evidence_packs(app, task_id: str, document_id: str) -> list[dict]:
+    """内部验证/测试使用；暂不暴露为工作台 API。"""
+    with connection(app) as conn:
+        rows = conn.execute(
+            "SELECT * FROM ew_evidence_packs WHERE task_id=? AND document_id=? ORDER BY component, rule_id",
+            (task_id, document_id),
+        ).fetchall()
+    values = []
+    for row in rows:
+        value = dict(row)
+        try:
+            value["payload"] = json.loads(value.pop("payload_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            value["payload"] = {}
+        values.append(value)
+    return values
 
 
 def get_project_scope_checkpoint(app, project_id: str, scope_key: str) -> dict | None:

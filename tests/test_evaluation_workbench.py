@@ -1749,6 +1749,35 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(score_rows[0]["vision_pages"], [8])
         self.assertEqual(score_rows[0]["vision_status"], "applied_partial")
 
+    def test_evidence_pack_is_shadow_only_and_records_page_provenance(self):
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "认证证书见第12页。")
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "认证评分", "check_rule": "核验认证证书", "scoring": {"max_score": 2},
+        })
+        task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        result = {
+            "rule_id": rule["rule_id"], "suggested_score": 2, "max_score": 2, "confidence": "high",
+            "visual_page_candidates": [12], "ocr_candidate_pages": [12], "ocr_evidence_pages": [12],
+            "vision_pages": [12, 13], "vision_evidence_pages": [12], "vision_status": "ocr_vision_applied",
+            "evidence": "证书名称可见", "reason": "建议得2分",
+            "evidence_layers": [{"source": "tencent_ocr", "summary": "P12识别到证书名称", "checked_pages": [12], "evidence_pages": [12], "service": "高精度版"}],
+        }
+        scan = {
+            "chunks": [{"chunk_id": "chunk-1", "start_page": 10, "end_page": 14}],
+            "findings": [{"rule_id": rule["rule_id"], "chunk_id": "chunk-1", "evidence": "第12页列有认证证书", "tentative_status": "supports", "evidence_priority": "high", "confidence": "high"}],
+            "evidence_ledger": {rule["rule_id"]: {"candidates": [{"chunk_id": "chunk-1", "source": "scan", "evidence": "第12页列有认证证书"}]}}
+        }
+        pack = worker._build_shadow_evidence_pack(task, document, "objective", rule, result, scan)
+        storage.save_evidence_packs(self.app, self.project["project_id"], task["task_id"], document["document_id"], document["sha256"], [pack])
+        saved = storage.list_evidence_packs(self.app, task["task_id"], document["document_id"])
+
+        self.assertEqual(len(saved), 1)
+        payload = saved[0]["payload"]
+        self.assertTrue(payload["decision_participation"] is False)
+        self.assertEqual(payload["mode"], "shadow_only")
+        self.assertIn({"source": "ocr_evidence", "page": 12}, payload["page_provenance"])
+        self.assertEqual(payload["ocr_findings"][0]["evidence_pages"], [12])
+
     def test_deleting_project_removes_files_and_related_records(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案：稳定运行。")
         source = storage.document_path(self.app, document)
@@ -2053,6 +2082,38 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(review_run["completed_document_ids"], [document["document_id"]])
         self.assertEqual(len(reviews), 1)
         self.assertEqual(summary["completed_documents"][0]["document_id"], document["document_id"])
+
+    def test_queued_task_exposes_running_project_progress_without_result_content(self):
+        running = storage.create_task(self.app, self.project["project_id"], "extract_rules")
+        self.assertEqual(storage.next_queued_task(self.app)["task_id"], running["task_id"])
+        storage.update_task(self.app, running["task_id"], progress=42, message="正在提取资格规则")
+        second_project = storage.create_project(self.app, "另一项目", "TEST-02", "包2")
+        waiting = storage.create_task(self.app, second_project["project_id"], "evaluate_all")
+
+        contexts = storage.task_queue_contexts(self.app, second_project["project_id"])
+
+        self.assertEqual(contexts[waiting["task_id"]]["waiting_count"], 1)
+        active = contexts[waiting["task_id"]]["active_task"]
+        self.assertEqual(active["project_name"], "评标测试项目")
+        self.assertEqual(active["progress"], 42)
+        self.assertNotIn("result_json", active)
+
+    def test_project_status_keeps_tasks_compatible_and_adds_queue_context(self):
+        running = storage.create_task(self.app, self.project["project_id"], "extract_rules")
+        storage.next_queued_task(self.app)
+        storage.update_task(self.app, running["task_id"], progress=55, message="正在处理规则")
+        second_project = storage.create_project(self.app, "排队项目", section_name="包1")
+        waiting = storage.create_task(self.app, second_project["project_id"], "evaluate_all")
+
+        with patch.object(evaluation_workbench_module, "_start_worker_if_needed"):
+            response = self.app.test_client().get(f"/api/evaluation-workbench/projects/{second_project['project_id']}")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertIn("tasks", payload)
+        context = payload["queue_contexts"][waiting["task_id"]]
+        self.assertEqual(context["waiting_count"], 1)
+        self.assertEqual(context["active_task"]["project_name"], "评标测试项目")
 
     def test_long_document_is_fully_scanned_before_rule_group_synthesis(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "近年的类似项目情况表：项目一。")

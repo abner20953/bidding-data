@@ -397,7 +397,13 @@ def project_api(project_id):
         return error
     if request.method == "GET":
         _start_worker_if_needed()
-        return jsonify({"project": project, "documents": storage.list_documents(current_app, project_id), "tasks": storage.list_task_summaries(current_app, project_id)})
+        return jsonify({
+            "project": project,
+            "documents": storage.list_documents(current_app, project_id),
+            "tasks": storage.list_task_summaries(current_app, project_id),
+            # 新字段：仅供排队提示使用，不改变原 tasks 列表的既有结构。
+            "queue_contexts": storage.task_queue_contexts(current_app, project_id),
+        })
     if request.method == "DELETE":
         try:
             storage.delete_project(current_app, project_id)
