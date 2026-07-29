@@ -24,3 +24,5 @@ tencentcloud-sdk-python-iai
 tencentcloud-sdk-python-common
 tencentcloud-sdk-python-ocr
 Pillow
+rapidocr==3.8.1
+onnxruntime==1.16.3

@@ -6,6 +6,8 @@ import json
 import os
 import re
 import threading
+import copy
+import base64
 
 import requests
 
@@ -16,6 +18,11 @@ except ImportError:  # 部署升级中的短暂兼容；正式镜像由 requirem
 
 
 _REQUEST_SESSIONS = threading.local()
+_VISION_TEST_IMAGE_DATA_URL = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/"
+    "wYHfWQAAAABJRU5ErkJggg=="
+)
 
 
 def _http_post(*args, **kwargs):
@@ -281,6 +288,50 @@ def _is_minimax_m3(profile: dict) -> bool:
     )
 
 
+def _vision_detail_for_profile(profile: dict, detail: object) -> str:
+    """将内部质量档位映射为当前 OpenAI-compatible 服务商可接受的 detail 值。
+
+    业务层只表达 low/standard/high，不能把某家模型的 default 语义散落在图片
+    渲染和规则逻辑中。MiniMax 保持已验证的 default 行为；其他兼容接口采用
+    OpenAI 规范的 auto，避免因 default 参数而拒绝图片请求。
+    """
+    value = str(detail or "standard").lower()
+    if value == "standard":
+        return "default" if _is_minimax_profile(profile) else "auto"
+    return value if value in {"low", "high"} else "auto"
+
+
+def build_vision_user_content(profile: dict, prompt: str, images: list[dict]) -> list[dict]:
+    """构造当前 OpenAI-compatible 图片内容块，并集中处理协议细节。
+
+    这是服务商适配边界的第一层：worker 只传稳定页号和内部质量档位。后续接入
+    Responses/Anthropic 等协议时，只扩展此处及网关，不改动评审候选、OCR 或结论链。
+    """
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    for image in images:
+        page = image.get("page")
+        if isinstance(page, (int, float)) and not isinstance(page, bool):
+            content.append({"type": "text", "text": f"以下图片对应投标文件第{int(page)}页。"})
+        raw_bytes = image.get("image_bytes")
+        mime_type = str(image.get("mime_type") or "image/jpeg")
+        if isinstance(raw_bytes, bytes):
+            item = {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime_type};base64," + base64.b64encode(raw_bytes).decode("ascii"),
+                    "detail": image.get("detail") or "standard",
+                },
+            }
+        else:
+            # 兼容现有测试、历史调用方和未来由远程 URL 提供的图片资产。
+            item = copy.deepcopy({key: value for key, value in image.items() if key != "page"})
+        image_url = item.get("image_url")
+        if isinstance(image_url, dict):
+            image_url["detail"] = _vision_detail_for_profile(profile, image_url.get("detail"))
+        content.append(item)
+    return content
+
+
 def model_capabilities(profile: dict) -> dict:
     """返回可展示、可路由的模型能力，不把服务商差异散落在业务流程里。
 
@@ -528,9 +579,17 @@ def request_json(profile: dict, system_prompt: str, user_prompt: object, *, usag
 def test_connection(profile: dict, prompt_text: str) -> str:
     """发送极小请求验证模型地址、密钥和兼容参数；不写入业务数据。"""
     api_key = _api_key_for(profile)
+    user_content: object = prompt_text
+    if profile.get("supports_vision"):
+        # 仅发送一张 1×1 PNG，验证“人工标记为多模态”的档案确实接受图片内容块；
+        # 失败只说明图片能力不可用，绝不影响同一档案的文本调用。
+        user_content = build_vision_user_content(profile, prompt_text, [{
+            "page": 1, "type": "image_url",
+            "image_url": {"url": _VISION_TEST_IMAGE_DATA_URL, "detail": "low"},
+        }])
     payload = {
         "model": profile["model_name"],
-        "messages": [{"role": "user", "content": prompt_text}],
+        "messages": [{"role": "user", "content": user_content}],
         "temperature": 0,
     }
     if _is_minimax_m3(profile):
@@ -565,4 +624,4 @@ def test_connection(profile: dict, prompt_text: str) -> str:
             raise ValueError("缺少 message 字段")
     except (ValueError, requests.JSONDecodeError, TypeError) as exc:
         raise ValueError("模型测试未返回有效的结构化 JSON 数据") from exc
-    return "连接成功：模型接口已响应，结构化 JSON 测试通过"
+    return "连接成功：模型接口已响应，图片与结构化 JSON 测试通过" if profile.get("supports_vision") else "连接成功：模型接口已响应，结构化 JSON 测试通过"

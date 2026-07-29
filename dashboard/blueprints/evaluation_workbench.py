@@ -47,15 +47,15 @@ _REPORT_VISION_STATUS_LABELS = {
     "unavailable": "未获得可用的多模态模型",
     "not_located": "未定位到可靠图片页",
     "skipped_text_sufficient": "文字证据充分，未调用图片模型",
-    "ocr_applied": "腾讯 OCR 已核验并采纳",
-    "ocr_applied_partial": "腾讯 OCR 已补充部分文字事实",
-    "ocr_uncovered": "腾讯 OCR 已执行，未覆盖关键材料",
-    "ocr_failed": "腾讯 OCR 失败，已保留文字结论",
+    "ocr_applied": "OCR 已核验并采纳",
+    "ocr_applied_partial": "OCR 已补充部分文字事实",
+    "ocr_uncovered": "OCR 已执行，未覆盖关键材料",
+    "ocr_failed": "OCR 未获得可用文字，已保留文字结论",
     "ocr_quota_exhausted": "腾讯 OCR 额度不足，已转图片识别",
     "ocr_not_located": "未定位到可靠 OCR 候选页",
-    "ocr_skipped_text_sufficient": "文字证据充分，未调用腾讯 OCR",
-    "ocr_vision_applied": "腾讯 OCR 与图片检查均已采纳",
-    "ocr_vision_applied_partial": "腾讯 OCR 与图片检查已补充部分事实",
+    "ocr_skipped_text_sufficient": "文字证据充分，未调用 OCR",
+    "ocr_vision_applied": "OCR 与图片检查均已采纳",
+    "ocr_vision_applied_partial": "OCR 与图片检查已补充部分事实",
     "ocr_vision_conflict": "OCR后图片检查发现疑似字段冲突",
 }
 _REPORT_AI_DECISION_LABELS = {
@@ -110,17 +110,17 @@ def _report_compact_objective_ocr_text(value: object) -> str:
     """兼容旧结果：打印客观分时只保留 OCR 结论摘要，不展示整页识别原文。"""
     text = str(value or "")
     text = re.sub(
-        r"【腾讯OCR原文·([^】]+)】[\s\S]*?(?=【(?:图片识别|腾讯OCR)|$)",
-        r"【腾讯OCR摘要·\1】已完成候选页文字识别；原始识别明细已省略。",
+        r"【(腾讯OCR|本地OCR|OCR)原文·([^】]+)】[\s\S]*?(?=【(?:图片识别|腾讯OCR|本地OCR|OCR)|$)",
+        r"【\1摘要·\2】已完成候选页文字识别；原始识别明细已省略。",
         text,
     )
 
     def compact(match: re.Match) -> str:
-        body = re.sub(r"\s+", " ", match.group(2) or "").strip()
-        return f"【腾讯OCR摘要·{match.group(1)}】{body[:220]}{'…' if len(body) > 220 else ''}"
+        body = re.sub(r"\s+", " ", match.group(3) or "").strip()
+        return f"【{match.group(1)}摘要·{match.group(2)}】{body[:220]}{'…' if len(body) > 220 else ''}"
 
     return re.sub(
-        r"【腾讯OCR·([^】]+)】([\s\S]*?)(?=【(?:图片识别|腾讯OCR)|$)",
+        r"【(腾讯OCR|本地OCR|OCR)·([^】]+)】([\s\S]*?)(?=【(?:图片识别|腾讯OCR|本地OCR|OCR)|$)",
         compact,
         text,
     ).strip()

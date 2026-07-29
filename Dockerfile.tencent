@@ -15,7 +15,7 @@ ENV PYTHONUNBUFFERED=1
 RUN (sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
     sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list) && \
     apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates gcc python3-dev file make && \
+    apt-get install -y --no-install-recommends ca-certificates gcc python3-dev file make libgl1 libglib2.0-0 && \
     rm -rf /var/lib/apt/lists/*
 
 # 【核心优化 1】单独安装并缓存极其庞大的 PyTorch CPU 版
@@ -40,6 +40,13 @@ COPY --chown=1000:1000 model_data /app/model_data
 # 【最后】才复制频繁变动的业务代码
 # 这样每次改代码发布时，上面所有步骤都会被跳过，只有这一步会重做
 COPY --chown=1000:1000 . .
+
+# RapidOCR 仅由短生命周期子进程按需加载；这里提前下载并校验 PP-OCRv5 mobile
+# 模型，避免用户发起评审时才联网下载。仅对 warmup 命令设置 HOME，不能污染容器内
+# 其他库（例如 HuggingFace）的缓存目录；运行时子进程会使用同一目录。
+RUN install -d -o 1000 -g 1000 /app/model_data/rapidocr && \
+    HOME=/app/model_data/rapidocr python -m dashboard.evaluation_workbench.rapidocr_worker --warmup && \
+    chown -R 1000:1000 /app/model_data/rapidocr
 
 # 创建运行时目录；COPY --chown 避免每次发布都递归复制整层镜像并 chown。
 RUN install -d -o 1000 -g 1000 results logs cache

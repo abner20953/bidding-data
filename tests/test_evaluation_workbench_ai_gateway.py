@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from dashboard.evaluation_workbench.ai_gateway import (
-    InvalidJsonResponse, ModelResponseEnvelopeError, _decode_json_content, _recover_complete_json_array,
+    InvalidJsonResponse, ModelResponseEnvelopeError, _decode_json_content, _recover_complete_json_array, build_vision_user_content,
     model_capabilities, request_json, test_connection,
 )
 
@@ -45,6 +45,29 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
 
         self.assertEqual(capabilities["structured_output"], "json_object")
         self.assertTrue(capabilities["strict_tool_schema"])
+
+    def test_vision_content_maps_internal_standard_quality_by_provider(self):
+        image = {"page": 7, "type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AA==", "detail": "standard"}}
+
+        generic = build_vision_user_content(self._profile(), "核验图片", [image])
+        minimax = build_vision_user_content(self._profile(base_url="https://api.minimaxi.com/v1"), "核验图片", [image])
+
+        self.assertEqual(generic[-1]["image_url"]["detail"], "auto")
+        self.assertEqual(minimax[-1]["image_url"]["detail"], "default")
+        self.assertEqual(image["image_url"]["detail"], "standard")
+
+    def test_vision_profile_connection_test_sends_a_tiny_image(self):
+        response = Mock(ok=True)
+        response.json.return_value = {"choices": [{"message": {"content": '{"message":"ok"}'}}]}
+        profile = self._profile(supports_vision=True)
+
+        with patch("dashboard.evaluation_workbench.ai_gateway._http_post", return_value=response) as post:
+            message = test_connection(profile, CONNECTION_TEST_PROMPT)
+
+        content = post.call_args.kwargs["json"]["messages"][0]["content"]
+        self.assertIsInstance(content, list)
+        self.assertTrue(any(item.get("type") == "image_url" for item in content if isinstance(item, dict)))
+        self.assertIn("图片与结构化 JSON", message)
 
     def test_connection_rejects_non_ascii_api_key_before_network_request(self):
         with patch("dashboard.evaluation_workbench.ai_gateway._http_post") as post:

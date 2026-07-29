@@ -24,11 +24,11 @@
   }
   function compactObjectiveOcrText(value) {
     let text = String(value || '');
-    text = text.replace(/【腾讯OCR原文·([^】]+)】[\s\S]*?(?=【(?:图片识别|腾讯OCR)|$)/g, (_all, meta) => `【腾讯OCR摘要·${meta}】已完成候选页文字识别；原始识别明细已省略，评分依据以前述AI总结为准。\n`);
-    return text.replace(/【腾讯OCR·([^】]+)】([\s\S]*?)(?=【(?:图片识别|腾讯OCR)|$)/g, (_all, meta, body) => {
+    text = text.replace(/【(腾讯OCR|本地OCR|OCR)原文·([^】]+)】[\s\S]*?(?=【(?:图片识别|腾讯OCR|本地OCR|OCR)|$)/g, (_all, source, meta) => `【${source}摘要·${meta}】已完成候选页文字识别；原始识别明细已省略，评分依据以前述AI总结为准。\n`);
+    return text.replace(/【(腾讯OCR|本地OCR|OCR)·([^】]+)】([\s\S]*?)(?=【(?:图片识别|腾讯OCR|本地OCR|OCR)|$)/g, (_all, source, meta, body) => {
       const concise = String(body || '').replace(/\s+/g, ' ').trim();
       const summary = concise.length > 220 ? `${concise.slice(0, 220)}…` : concise;
-      return `【腾讯OCR摘要·${meta}】${summary || '已完成候选页文字识别。'}\n`;
+      return `【${source}摘要·${meta}】${summary || '已完成候选页文字识别。'}\n`;
     }).trim();
   }
   function roleLabel(role) { return {tender:'主招标文件', tender_attachment:'招标附件', bid:'投标文件'}[role] || role; }
@@ -110,9 +110,13 @@
   function applyModelPreset() { const preset = modelPresets[$('model-preset').value]; if (!preset) return; $('model-display-name').value = preset.displayName; $('model-base-url').value = preset.baseUrl; $('model-name').value = preset.modelName; $('model-json-mode').value = preset.jsonMode; $('model-thinking').value = preset.thinking; $('model-supports-vision').checked = Boolean(preset.supportsVision); }
   function renderOcrConfiguration() {
     $('ocr-enabled').checked = Boolean(ocrConfiguration.enabled); $('ocr-region').value = ocrConfiguration.region || 'ap-guangzhou';
+    $('local-ocr-enabled').checked = Boolean(ocrConfiguration.local?.enabled);
     const source = {manual:'手动保存', environment:'运行环境变量', none:'未配置'}[ocrConfiguration.credentials_source] || '未配置';
     const imageGate = visionConfiguration.enabled ? '全系统图片识别已开启。' : '提示：全系统图片识别总开关当前关闭，OCR 不会在评审中运行。';
-    $('ocr-configuration-hint').textContent = `凭据：${source}。本月 ${ocrConfiguration.month_key || '-'}；系统会按材料类型、识图强度、接口可用性和剩余额度自动选择已启用服务。每次真实请求保守计入一次，缓存命中不消耗额度。${imageGate}`;
+    const readiness = ocrConfiguration.local?.readiness || {};
+    const readinessHint = readiness.ready_for_manual_validation ? '已积累至少30页、3个项目的本地OCR样本：建议按设计文档发起第二阶段人工验收；未人工确认前不会自动切换优先级。' : `本地验收样本：${Number(readiness.sample_pages) || 0}/30页、${Number(readiness.sample_projects) || 0}/3个项目。`;
+    const local = ocrConfiguration.local?.enabled ? (ocrConfiguration.local?.runtime_available ? `本地 RapidOCR 回退已开启：仅在腾讯 OCR 不可用时按批启动，结束即释放内存。${readinessHint}` : '本地 RapidOCR 回退已开启，但当前运行环境未发现 RapidOCR/ONNX 依赖；重新部署后会自动恢复。') : '本地 RapidOCR 回退当前关闭。';
+    $('ocr-configuration-hint').textContent = `凭据：${source}。本月 ${ocrConfiguration.month_key || '-'}；系统会按材料类型、识图强度、接口可用性和剩余额度自动选择已启用服务。每次腾讯真实请求保守计入一次，缓存命中不消耗额度。${local}${imageGate}`;
     $('ocr-services').innerHTML = (ocrConfiguration.services || []).map((item) => `<div class="ocr-service-row"><label class="inline-check"><input class="ocr-service-enabled" data-service="${escapeHtml(item.service)}" type="checkbox" ${item.enabled ? 'checked' : ''}> ${escapeHtml(item.label)}${item.legacy ? '（仅账号支持时启用）' : ''}</label><label>安全上限<input class="ocr-service-limit" data-service="${escapeHtml(item.service)}" type="number" min="1" max="1000" value="${Number(item.monthly_limit) || 900}"></label><small>${escapeHtml(item.usage || '由系统按规则场景自动选择')} · 本月已用 ${Number(item.used) || 0} · 预计可用 ${Number(item.remaining) || 0}</small></div>`).join('') || '<p class="muted">暂无 OCR 接口设置。</p>';
   }
   async function loadProfiles() {
@@ -155,7 +159,7 @@
       const ocrCell = r.vision_trigger !== 'off' ? `<span class="tag">图片识别：${visionLabel} · ${levelLabel}</span>` : (r.check_mode === 'ocr' ? '<span class="tag">需要 OCR（未启用图片识别）</span>' : '<span class="muted">无需图片识别</span>');
       const sourceLabel = r.source_type === 'ai' ? 'AI 提取' : r.source_type === 'global' ? '通用规则库' : ['ai_edited', 'ai_locked'].includes(r.source_type) ? 'AI 提取 · 人工修改' : '人工补充';
       const enabledControl = isDraft ? `<label class="rule-enabled-control" title="仅影响当前规则集；重新提取规则后会重新选择"><input class="rule-enabled" data-rule="${r.rule_id}" type="checkbox" ${r.enabled ? 'checked' : ''}><span>启用</span></label>` : (r.enabled ? '' : '<span class="tag rule-disabled">未启用</span>');
-      const visionControl = isDraft ? `<div class="rule-vision-controls"><label>图片识别条件<select class="rule-vision-trigger" data-rule="${r.rule_id}"><option value="off" ${r.vision_trigger === 'off' ? 'selected' : ''}>不使用图片</option><option value="text_fallback" ${r.vision_trigger === 'text_fallback' ? 'selected' : ''}>文字不足时识图</option><option value="required" ${r.vision_trigger === 'required' ? 'selected' : ''}>必须识图</option></select></label><label>识图强度<select class="rule-vision-level" data-rule="${r.rule_id}" ${r.vision_trigger === 'off' ? 'disabled' : ''}><option value="off" ${r.vision_level === 'off' ? 'selected' : ''}>暂不执行</option><option value="low" ${r.vision_level === 'low' ? 'selected' : ''}>快速（最多2页，不补页）</option><option value="standard" ${r.vision_level === 'standard' ? 'selected' : ''}>标准（首批最多4页，可补4页）</option><option value="high" ${r.vision_level === 'high' ? 'selected' : ''}>精细（首批最多6页，可补6页并支持扫描件找页）</option></select></label><small>${visionConfiguration.enabled ? '已开启全系统图片识别；腾讯 OCR 先提取候选页文字，多模态再核验签章、勾选、版式及冲突，并把结果合并回最终结论。' : '全系统图片识别当前关闭，保存后不会产生图片调用。'}</small></div>` : '';
+      const visionControl = isDraft ? `<div class="rule-vision-controls"><label>图片识别条件<select class="rule-vision-trigger" data-rule="${r.rule_id}"><option value="off" ${r.vision_trigger === 'off' ? 'selected' : ''}>不使用图片</option><option value="text_fallback" ${r.vision_trigger === 'text_fallback' ? 'selected' : ''}>文字不足时识图</option><option value="required" ${r.vision_trigger === 'required' ? 'selected' : ''}>必须识图</option></select></label><label>识图强度<select class="rule-vision-level" data-rule="${r.rule_id}" ${r.vision_trigger === 'off' ? 'disabled' : ''}><option value="off" ${r.vision_level === 'off' ? 'selected' : ''}>暂不执行</option><option value="low" ${r.vision_level === 'low' ? 'selected' : ''}>快速（最多2页，不补页）</option><option value="standard" ${r.vision_level === 'standard' ? 'selected' : ''}>标准（首批最多4页，可补4页）</option><option value="high" ${r.vision_level === 'high' ? 'selected' : ''}>精细（首批最多6页，可补6页并支持扫描件找页）</option></select></label><small>${visionConfiguration.enabled ? '已开启全系统图片识别；普通文字材料优先由腾讯 OCR 提取，证书、证件等图片材料优先由多模态定位后再做关键文字 OCR 复核。所有图片证据都会合并回 AI 建议。' : '全系统图片识别当前关闭，保存后不会产生图片调用。'}</small></div>` : '';
       return `<details class="rule-card"><summary><span class="rule-card-summary">${enabledControl}<span class="tag">${categoryLabel(r.category)}</span><strong class="rule-card-title">${escapeHtml(r.title)}</strong><span class="tag">${sourceLabel}</span>${ocrCell}</span></summary><div class="rule-card-body"><div class="rule-card-grid"><label>检查规则${checkContent}</label><div class="rule-field"><span class="rule-field-label">招标原文依据</span><div class="rule-text">${escapeHtml(r.source_text || '未提供')}</div></div></div>${visionControl}${isDraft ? `<div class="actions rule-card-actions"><button class="save-check-rule primary" data-rule="${r.rule_id}">保存检查规则</button></div>` : ''}</div></details>`;
     }).join('')}</div>` : '<p class="muted">暂无规则。</p>';
     $('rules').querySelectorAll('details.rule-card').forEach((card, index) => {
@@ -186,15 +190,15 @@
       unavailable:'未获得可用的多模态模型',
       not_located:'未定位到可靠图片页',
       skipped_text_sufficient:'文字证据充分，未调用图片模型',
-      ocr_applied:'✓ 腾讯 OCR 已核验并采纳',
-      ocr_applied_partial:'腾讯 OCR 已补充部分文字事实',
-      ocr_uncovered:'腾讯 OCR 已执行，未覆盖关键材料',
-      ocr_failed:'腾讯 OCR 失败，已保留文字结论',
+      ocr_applied:'✓ OCR 已核验并采纳',
+      ocr_applied_partial:'OCR 已补充部分文字事实',
+      ocr_uncovered:'OCR 已执行，未覆盖关键材料',
+      ocr_failed:'OCR 未获得可用文字，已保留文字结论',
       ocr_quota_exhausted:'腾讯 OCR 额度不足，已转图片识别',
       ocr_not_located:'未定位到可靠 OCR 候选页',
-      ocr_skipped_text_sufficient:'文字证据充分，未调用腾讯 OCR',
-      ocr_vision_applied:'✓ 腾讯 OCR 与图片检查均已采纳',
-      ocr_vision_applied_partial:'腾讯 OCR 与图片检查已补充部分事实',
+      ocr_skipped_text_sufficient:'文字证据充分，未调用 OCR',
+      ocr_vision_applied:'✓ OCR 与图片检查均已采纳',
+      ocr_vision_applied_partial:'OCR 与图片检查已补充部分事实',
       ocr_vision_conflict:'⚠ OCR后图片检查发现疑似字段冲突',
     };
     const label = labels[status] || '图片识别状态';
@@ -212,8 +216,8 @@
       conflict:'⚠ 图片字段疑似冲突',
       uncovered:'已图片检查（未覆盖）',
       failed:'图片检查失败',
-      ocr_applied:'✓ 已腾讯 OCR 核验',
-      ocr_applied_partial:'腾讯 OCR（部分补充）',
+      ocr_applied:'✓ 已 OCR 核验',
+      ocr_applied_partial:'OCR（部分补充）',
       ocr_vision_applied:'✓ OCR＋图片检查',
       ocr_vision_applied_partial:'OCR＋图片检查（部分补充）',
       ocr_vision_conflict:'⚠ OCR后图片字段疑似冲突',
@@ -223,7 +227,7 @@
   function evidenceChainHtml(result) {
     const layers = Array.isArray(result?.evidence_layers) ? result.evidence_layers.filter((item) => item && typeof item === 'object' && item.summary) : [];
     if (!layers.length) return '';
-    const labels = {text:'文字解析', tencent_ocr:'腾讯 OCR', vision:'图片识别'};
+    const labels = {text:'文字解析', tencent_ocr:'腾讯 OCR', local_ocr:'本地 RapidOCR', vision:'图片识别'};
     return `<details class="evidence-chain"><summary>证据链详情</summary>${layers.map((layer) => {
       const checked = Array.isArray(layer.checked_pages) ? layer.checked_pages.map((page) => `P${page}`).join('、') : '';
       const evidence = Array.isArray(layer.evidence_pages) ? layer.evidence_pages.map((page) => `P${page}`).join('、') : '';
@@ -328,7 +332,7 @@
   $('model-preset').onchange = applyModelPreset;
   $('save-model-profile').onclick = async () => { try { const profileId = $('model-profile-id').value; const modelName = $('model-name').value; const payload = {display_name:$('model-display-name').value, base_url:$('model-base-url').value, model_name:modelName, api_key:$('model-api-key').value, json_mode:$('model-json-mode').value === 'true', thinking_mode:normalizedThinkingMode(modelName, $('model-thinking').value), supports_vision:$('model-supports-vision').checked}; await request(profileId ? `/model-profiles/${profileId}` : '/model-profiles', {method:profileId ? 'PATCH' : 'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}); resetModelForm(); await loadProfiles(); } catch (error) { alert(error.message); } };
   $('save-vision-configuration').onclick = async () => { try { await request('/vision-configuration', {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled:$('vision-enabled').checked, default_profile_id:$('vision-default-profile').value || null})}); await loadProfiles(); } catch (error) { alert(error.message); } };
-  $('save-ocr-configuration').onclick = async () => { try { const services = {}; $('ocr-services').querySelectorAll('.ocr-service-enabled').forEach((input) => { const limit = $('ocr-services').querySelector(`.ocr-service-limit[data-service="${input.dataset.service}"]`); services[input.dataset.service] = {enabled:input.checked, monthly_limit:Number(limit?.value || 900)}; }); await request('/tencent-ocr-configuration', {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled:$('ocr-enabled').checked, region:$('ocr-region').value, secret_id:$('ocr-secret-id').value, secret_key:$('ocr-secret-key').value, services})}); $('ocr-secret-id').value = ''; $('ocr-secret-key').value = ''; await loadProfiles(); } catch (error) { alert(error.message); } };
+  $('save-ocr-configuration').onclick = async () => { try { const services = {}; $('ocr-services').querySelectorAll('.ocr-service-enabled').forEach((input) => { const limit = $('ocr-services').querySelector(`.ocr-service-limit[data-service="${input.dataset.service}"]`); services[input.dataset.service] = {enabled:input.checked, monthly_limit:Number(limit?.value || 900)}; }); await request('/tencent-ocr-configuration', {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled:$('ocr-enabled').checked, local:{enabled:$('local-ocr-enabled').checked}, region:$('ocr-region').value, secret_id:$('ocr-secret-id').value, secret_key:$('ocr-secret-key').value, services})}); $('ocr-secret-id').value = ''; $('ocr-secret-key').value = ''; await loadProfiles(); } catch (error) { alert(error.message); } };
   $('test-ocr-configuration').onclick = async () => { try { const data = await request('/tencent-ocr-configuration/test', {method:'POST'}); alert(data.message); } catch (error) { alert(error.message); } };
   $('open-report').onclick = () => window.open(`/pingbiao/projects/${activeProject}/report`, '_blank', 'noopener');
   $('export-score-csv').onclick = async () => { try { const [objective, subjective] = await Promise.all(['objective', 'subjective'].map((type) => request(`/projects/${activeProject}/score-results/${type}`))); const rows = [['评分类型','投标人','检查规则','AI建议得分','满分','置信度','证据','理由']]; for (const [type, data] of [['客观分', objective], ['主观分', subjective]]) for (const item of data.results) { const compactOcr = type === '客观分'; rows.push([type, item.bidder_name || item.original_name, item.check_rule || item.title, item.suggested_score ?? '', item.max_score ?? '', confidenceLabel(item.confidence), compactOcr ? compactObjectiveOcrText(item.evidence) : (item.evidence || ''), compactOcr ? compactObjectiveOcrText(item.reason) : (item.reason || '')]); } const csv = '\ufeff' + rows.map((row) => row.map((cell) => `"${String(cell).replaceAll('"', '""')}"`).join(',')).join('\r\n'); const link = document.createElement('a'); link.href = URL.createObjectURL(new Blob([csv], {type:'text/csv;charset=utf-8'})); link.download = '评标评分汇总.csv'; link.click(); URL.revokeObjectURL(link.href); } catch (error) { alert(error.message); } };

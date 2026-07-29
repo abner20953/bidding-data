@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -703,10 +704,44 @@ def _ocr_service_settings(value: object) -> dict:
     return result
 
 
+def _local_ocr_settings(value: object) -> dict:
+    """本地 OCR 仅作为第一阶段安全回退，不能改写腾讯 OCR 的额度语义。"""
+    raw = value if isinstance(value, dict) else {}
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        enabled = True
+    return {
+        "enabled": enabled,
+        "mode": "fallback",
+        "engine": "RapidOCR / PP-OCRv5 mobile / ONNX CPU",
+        # find_spec 不导入模型，不会让 ONNX Runtime 在 Web 服务常驻。
+        "runtime_available": bool(importlib.util.find_spec("rapidocr") and importlib.util.find_spec("onnxruntime")),
+    }
+
+
+def _local_ocr_readiness(app) -> dict:
+    """仅提示是否应人工发起第二阶段验收，绝不自动切换 OCR 优先级。"""
+    with connection(app) as conn:
+        row = conn.execute(
+            """SELECT COUNT(DISTINCT c.document_id || ':' || c.page_number) AS page_count,
+                      COUNT(DISTINCT d.project_id) AS project_count
+               FROM ew_ocr_page_cache c JOIN ew_documents d ON d.document_id=c.document_id
+               WHERE c.service='rapidocr_local'"""
+        ).fetchone()
+    pages = int(row["page_count"] or 0) if row else 0
+    projects = int(row["project_count"] or 0) if row else 0
+    return {
+        "sample_pages": pages, "sample_projects": projects,
+        # 这只是“提醒人工验收”的最低客观门槛；准确率和内存指标仍须人工确认。
+        "ready_for_manual_validation": pages >= 30 and projects >= 3,
+    }
+
+
 def ocr_configuration(app) -> dict:
     """公开腾讯 OCR 配置；绝不返回 SecretId/SecretKey 明文或密文。"""
     raw = _ocr_configuration_raw(app)
     services = _ocr_service_settings(raw.get("services"))
+    local = {**_local_ocr_settings(raw.get("local")), "readiness": _local_ocr_readiness(app)}
     month_key = _ocr_month_key()
     with connection(app) as conn:
         rows = conn.execute(
@@ -733,7 +768,7 @@ def ocr_configuration(app) -> dict:
         "region": str(raw.get("region") or "ap-guangzhou"),
         "credentials_configured": (manual_id and manual_key) or env_ready,
         "credentials_source": "manual" if manual_id and manual_key else "environment" if env_ready else "none",
-        "month_key": month_key, "services": values,
+        "month_key": month_key, "services": values, "local": local,
     }
 
 
@@ -759,12 +794,16 @@ def update_ocr_configuration(app, payload: dict) -> dict:
     if not isinstance(service_input, dict):
         raise ValueError("OCR 接口设置格式不正确")
     services = _ocr_service_settings(service_input)
+    local_input = payload.get("local", existing.get("local", {}))
+    if not isinstance(local_input, dict):
+        raise ValueError("本地 OCR 设置格式不正确")
+    local = _local_ocr_settings(local_input)
     if enabled and not ((encrypted_id and encrypted_key) or (
         os.environ.get("TENCENTCLOUD_SECRET_ID", "").strip() and os.environ.get("TENCENTCLOUD_SECRET_KEY", "").strip()
     )):
         raise ValueError("开启腾讯 OCR 前，请配置 SecretId 和 SecretKey，或在运行环境设置 TENCENTCLOUD_SECRET_ID/KEY")
     value = {"enabled": enabled, "region": region, "secret_id_encrypted": encrypted_id,
-             "secret_key_encrypted": encrypted_key, "services": services}
+             "secret_key_encrypted": encrypted_key, "services": services, "local": local}
     with connection(app) as conn:
         conn.execute(
             "INSERT INTO ew_settings(setting_key, setting_value, updated_at) VALUES (?, ?, ?) "
@@ -2405,7 +2444,7 @@ def _evidence_layers_json(item: dict) -> str:
         if not isinstance(value, dict):
             continue
         source = str(value.get("source") or "").strip()
-        if source not in {"text", "tencent_ocr", "vision"}:
+        if source not in {"text", "tencent_ocr", "local_ocr", "vision"}:
             continue
         checked = json.loads(_pages_json(value, "checked_pages", "checked_pages_json"))
         evidence = json.loads(_pages_json(value, "evidence_pages", "evidence_pages_json"))

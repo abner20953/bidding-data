@@ -169,10 +169,13 @@ PROMPT_TEMPLATES["evaluate_all_visual_user"] = _template(
     "\"conclusion_scope\":\"full|partial|none\","
     "\"conflict_level\":\"none|possible|material\","
     "\"evidence_pages\":[本次实际形成证据的PDF页码],"
+    "\"irrelevant_pages\":[本次已看但与当前规则无关的PDF页码],"
+    "\"score_items\":[{\"item_id\":\"评分叶子项标识\",\"status\":\"confirmed|unresolved|invalid\",\"suggested_score\":数字,\"evidence_pages\":[页码}],"
     "\"field_checks\":[{\"field\":\"字段名\",\"text_value\":\"文字层候选值\",\"image_value\":\"图片逐字值\","
     "\"match\":\"match|conflict|uncertain\"}],"
     "\"coverage\":\"covered|not_covered|uncertain\",\"needs_more_image\":true|false,\"requested_pages\":[页码]}。"
-    "suggested_score 仅在评分规则存在时填写，且不得超出满分；非评分规则必须为 null。"
+    "suggested_score 仅在评分规则存在时填写，且不得超出满分；非评分规则必须为 null。评分规则中 score_items 必须按"
+    "实际可独立计分的叶子项或封顶项填写；只有证据页清楚覆盖的 confirmed 项才可给正分，未覆盖项填 unresolved。"
     "coverage=covered 表示本次图片至少包含一项与规则直接相关且可引用的可见事实；只覆盖部分材料时仍返回"
     "covered，但 conclusion_scope=partial、needs_more_image=true，并列出已经看清的事实。只有图片足以完成整条"
     "规则判断时才使用 conclusion_scope=full。图片完全未包含目标材料时返回 not_covered、conclusion_scope=none、"
@@ -185,8 +188,10 @@ PROMPT_TEMPLATES["evaluate_all_visual_user"] = _template(
     "存在可能影响合规性或计分的字段冲突时 conflict_level=material，一般疑似冲突为 possible；没有冲突为 none。"
     "conflict_level=material 时必须至少提供一项 match=conflict 且 text_value、image_value 均非空的 field_checks；"
     "没有逐字对照值的疑点最多只能标 possible。"
-    "发现冲突时不得用图片值直接覆盖文字值或直接改分，只把两值"
-    "并列作为人工复核线索。field_checks 最多12项，只列与当前规则结论或计分直接相关的字段。requested_pages 只能填写"
+    "金额、日期、编号、型号、数量等文字字段：若可靠文字层或腾讯OCR与图片不同，必须先判断图片是否清晰；"
+    "低清或难辨图片应填 uncertain，不得凭疑似数字制造 conflict。发现冲突时不得用图片值直接覆盖文字值或直接改分，只把两值"
+    "并列作为人工复核线索。页面若属于目录、招标要求复述、合同签章页等且不属于当前规则所需材料，写入 irrelevant_pages，"
+    "不得写入 evidence_pages 或作为替代证据。field_checks 最多12项，只列与当前规则结论或计分直接相关的字段。requested_pages 只能填写"
     "与本次传入页相邻、且确有必要补看的页码；无法判断时返回空数组。证据和理由不得复述规则。\n规则：{{rule}}\n投标文件：{{document_name}}；投标人：{{bidder_name}}\n"
     "图片识别条件：{{vision_trigger}}；识图强度：{{vision_level}}。\n"
     "已有文字、OCR及前序图片结论（仅作辅助，不得照抄；prior_image_batches 表示前一批已看图片）：{{text_result}}",
@@ -194,7 +199,7 @@ PROMPT_TEMPLATES["evaluate_all_visual_user"] = _template(
 )
 PROMPT_TEMPLATES["evaluate_all_ocr_user"] = _template(
     "综合评审 · OCR 证据补充",
-    "仅依据腾讯OCR已识别文字，为单条规则补充可追溯的文字结论；不替代图片外观核验。",
+    "仅依据已识别的 OCR 文字，为单条规则补充可追溯的文字结论；不替代图片外观核验。",
     "你正在根据专用 OCR 已识别的页面文字，对一条招投标规则补充审查。只能引用给出的 OCR 文字和已有文字结论，"
     "不得把 OCR 未识别到的内容当作材料缺失；签字、盖章、勾选、证件外观、图片真实性或版式完整性仍需要图片核验。"
     "只返回合法 JSON：{\"status\":\"satisfied|not_satisfied|partial|not_found|manual\",\"suggested_score\":数字或null,"
@@ -211,6 +216,8 @@ PROMPT_TEMPLATES["evaluate_all_ocr_user"] = _template(
 PROMPT_TEMPLATES["evaluate_all_visual_user"]["content"] += (
     "\n\n找页补充：图片标签 Pn 是系统实际发送的 PDF 页，不得以目录或印刷页码替代。"
     "若 text_result 含 prior_image_batches，必须以文字证据与图片证据的合并覆盖给出最终建议，并重新给出整条规则的 suggested_score；多材料规则应明确已覆盖与未覆盖项。"
+    "对证书、证件、执照、许可、签章等视觉优先材料，先在本次图片中直接逐字读取与规则有关的名称、编号、日期、有效期、型号、数量等可见字段，"
+    "写入 evidence 或 field_checks；不得等待或假定后续 OCR 会补足。后续腾讯 OCR 仅可能作为独立文字复核，不能替代你对页面相关性、签章和外观事实的判断。"
 )
 PROMPT_TEMPLATES["evaluate_all_ocr_user"]["content"] += (
     "\n\n补充：Pn 仅指系统实际 PDF 页；关键字段逐字引用，模糊字不得补全。"
@@ -220,16 +227,17 @@ PROMPT_TEMPLATES["evaluate_all_visual_contract"] = _template(
     "综合评审 · 图片识别结果协议",
     "图片识别任务的固定输出字段与证据边界；与可修改的业务指令分离。",
     "只返回合法 JSON，不得使用 Markdown。必须包含 status、suggested_score、evidence、reason、risk_level、confidence、"
-    "coverage、conclusion_scope、evidence_pages、field_checks、conflict_level、needs_more_image、requested_pages。"
+    "coverage、conclusion_scope、evidence_pages、irrelevant_pages、score_items、field_checks、conflict_level、needs_more_image、requested_pages。"
     "coverage 只描述本次传入图片是否包含规则相关事实；conclusion_scope 描述文字、OCR、前序图片和本次图片合并后，"
     "整条规则能否完成判断。evidence_pages 只能列本次实际看到且形成直接证据的 PDF 页，必须是传入页的子集；"
-    "若 text_result 中含 prior_image_batches，必须合并前序批次事实，不得只根据当前页重新判断。"
+    "若 text_result 中含 prior_image_batches，必须合并前序批次事实，不得只根据当前页重新判断。评分规则的 score_items"
+    "只列可以由已发送图片直接支持的叶子项或封顶项；未覆盖项必须标 unresolved。"
     "未覆盖、模糊或未出现的字段不是冲突。只有同一主体、同一材料、同一字段在文字与图片中均清晰可见且逐字不同，"
     "才可在 field_checks 中写 conflict；material 冲突必须提供双方非空的逐字值。证据和理由不复述规则。"
 )
 PROMPT_TEMPLATES["evaluate_all_ocr_contract"] = _template(
     "综合评审 · OCR 结果协议",
-    "腾讯 OCR 任务的固定输出字段与证据边界；与可修改的业务指令分离。",
+    "腾讯或本地 OCR 任务共用的固定输出字段与证据边界；与可修改的业务指令分离。",
     "只返回合法 JSON，不得使用 Markdown。必须包含 status、suggested_score、evidence、reason、risk_level、confidence、"
     "coverage、conclusion_scope、evidence_pages。coverage 只表示本次 OCR 文字是否覆盖规则相关材料；"
     "conclusion_scope 表示结合既有文字后整条规则是否足以完成判断。evidence_pages 只能列本次 OCR 实际识别页中直接形成证据的 PDF 页，"
