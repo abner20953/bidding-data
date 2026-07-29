@@ -199,6 +199,13 @@ class EvaluationWorkbenchTests(unittest.TestCase):
                                   context_mode="vision_standard_1", usage={"total_tokens": 40})
         storage.record_model_call(self.app, task["task_id"], self.project["project_id"], "evaluate_all_review_ocr", None,
                                   context_mode="tencent_ocr", usage={"total_tokens": 20})
+        storage.record_model_call(self.app, task["task_id"], self.project["project_id"], "evaluate_all_review_ocr", None,
+                                  context_mode="local_ocr", usage={"total_tokens": 15})
+        document = self._add_pdf("local-ocr.pdf", "bid", "甲公司", "本地 OCR 缓存页")
+        storage.save_ocr_page_cache(
+            self.app, document["document_id"], 1, "local-hash", local_ocr_gateway.LOCAL_OCR_SERVICE,
+            {"service": local_ocr_gateway.LOCAL_OCR_SERVICE, "text": "本地文字", "parser_version": 1},
+        )
         with storage.connection(self.app) as conn:
             conn.execute(
                 "INSERT INTO ew_ocr_usage_ledger(usage_id, task_id, project_id, service, month_key, status, billed_units, created_at)"
@@ -212,9 +219,11 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(usage["families"]["vision"]["call_count"], 1)
         self.assertEqual(usage["families"]["vision"]["total_tokens"], 40)
         self.assertEqual(usage["families"]["tencent_ocr"]["call_count"], 1)
+        self.assertEqual(usage["families"]["local_ocr"]["call_count"], 1)
         self.assertEqual(usage["ocr_requests"], 2)
+        self.assertEqual(usage["local_ocr_pages"], 1)
         # 汇总口径保持不变，新增字段不影响既有调用方。
-        self.assertEqual(usage["call_count"], 3)
+        self.assertEqual(usage["call_count"], 4)
 
     def test_document_evidence_manifest_is_reusable_without_storing_document_text(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案：稳定运行。")
@@ -434,6 +443,29 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual({item["dimension"] for item in analysis["signals"]}, {"person_name", "email", "address"})
         self.assertNotIn("address", {item["dimension"] for item in analysis["not_executed_dimensions"]})
         self.assertTrue(all(item["signal_type"] == "collusion_signal" for item in analysis["signals"]))
+
+    def test_cross_bid_signal_hides_cover_and_standard_form_noise_but_keeps_technical_text(self):
+        left = {"document_id": "a", "bidder_name": "甲公司", "original_name": "a.pdf"}
+        right = {"document_id": "b", "bidder_name": "乙公司", "original_name": "b.pdf"}
+        result = {"paragraphs": [
+            {"type": "text", "text_a": "投标文件正本 项目名称 教学仪器采购 项目编号 JY-01 投标人名称",
+             "text_b": "投标文件正本 项目名称 教学仪器采购 项目编号 JY-01 投标人名称", "page_a": 1, "page_b": 1},
+            {"type": "text", "text_a": "实验台采用耐腐蚀环氧树脂台面并配独立通风控制模块",
+             "text_b": "实验台采用耐腐蚀环氧树脂台面并配独立通风控制模块", "page_a": 88, "page_b": 96},
+        ]}
+
+        analysis = build_cross_bid_analysis("task-1", [(left, right, result)], tender_loaded=True)
+
+        signal = next(item for item in analysis["signals"] if item["dimension"] == "text_similarity")
+        self.assertEqual(len(signal["evidence"]), 1)
+        self.assertIn("环氧树脂", signal["evidence"][0]["text_a"])
+
+    def test_form_field_completion_is_not_a_substantive_tender_edit(self):
+        detector = CollusionDetector()
+        tender = "采购人：\n项目名称：\n项目编号：\n"
+        edit = {"original": "", "modified": "太原市某单位", "source_start": 4, "source_end": 4}
+
+        self.assertTrue(detector._is_form_field_completion(edit, tender))
 
     def test_voice_only_tender_edit_signal_is_downgraded(self):
         left = {"document_id": "a", "bidder_name": "甲公司", "original_name": "a.pdf"}
@@ -1424,9 +1456,10 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         ], "")) as local_pages:
             values, failure = worker._ocr_page_texts(self.app, {"task_id": "task"}, document, rule, {}, "standard", pages=[1])
 
-        self.assertEqual(failure, "腾讯 OCR 未启用，已由本地 RapidOCR 直接识别")
+        self.assertEqual(failure, "")
         self.assertEqual(values[0]["service"], local_ocr_gateway.LOCAL_OCR_SERVICE)
-        local_pages.assert_called_once()
+        self.assertEqual(local_pages.call_args.kwargs["rule"], rule)
+        self.assertEqual(local_pages.call_args.kwargs["level"], "standard")
 
     def test_ocr_runtime_uses_local_path_when_tencent_is_disabled(self):
         self.assertTrue(worker._ocr_runtime_enabled({
@@ -1438,6 +1471,20 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertFalse(worker._ocr_runtime_enabled({
             "tencent_enabled": False, "local": {"enabled": True, "runtime_available": False},
         }))
+
+    def test_evaluation_local_ocr_does_not_require_a_vision_model_profile(self):
+        configuration = {"tencent_enabled": False, "local": {"enabled": True, "runtime_available": True}}
+
+        self.assertTrue(worker._evaluation_ocr_enabled(True, configuration))
+        self.assertFalse(worker._evaluation_ocr_enabled(False, configuration))
+
+    def test_legacy_ocr_rule_uses_hybrid_chain_instead_of_skipping_local_ocr(self):
+        legacy_rule = {
+            "title": "证书扫描件", "check_rule": "核验证书扫描件文字内容",
+            "check_mode": "ocr", "ocr_required": True, "evidence_requirements": ["visual"],
+        }
+
+        self.assertEqual(worker._rule_image_strategy(legacy_rule), "hybrid")
 
     def test_tencent_ocr_success_never_starts_local_fallback(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "扫描件候选页")
@@ -1485,7 +1532,83 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(values[0]["service"], local_ocr_gateway.LOCAL_OCR_SERVICE)
         self.assertEqual(values[0]["parser_version"], local_ocr_gateway.LOCAL_OCR_PARSER_VERSION)
+        self.assertEqual(values[0]["state"], "recognized")
         run.assert_called_once()
+
+    def test_local_ocr_gateway_retains_empty_and_failed_page_states(self):
+        with tempfile.TemporaryDirectory(prefix="local_ocr_test_") as folder:
+            first = Path(folder) / "first.jpg"
+            second = Path(folder) / "second.jpg"
+            first.write_bytes(b"jpeg")
+            second.write_bytes(b"jpeg")
+            completed = type("Completed", (), {
+                "returncode": 0,
+                "stdout": json.dumps({"ok": True, "pages": [
+                    {"page": 1, "text": ""}, {"page": 2, "error": "model page failure"},
+                ]}, ensure_ascii=False),
+                "stderr": "",
+            })()
+            with patch("dashboard.evaluation_workbench.local_ocr_gateway.subprocess.run", return_value=completed):
+                values, error = local_ocr_gateway.request_local_ocr([
+                    {"page": 1, "path": str(first)}, {"page": 2, "path": str(second)},
+                ])
+
+        self.assertIsNone(error)
+        self.assertEqual([item["state"] for item in values], ["empty", "failed"])
+
+    def test_local_ocr_caches_empty_page_and_reports_failed_page(self):
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "扫描件候选页")
+        with patch("dashboard.evaluation_workbench.worker._render_ocr_page", return_value=(b"jpeg", "local-empty")), \
+             patch("dashboard.evaluation_workbench.worker.request_local_ocr", return_value=([
+                 {"page": 1, "service": local_ocr_gateway.LOCAL_OCR_SERVICE, "state": "empty"},
+             ], None)):
+            values, failure = worker._local_ocr_page_texts(self.app, document, [1])
+
+        cached = storage.get_ocr_page_cache(
+            self.app, document["document_id"], 1, "local-empty", local_ocr_gateway.LOCAL_OCR_SERVICE,
+        )
+        self.assertEqual(values, [])
+        self.assertIn("未在候选页识别到文字", failure)
+        self.assertTrue(cached["empty"])
+
+    def test_local_ocr_serializes_parallel_subprocess_requests(self):
+        documents = [
+            self._add_pdf("bid-a.pdf", "bid", "甲公司", "扫描件候选页"),
+            self._add_pdf("bid-b.pdf", "bid", "乙公司", "扫描件候选页"),
+        ]
+        active = maximum = 0
+        lock = threading.Lock()
+
+        def fake_local_ocr(pages):
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+            time.sleep(0.04)
+            with lock:
+                active -= 1
+            return ([{"page": pages[0]["page"], "service": local_ocr_gateway.LOCAL_OCR_SERVICE,
+                      "state": "recognized", "text": "本地识别文字"}], None)
+
+        with patch("dashboard.evaluation_workbench.worker.request_local_ocr", side_effect=fake_local_ocr):
+            threads = [threading.Thread(target=worker._local_ocr_page_texts, args=(self.app, document, [1])) for document in documents]
+            for item in threads:
+                item.start()
+            for item in threads:
+                item.join()
+
+        self.assertEqual(maximum, 1)
+
+    def test_local_ocr_uses_high_quality_rendering_for_high_strength_certificate_rule(self):
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "扫描件候选页")
+        rule = {"title": "认证证书", "check_rule": "核验证书编号与有效期"}
+        with patch("dashboard.evaluation_workbench.worker._render_ocr_page", return_value=(b"jpeg", "quality-hash")) as render, \
+             patch("dashboard.evaluation_workbench.worker.request_local_ocr", return_value=([
+                 {"page": 1, "service": local_ocr_gateway.LOCAL_OCR_SERVICE, "state": "recognized", "text": "证书编号A123"},
+             ], None)):
+            worker._local_ocr_page_texts(self.app, document, [1], rule=rule, level="high")
+
+        self.assertEqual(render.call_args.args[3], "accurate")
 
     def test_local_ocr_runtime_environment_scopes_model_home_and_threads(self):
         with patch.dict(os.environ, {"RAPIDOCR_MODEL_HOME": "/tmp/rapidocr-model"}, clear=False):
@@ -1606,6 +1729,32 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(result["ocr_candidate_pages"], [12, 20])
         self.assertEqual(result["ocr_evidence_pages"], [12])
         self.assertEqual(worker._vision_page_candidates(document, rule, result)[:2], [12, 30])
+
+    def test_partial_local_ocr_failure_cannot_claim_full_rule_coverage(self):
+        document = {"document_id": "doc", "extension": ".pdf", "page_count": 50,
+                    "original_name": "投标.pdf", "bidder_name": "甲"}
+        rule = {"rule_id": "cert", "title": "证书评分", "check_rule": "证书有效得2分",
+                "vision_trigger": "required", "vision_level": "standard", "scoring": {"max_score": 2}}
+        original = {"rule_id": "cert", "suggested_score": 0, "max_score": 2,
+                    "evidence": "文字层未找到证书", "reason": "待 OCR", "confidence": "low"}
+        parsed = {
+            "coverage": "covered", "conclusion_scope": "full", "suggested_score": 2,
+            "evidence": "P12证书编号和有效期可见", "reason": "满足计分条件",
+            "confidence": "high", "evidence_pages": [12],
+        }
+        with patch("dashboard.evaluation_workbench.worker._ocr_page_texts", return_value=([
+            {"page": 12, "service": local_ocr_gateway.LOCAL_OCR_SERVICE, "text": "证书编号A123"},
+        ], "本地 RapidOCR 未完成 P13")), patch(
+            "dashboard.evaluation_workbench.worker._request_task_json", return_value=parsed,
+        ):
+            result = worker._run_ocr_supplement(
+                self.app, {"task_id": "task"}, document, "objective", rule, original,
+                {"profile_id": "text", "display_name": "文本模型"},
+            )
+
+        self.assertEqual(result["vision_status"], "ocr_applied_partial")
+        self.assertEqual(result["suggested_score"], 0)
+        self.assertIn("未完成 P13", result["vision_message"])
 
     def test_high_ocr_reuses_single_visual_locator_result_for_later_multimodal_fallback(self):
         document = {"document_id": "doc", "extension": ".pdf", "page_count": 50,
@@ -2960,6 +3109,92 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(worker._confirmed_partial_score(rule, parsed, 0, 3), 1)
         self.assertEqual(worker._confirmed_partial_score(rule, {"suggested_score": 3}, 0, 3), 0)
         self.assertEqual(worker._confirmed_partial_score(rule, parsed, 0, 3, checked_pages=[10]), 0)
+
+    def test_partial_visual_score_accepts_confirmed_single_cap_materials_with_model_item_ids(self):
+        rule = {"scoring": {"max_score": 3, "items": [{"item_id": "SI-1", "max_score": 3}]}}
+        parsed = {"score_items": [
+            {"item_id": "合同-淹底乡", "status": "confirmed", "suggested_score": 3, "evidence_pages": [188, 189]},
+            {"item_id": "合同-待补", "status": "unresolved", "suggested_score": 3, "evidence_pages": []},
+        ]}
+
+        self.assertEqual(worker._confirmed_partial_score(rule, parsed, 0, 3, checked_pages=[189]), 3)
+        self.assertEqual(worker._confirmed_partial_score(rule, parsed, 0, 3, checked_pages=[20]), 0)
+
+    def test_cross_bid_price_fact_retracts_stale_price_absence_review(self):
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "报价文件")
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "compliance", "title": "投标报价核验", "check_rule": "核验投标报价是否符合最高限价",
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        review_run = storage.create_review_run(self.app, self.project["project_id"], task["task_id"], None)
+        score_run = storage.create_score_run(self.app, self.project["project_id"], task["task_id"], "objective", None)
+        storage.save_review_results(self.app, review_run["review_run_id"], document["document_id"], [{
+            "rule_id": rule["rule_id"], "status": "not_found", "evidence": "未见总报价金额", "reason": "报价总价未直接呈现。",
+            "risk_level": "high", "confidence": "high", "evidence_quality": "sufficient",
+        }])
+        storage.save_score_results(self.app, score_run["score_run_id"], document["document_id"], [{
+            "rule_id": rule["rule_id"], "suggested_score": 0, "max_score": 10,
+            "evidence": "投标总报价（大写）：人民币陆拾贰万柒仟元整；¥627,000元。", "reason": "已定位报价。",
+        }])
+
+        self.assertEqual(storage.reconcile_price_review_results(self.app, review_run["review_run_id"], score_run["score_run_id"]), 1)
+        with storage.connection(self.app) as conn:
+            row = conn.execute("SELECT status, risk_level, reason FROM ew_review_results WHERE review_run_id=?", (review_run["review_run_id"],)).fetchone()
+        self.assertEqual(row["status"], "partial")
+        self.assertEqual(row["risk_level"], "low")
+        self.assertIn("已定位报价金额", row["reason"])
+
+    def test_price_fact_retraction_matches_amount_without_thousands_separator(self):
+        document = self._add_pdf("bid.pdf", "bid", "乙公司", "报价文件")
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "compliance", "title": "投标报价核验", "check_rule": "核验投标报价是否符合最高限价",
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        review_run = storage.create_review_run(self.app, self.project["project_id"], task["task_id"], None)
+        score_run = storage.create_score_run(self.app, self.project["project_id"], task["task_id"], "objective", None)
+        storage.save_review_results(self.app, review_run["review_run_id"], document["document_id"], [{
+            "rule_id": rule["rule_id"], "status": "not_found", "evidence": "未见总报价金额", "reason": "报价总价未直接呈现。",
+            "risk_level": "high", "confidence": "high", "evidence_quality": "sufficient",
+        }])
+        storage.save_score_results(self.app, score_run["score_run_id"], document["document_id"], [{
+            "rule_id": rule["rule_id"], "suggested_score": 0, "max_score": 10,
+            "evidence": "投标总报价￥：632836 元", "reason": "已定位报价，另核实174.6762万元口径。",
+        }])
+
+        self.assertEqual(storage.reconcile_price_review_results(self.app, review_run["review_run_id"], score_run["score_run_id"]), 1)
+        with storage.connection(self.app) as conn:
+            row = conn.execute("SELECT status FROM ew_review_results WHERE review_run_id=?", (review_run["review_run_id"],)).fetchone()
+        self.assertEqual(row["status"], "partial")
+
+    def test_non_price_rule_amount_does_not_count_as_located_bid_price(self):
+        document = self._add_pdf("bid.pdf", "bid", "丙公司", "投标文件")
+        price_rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "compliance", "title": "投标报价核验", "check_rule": "核验投标报价是否符合最高限价",
+        })
+        perf_rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "近三年同类业绩", "check_rule": "核验同类项目业绩合同",
+            "scoring": {"max_score": 6},
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        review_run = storage.create_review_run(self.app, self.project["project_id"], task["task_id"], None)
+        score_run = storage.create_score_run(self.app, self.project["project_id"], task["task_id"], "objective", None)
+        storage.save_review_results(self.app, review_run["review_run_id"], document["document_id"], [{
+            "rule_id": price_rule["rule_id"], "status": "not_found", "evidence": "未见总报价金额", "reason": "报价总价未直接呈现。",
+            "risk_level": "high", "confidence": "high", "evidence_quality": "sufficient",
+        }])
+        storage.save_score_results(self.app, score_run["score_run_id"], document["document_id"], [{
+            "rule_id": perf_rule["rule_id"], "suggested_score": 2, "max_score": 6,
+            "evidence": "合同金额2163180元", "reason": "已定位同类业绩合同。",
+        }])
+
+        self.assertEqual(storage.reconcile_price_review_results(self.app, review_run["review_run_id"], score_run["score_run_id"]), 0)
+        with storage.connection(self.app) as conn:
+            row = conn.execute("SELECT status, risk_level FROM ew_review_results WHERE review_run_id=?", (review_run["review_run_id"],)).fetchone()
+        self.assertEqual(row["status"], "not_found")
+        self.assertEqual(row["risk_level"], "high")
 
     def test_irrelevant_visual_pages_cannot_become_evidence_pages(self):
         merged, _, checked, evidence = worker._merge_usable_visual_responses([(

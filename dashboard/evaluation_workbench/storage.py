@@ -1550,6 +1550,7 @@ def project_token_usage(app, project_id: str) -> dict:
             """SELECT CASE
                         WHEN context_mode LIKE 'vision%' THEN 'vision'
                         WHEN context_mode = 'tencent_ocr' THEN 'tencent_ocr'
+                        WHEN context_mode = 'local_ocr' THEN 'local_ocr'
                         ELSE 'text' END AS family,
                       COUNT(*) AS call_count,
                       COALESCE(SUM(total_tokens), 0) AS total_tokens,
@@ -1559,6 +1560,12 @@ def project_token_usage(app, project_id: str) -> dict:
         ).fetchall()
         ocr_row = conn.execute(
             "SELECT COALESCE(SUM(billed_units), 0) AS ocr_requests FROM ew_ocr_usage_ledger WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+        local_ocr_row = conn.execute(
+            """SELECT COUNT(DISTINCT c.document_id || ':' || c.page_number) AS local_ocr_pages
+               FROM ew_ocr_page_cache c JOIN ew_documents d ON d.document_id=c.document_id
+               WHERE d.project_id=? AND c.service='rapidocr_local'""",
             (project_id,),
         ).fetchone()
     usage = dict(row)
@@ -1573,6 +1580,8 @@ def project_token_usage(app, project_id: str) -> dict:
         for item in family_rows
     }
     usage["ocr_requests"] = int(ocr_row["ocr_requests"] or 0) if ocr_row else 0
+    # 本地 OCR 没有额度台账；以已缓存的去重页数呈现真实处理规模（含空白页缓存）。
+    usage["local_ocr_pages"] = int(local_ocr_row["local_ocr_pages"] or 0) if local_ocr_row else 0
     return usage
 
 
@@ -2070,6 +2079,10 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
     if payload.get("ocr_required") or payload.get("check_mode") == "ocr":
         if "visual" not in normalized:
             normalized.append("visual")
+        # “需 OCR”不是纯图片外观结论：它至少还需要可读文字。保留 visual 以便
+        # 用户要求时继续交给多模态核验，同时让腾讯关闭后的 RapidOCR 能正常接管。
+        if "text" not in normalized:
+            normalized.append("text")
     applicability = payload.get("applicability", base["applicability"])
     if not isinstance(applicability, dict):
         applicability = {}
@@ -2080,7 +2093,11 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
     if trigger_value is None and trigger == "off" and (
         "visual" in normalized or payload.get("ocr_required") or payload.get("check_mode") == "ocr"
     ):
-        trigger = "text_fallback" if "text" in normalized else "required"
+        # 兼容既有“需 OCR”规则的默认口径：只新增文字证据维度，不能改变它原先
+        # “必须图片核验、待人工选择强度”的触发语义。
+        trigger = "required" if (payload.get("ocr_required") or payload.get("check_mode") == "ocr") else (
+            "text_fallback" if "text" in normalized else "required"
+        )
     level = str(payload.get("vision_level", base["vision_level"]) or "off")
     if trigger not in _VISION_TRIGGERS:
         raise ValueError("图片识别条件不正确")
@@ -2703,6 +2720,70 @@ def save_score_results(app, score_run_id: str, document_id: str, results: list[d
                  item.get("review_reason", ""), item.get("vision_status", "not_requested"), _vision_pages_json(item), _vision_evidence_pages_json(item), _evidence_layers_json(item),
                  item.get("vision_model", ""), item.get("vision_message", ""), timestamp, timestamp),
             )
+
+
+_PRICE_RULE_MARKERS = re.compile(r"(?:报价|投标价|评标价|评审价|最高限价|预算金额|总价)")
+_PRICE_ABSENCE_MARKERS = re.compile(r"(?:未见|未提供|未直接呈现|缺失|未核)[^。；;\n]{0,36}(?:报价|总价|金额)|(?:报价|总价|金额)[^。；;\n]{0,36}(?:未见|未提供|未直接呈现|缺失|未核)")
+# 真实评分证据的金额写法多样：千分位“¥627,000元”、无分隔“￥：632836 元”、
+# “628120.00元”、万元小数“174.6762万元”和中文大写“…元整”都必须命中，
+# 否则价格核验已定位的事实会被静默漏掉，陈旧“报价未见”结论无法回收。
+_CONCRETE_PRICE_MARKERS = re.compile(
+    r"(?:￥|¥|人民币)?\s*\d{1,3}(?:,\d{3})+(?:\.\d+)?\s*元?"
+    r"|[￥¥]\s*[:：]?\s*\d{4,}(?:\.\d+)?"
+    r"|\d{4,}(?:\.\d+)?\s*元"
+    r"|\d+(?:\.\d+)?\s*万元"
+    r"|(?:人民币)?[零壹贰叁肆伍陆柒捌玖拾佰仟万亿两]+元整"
+)
+
+
+def reconcile_price_review_results(app, review_run_id: str, objective_run_id: str) -> int:
+    """用同批跨投标人报价事实撤销“报价未见”的旧文字结论。
+
+    单文件审查先完成、跨投标人价格核验后完成。若后者已在同一投标文件中定位到
+    明确金额，前者不能继续以“未见报价”为高风险依据。这里仅把该类结论降为
+    ``partial`` 并保留限价/口径待核验，不自动认定报价合规或改写任何价格分。
+    """
+    with connection(app) as conn:
+        score_rows = conn.execute(
+            """SELECT item.document_id, item.evidence, item.reason, rule.title, rule.check_rule
+               FROM ew_score_results item JOIN ew_rules rule ON rule.rule_id=item.rule_id
+               WHERE item.score_run_id=?""", (objective_run_id,)
+        ).fetchall()
+        price_documents = {
+            str(row["document_id"])
+            for row in score_rows
+            if _PRICE_RULE_MARKERS.search(f"{row['title'] or ''} {row['check_rule'] or ''}")
+            and _CONCRETE_PRICE_MARKERS.search(f"{row['evidence'] or ''} {row['reason'] or ''}")
+        }
+        if not price_documents:
+            return 0
+        rows = conn.execute(
+            """SELECT item.review_result_id, item.document_id, item.status, item.evidence, item.reason,
+                      rule.title, rule.check_rule
+               FROM ew_review_results item JOIN ew_rules rule ON rule.rule_id=item.rule_id
+               WHERE item.review_run_id=?""", (review_run_id,)
+        ).fetchall()
+        updated = 0
+        for row in rows:
+            if str(row["document_id"]) not in price_documents:
+                continue
+            rule_text = f"{row['title'] or ''} {row['check_rule'] or ''}"
+            current_text = f"{row['evidence'] or ''}\n{row['reason'] or ''}"
+            if not _PRICE_RULE_MARKERS.search(rule_text) or not _PRICE_ABSENCE_MARKERS.search(current_text):
+                continue
+            pieces = re.split(r"(?<=[。；;])\s*|\n+", str(row["reason"] or ""))
+            retained = [piece.strip() for piece in pieces if piece.strip() and not _PRICE_ABSENCE_MARKERS.search(piece)]
+            retained.append("同批价格核验已定位报价金额；是否符合限价、报价口径及本规则仍需结合原文复核。")
+            conn.execute(
+                """UPDATE ew_review_results
+                   SET status='partial', reason=?, risk_level='low', confidence='medium',
+                       evidence_quality='limited', automation_status='needs_review', requires_review=1,
+                       review_reason='同批价格核验已定位报价金额，原“报价未见”表述已撤销，仍需人工核对限价和口径。'
+                   WHERE review_result_id=?""",
+                (" ".join(dict.fromkeys(retained))[:2000], row["review_result_id"]),
+            )
+            updated += 1
+    return updated
 
 
 def latest_score_results(app, project_id: str, score_type: str) -> tuple[dict | None, list[dict]]:

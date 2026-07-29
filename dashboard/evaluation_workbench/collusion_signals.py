@@ -74,6 +74,53 @@ def _page_evidence(item: dict) -> dict:
     return evidence
 
 
+_FORM_TEMPLATE_MARKERS = (
+    "项目名称", "项目编号", "投标函", "授权委托书", "法定代表人身份证明",
+    "开标一览表", "投标有效期", "投标人名称", "采购人", "招标人",
+)
+
+
+def _collision_value(item: dict) -> int:
+    """给横向碰撞排序并屏蔽明显的公共格式残留。
+
+    底层比较器已经按招标原文做了主过滤；这里是面向“是否值得送 AI/展示”的第二道
+    通用门槛。它不依赖某个项目名称：只排除可预期的格式字段、封面和法定表单，
+    对技术参数、专有表述、金额/型号组合和正文异常仍优先保留。
+    """
+    text = re.sub(r"\s+", "", f"{item.get('text_a') or ''}{item.get('text_b') or ''}")
+    if not text:
+        return 0
+    marker_count = sum(marker in text for marker in _FORM_TEMPLATE_MARKERS)
+    if marker_count >= 2:
+        return 0
+    if "投标文件" in text and any(marker in text for marker in ("正本", "副本", "封面")):
+        return 0
+    if "遵守本投标文件" in text and "投标有效期" in text:
+        return 0
+    # 同一采购人、项目号或日期本身不构成独立线索；只有同时带有较长的非表单正文
+    # 时才保留，且分值较低，让真正的技术/方案证据优先进入 AI 证据包。
+    value = min(180, len(re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]", "", text)))
+    if marker_count:
+        value -= 80
+    if re.search(r"(?:\d+(?:\.\d+)?\s*(?:mm|cm|kg|台|套|项|元|%|㎡|m²)|[A-Za-z]{2,}[-－]?\d+)", text):
+        value += 45
+    if item.get("type") == "fuzzy":
+        try:
+            value += max(0, int(float(item.get("similarity") or 0)) - 85)
+        except (TypeError, ValueError):
+            pass
+    return max(0, value)
+
+
+def _rank_reportable_items(items: list[dict], *, minimum_value: int = 16) -> tuple[list[dict], int]:
+    values = [(item, _collision_value(item)) for item in items]
+    # 非模板的短独有技术表述也可能是有价值线索；格式字段已在上层严格剔除，
+    # 此处仅过滤几乎不含信息的残片。
+    kept = [item for item, value in values if value >= minimum_value]
+    kept.sort(key=lambda item: (-_collision_value(item), int(item.get("page_a") or 0), int(item.get("page_b") or 0)))
+    return kept, len(items) - len(kept)
+
+
 def _signal(task_id: str, left: dict, right: dict, dimension: str, confidence: str,
             basis: str, evidence: list[dict], counter_evidence: list[str] | None = None) -> dict:
     return {
@@ -102,7 +149,9 @@ def analyze_pair(task_id: str, left: dict, right: dict, result: dict, *, tender_
     paragraphs = result.get("paragraphs") or []
     signals = []
 
-    text_items = [item for item in paragraphs if item.get("type") in {"text", "fuzzy"}]
+    text_items, filtered_text_count = _rank_reportable_items([
+        item for item in paragraphs if item.get("type") in {"text", "fuzzy"}
+    ])
     if text_items:
         exact_count = sum(item.get("type") == "text" for item in text_items)
         signals.append(_signal(
@@ -110,16 +159,24 @@ def analyze_pair(task_id: str, left: dict, right: dict, result: dict, *, tender_
             f"发现 {exact_count} 处完全雷同、{len(text_items) - exact_count} 处近似雷同；"
             + ("已由底层算法排除招标原文直接复制内容。" if tender_loaded else "未提供招标文件，尚未完成招标原文排除。"),
             [_page_evidence(item) for item in text_items],
-            ["常见行业表述、法定格式或未提供的公共模板仍可能形成相似文本，需结合完整上下文复核。"],
+            [
+                "已在信号层剔除封面、投标函、授权等常见格式字段；仍需结合完整上下文复核。",
+                *( [f"另有 {filtered_text_count} 条低信息格式/公共来源碰撞未进入 AI 判定。"] if filtered_text_count else [] ),
+            ],
         ))
 
-    error_items = [item for item in paragraphs if item.get("type") in {"shared_error", "rare_word"}]
+    error_items, filtered_error_count = _rank_reportable_items([
+        item for item in paragraphs if item.get("type") in {"shared_error", "rare_word"}
+    ], minimum_value=8)
     if error_items:
         signals.append(_signal(
             task_id, left, right, "text_error", "C3" if any(item.get("type") == "shared_error" for item in error_items) else "C2",
             f"发现 {len(error_items)} 处共同的高置信异常、错误或罕见表述。",
             [_page_evidence(item) for item in error_items],
-            ["同一资料来源、行业惯用文本或共同第三方模板也可能产生相同错误。"],
+            [
+                "同一资料来源、行业惯用文本或共同第三方模板也可能产生相同错误。",
+                *( [f"另有 {filtered_error_count} 条低信息排版/格式异常未作为线索展示。"] if filtered_error_count else [] ),
+            ],
         ))
 
     entity_groups = {"contact": [], "email": [], "person_name": [], "person_identity": [], "address": []}

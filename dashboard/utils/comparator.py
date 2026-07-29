@@ -537,6 +537,20 @@ class CollusionDetector:
             and "公开招标采购" in normalized
         ):
             return True
+        # 封面、投标函和授权文件中的项目/主体填空虽会因各投标人都填入同一采购
+        # 信息而高度相似，但本质是招标格式的正常完成，不具备横向异常价值。
+        if "投标文件" in normalized and "项目名称" in normalized and "项目编号" in normalized and any(
+            marker in normalized for marker in ("正本", "副本", "封面", "投标人名称")
+        ):
+            return True
+        if "投标函" in normalized and "项目名称" in normalized and any(
+            marker in normalized for marker in ("投标报价", "投标有效期", "遵守本投标文件")
+        ):
+            return True
+        if "授权委托书" in normalized and "委托代理人" in normalized and any(
+            marker in normalized for marker in ("法定代表人", "身份证", "授权")
+        ):
+            return True
         if (
             "政府采购" in normalized
             and "自愿参加本次政府采购活动" in normalized
@@ -676,7 +690,32 @@ class CollusionDetector:
             return True
         if not original and len(modified) < 3:
             return True
+        # 仅删除招标格式中的变量占位符（如“（标的名称）”）不会形成投标人之间
+        # 的独立共同编辑；它与填表、模板转换的方式有关，不应进入串标线索。
+        if not modified and re.fullmatch(r"[（(][^（）()]{1,24}[）)](?:[,，:：])?", original):
+            return True
         return False
+
+    @staticmethod
+    def _is_form_field_completion(edit, tender_text):
+        """识别招标格式中项目/主体字段的正常填写，不把它当作共同实质编辑。
+
+        判断依赖原文局部字段标签而非具体项目名称、采购人或企业名称，因此可用于
+        不同项目。只处理新增或替换占位符的情形，数值、期限、技术参数等仍完整保留。
+        """
+        original = str(edit.get("original") or "")
+        modified = str(edit.get("modified") or "")
+        if not modified:
+            return False
+        start = max(0, int(edit.get("source_start") or 0) - 40)
+        end = min(len(tender_text), int(edit.get("source_end") or 0) + 40)
+        context = tender_text[start:end]
+        field_markers = (
+            "项目名称", "项目编号", "采购人", "招标人", "采购代理", "供应商", "投标人",
+            "法定代表人", "委托代理人", "联系人", "日期", "包号", "标包",
+        )
+        placeholder = bool(re.fullmatch(r"\s*(?:[（(][^（）()]{0,24}[）)])?\s*", original))
+        return placeholder and any(marker in context for marker in field_markers)
 
     @staticmethod
     def _is_leading_table_title_insertion(edit, tender_text):
@@ -833,6 +872,7 @@ class CollusionDetector:
             signature: edit
             for signature, edit in edits_a.items()
             if not self._is_low_value_tender_edit(edit)
+            and not self._is_form_field_completion(edit, tender_text)
             and not self._is_leading_table_title_insertion(edit, tender_text)
             and not self._is_segment_artifact_deletion(edit, tender_text)
         }
@@ -840,6 +880,7 @@ class CollusionDetector:
             signature: edit
             for signature, edit in edits_b.items()
             if not self._is_low_value_tender_edit(edit)
+            and not self._is_form_field_completion(edit, tender_text)
             and not self._is_leading_table_title_insertion(edit, tender_text)
             and not self._is_segment_artifact_deletion(edit, tender_text)
         }
@@ -1095,6 +1136,10 @@ class CollusionDetector:
         for fingerprint in shared_fingerprints:
             issue_a = issues_a[fingerprint]
             issue_b = issues_b[fingerprint]
+            # 解析表格时，编号/标点常由单元格顺序或换行造成。该类错误没有独立
+            # 来源价值；保留计算错误和正文文字错误，避免掩盖真正的共同异常。
+            if issue_a["kind"] in {"punctuation", "numbering"} and self._looks_like_table_extraction(issue_a["text"]):
+                continue
             matches.append(
                 {
                     "type": "shared_error",

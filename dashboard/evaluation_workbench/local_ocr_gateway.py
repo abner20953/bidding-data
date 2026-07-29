@@ -93,6 +93,8 @@ def request_local_ocr(pages: list[dict]) -> tuple[list[dict], dict | None]:
     if completed.returncode != 0 or not isinstance(payload, dict) or not payload.get("ok"):
         detail = payload.get("error") if isinstance(payload, dict) else ""
         return [], _error("unavailable", detail or completed.stderr or "RapidOCR 子进程未返回有效结果")
+    # 保留每个页面的结果状态，不能把“空白/单页失败”悄悄丢掉。调用方据此
+    # 决定是否只能形成部分 OCR 结论；这对腾讯关闭后的本地直连路径尤其重要。
     values: list[dict] = []
     for item in payload.get("pages") or []:
         if not isinstance(item, dict):
@@ -101,8 +103,22 @@ def request_local_ocr(pages: list[dict]) -> tuple[list[dict], dict | None]:
             page = int(item.get("page") or 0)
         except (TypeError, ValueError):
             page = 0
+        if page <= 0:
+            continue
+        page_error = str(item.get("error") or "").strip()
+        if page_error:
+            values.append({
+                "service": LOCAL_OCR_SERVICE, "page": page, "state": "failed",
+                "error": page_error[:240], "parser_version": LOCAL_OCR_PARSER_VERSION,
+            })
+            continue
         text = str(item.get("text") or "").strip()
-        if page <= 0 or not text:
+        if not text:
+            values.append({
+                "service": LOCAL_OCR_SERVICE, "page": page, "state": "empty",
+                "line_count": int(item.get("line_count") or 0), "confidence": item.get("confidence"),
+                "parser_version": LOCAL_OCR_PARSER_VERSION,
+            })
             continue
         values.append({
             "service": LOCAL_OCR_SERVICE,
@@ -111,5 +127,6 @@ def request_local_ocr(pages: list[dict]) -> tuple[list[dict], dict | None]:
             "confidence": item.get("confidence"),
             "parser_version": LOCAL_OCR_PARSER_VERSION,
             "page": page,
+            "state": "recognized",
         })
     return values, None
