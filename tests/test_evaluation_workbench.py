@@ -2847,6 +2847,34 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(candidates[:2], [12, 13])
         self.assertIn(1, candidates)
 
+    def test_long_directory_continuation_prioritises_material_page_for_vision_and_ocr(self):
+        parsed = self.temp_dir / "parsed_long_directory.txt"
+        parts = ["[第1页]\n投标文件首页\n", "[第2页]\n目录\n商务部分……3\n技术部分……4\n附件目录……5\n"]
+        for page in range(3, 8):
+            line = "普通目录条目……%d\n" % (page + 10)
+            if page == 7:
+                line = "精密空调（氟泵）节能产品认证证书复印件……564\n" + line
+            parts.append(f"[第{page}页]\n{line}其他附件目录……{page + 20}\n技术资料目录……{page + 30}\n")
+        for page in range(8, 565):
+            text = "" if page == 564 else f"这是第{page}页的正文内容。\n"
+            parts.append(f"[第{page}页]\n{text}")
+        parsed.write_text("".join(parts), encoding="utf-8")
+        document = {"document_id": "doc-long-directory", "extension": ".pdf", "page_count": 564,
+                    "parsed_path": str(parsed)}
+        rule = {"title": "强制节能产品认证证书", "check_rule": "核验精密空调（氟泵）节能产品认证证书复印件"}
+        result = {"evidence": "仅见承诺，证书待核验", "reason": "需检查证书本体", "visual_page_candidates": [2, 200]}
+
+        self.assertEqual(worker._page_material_role("精密空调认证证书复印件……564\n其他附件……565\n技术资料……566"), "directory")
+        visual_pages = worker._vision_page_candidates(document, rule, result)
+        ocr_pages = worker._ocr_candidate_pages(document, rule, result, "standard")
+
+        self.assertEqual(visual_pages[0], 564)
+        self.assertEqual(ocr_pages[0], 564)
+
+    def test_directory_word_in_body_is_not_misclassified_as_directory(self):
+        body = "本产品符合强制性产品认证目录要求，并提供认证证书复印件。\n参数说明\n有效期说明"
+        self.assertEqual(worker._page_material_role(body), "certificate")
+
     def test_page_specific_business_license_route_falls_back_without_disabling_later_license_page(self):
         rule = {"title": "营业执照", "check_rule": "核验营业执照和统一社会信用代码"}
 

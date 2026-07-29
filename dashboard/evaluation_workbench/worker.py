@@ -2318,10 +2318,12 @@ _VISUAL_GAP_CONTEXT_PATTERN = re.compile(
 )
 # 出现在“目录”语境中的页码是投标文件的印刷页码，不是 PDF 页序，需要先纠偏再使用。
 _VISUAL_TOC_CONTEXT_PATTERN = re.compile(r"目\s*录")
+_DIRECTORY_HEADER_PATTERN = re.compile(r"^\s*(?:第[一二三四五六七八九十百千0-9]+[章节]\s*)?目\s*录(?:\s|$)", re.IGNORECASE)
 _DIRECTORY_TRAILING_PAGE_PATTERN = re.compile(
     r"(?:第\s*|页\s*)?(\d{1,4}(?:\s*(?:[/、,，]|至|[-—–~～])\s*\d{1,4}){0,5})\s*(?:页)?\s*$"
 )
 _DIRECTORY_LEADER_PATTERN = re.compile(r"[.．·…]{2,}|\s{3,}")
+_DIRECTORY_CONTINUATION_MAX_PAGES = 8
 _MATERIAL_ROLE_TERMS = {
     "directory": ("目录", "contents"),
     "response_form": ("响应函", "投标函", "报价函"),
@@ -2352,13 +2354,42 @@ def _rule_material_roles(rule: dict) -> set[str]:
     return roles
 
 
+def _directory_leader_line_count(text: object) -> int:
+    """统计目录式引导符行，避免“产品目录”等普通正文被误认成目录。"""
+    count = 0
+    for line in str(text or "").splitlines():
+        if not _DIRECTORY_LEADER_PATTERN.search(line):
+            continue
+        # 点线类引导符（……564）直接算目录条目；仅靠空白对齐的行还要求页码
+        # 紧跟空白列间隙出现在行尾（“商务部分    3”），否则表格里“3.2”、
+        # 数量等行尾数字会把应答表、报价表等材料页误判成目录。
+        if re.search(r"[.．·…]{2,}", line) or re.search(r"\s{3,}\d{1,4}\s*页?\s*$", line):
+            count += 1
+    return count
+
+
+def _looks_like_directory_page(text: object) -> bool:
+    """以真正目录标题或足够密集的引导符识别目录及其跨页续页。
+
+    目录续页通常不再重复“目录”标题，且条目本身会包含“认证证书”等材料词；
+    因此不能先按材料关键词分类。反过来，正文中的“产品目录”也不能仅凭含有
+    “目录”二字成为目录页。
+    """
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if any(_DIRECTORY_HEADER_PATTERN.match(line) for line in lines[:2]):
+        return True
+    return _directory_leader_line_count(text) >= 3
+
+
 def _page_material_role(text: object) -> str:
     """基于本地解析文本做保守页面角色判断；扫描页保持 unknown，不据此排除。"""
     value = _clean_model_text(text)
     if not value:
         return "scanned"
     lowered = value.lower()
-    if _VISUAL_TOC_CONTEXT_PATTERN.search(value[:180]):
+    # 目录续页先于证书/合同等材料词判定，防止“证书复印件……564”这样的
+    # 目录条目被当成证书本体页，导致后续无法解析其明确页码。
+    if _looks_like_directory_page(value):
         return "directory"
     # 目录、证明材料和要求复述都可能含有同一关键词，先判断更具体的材料本体。
     ordered_roles = (
@@ -2416,13 +2447,16 @@ def _directory_material_candidates(page_texts: dict[int, str], rule: dict, page_
         return []
     directory_pages: set[int] = {
         page for page, text in page_texts.items()
-        if _page_material_role(text) == "directory"
+        if _looks_like_directory_page(text)
     }
-    # 目录经常跨两页，后一页未重复“目录”标题；在首个目录页后保守延伸两页。
-    for page in list(directory_pages):
-        for nearby in (page + 1, page + 2):
-            if nearby in page_texts and _DIRECTORY_LEADER_PATTERN.search(str(page_texts.get(nearby) or "")):
+    # 目录经常跨多页，续页又未重复“目录”标题。以引导符连续性链式延伸；一旦
+    # 中断立即停止，且每个目录首页最多延伸 8 页，避免正文中的零散点线扩张范围。
+    for page in sorted(directory_pages):
+        for nearby in range(page + 1, min(page_count, page + _DIRECTORY_CONTINUATION_MAX_PAGES) + 1):
+            if _looks_like_directory_page(page_texts.get(nearby)):
                 directory_pages.add(nearby)
+                continue
+            break
     candidates: list[int] = []
     for page in sorted(directory_pages):
         for line in str(page_texts.get(page) or "").splitlines():
@@ -5261,7 +5295,7 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
         page_text = "、".join(f"P{page}" for page in attempted_pages)
         return _with_vision_execution(
             result, "uncovered", attempted_pages, vision_profile,
-            f"已识别{page_text or '候选页'}，但尚未覆盖可形成结论的关键材料，已保留文字结论。",
+            f"已检查{page_text or '候选页'}，但尚未覆盖可形成结论的关键材料，已保留文字结论。",
         )
     conflict_level = _visual_response_conflict_level(parsed)
     # 仅 material（影响合规/计分的实质字段冲突）才升级为 conflict 状态并冻结结论；
@@ -5303,7 +5337,11 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
         "图片检查发现文字层与图片层关键字段疑似不一致，已保留原结论并标记人工重点复核。"
         if has_conflict else (
             "图片识别已形成完整补充并写入本条结论。" if conclusion_scope == "full"
-            else "图片识别已补充可见事实；因材料覆盖不完整，原文字结论和建议分保持不变。"
+            else (
+                "图片识别已补充可见事实；已检查"
+                f"{'、'.join(f'P{page}' for page in attempted_pages) or '候选页'}，"
+                "但材料覆盖不完整，原文字结论和建议分保持不变。"
+            )
         )
     )
     if conflict_level == "possible":
