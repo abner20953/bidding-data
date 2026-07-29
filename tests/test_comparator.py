@@ -664,6 +664,47 @@ class ComparatorTests(unittest.TestCase):
 
         self.assertIsNone(evidence)
 
+    def test_inserted_table_field_label_is_not_a_shared_tender_edit(self):
+        detector = CollusionDetector()
+        tender_text = detector.normalize(
+            "体育器材架规格1000×500×2000mm整体为可拆装活动式设计"
+        )
+        bid_text = detector.normalize(
+            "体育器材架【材质】:规格1000×500×2000mm整体为可拆装活动式设计"
+        )
+
+        evidence = detector._shared_tender_edit_evidence(
+            tender_text, bid_text, bid_text
+        )
+
+        self.assertIsNone(evidence)
+
+    def test_bare_table_row_number_change_is_not_a_shared_tender_edit(self):
+        detector = CollusionDetector()
+        tender_text = detector.normalize(
+            "2电子绘画板产品尺寸330×200×7mm压感级别8192级"
+        )
+        bid_text = detector.normalize(
+            "1电子绘画板产品尺寸330×200×7mm压感级别8192级"
+        )
+
+        evidence = detector._shared_tender_edit_evidence(
+            tender_text, bid_text, bid_text
+        )
+
+        self.assertIsNone(evidence)
+
+    def test_table_operator_to_separator_is_not_a_shared_tender_edit(self):
+        detector = CollusionDetector()
+        tender_text = detector.normalize("规格≥450mm×320mm×18mm")
+        bid_text = detector.normalize("规格:450mm×320mm×18mm")
+
+        evidence = detector._shared_tender_edit_evidence(
+            tender_text, bid_text, bid_text
+        )
+
+        self.assertIsNone(evidence)
+
     def test_numeric_only_tender_change_is_preserved(self):
         detector = CollusionDetector()
         tender_text = detector.normalize(
@@ -685,6 +726,18 @@ class ComparatorTests(unittest.TestCase):
         self.assertIn(
             {"original": "5", "modified": "3"}, collisions[0]["shared_edits"]
         )
+
+    def test_written_chinese_numeric_tender_change_is_preserved(self):
+        detector = CollusionDetector()
+        tender_text = detector.normalize("供应商应提供五年免费质量保证服务")
+        bid_text = detector.normalize("供应商应提供1免费质量保证服务")
+
+        evidence = detector._shared_tender_edit_evidence(
+            tender_text, bid_text, bid_text
+        )
+
+        self.assertIsNotNone(evidence)
+        self.assertTrue(evidence["changes"])
 
     def test_split_line_deletion_artifact_is_not_a_shared_edit(self):
         """被“删除”的半句仍存在于两份投标文件全文时，属于换行分段假象。"""
@@ -843,6 +896,54 @@ class ComparatorTests(unittest.TestCase):
 
         self.assertFalse(matches)
 
+    def test_tender_derived_interleaved_table_text_is_suppressed_by_source_coverage(self):
+        detector = CollusionDetector()
+        tender_text = detector.normalize(
+            "篮球架立柱采用优质钢管制作且底部配备防护装饰罩"
+            "表面采用静电喷塑工艺防腐蚀防锈蚀能力优异"
+            "器材架层板采用冷轧钢板层数为四层并可上下调节"
+        )
+        detector.tender_units = [{"text": tender_text, "page": 1}]
+        detector.tender_unit_index = detector._build_unit_index(detector.tender_units)
+        text_a = detector.normalize(
+            "篮球架立柱采用优质钢管制作器材架层板采用冷轧钢板"
+            "且底部配备防护装饰罩层数为四层并可上下调节"
+            "表面采用静电喷塑工艺防腐蚀防锈蚀能力优异"
+        )
+        text_b = detector.normalize(
+            "篮球架立柱采用优质钢管制作且底部配备防护装饰罩"
+            "器材架层板采用冷轧钢板层数为四层并可上下调节"
+            "表面采用静电喷塑工艺防腐蚀防锈蚀能力优异"
+        )
+
+        matches = detector._find_fuzzy_collisions(
+            [{"text": text_a, "page": 2}],
+            [{"text": text_b, "page": 3}],
+            set(),
+        )
+
+        self.assertFalse(matches)
+
+    def test_shared_novel_passage_in_tender_derived_table_is_preserved(self):
+        detector = CollusionDetector()
+        tender_text = detector.normalize(
+            "篮球架立柱采用优质钢管制作且底部配备防护装饰罩"
+            "表面采用静电喷塑工艺防腐蚀防锈蚀能力优异"
+        )
+        novel = "双方共同新增逐批复核责任人签名与异常上报闭环记录要求"
+        detector.tender_units = [{"text": tender_text, "page": 1}]
+        detector.tender_unit_index = detector._build_unit_index(detector.tender_units)
+        text_a = detector.normalize(tender_text + novel + "甲方交付")
+        text_b = detector.normalize(tender_text + novel + "乙方交付")
+
+        matches = detector._find_fuzzy_collisions(
+            [{"text": text_a, "page": 2}],
+            [{"text": text_b, "page": 3}],
+            set(),
+        )
+
+        self.assertTrue(matches)
+
     def test_contiguous_exact_segments_are_merged(self):
         path_a = self.path("a.pdf")
         path_b = self.path("b.pdf")
@@ -997,6 +1098,33 @@ class ComparatorTests(unittest.TestCase):
             [item for item in result["paragraphs"] if item["type"] == "text"]
         )
 
+    def test_mixed_table_cell_terminators_are_not_punctuation_errors(self):
+        detector = CollusionDetector()
+        content = "3.透明塑料面板≥2㎜.；4.悬挂件牢固可靠"
+        pages = [(1, content, detector.normalize(content))]
+
+        errors = detector._find_shared_high_confidence_errors(pages, pages)
+
+        self.assertFalse(errors)
+
+    def test_same_numbered_cell_repeated_on_one_line_is_not_an_error(self):
+        detector = CollusionDetector()
+        content = "2）U盘导出方式； 2）U盘导出方式；"
+        pages = [(1, content, detector.normalize(content))]
+
+        errors = detector._find_shared_high_confidence_errors(pages, pages)
+
+        self.assertFalse(errors)
+
+    def test_incomplete_table_cell_bracket_is_not_reported(self):
+        detector = CollusionDetector()
+        content = "5)可扩展身份证读取输入（可显示身份证号、姓名、"
+        pages = [(1, content, detector.normalize(content))]
+
+        errors = detector._find_shared_high_confidence_errors(pages, pages)
+
+        self.assertFalse(errors)
+
     def test_error_in_tender_is_not_reported_as_shared_bid_error(self):
         path_a = self.path("a.pdf")
         path_b = self.path("b.pdf")
@@ -1016,6 +1144,24 @@ class ComparatorTests(unittest.TestCase):
         )
 
         errors = [item for item in result["paragraphs"] if item["type"] == "shared_error"]
+        self.assertFalse(errors)
+
+    def test_tender_error_with_different_line_boundary_is_not_reported(self):
+        detector = CollusionDetector()
+        tender = (
+            "设备技术参数说明型号ABC123,,应满足连续运行要求并提供完整证明材料"
+            "以及安装调试服务"
+        )
+        bid_line = "型号ABC123,,应满足连续运行要求并提供完整证明材料"
+        detector.tender_pages = [(1, tender, detector.normalize(tender))]
+        detector.tender_units = [
+            {"text": detector.normalize(tender), "page": 1},
+        ]
+        detector.tender_unit_index = detector._build_unit_index(detector.tender_units)
+        pages = [(2, bid_line, detector.normalize(bid_line))]
+
+        errors = detector._find_shared_high_confidence_errors(pages, pages)
+
         self.assertFalse(errors)
 
     def test_error_only_mode_does_not_build_text_indexes(self):
@@ -1093,6 +1239,20 @@ class ComparatorTests(unittest.TestCase):
         numbering = [item for item in errors if item["error_kind"] == "numbering"]
         self.assertEqual(len(numbering), 1)
         self.assertIn("重复", numbering[0]["desc"])
+
+    def test_identical_numbered_table_cells_are_not_duplicate_number_errors(self):
+        detector = CollusionDetector()
+        content = (
+            "1、第一项技术参数\n"
+            "2、容弹量2发\n"
+            "2、容弹量2发\n"
+            "3、发射方式为单发"
+        )
+        pages = [(1, content, detector.normalize(content))]
+
+        errors = detector._find_shared_high_confidence_errors(pages, pages)
+
+        self.assertFalse(errors)
 
     def test_numbering_gap_alone_is_not_reported(self):
         detector = CollusionDetector()

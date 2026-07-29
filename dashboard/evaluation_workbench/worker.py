@@ -43,7 +43,7 @@ MAX_PARSE_PAGES = 2000
 MAX_PARSED_CHARS = 2_000_000
 MAX_DOCX_XML_BYTES = 50 * 1024 * 1024
 PROMPT_VERSION = EVALUATION_PROMPT_VERSION
-COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v2"
+COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v3"
 # 单条线索的证据包虽小，但查重往往同时命中多种维度；以较小批次起步，并在
 # 截断时继续局部拆分，避免某一批过长导致整批线索都只能降级为人工核验。
 COMPARE_AI_BATCH_SIZE = 8
@@ -371,7 +371,12 @@ def _compare_evidence_packet(signal: dict) -> dict:
     evidence = []
     for item in signal.get("evidence", [])[:3]:
         evidence.append({key: str(value)[:280] for key, value in item.items()
-                         if key in {"page_a", "page_b", "text_a", "text_b", "similarity", "shared_edits", "error_kind", "entity_kind", "field", "value", "strength"}})
+                         if key in {
+                             "page_a", "page_b", "text_a", "text_b", "similarity",
+                             "tender_similarity", "tender_coverage_a",
+                             "tender_coverage_b", "segment_count", "shared_edits",
+                             "error_kind", "entity_kind", "field", "value", "strength",
+                         }})
     return {
         "signal_id": signal["signal_id"], "bidders": [signal.get("bidder_a"), signal.get("bidder_b")],
         "fixed_rule": signal.get("dimension_label"), "basis": str(signal.get("basis", ""))[:420],
@@ -492,23 +497,53 @@ def _assess_compare_signals_with_ai(app, task: dict, analysis: dict) -> None:
             summary["assessment_result"] = "excluded"
         elif decisions:
             summary["assessment_result"] = "unassessable"
-        # 复核优先级只统计 AI 未排除且具有可报告价值的维度。此前格式模板、公共
-        # 填表等原始维度会在 AI 已倾向排除后仍抬高优先级，造成“线索多但无价值”。
+        # “被模型列为疑似”不等于“足以抬高整对文件的复核级别”。低风险或低
+        # 置信线索继续展示，但不参与维度计数；高优先级只由强线索组合产生，
+        # 避免三个低信息格式候选叠加成一个高风险配对。
+        reportable_signals = []
+        strong_signals = []
+        direct_entity_dimensions = {
+            "contact", "email", "person_name", "person_identity", "address",
+        }
+        for signal in pair_signals:
+            assessment = signal.get("ai_assessment") or {}
+            decision = assessment.get("decision")
+            risk = assessment.get("risk_level")
+            confidence = assessment.get("confidence")
+            if (
+                decision not in {"confirmed_clue", "suspected_clue"}
+                or risk == "low"
+                or confidence == "low"
+                or signal.get("voice_adaptation_only")
+            ):
+                continue
+            reportable_signals.append(signal)
+            if (
+                decision == "confirmed_clue"
+                or risk == "high"
+                or signal.get("dimension") in direct_entity_dimensions
+            ):
+                strong_signals.append(signal)
         retained_dimensions = sorted({
-            signal.get("dimension") for signal in pair_signals
-            if signal.get("ai_assessment", {}).get("decision") in {"confirmed_clue", "suspected_clue"}
-            and not signal.get("voice_adaptation_only")
+            signal.get("dimension") for signal in reportable_signals
         })
+        strong_dimensions = {
+            signal.get("dimension") for signal in strong_signals
+        }
         summary["independent_dimension_count"] = len(retained_dimensions)
+        summary["strong_dimension_count"] = len(strong_dimensions)
         summary["dimensions"] = retained_dimensions
-        summary["dimension_labels"] = [
+        summary["dimension_labels"] = list(dict.fromkeys(
             str(signal.get("dimension_label") or signal.get("dimension"))
-            for signal in pair_signals
-            if signal.get("dimension") in retained_dimensions
-        ]
-        if len(retained_dimensions) >= 3:
+            for signal in reportable_signals
+        ))
+        summary["raw_signal_count"] = len(pair_signals)
+        summary["signal_count"] = len(reportable_signals)
+        if len(strong_dimensions) >= 3:
             summary["review_priority"] = "high"
-        elif len(retained_dimensions) == 2:
+        elif len(strong_dimensions) >= 2 or (
+            strong_dimensions and len(retained_dimensions) >= 2
+        ):
             summary["review_priority"] = "medium"
         elif retained_dimensions:
             summary["review_priority"] = "normal"
@@ -664,6 +699,15 @@ def _score_clause_packets(text: str, limit: int = 240) -> list[dict]:
     packets: list[dict] = []
     for index, line in enumerate(lines):
         if not _SCORE_CLAUSE_PATTERN.search(re.sub(r"\s+", "", line)):
+            continue
+        # PDF 评分表在分页处常把同一评分项拆为“标题及前两个子项”与
+        # “（1.5分）、其余子项”。后者不是新的计分事实，应续接到前一个完整
+        # 评分包，防止模型生成错误标题的重复评分规则。
+        if packets and _is_score_fragment_continuation(lines, index):
+            continuation = str(line or "").strip()
+            if continuation and continuation not in packets[-1]["text"]:
+                packets[-1]["text"] = (packets[-1]["text"] + "\n" + continuation)[:1_400]
+                packets[-1]["score_line"] = (packets[-1]["score_line"] + " " + continuation)[:520]
             continue
         # 评分表经 PDF 文本抽取后，项目名称、证明材料和计分行可能被分页符和大量空行
         # 分开。不能把分页符当作新评分项边界；最近一条明确计分行才是可靠边界。
@@ -2182,6 +2226,29 @@ def _status_conflicts_with_positive_reason(status: str, reason: object) -> bool:
     return any(marker in text for marker in ("符合", "满足要求", "满足", "未发现"))
 
 
+_BOUNDARY_COMPARISON_PATTERN = re.compile(
+    r"(?:招标(?:文件)?(?:要求)?|采购(?:文件)?(?:要求)?|要求|规定)[^。；;\n]{0,70}?"
+    r"([≥≤])\s*(\d+(?:\.\d+)?)\s*(mm|cm|m|kg|g|w|kw|v|a|hz|%|年|月|日|天|小时|分钟|次|个|项|台|套|件|页)"
+    r"[^。；;\n]{0,90}?(?:投标(?:文件|响应)?|响应(?:值|内容)?|填写|提供)[^。；;\n]{0,36}?"
+    r"(?:Φ|φ)?\s*(\d+(?:\.\d+)?)\s*\3",
+    flags=re.IGNORECASE,
+)
+
+
+def _satisfied_boundary_comparison(item: dict) -> str:
+    """识别“响应值恰等于 ≥/≤ 边界”被模型误报为偏离的通用情形。"""
+    text = "\n".join(str(item.get(key) or "") for key in ("evidence", "reason"))
+    for match in _BOUNDARY_COMPARISON_PATTERN.finditer(text):
+        operator, required, unit, actual = match.groups()
+        try:
+            required_value, actual_value = Decimal(required), Decimal(actual)
+        except InvalidOperation:
+            continue
+        if (operator == "≥" and actual_value >= required_value) or (operator == "≤" and actual_value <= required_value):
+            return f"数值边界复核：响应值{actual}{unit}满足招标{operator}{required}{unit}，该比较本身不构成偏离。"
+    return ""
+
+
 def _normalise_review_results(output: object, rules: list[dict]) -> list[dict]:
     by_id = {item["rule_id"]: item for item in rules}
     normalized = []
@@ -2196,6 +2263,21 @@ def _normalise_review_results(output: object, rules: list[dict]) -> list[dict]:
         if _status_conflicts_with_positive_reason(status, item.get("reason")):
             status = "satisfied" if any(marker in _clean_model_text(item.get("reason")) for marker in ("符合", "满足")) else "manual"
             item = {**item, "risk_level": "low"}
+        # 边界相等符合“≥/≤”要求。此时不能把这一个比较写成高风险偏离；若该
+        # 规则还包含其他参数，保守降为 partial，交由后续证据继续判断。
+        boundary_note = _satisfied_boundary_comparison(item)
+        if boundary_note:
+            original_reason = _clean_model_text(item.get("reason"))
+            original_evidence = _clean_model_text(item.get("evidence"))
+            item = {
+                **item,
+                "risk_level": "low",
+                "confidence": "medium" if item.get("confidence") == "high" else item.get("confidence"),
+                "reason": "；".join(value for value in (boundary_note, original_reason) if value)[:2000],
+                "evidence": re.sub(r"(?:实质)?差异未(?:披露|说明)|未披露(?:偏离)?|负偏离", "", original_evidence),
+            }
+            if status == "not_satisfied":
+                status = "partial"
         visual_rule = _rule_requires_visual_verification(by_id[rule_id])
         # OCR 规则在当前流程尚未真正识别图像时，不能因文本层未命中就输出高风险
         # 不满足；模型若在理由中明确提出 OCR 缺口，也统一回落到待 OCR。
@@ -2348,11 +2430,33 @@ _DIRECTORY_HEADER_PATTERN = re.compile(r"^\s*(?:第[一二三四五六七八九�
 _DIRECTORY_TRAILING_PAGE_PATTERN = re.compile(
     r"(?:第\s*|页\s*)?(\d{1,4}(?:\s*(?:[/、,，]|至|[-—–~～])\s*\d{1,4}){0,5})\s*(?:页)?\s*$"
 )
+
+
+def _is_score_fragment_continuation(lines: list[str], index: int) -> bool:
+    """识别跨页评分单元的续行，避免把“（1.5分）、保障措施…”拆成新评分项。
+
+    这只处理以分值片段开头、且没有新的编号或标题的行；普通的“每项1分”条目
+    仍保持独立评分条款。规则提取模型随后会收到完整的父项和全部叶子项。
+    """
+    line = str(lines[index] or "").strip()
+    compact = re.sub(r"\s+", "", line)
+    if not re.match(r"^[（(]?\d+(?:\.\d+)?分[）)]?[、，,；;]", compact):
+        return False
+    if re.match(r"^(?:\d+|[一二三四五六七八九十]+)[.、．]", compact):
+        return False
+    previous = ""
+    for value in reversed(lines[max(0, index - 8):index]):
+        if str(value or "").strip() and not re.fullmatch(r"\[第\d+页\]", str(value).strip()):
+            previous = re.sub(r"\s+", "", str(value))
+            break
+    return bool(previous and ("分" in previous or "计划" in previous or "方案" in previous))
 _DIRECTORY_LEADER_PATTERN = re.compile(r"[.．·…]{2,}|\s{3,}")
 _DIRECTORY_CONTINUATION_MAX_PAGES = 8
 _MATERIAL_ROLE_TERMS = {
     "directory": ("目录", "contents"),
-    "response_form": ("响应函", "投标函", "报价函"),
+    # 声明函、偏离表、报价表等均可能跨两三页。统一归为固定响应表单，后续按
+    # 连续页补充候选；不针对任何特定声明函或行业材料做单独补丁。
+    "response_form": ("响应函", "投标函", "报价函", "声明函", "承诺函", "偏离表", "报价表"),
     "authorization": ("授权委托书", "法定代表人身份证明", "法定代表人证明"),
     "business_license": ("营业执照", "统一社会信用代码"),
     "identity": ("身份证", "居民身份证"),
@@ -4436,6 +4540,7 @@ def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: d
     # 客观分已有文字层证据与计分过程，OCR只补充简短结论，避免重复展示整页识别字段。
     evidence_limit = 500 if component == "objective" else 1600
     reason_limit = 400 if component == "objective" else 1200
+    merge_limit = 1_000 if component == "objective" else 2_000
     evidence = _clean_model_text(parsed.get("evidence"))[:evidence_limit]
     reason = _clean_model_text(parsed.get("reason"))[:reason_limit]
     status = "ocr_applied" if scope == "full" else "ocr_applied_partial"
@@ -4450,9 +4555,9 @@ def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: d
         if selected_status not in {"satisfied", "not_satisfied", "partial", "not_found", "manual"}:
             selected_status = "manual"
         merged = _review_result_from_model({
-            "evidence": _merge_supplement_text(reconciled_evidence, f"{prefix}{evidence}" if evidence else ""),
+            "evidence": _merge_supplement_text(reconciled_evidence, f"{prefix}{evidence}" if evidence else "", limit=merge_limit),
             "page_hint": "P" + "、P".join(str(page) for page in (evidence_pages or pages)),
-            "reason": _merge_supplement_text(reconciled_reason, f"{prefix}{reason}" if reason else ""),
+            "reason": _merge_supplement_text(reconciled_reason, f"{prefix}{reason}" if reason else "", limit=merge_limit),
             "risk_level": parsed.get("risk_level") if scope == "full" else working_result.get("risk_level"),
             "confidence": parsed.get("confidence") if scope == "full" else working_result.get("confidence"),
             "evidence_quality": "sufficient" if scope == "full" and evidence else working_result.get("evidence_quality"),
@@ -4468,8 +4573,8 @@ def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: d
         max_score = float(_rule_scoring(rule).get("max_score") or working_result.get("max_score") or 0)
         suggested = _bounded_model_score(parsed.get("suggested_score"), max_score) if scope == "full" and max_score > 0 else working_result.get("suggested_score")
         merged = {**working_result, "suggested_score": suggested,
-                  "evidence": _merge_supplement_text(reconciled_evidence, f"{prefix}{evidence}" if evidence else ""),
-                  "reason": _merge_supplement_text(reconciled_reason, f"{prefix}{reason}" if reason else ""),
+                  "evidence": _merge_supplement_text(reconciled_evidence, f"{prefix}{evidence}" if evidence else "", limit=merge_limit),
+                  "reason": _merge_supplement_text(reconciled_reason, f"{prefix}{reason}" if reason else "", limit=merge_limit),
                   "confidence": _enum_text(parsed.get("confidence"), {"high", "medium", "low"}, working_result.get("confidence")) if scope == "full" else working_result.get("confidence"),
                   "ocr_candidate_pages": pages, "ocr_evidence_pages": evidence_pages,
                   "requires_review": True, "automation_status": "needs_review", "review_reason": f"{service_labels} 结果已补充，需人工复核。"}
@@ -4749,6 +4854,47 @@ def _scan_like_pages(page_texts: dict[int, str]) -> set[int]:
     }
 
 
+def _form_continuation_pages(page_texts: dict[int, str], rule: dict, pages: list[int], page_count: int) -> list[int]:
+    """为固定表单补齐紧随其后的连续页。
+
+    长声明函、偏离表、报价表等经常在第二页继续列货物或填写项。若只看命中首页，
+    会把后续的真实填写内容错误写成“未提供”。这里只在规则本身需要固定表单时，
+    为命中页保守补充最多两个相邻续页；新章节、目录或其他材料会立即停止。
+    """
+    if "response_form" not in _rule_material_roles(rule) or not page_texts:
+        return []
+    expanded: list[int] = []
+    for page in pages:
+        if _page_material_role(page_texts.get(page)) != "response_form":
+            continue
+        prior_was_continuation = False
+        for candidate in range(page + 1, min(page_count, page + 2) + 1):
+            text = str(page_texts.get(candidate) or "")
+            role = _page_material_role(text)
+            compact = re.sub(r"\s+", "", text)
+            # 同类表单页直接保留；文本抽取没有重复标题时，长表格续页通常仍含
+            # 多个下划线、序号或填写字段。目录/合同/证书等新材料则不跨入。
+            likely_continuation = (
+                role == "response_form"
+                or (
+                    role in {"other", "scanned"}
+                    and len(compact) >= 30
+                    and ("_" in text or "（" in text or bool(re.search(r"(?:^|\n)\s*\d+[.、]", text)))
+                )
+                or (
+                    prior_was_continuation
+                    and role in {"other", "scanned"}
+                    and any(term in text for term in ("盖章", "签字", "日期", "法定代表人"))
+                )
+            )
+            if not likely_continuation:
+                break
+            if candidate not in expanded:
+                expanded.append(candidate)
+            prior_was_continuation = True
+    return expanded
+
+
 def _vision_page_candidates(document: dict, rule: dict, result: dict) -> list[int]:
     """OCR已命中页、图片缺口语境、裸结构化页码按可靠度生成候选。"""
     if document.get("extension") != ".pdf" or not document.get("page_count"):
@@ -4801,10 +4947,15 @@ def _vision_page_candidates(document: dict, rule: dict, result: dict) -> list[in
     anchors = _prioritise_material_pages(document, rule, pages + [page for page in ordinary if page not in pages],
                                          protected=result.get("ocr_evidence_pages"))
     if page_texts:
+        form_continuations = _form_continuation_pages(page_texts, rule, anchors, page_count)
         scan_pages = _scan_like_pages(page_texts)
         expanded: list[int] = []
         for anchor in anchors:
             expanded.append(anchor)
+            # 连续固定表单页紧随命中页插入，优先于泛化的扫描件邻页扩展。
+            for continuation in form_continuations:
+                if continuation > anchor and continuation - anchor <= 2 and continuation not in expanded:
+                    expanded.append(continuation)
             if anchor in scan_pages:
                 continue
             for neighbor in (anchor + 1, anchor - 1, anchor + 2, anchor - 2):
@@ -4945,7 +5096,7 @@ def _reported_irrelevant_pages(parsed: dict, sent_pages: list[int]) -> list[int]
     return [page for page in _normalise_result_pages(parsed.get("irrelevant_pages")) if page in sent_pages]
 
 
-_STALE_PENDING_PATTERN = re.compile(r"(?:未见|未提供|未检索到|尚未见|仍需(?:OCR|图片|识图)?核验|待(?:OCR|图片|识图)?核验)")
+_STALE_PENDING_PATTERN = re.compile(r"(?:未见|未提供|未检索到|尚未见|(?:仍)?需(?:OCR|图片|识图)?核验|待(?:OCR|图片|识图)?核验)")
 _CONFIRMED_FACT_PATTERN = re.compile(r"(?:可见|已确认|已核验|已提供|齐全|有效期内|清晰可读)")
 
 
@@ -5450,8 +5601,12 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
         if page not in all_evidence_pages:
             all_evidence_pages.append(page)
     page_hint = "P" + "、P".join(str(page) for page in (visual_evidence_pages or checked_pages))
-    visual_evidence = _clean_model_text(parsed.get("evidence"))[:1600]
-    visual_reason = _clean_model_text(parsed.get("reason"))[:1200]
+    # 客观分页面只需要“材料类别、数量/有效性、计分结论”。原始图片/OCR字段仍
+    # 记录在 evidence_layers，避免把一页证书或合同逐字复述到最终评分表中。
+    visual_evidence_limit = 520 if component == "objective" else 1600
+    visual_reason_limit = 420 if component == "objective" else 1200
+    visual_evidence = _clean_model_text(parsed.get("evidence"))[:visual_evidence_limit]
+    visual_reason = _clean_model_text(parsed.get("reason"))[:visual_reason_limit]
     conflict_text = _visual_field_conflict_text(parsed)
     if conflict_text:
         visual_reason = "\n".join(value for value in (visual_reason, f"图片与文字候选字段疑似不一致：{conflict_text}") if value)[:1200]
@@ -5516,13 +5671,16 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
     suggested = _bounded_model_score(parsed.get("suggested_score"), max_score) if max_score > 0 and conclusion_scope == "full" else None
     if suggested is None:
         suggested = _confirmed_partial_score(rule, parsed, result.get("suggested_score"), max_score, checked_pages)
+    merge_limit = 1_000 if component == "objective" else 2_000
     merged = {
         **result,
         "suggested_score": suggested,
-        "evidence": _merge_supplement_text(reconciled_evidence, f"{prefix}{visual_evidence}" if visual_evidence else ""),
+        "evidence": _merge_supplement_text(
+            reconciled_evidence, f"{prefix}{visual_evidence}" if visual_evidence else "", limit=merge_limit,
+        ),
         "reason": _merge_supplement_text(
             reconciled_reason, f"{prefix}{visual_reason}" if visual_reason else "",
-            supplement_first=has_conflict,
+            limit=merge_limit, supplement_first=has_conflict,
         ),
         "confidence": "low" if has_conflict else (
             _enum_text(parsed.get("confidence"), {"high", "medium", "low"}, result.get("confidence"))
@@ -5807,6 +5965,42 @@ def _decimal_price(value: object) -> Decimal | None:
     return parsed if parsed.is_finite() and parsed > 0 else None
 
 
+_TOTAL_QUOTE_LABEL_PATTERN = re.compile(r"(?:投标|响应)?(?:总)?报价|开标一览表")
+_TOTAL_QUOTE_NUMBER_PATTERN = re.compile(
+    r"(?:[￥¥]\s*[:：]?\s*|人民币\s*)?(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d{4,}(?:\.\d+)?)\s*元?"
+)
+
+
+def _local_total_quote(document: dict) -> tuple[Decimal | None, str]:
+    """从本地已解析文本保守提取唯一总报价，作为横向价格模型漏项的回填兜底。
+
+    仅接受“总报价/投标报价/开标一览表”近邻窗口内唯一的数字金额；出现多个候选
+    或无法确认口径时返回空，绝不猜测，更不会替代模型对资格扣除口径的判断。
+    """
+    path = str(document.get("parsed_path") or "")
+    if not path or not Path(path).is_file():
+        return None, ""
+    lines = Path(path).read_text(encoding="utf-8", errors="ignore").splitlines()
+    candidates: list[tuple[Decimal, str]] = []
+    for index, line in enumerate(lines):
+        if not _TOTAL_QUOTE_LABEL_PATTERN.search(str(line or "")):
+            continue
+        window = " ".join(str(value or "") for value in lines[index:index + 3])
+        for match in _TOTAL_QUOTE_NUMBER_PATTERN.finditer(window):
+            try:
+                value = Decimal(match.group(1).replace(",", ""))
+            except (InvalidOperation, AttributeError):
+                continue
+            if value.is_finite() and value > 0:
+                candidates.append((value, window[:260]))
+    unique = {value for value, _ in candidates}
+    if len(unique) != 1:
+        return None, ""
+    value = next(iter(unique))
+    excerpt = next((source for candidate, source in candidates if candidate == value), "")
+    return value, excerpt
+
+
 def _uses_lowest_price_ratio(rule: dict) -> bool:
     text = re.sub(r"\s+", "", " ".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text")))
     return bool(re.search(r"(?:评标价|评审价|评标基准价|基准价|最低(?:评标|评审|投标)?价).{0,36}[／/]?.{0,36}投标报价", text))
@@ -5892,8 +6086,30 @@ def _run_cross_bid_price_scoring(app, task: dict, profile: dict, documents: list
         return {"rule_count": len(rules), "result_count": 0, "retry_count": retry_count,
                 "missing_count": len(expected), "format_failure": True}
 
-    valid_rows = [raw for raw in parsed["results"] if isinstance(raw, dict) and
+    valid_rows = [dict(raw) for raw in parsed["results"] if isinstance(raw, dict) and
                   (str(raw.get("document_id") or ""), str(raw.get("rule_id") or "")) in expected]
+    # 模型偶尔已返回该投标人行却遗漏 quoted_price，或直接漏掉一行。对每个横向
+    # 价格规则使用本地解析文本的“唯一总报价”作保守补位，避免一个明确报价被
+    # 静默保存为 null。价格扣除、资格有效性和非标准公式仍完全保留给模型/人工。
+    rows_by_key = {
+        (str(raw.get("document_id") or ""), str(raw.get("rule_id") or "")): raw
+        for raw in valid_rows
+    }
+    for document in documents:
+        local_price, excerpt = _local_total_quote(document)
+        if local_price is None:
+            continue
+        for rule in rules:
+            key = (document["document_id"], rule["rule_id"])
+            raw = rows_by_key.get(key)
+            if raw is None:
+                raw = {"document_id": key[0], "rule_id": key[1], "confidence": "medium"}
+                valid_rows.append(raw)
+                rows_by_key[key] = raw
+            if _decimal_price(raw.get("quoted_price")) is None:
+                raw["quoted_price"] = float(local_price)
+                raw["evidence"] = _clean_model_text(raw.get("evidence")) or f"本地解析定位总报价：{local_price}元。"
+                raw["reason"] = _clean_model_text(raw.get("reason")) or "模型报价字段缺失，已由投标文件中唯一总报价回填，仍需人工核对报价口径。"
     prices_by_rule: dict[str, list[object]] = {}
     for raw in valid_rows:
         prices_by_rule.setdefault(str(raw.get("rule_id") or ""), []).append(raw.get("quoted_price"))
@@ -6301,6 +6517,11 @@ def _normalise_evaluation_highlights(parsed: dict, candidates: list[dict],
                 level = "attention"
             if level == "critical" and not candidate.get("_critical_eligible"):
                 level = "high"
+            # 用户保留“照抄照搬”作为独立复核规则时仍可展示，但技术响应表对
+            # 招标参数的逐项复述通常是响应方式本身，不能在重要结论层被放大成
+            # 高风险；除非上游规则已经给出其他实质性不响应证据。
+            if "照抄" in str(candidate.get("title") or "") and level in {"critical", "high"}:
+                level = "attention"
             keyword = re.sub(r"[*_`#]+", "", str(item.get("keyword") or "")).strip()[:16]
             conclusion = re.sub(r"\s+", " ", str(item.get("conclusion") or "")).strip()[:80]
             basis = re.sub(r"\s+", " ", str(item.get("basis") or "")).strip()[:140]

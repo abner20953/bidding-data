@@ -311,6 +311,36 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         self.assertIn("第七服务模块", catalog[0]["q"])
 
+    def test_score_clause_packets_join_cross_page_score_fragment(self):
+        text = """[第34页]
+4. 实施进度计划
+供应商提供完整的进度控制计划（1.5分）、时间进度安排（时间进度表）
+[第35页]
+（1.5分）、保障措施（1.5分）、应急预案（1.5分）。
+上述方案无缺陷得6分，每处缺陷扣0.5分。
+5. 整体实施方案
+提供配送、运输供货方案（1.5分）。"""
+
+        packets = worker._score_clause_packets(text)
+
+        progress = next(item for item in packets if "实施进度计划" in item["text"])
+        self.assertIn("保障措施（1.5分）", progress["text"])
+        self.assertIn("应急预案（1.5分）", progress["text"])
+        self.assertEqual(sum("保障措施" in item["text"] for item in packets), 1)
+
+    def test_numeric_boundary_equality_is_not_saved_as_high_risk_deviation(self):
+        rule = {"rule_id": "rope", "title": "关键参数响应", "check_rule": "核对参数是否满足招标要求"}
+        results = worker._normalise_review_results([{
+            "rule_id": "rope", "status": "not_satisfied", "risk_level": "high", "confidence": "high",
+            "evidence": "第128页招标要求Φ≥30mm，投标响应Φ30mm，实质差异未披露。",
+            "reason": "投标直径30mm未披露偏离。",
+        }], [rule])
+
+        self.assertEqual(results[0]["status"], "partial")
+        self.assertEqual(results[0]["risk_level"], "low")
+        self.assertIn("满足招标≥30mm", results[0]["reason"])
+        self.assertNotIn("差异未披露", results[0]["evidence"])
+
     def test_parse_task_reuses_successful_parse_cache(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案：稳定运行。")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
@@ -547,6 +577,54 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn('"signal-1"', request_json.call_args_list[0].args[2])
         self.assertNotIn('"signal-1"', request_json.call_args_list[1].args[2])
         self.assertTrue(all(item["ai_assessment"]["reason"] != "AI 未返回该线索的可用判定。" for item in signals))
+
+    def test_low_value_ai_dimensions_do_not_escalate_pair_priority(self):
+        task = storage.create_task(self.app, self.project["project_id"], "compare_documents")
+        signals = [
+            {
+                "signal_id": "text", "document_a_id": "a", "document_b_id": "b",
+                "bidder_a": "甲", "bidder_b": "乙", "dimension": "text_similarity",
+                "dimension_label": "正文雷同", "basis": "存在一段独有正文", "evidence": [],
+            },
+            {
+                "signal_id": "error", "document_a_id": "a", "document_b_id": "b",
+                "bidder_a": "甲", "bidder_b": "乙", "dimension": "text_error",
+                "dimension_label": "共同异常或错误", "basis": "句末格式候选", "evidence": [],
+            },
+            {
+                "signal_id": "edit", "document_a_id": "a", "document_b_id": "b",
+                "bidder_a": "甲", "bidder_b": "乙", "dimension": "tender_common_edit",
+                "dimension_label": "招标原文共同改动", "basis": "表格结构补全", "evidence": [],
+            },
+        ]
+        analysis = {
+            "signals": signals,
+            "pair_summaries": [{
+                "document_a_id": "a", "document_b_id": "b",
+                "bidder_a": "甲", "bidder_b": "乙",
+                "independent_dimension_count": 3, "signal_count": 3,
+                "dimensions": ["text_similarity", "text_error", "tender_common_edit"],
+                "dimension_labels": ["正文雷同", "共同异常或错误", "招标原文共同改动"],
+                "review_priority": "high",
+            }],
+        }
+        response = {"assessments": [
+            {"signal_id": "text", "decision": "suspected_clue", "risk_level": "high",
+             "confidence": "medium", "reason": "存在独有正文", "suggested_check": "核验来源"},
+            {"signal_id": "error", "decision": "suspected_clue", "risk_level": "low",
+             "confidence": "low", "reason": "格式噪声", "suggested_check": "无需升级"},
+            {"signal_id": "edit", "decision": "suspected_clue", "risk_level": "low",
+             "confidence": "medium", "reason": "结构补全", "suggested_check": "核对模板"},
+        ]}
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value=response):
+            worker._assess_compare_signals_with_ai(self.app, task, analysis)
+
+        summary = analysis["pair_summaries"][0]
+        self.assertEqual(summary["raw_signal_count"], 3)
+        self.assertEqual(summary["signal_count"], 1)
+        self.assertEqual(summary["independent_dimension_count"], 1)
+        self.assertEqual(summary["review_priority"], "normal")
 
     def test_compare_ai_retries_single_missing_signal_once_then_uses_fallback(self):
         task = storage.create_task(self.app, self.project["project_id"], "compare_documents")
@@ -2281,6 +2359,17 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(values[0]["highlights"][0]["keyword"], "明确否决")
         self.assertEqual(values[0]["highlights"][1]["level"], "high")
 
+    def test_copying_response_table_highlight_is_attention_not_high_risk(self):
+        candidates = [{"document_id": "bid-a", "bidder_name": "甲公司", "candidates": []}]
+        allowed = {("bid-a", "copy"): {"_critical_eligible": False, "title": "照抄照搬"}}
+
+        values = worker._normalise_evaluation_highlights({"summaries": [{
+            "document_id": "bid-a", "headline": "存在复核事项",
+            "highlights": [{"rule_id": "copy", "level": "high", "keyword": "参数复述", "conclusion": "技术响应表复述参数", "basis": "逐项响应表"}],
+        }]}, candidates, allowed)
+
+        self.assertEqual(values[0]["highlights"][0]["level"], "attention")
+
     def test_latest_review_results_exposes_saved_important_highlights(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "资质材料。")
         rule = storage.add_rule(self.app, self.project["project_id"], {
@@ -2482,6 +2571,63 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(request_json.call_count, 1)
         self.assertIn(bid_a["document_id"], request_json.call_args.args[2])
         self.assertIn(bid_b["document_id"], request_json.call_args.args[2])
+
+    def test_cross_bid_price_uses_unique_local_total_quote_when_model_omits_one_price(self):
+        bid_a = self._add_pdf("a.pdf", "bid", "甲公司", "总报价：￥100000元。")
+        bid_b = self._add_pdf("b.pdf", "bid", "乙公司", "投标总报价（大写）壹拾贰万元整 ￥：120000元。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        # PDF 测试夹具的默认字体不保证中文可提取；以解析完成后的真实文本缓存模拟
+        # 线上解析器输出，专门覆盖本地“唯一总报价”回填分支。
+        local_a = self.temp_dir / "quote-a.txt"
+        local_b = self.temp_dir / "quote-b.txt"
+        local_a.write_text("[第1页]\n投标总报价：￥100000元。\n", encoding="utf-8")
+        local_b.write_text("[第1页]\n投标总报价（大写）壹拾贰万元整 ￥：120000元。\n", encoding="utf-8")
+        with storage.connection(self.app) as conn:
+            conn.execute("UPDATE ew_documents SET parsed_path=? WHERE document_id=?", (str(local_a), bid_a["document_id"]))
+            conn.execute("UPDATE ew_documents SET parsed_path=? WHERE document_id=?", (str(local_b), bid_b["document_id"]))
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "最低价报价得分",
+            "check_rule": "投标报价得分=（评标基准价／投标报价）×10，保留两位小数。",
+            "source_text": "最低评审价得10分", "scoring": {"kind": "manual", "max_score": 10},
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        cross = {"results": [
+            {"document_id": bid_a["document_id"], "rule_id": rule["rule_id"], "quoted_price": 100000,
+             "suggested_score": 10, "evidence": "总报价100000元", "confidence": "high"},
+            {"document_id": bid_b["document_id"], "rule_id": rule["rule_id"], "quoted_price": None,
+             "suggested_score": None, "evidence": "已核对开标一览表", "confidence": "medium"},
+        ]}
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value=cross):
+            finished = self._run_next_task()
+
+        _, results = storage.latest_score_results(self.app, self.project["project_id"], "objective")
+        scores = {item["bidder_name"]: item["suggested_score"] for item in results}
+        self.assertEqual(finished["status"], "success")
+        self.assertEqual(scores["甲公司"], 10.0)
+        self.assertEqual(scores["乙公司"], 8.33)
+
+    def test_form_candidates_include_adjacent_continuation_pages(self):
+        parsed = self.temp_dir / "statement.txt"
+        parsed.write_text(
+            "[第314页]\n中小企业声明函\n1. 货物甲，所属行业工业。\n"
+            "[第315页]\n2. 电子绘画板（教师）、电子绘画板（学生），企业类型中型企业。\n"
+            "[第316页]\n投标人（盖章） 日期。\n"
+            "[第317页]\n第九章 合同文本\n",
+            encoding="utf-8",
+        )
+        document = {"document_id": "statement", "parsed_path": str(parsed), "extension": ".pdf", "page_count": 317}
+        rule = {"title": "中小企业声明函填写完整性", "check_rule": "核对中小企业声明函填写内容"}
+        result = {"evidence": "第314页中小企业声明函", "reason": "需要核对后续填写项"}
+
+        pages = worker._vision_page_candidates(document, rule, result)
+
+        self.assertIn(314, pages)
+        self.assertIn(315, pages)
+        self.assertIn(316, pages)
+        self.assertNotIn(317, pages)
 
     def test_manual_objective_score_can_be_calculated_from_matched_count(self):
         payload = [{

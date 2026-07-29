@@ -10,7 +10,7 @@ import re
 import uuid
 
 
-ANALYSIS_VERSION = "cross-bid-signals-v3"
+ANALYSIS_VERSION = "cross-bid-signals-v4"
 DECISION_BOUNDARY = (
     "本结果仅表示投标文件之间存在需要复核的横向异常线索，不构成串通投标认定、"
     "法定情形认定、废标依据或自动扣分依据。最终结论须由评标委员会结合原件、"
@@ -65,6 +65,14 @@ def _page_evidence(item: dict) -> dict:
     }
     if item.get("similarity") is not None:
         evidence["similarity"] = item["similarity"]
+    if item.get("tender_similarity") is not None:
+        evidence["tender_similarity"] = item["tender_similarity"]
+    if item.get("tender_coverage_a") is not None:
+        evidence["tender_coverage_a"] = item["tender_coverage_a"]
+    if item.get("tender_coverage_b") is not None:
+        evidence["tender_coverage_b"] = item["tender_coverage_b"]
+    if item.get("segment_count") is not None:
+        evidence["segment_count"] = item["segment_count"]
     if item.get("shared_edits"):
         evidence["shared_edits"] = item["shared_edits"]
     if item.get("error_kind"):
@@ -89,6 +97,15 @@ def _collision_value(item: dict) -> int:
     """
     text = re.sub(r"\s+", "", f"{item.get('text_a') or ''}{item.get('text_b') or ''}")
     if not text:
+        return 0
+    try:
+        tender_coverage = min(
+            float(item.get("tender_coverage_a") or 0),
+            float(item.get("tender_coverage_b") or 0),
+        )
+    except (TypeError, ValueError):
+        tender_coverage = 0
+    if tender_coverage >= 0.20 and not item.get("shared_edits"):
         return 0
     marker_count = sum(marker in text for marker in _FORM_TEMPLATE_MARKERS)
     if marker_count >= 2:
@@ -311,10 +328,12 @@ def build_cross_bid_analysis(task_id: str, pairs: list[tuple[dict, dict, dict]],
             "pairwise": True,
             "tender_source_excluded": bool(tender_loaded),
             "public_template_removed": False,
+            "builtin_form_filter_applied": True,
             "template_filter_note": (
-                "已加载招标文件并排除其直接复制内容；尚未配置经人工确认的其他公共模板库"
+                "已排除招标原文直接复制、表格提取伪差异及内置封面、投标函、授权等固定表单；"
+                "公开产品彩页或第三方参数库尚无可靠来源库"
                 if tender_loaded else
-                "未提供招标文件且尚未配置经人工确认的公共模板库；文本线索需提高复核谨慎度"
+                "未提供招标文件；已应用内置固定表单过滤，但文本线索仍需提高复核谨慎度"
             ),
             "severity_rule": "全部线索固定为 S3（人工核验），多维命中只提高复核优先级，不提高法律定性。",
         },

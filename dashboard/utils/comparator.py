@@ -13,7 +13,7 @@ import fitz  # PyMuPDF
 
 # 共同删改的全文锚点校验与义务主体改写簇识别已改变查重结论；同步失效旧解析
 # 缓存，避免历史结果与当前算法混用。
-ALGORITHM_VERSION = 9
+ALGORITHM_VERSION = 10
 MIN_EXACT_LENGTH = 9
 MIN_EXACT_DISPLAY_LENGTH = 30
 MAX_EXACT_BLOCK_LENGTH = 1200
@@ -39,6 +39,11 @@ TENDER_EXACT_SHINGLE_COVERAGE = 0.65
 TENDER_FRAGMENT_SHINGLE_COVERAGE = 0.40
 MIN_SHARED_NONTENDER_SHINGLES = 24
 MIN_SHARED_NONTENDER_RATIO = 0.20
+MIN_TENDER_FRAGMENT_COVERAGE = 0.20
+MIN_SHARED_NONTENDER_RUN = 24
+MIN_NUMERIC_NONTENDER_RUN = 12
+DIRECT_TENDER_WINDOW = 10
+TENDER_COVERAGE_CACHE_SIZE = 10_000
 CACHE_MAX_BYTES = 256 * 1024 * 1024
 CACHE_DIR = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "data", "bijiao_cache")
@@ -101,6 +106,8 @@ class CollusionDetector:
         self.tender_stats = {}
         self.tender_units = []
         self.tender_unit_index = None
+        self._tender_coverage_cache = {}
+        self._nontender_runs_cache = {}
         if tender_path and os.path.exists(tender_path):
             self.load_tender()
 
@@ -516,6 +523,10 @@ class CollusionDetector:
 
         if normalized.count("所有条款无偏差") >= 2:
             return True
+        # 中小企业声明函等固定表单会把本包全部标的名称串成超长清单；该清单
+        # 来自采购范围而非投标人原创，不因换行/少量漏项形成横向异常。
+        if len(normalized) >= 140 and normalized.count("、") >= 12:
+            return True
         if "无偏离" in normalized:
             return True
         if "招标文件要求" in normalized and "投标文件对应内容" in normalized:
@@ -618,11 +629,36 @@ class CollusionDetector:
     def _tender_shingle_coverage(self, text):
         if not self.tender_unit_index:
             return 0.0
-        signature = self._shingles(text)
+        normalized = self.normalize(text)
+        cached = self._tender_coverage_cache.get(normalized)
+        if cached is not None:
+            return cached
+        signature = self._shingles(normalized)
         if not signature:
             return 0.0
         tender_postings = self.tender_unit_index["postings"]
-        return sum(shingle in tender_postings for shingle in signature) / len(signature)
+        shingle_coverage = (
+            sum(shingle in tender_postings for shingle in signature) / len(signature)
+        )
+        direct_coverage = 0.0
+        if self.tender_full_text and len(normalized) >= DIRECT_TENDER_WINDOW:
+            starts = list(range(
+                0,
+                len(normalized) - DIRECT_TENDER_WINDOW + 1,
+                max(1, DIRECT_TENDER_WINDOW // 2),
+            ))
+            final_start = len(normalized) - DIRECT_TENDER_WINDOW
+            if final_start not in starts:
+                starts.append(final_start)
+            direct_coverage = sum(
+                normalized[start : start + DIRECT_TENDER_WINDOW]
+                in self.tender_full_text
+                for start in starts
+            ) / len(starts)
+        coverage = max(shingle_coverage, direct_coverage)
+        if len(self._tender_coverage_cache) < TENDER_COVERAGE_CACHE_SIZE:
+            self._tender_coverage_cache[normalized] = coverage
+        return coverage
 
     def _shared_nontender_shingle_stats(self, text_a, text_b):
         """Measure shared wording that cannot be explained by the tender text."""
@@ -634,6 +670,80 @@ class CollusionDetector:
         tender_postings = self.tender_unit_index["postings"]
         novel_count = sum(shingle not in tender_postings for shingle in shared)
         return novel_count, novel_count / len(shared)
+
+    def _nontender_runs(self, text):
+        """Return contiguous wording not covered by the tender's character shingles.
+
+        PDF tables often interleave two columns and duplicate fragments.  A whole
+        extracted row therefore may not align with a single tender unit even though
+        nearly all of its wording comes from the tender.  Marking source-covered
+        character spans avoids treating the artificial joins between those fragments
+        as bidder-authored prose.
+        """
+        normalized = self.normalize(text)
+        if not normalized or not self.tender_unit_index:
+            return [normalized] if normalized else []
+        cached = self._nontender_runs_cache.get(normalized)
+        if cached is not None:
+            return cached
+        postings = self.tender_unit_index["postings"]
+        covered = [False] * len(normalized)
+        if len(normalized) < SHINGLE_SIZE:
+            return [normalized]
+        for start in range(len(normalized) - SHINGLE_SIZE + 1):
+            if hash(normalized[start : start + SHINGLE_SIZE]) not in postings:
+                continue
+            for index in range(start, start + SHINGLE_SIZE):
+                covered[index] = True
+        if self.tender_full_text and len(normalized) >= DIRECT_TENDER_WINDOW:
+            for start in range(len(normalized) - DIRECT_TENDER_WINDOW + 1):
+                if all(covered[start : start + DIRECT_TENDER_WINDOW]):
+                    continue
+                if normalized[start : start + DIRECT_TENDER_WINDOW] not in self.tender_full_text:
+                    continue
+                for index in range(start, start + DIRECT_TENDER_WINDOW):
+                    covered[index] = True
+        runs = []
+        start = None
+        for index, is_covered in enumerate(covered + [True]):
+            if not is_covered and start is None:
+                start = index
+            elif is_covered and start is not None:
+                value = normalized[start:index].strip(" ,.;:!?，。；：！？、()（）[]【】{}")
+                if value:
+                    runs.append(value)
+                start = None
+        if len(self._nontender_runs_cache) < TENDER_COVERAGE_CACHE_SIZE:
+            self._nontender_runs_cache[normalized] = runs
+        return runs
+
+    def _has_substantial_shared_nontender_content(self, text_a, text_b):
+        """Keep mixed tender rows only when both bids share a real novel passage."""
+        runs_a = self._nontender_runs(text_a)
+        runs_b = self._nontender_runs(text_b)
+        for left in runs_a:
+            left_information = re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", left)
+            if len(left_information) < MIN_NUMERIC_NONTENDER_RUN:
+                continue
+            for right in runs_b:
+                right_information = re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", right)
+                minimum_length = min(len(left_information), len(right_information))
+                if minimum_length < MIN_NUMERIC_NONTENDER_RUN:
+                    continue
+                contains_numeric_detail = (
+                    len(re.findall(r"\d+(?:\.\d+)?", left_information)) >= 2
+                    and len(re.findall(r"\d+(?:\.\d+)?", right_information)) >= 2
+                )
+                if minimum_length < MIN_SHARED_NONTENDER_RUN and not contains_numeric_detail:
+                    continue
+                length_ratio = minimum_length / max(len(left_information), len(right_information))
+                if length_ratio < 0.65:
+                    continue
+                if SequenceMatcher(
+                    None, left_information, right_information, autojunk=False
+                ).ratio() >= 0.88:
+                    return True
+        return False
 
     @staticmethod
     def _edit_operations(source, target):
@@ -667,7 +777,16 @@ class CollusionDetector:
         return len(numeric_groups) >= 5 and len(measurement_markers) >= 2
 
     @staticmethod
-    def _is_low_value_tender_edit(edit):
+    def _is_repeated_extraction_line(text):
+        """Detect one table cell emitted twice on the same extracted line."""
+        normalized = CollusionDetector.normalize(text)
+        if len(normalized) < 12 or len(normalized) % 2:
+            return False
+        midpoint = len(normalized) // 2
+        return normalized[:midpoint] == normalized[midpoint:]
+
+    @staticmethod
+    def _is_low_value_tender_edit(edit, tender_text=""):
         """Reject table artifacts and trivial structural changes in tender text."""
         original = edit["original"]
         modified = edit["modified"]
@@ -689,6 +808,41 @@ class CollusionDetector:
         if not modified and re.fullmatch(r"提供.{1,8}服务[,]?", original):
             return True
         if not original and len(modified) < 3:
+            return True
+        if not original and re.fullmatch(
+            r"(?:【[^】]{1,10}】|[\u4e00-\u9fff]{1,8})[:：、]?", modified
+        ):
+            return True
+        if original in {"≥", "≤", ">", "<"} and modified in {"", ":", "："}:
+            return True
+        if len(original) == 1 and len(modified) == 1 and all(
+            value in "0123456789:：,，.;；、" for value in (original, modified)
+        ):
+            source_start = max(0, int(edit.get("source_start") or 0) - 12)
+            source_end = min(
+                len(tender_text), int(edit.get("source_end") or 0) + 12
+            )
+            context = tender_text[source_start:source_end]
+            numeric_requirement = re.search(
+                rf"(?:质保|保修|期限|工期|交付|响应|数量|得分|扣分|价格|金额)"
+                rf"[^0-9]{{0,8}}{re.escape(original)}|"
+                rf"{re.escape(original)}(?:年|月|日|天|小时|分钟|次|个|项|台|套|件|页|"
+                rf"%|万元|元|mm|cm|kg|m²|m2|m3)",
+                context,
+            )
+            if not numeric_requirement:
+                return True
+        if (
+            len(modified) == 1
+            and modified.isdigit()
+            and re.search(r"[\u4e00-\u9fff]", original)
+            and len(original) <= 16
+            and not re.search(
+                r"[一二三四五六七八九十百千万两\d]+"
+                r"(?:年|月|日|天|小时|分钟|次|个|项|台|套|件|页|分|元)",
+                original,
+            )
+        ):
             return True
         # 仅删除招标格式中的变量占位符（如“（标的名称）”）不会形成投标人之间
         # 的独立共同编辑；它与填表、模板转换的方式有关，不应进入串标线索。
@@ -871,7 +1025,7 @@ class CollusionDetector:
         edits_a = {
             signature: edit
             for signature, edit in edits_a.items()
-            if not self._is_low_value_tender_edit(edit)
+            if not self._is_low_value_tender_edit(edit, tender_text)
             and not self._is_form_field_completion(edit, tender_text)
             and not self._is_leading_table_title_insertion(edit, tender_text)
             and not self._is_segment_artifact_deletion(edit, tender_text)
@@ -879,7 +1033,7 @@ class CollusionDetector:
         edits_b = {
             signature: edit
             for signature, edit in edits_b.items()
-            if not self._is_low_value_tender_edit(edit)
+            if not self._is_low_value_tender_edit(edit, tender_text)
             and not self._is_form_field_completion(edit, tender_text)
             and not self._is_leading_table_title_insertion(edit, tender_text)
             and not self._is_segment_artifact_deletion(edit, tender_text)
@@ -956,10 +1110,19 @@ class CollusionDetector:
             numbered_lines = []
 
             for line_index, line in enumerate(raw_lines):
+                if self._is_repeated_extraction_line(line):
+                    continue
                 for punctuation_match in punctuation_pattern.finditer(line):
                     cluster = punctuation_match.group()
                     is_ellipsis = len(cluster) >= 3 and set(cluster) <= {".", "。"}
                     if is_ellipsis:
+                        continue
+                    # “.；”“。；”等多用于参数表单元格结尾，并非重复标点。
+                    # 只把同类标点的真正重复视为高置信错误。
+                    canonical_cluster = cluster.translate(str.maketrans(
+                        {"，": ",", "。": ".", "；": ";", "：": ":"}
+                    ))
+                    if len(set(canonical_cluster)) != 1:
                         continue
                     self._add_error_issue(
                         issues,
@@ -1032,6 +1195,11 @@ class CollusionDetector:
                 if previous["number"] != current["number"]:
                     continue
                 if current["line_index"] - previous["line_index"] > 3:
+                    continue
+                # 技术响应表常把“招标要求/投标响应”两列的同一行连续抽取两次。
+                # 编号和正文都完全相同表示版式重复，不是编号错误；相同编号但正文
+                # 不同仍按原逻辑报告。
+                if self.normalize(previous["line"]) == self.normalize(current["line"]):
                     continue
                 has_previous_context = (
                     index >= 2
@@ -1111,6 +1279,15 @@ class CollusionDetector:
             if line_end < 0:
                 line_end = len(raw_text)
             line = raw_text[line_start:line_end].strip()
+            # 同一表格单元格被 PDF 解析器在一行内重复输出时，左右括号也会
+            # 跟着重复入栈。该行并不存在真实的括号缺失，不能在全局括号
+            # 扫描阶段重新把它报成错误。
+            if self._is_repeated_extraction_line(line):
+                continue
+            # 表格单元格或跨行提取常在顿号/逗号处被截断；此时单行内的左括号
+            # 不完整不能证明源文件存在标点错误。
+            if character in bracket_pairs and re.search(r"[,，、:：;；]\s*$", line):
+                continue
             self._add_error_issue(
                 issues,
                 "punctuation",
@@ -1140,6 +1317,15 @@ class CollusionDetector:
             # 来源价值；保留计算错误和正文文字错误，避免掩盖真正的共同异常。
             if issue_a["kind"] in {"punctuation", "numbering"} and self._looks_like_table_extraction(issue_a["text"]):
                 continue
+            coverage_a = self._tender_shingle_coverage(issue_a["text"])
+            coverage_b = self._tender_shingle_coverage(issue_b["text"])
+            if (
+                min(coverage_a, coverage_b) >= MIN_TENDER_FRAGMENT_COVERAGE
+                and not self._has_substantial_shared_nontender_content(
+                    issue_a["text"], issue_b["text"]
+                )
+            ):
+                continue
             matches.append(
                 {
                     "type": "shared_error",
@@ -1149,6 +1335,8 @@ class CollusionDetector:
                     "page_a": issue_a["page"],
                     "page_b": issue_b["page"],
                     "similarity": 100.0,
+                    "tender_coverage_a": round(coverage_a, 4),
+                    "tender_coverage_b": round(coverage_b, 4),
                     "tender_text": "",
                     "shared_edits": [],
                     "badges": [issue_a["label"]],
@@ -1367,6 +1555,14 @@ class CollusionDetector:
             ):
                 continue
 
+            tender_coverage = self._tender_shingle_coverage(text)
+            if (
+                not shared_edits
+                and tender_coverage >= MIN_TENDER_FRAGMENT_COVERAGE
+                and not self._has_substantial_shared_nontender_content(text, text)
+            ):
+                continue
+
             if shared_edits:
                 result_type = "tender_related"
                 badges = ["完全匹配", "已验证共同修改"]
@@ -1396,6 +1592,8 @@ class CollusionDetector:
                         if tender_similarities
                         else 0
                     ),
+                    "tender_coverage_a": round(tender_coverage, 4),
+                    "tender_coverage_b": round(tender_coverage, 4),
                     "tender_text": "；".join(tender_references[:3]),
                     "shared_edits": shared_edits,
                     "voice_adaptation_only": bool(shared_edits) and has_tender_edit and tender_edit_voice_only,
@@ -1757,20 +1955,17 @@ class CollusionDetector:
 
             table_a = self._looks_like_table_extraction(text_a)
             table_b = self._looks_like_table_extraction(text_b)
-            has_substantial_nontender_table_content = False
-            if table_a and table_b and min(
-                self._tender_shingle_coverage(text_a),
-                self._tender_shingle_coverage(text_b),
-            ) >= 0.75:
-                novel_count, novel_ratio = self._shared_nontender_shingle_stats(
-                    text_a, text_b
-                )
-                has_substantial_nontender_table_content = (
-                    novel_count >= MIN_SHARED_NONTENDER_SHINGLES
-                    and novel_ratio >= MIN_SHARED_NONTENDER_RATIO
-                )
-                if not has_substantial_nontender_table_content:
-                    continue
+            tender_coverage_a = self._tender_shingle_coverage(text_a)
+            tender_coverage_b = self._tender_shingle_coverage(text_b)
+            novel_count, novel_ratio = self._shared_nontender_shingle_stats(
+                text_a, text_b
+            )
+            has_substantial_nontender_table_content = (
+                novel_count >= MIN_SHARED_NONTENDER_SHINGLES
+                and novel_ratio >= MIN_SHARED_NONTENDER_RATIO
+                and
+                self._has_substantial_shared_nontender_content(text_a, text_b)
+            )
 
             if tender_a and tender_b and tender_a["index"] == tender_b["index"]:
                 candidate_tender_text = tender_a["unit"]["text"]
@@ -1793,6 +1988,13 @@ class CollusionDetector:
                         f"{len(shared_edits)} 处相同改动"
                     )
 
+            if (
+                not verified_tender_edit
+                and min(tender_coverage_a, tender_coverage_b)
+                >= MIN_TENDER_FRAGMENT_COVERAGE
+                and not has_substantial_nontender_table_content
+            ):
+                continue
             if not verified_tender_edit and self.tender_unit_index:
                 derived_a = tender_a or self._best_tender_match(
                     text_a, minimum_ratio=0.55, minimum_jaccard=0.12
@@ -1847,6 +2049,8 @@ class CollusionDetector:
                     "shared_edits": shared_edits,
                     "voice_adaptation_only": voice_adaptation_only,
                     "error_kind": error_kind,
+                    "tender_coverage_a": round(tender_coverage_a, 4),
+                    "tender_coverage_b": round(tender_coverage_b, 4),
                     "badges": badges,
                     "desc": desc,
                 }
