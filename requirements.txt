@@ -25,4 +25,8 @@ tencentcloud-sdk-python-common
 tencentcloud-sdk-python-ocr
 Pillow
 rapidocr==3.8.1
-onnxruntime==1.16.3
+# PP-OCRv5 mobile 模型使用 ONNX IR v10，需要 onnxruntime>=1.18；
+# 1.19.2 是同时保留 Python 3.9 wheel 且兼容 numpy 1.26（torch 2.2 锁定）的稳定版。
+onnxruntime==1.19.2
+# 固定 numpy 1.x 兼容的 opencv 版本，避免 pip 为回溯解析反复下载 60-77MB 大包。
+opencv-python==4.10.0.84
