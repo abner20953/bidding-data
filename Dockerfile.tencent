@@ -44,6 +44,9 @@ COPY --chown=1000:1000 . .
 # RapidOCR 仅由短生命周期子进程按需加载；这里提前下载并校验 PP-OCRv5 mobile
 # 模型，避免用户发起评审时才联网下载。仅对 warmup 命令设置 HOME，不能污染容器内
 # 其他库（例如 HuggingFace）的缓存目录；运行时子进程会使用同一目录。
+# onnxruntime 1.16.3 的 pybind 共享库带有 executable-stack 标记，Debian trixie 的
+# glibc>=2.41 默认拒绝加载；通过官方 tunable 显式放行（仅限本容器内进程）。
+ENV GLIBC_TUNABLES=glibc.rtld.execstack=2
 RUN install -d -o 1000 -g 1000 /app/model_data/rapidocr && \
     HOME=/app/model_data/rapidocr python -m dashboard.evaluation_workbench.rapidocr_worker --warmup && \
     chown -R 1000:1000 /app/model_data/rapidocr
