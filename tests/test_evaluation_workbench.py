@@ -1329,6 +1329,15 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertFalse(services["fast"]["enabled"])
         self.assertFalse(services["efficient"]["enabled"])
 
+    def test_disabled_tencent_ocr_keeps_credentials_available_for_configuration_test_only(self):
+        storage.update_ocr_configuration(self.app, {
+            "tencent_enabled": True, "secret_id": "AKID-example", "secret_key": "secret-example",
+        })
+        storage.update_ocr_configuration(self.app, {"tencent_enabled": False})
+
+        self.assertIsNone(storage.tencent_ocr_credentials(self.app))
+        self.assertEqual(storage.tencent_ocr_credentials(self.app, require_enabled=False)[2], "ap-guangzhou")
+
     def test_tencent_ocr_sdk_top_level_response_is_parsed(self):
         class FakeResponse:
             @staticmethod
@@ -1397,13 +1406,15 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(cached["text"], "证书编号A")
         self.assertIsNone(storage.get_ocr_page_cache(self.app, document["document_id"], 1, "page-hash", "basic"))
 
-    def test_local_ocr_configuration_defaults_to_safe_fallback_and_can_be_disabled(self):
+    def test_local_ocr_is_always_available_as_direct_or_fallback_path(self):
         initial = storage.ocr_configuration(self.app)
         self.assertTrue(initial["local"]["enabled"])
         self.assertFalse(initial["local"]["readiness"]["ready_for_manual_validation"])
-        updated = storage.update_ocr_configuration(self.app, {"enabled": False, "local": {"enabled": False}})
-        self.assertFalse(updated["local"]["enabled"])
-        self.assertEqual(updated["local"]["mode"], "fallback")
+        # 兼容旧请求中的 local.enabled=false，但不能让关闭腾讯云后完全失去 OCR。
+        updated = storage.update_ocr_configuration(self.app, {"tencent_enabled": False, "local": {"enabled": False}})
+        self.assertFalse(updated["tencent_enabled"])
+        self.assertTrue(updated["local"]["enabled"])
+        self.assertEqual(updated["local"]["mode"], "fallback_or_primary")
 
     def test_local_ocr_is_used_when_tencent_ocr_is_not_enabled(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "扫描件候选页")
@@ -1413,9 +1424,20 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         ], "")) as local_pages:
             values, failure = worker._ocr_page_texts(self.app, {"task_id": "task"}, document, rule, {}, "standard", pages=[1])
 
-        self.assertEqual(failure, "腾讯 OCR 未启用，已由本地 RapidOCR 回退")
+        self.assertEqual(failure, "腾讯 OCR 未启用，已由本地 RapidOCR 直接识别")
         self.assertEqual(values[0]["service"], local_ocr_gateway.LOCAL_OCR_SERVICE)
         local_pages.assert_called_once()
+
+    def test_ocr_runtime_uses_local_path_when_tencent_is_disabled(self):
+        self.assertTrue(worker._ocr_runtime_enabled({
+            "tencent_enabled": False, "local": {"enabled": True, "runtime_available": True},
+        }))
+        self.assertTrue(worker._ocr_runtime_enabled({
+            "tencent_enabled": True, "local": {"enabled": True, "runtime_available": False},
+        }))
+        self.assertFalse(worker._ocr_runtime_enabled({
+            "tencent_enabled": False, "local": {"enabled": True, "runtime_available": False},
+        }))
 
     def test_tencent_ocr_success_never_starts_local_fallback(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "扫描件候选页")

@@ -705,14 +705,14 @@ def _ocr_service_settings(value: object) -> dict:
 
 
 def _local_ocr_settings(value: object) -> dict:
-    """本地 OCR 仅作为第一阶段安全回退，不能改写腾讯 OCR 的额度语义。"""
-    raw = value if isinstance(value, dict) else {}
-    enabled = raw.get("enabled", True)
-    if not isinstance(enabled, bool):
-        enabled = True
+    """本地 OCR 是稳定兜底，不再暴露为可关闭的业务开关。
+
+    腾讯云开关关闭时它承担直接 OCR；腾讯云优先路径不可用时它承担回退。旧版本
+    保存的 ``local.enabled=false`` 仅为历史配置，不能让关闭腾讯后系统没有 OCR。
+    """
     return {
-        "enabled": enabled,
-        "mode": "fallback",
+        "enabled": True,
+        "mode": "fallback_or_primary",
         "engine": "RapidOCR / PP-OCRv5 mobile / ONNX CPU",
         # find_spec 不导入模型，不会让 ONNX Runtime 在 Web 服务常驻。
         "runtime_available": bool(importlib.util.find_spec("rapidocr") and importlib.util.find_spec("onnxruntime")),
@@ -738,7 +738,7 @@ def _local_ocr_readiness(app) -> dict:
 
 
 def ocr_configuration(app) -> dict:
-    """公开腾讯 OCR 配置；绝不返回 SecretId/SecretKey 明文或密文。"""
+    """公开 OCR 路由配置；绝不返回 SecretId/SecretKey 明文或密文。"""
     raw = _ocr_configuration_raw(app)
     services = _ocr_service_settings(raw.get("services"))
     local = {**_local_ocr_settings(raw.get("local")), "readiness": _local_ocr_readiness(app)}
@@ -763,8 +763,11 @@ def ocr_configuration(app) -> dict:
     manual_id = bool(raw.get("secret_id_encrypted"))
     manual_key = bool(raw.get("secret_key_encrypted"))
     env_ready = bool(os.environ.get("TENCENTCLOUD_SECRET_ID", "").strip() and os.environ.get("TENCENTCLOUD_SECRET_KEY", "").strip())
+    tencent_enabled = bool(raw.get("enabled", False))
     return {
-        "enabled": bool(raw.get("enabled", False)),
+        # enabled 保留给既有前端/API 调用方；tencent_enabled 是当前更明确的语义字段。
+        "enabled": tencent_enabled,
+        "tencent_enabled": tencent_enabled,
         "region": str(raw.get("region") or "ap-guangzhou"),
         "credentials_configured": (manual_id and manual_key) or env_ready,
         "credentials_source": "manual" if manual_id and manual_key else "environment" if env_ready else "none",
@@ -774,7 +777,7 @@ def ocr_configuration(app) -> dict:
 
 def update_ocr_configuration(app, payload: dict) -> dict:
     existing = _ocr_configuration_raw(app)
-    enabled = payload.get("enabled", existing.get("enabled", False))
+    enabled = payload.get("tencent_enabled", payload.get("enabled", existing.get("enabled", False)))
     if not isinstance(enabled, bool):
         raise ValueError("腾讯 OCR 总开关必须为布尔值")
     region = str(payload.get("region", existing.get("region", "ap-guangzhou")) or "").strip()
@@ -794,16 +797,14 @@ def update_ocr_configuration(app, payload: dict) -> dict:
     if not isinstance(service_input, dict):
         raise ValueError("OCR 接口设置格式不正确")
     services = _ocr_service_settings(service_input)
-    local_input = payload.get("local", existing.get("local", {}))
-    if not isinstance(local_input, dict):
-        raise ValueError("本地 OCR 设置格式不正确")
-    local = _local_ocr_settings(local_input)
     if enabled and not ((encrypted_id and encrypted_key) or (
         os.environ.get("TENCENTCLOUD_SECRET_ID", "").strip() and os.environ.get("TENCENTCLOUD_SECRET_KEY", "").strip()
     )):
         raise ValueError("开启腾讯 OCR 前，请配置 SecretId 和 SecretKey，或在运行环境设置 TENCENTCLOUD_SECRET_ID/KEY")
+    # 本地 RapidOCR 是固定的直接/回退路径，不接受前端关闭；保留 local 配置对象只为
+    # 已有数据库和 API 响应兼容，实际运行语义统一由 _local_ocr_settings 决定。
     value = {"enabled": enabled, "region": region, "secret_id_encrypted": encrypted_id,
-             "secret_key_encrypted": encrypted_key, "services": services, "local": local}
+             "secret_key_encrypted": encrypted_key, "services": services, "local": {"enabled": True}}
     with connection(app) as conn:
         conn.execute(
             "INSERT INTO ew_settings(setting_key, setting_value, updated_at) VALUES (?, ?, ?) "
@@ -813,9 +814,14 @@ def update_ocr_configuration(app, payload: dict) -> dict:
     return ocr_configuration(app)
 
 
-def tencent_ocr_credentials(app) -> tuple[str, str, str] | None:
+def tencent_ocr_credentials(app, *, require_enabled: bool = True) -> tuple[str, str, str] | None:
+    """读取腾讯云 OCR 凭据。
+
+    业务调用保持默认 ``require_enabled=True``；配置页测试可显式忽略运行开关，
+    这样用户先关闭腾讯云改用本地 OCR 后，仍能验证并维护已保存的云端配置。
+    """
     raw = _ocr_configuration_raw(app)
-    if not raw.get("enabled"):
+    if require_enabled and not raw.get("enabled"):
         return None
     secret_id = _decrypt_model_api_key(app, raw["secret_id_encrypted"]) if raw.get("secret_id_encrypted") else os.environ.get("TENCENTCLOUD_SECRET_ID", "").strip()
     secret_key = _decrypt_model_api_key(app, raw["secret_key_encrypted"]) if raw.get("secret_key_encrypted") else os.environ.get("TENCENTCLOUD_SECRET_KEY", "").strip()

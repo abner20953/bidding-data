@@ -612,7 +612,7 @@ def test_tencent_ocr_configuration_api():
     if not configuration["credentials_configured"]:
         return jsonify({"error": "未配置腾讯 OCR SecretId/SecretKey"}), 400
     try:
-        credentials = storage.tencent_ocr_credentials(current_app)
+        credentials = storage.tencent_ocr_credentials(current_app, require_enabled=False)
     except ValueError:
         return jsonify({"error": "已保存的腾讯 OCR 凭据无法解密，请重新配置 SecretId 和 SecretKey"}), 400
     if not credentials:

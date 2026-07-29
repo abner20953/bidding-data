@@ -3961,6 +3961,19 @@ def _ocr_candidate_pages(document: dict, rule: dict, result: dict, level: str) -
     return pages[:_OCR_PAGE_LIMITS.get(level, 1)]
 
 
+def _ocr_runtime_enabled(configuration: dict) -> bool:
+    """判断当前图片审查是否至少有一个可用 OCR 路径。
+
+    腾讯云关闭时仍必须让本地 RapidOCR 承担直接识别；腾讯云开启但额度、凭据或
+    服务异常时，具体页面级回退仍由 _ocr_page_texts 处理。
+    """
+    local = configuration.get("local") if isinstance(configuration, dict) else {}
+    return bool(
+        (isinstance(configuration, dict) and configuration.get("tencent_enabled", configuration.get("enabled")))
+        or (isinstance(local, dict) and local.get("enabled") and local.get("runtime_available"))
+    )
+
+
 def _ocr_parser_version_for_service(service: str) -> int:
     return LOCAL_OCR_PARSER_VERSION if service == LOCAL_OCR_SERVICE else OCR_PARSER_VERSION
 
@@ -4028,7 +4041,7 @@ def _ocr_page_texts(app, task: dict, document: dict, rule: dict, result: dict, l
         if not local_enabled:
             return [], "腾讯 OCR 未启用"
         local_values, local_failure = _local_ocr_page_texts(app, document, pages)
-        return local_values, local_failure or "腾讯 OCR 未启用，已由本地 RapidOCR 回退"
+        return local_values, local_failure or "腾讯 OCR 未启用，已由本地 RapidOCR 直接识别"
     values: list[dict] = []
     failure = ""
     unavailable_services: set[str] = set()
@@ -5933,8 +5946,10 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
         ("objective", objective_rules, objective_run),
         ("subjective", subjective_rules, subjective_run),
     )
-    # 全系统图片识别开关是总闸：关闭时必须与此前的纯文字流程完全一致。
-    ocr_enabled = bool(vision_profile and storage.ocr_configuration(app).get("enabled"))
+    # 全系统图片识别开关仍是总闸。腾讯关闭时，本地 RapidOCR 直接承担 OCR；
+    # 腾讯开启时先走云端，页面级不可用再由 _ocr_page_texts 回退到本地。
+    ocr_configuration = storage.ocr_configuration(app)
+    ocr_enabled = bool(vision_profile and _ocr_runtime_enabled(ocr_configuration))
     for component, component_rules, run in visual_components:
         for rule in component_rules:
             trigger, level = _rule_vision_policy(rule)
@@ -5958,21 +5973,21 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
                 merged = _run_visual_supplement(app, task, document, component, rule, merged, vision_profile)
                 values["batch_count"] += 1
                 if ocr_enabled and _needs_post_vision_ocr_verification(rule, merged):
-                    progress.message(f"正在腾讯 OCR 复核关键页：{bidder_name} · {label}")
+                    progress.message(f"正在 OCR 复核关键页：{bidder_name} · {label}")
                     merged = _run_ocr_verification_after_vision(
                         app, task, document, component, rule, merged,
                     )
                     values["batch_count"] += 1
                 elif ocr_enabled and str(merged.get("vision_status") or "") in {"not_located", "failed", "uncovered"}:
                     # 视觉找页失败时回退到原 OCR 链路，不能因新增优化而降低材料覆盖率。
-                    progress.message(f"图片未定位，回退腾讯 OCR：{bidder_name} · {label}")
+                    progress.message(f"图片未定位，回退 OCR：{bidder_name} · {label}")
                     merged = _run_ocr_supplement(
                         app, task, document, component, rule, merged, profile,
                         locator_profile=vision_profile,
                     )
                     values["batch_count"] += 1
             elif ocr_enabled and image_strategy in {"ocr", "hybrid"}:
-                progress.message(f"正在腾讯 OCR 识别：{bidder_name} · {label}")
+                progress.message(f"正在 OCR 识别：{bidder_name} · {label}")
                 merged = _run_ocr_supplement(
                     app, task, document, component, rule, merged, profile,
                     locator_profile=vision_profile,
