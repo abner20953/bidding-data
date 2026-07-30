@@ -498,6 +498,16 @@ def tasks_api(project_id):
                     return jsonify({"error": "已启用图片识别规则，但当前评审模型不是多模态模型，且未配置可用的默认图片识别模型。请在模型配置中勾选多模态模型并设为默认图片模型。"}), 400
     try:
         requested_profile_id = data.get("profile_id") or storage.default_model_profile_id(current_app)
+        retry_failed_task_id = str(data.get("retry_failed_task_id") or "").strip()
+        if retry_failed_task_id:
+            if task_type != "evaluate_all":
+                return jsonify({"error": "仅综合评审支持仅重跑失败项"}), 400
+            prior = storage.get_task(current_app, retry_failed_task_id)
+            if not prior or prior.get("project_id") != project_id or prior.get("task_type") != "evaluate_all":
+                return jsonify({"error": "待重跑的综合评审任务不存在或不属于当前项目"}), 400
+            failed_units = (prior.get("result") or {}).get("failed_units")
+            if not isinstance(failed_units, list) or not failed_units:
+                return jsonify({"error": "该任务没有可单独重跑的失败项"}), 400
         # force_rerun 必须随任务进入后台。仅在 API 层跳过整任务复用还不够：
         # 综合评审内部还有按投标文件复用的增量缓存。
         payload = {
@@ -505,11 +515,13 @@ def tasks_api(project_id):
             "prompt_version": TASK_PROMPT_VERSION,
             "force_rerun": data.get("force_rerun") is True,
         }
+        if retry_failed_task_id:
+            payload["retry_failed_task_id"] = retry_failed_task_id
         if task_type in {"compare_documents", "extract_rules", "review_documents", "score_objective", "score_subjective", "evaluate_all"}:
             payload["input_fingerprint"] = storage.task_input_fingerprint(
                 current_app, project_id, task_type, requested_profile_id, TASK_PROMPT_VERSION,
             )
-            if data.get("force_rerun") is not True:
+            if data.get("force_rerun") is not True and not retry_failed_task_id:
                 reusable = storage.find_reusable_task(current_app, project_id, task_type, payload["input_fingerprint"])
                 if reusable:
                     return jsonify({"task": reusable, "reused": True})

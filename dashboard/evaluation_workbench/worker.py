@@ -96,9 +96,34 @@ class _EvaluationRequestGate:
 def _is_rate_limit_error(error: Exception) -> bool:
     message = str(error).lower()
     return any(term in message for term in (
-        "http 429", "http 529", "http 502", "http 503", "http 504",
+        "http 408", "http 429", "http 529", "http 502", "http 503", "http 504",
         "rate limit", "too many requests", "overloaded", "temporarily unavailable", "timeout", "timed out",
     )) or "限流" in str(error) or "接口繁忙" in str(error)
+
+
+# 重试只覆盖服务端或链路的短暂故障。鉴权、余额、参数、内容安全和输出长度分别有
+# 明确的处理路径，不能靠重复同一请求掩盖真实问题。
+_TRANSIENT_TRANSPORT_MARKERS = (
+    "remotedisconnected", "remote end closed", "connection reset", "connection aborted",
+    "connection broken", "connection refused", "connection timed out", "read timed out",
+    "connect timeout", "temporary failure in name resolution", "name or service not known",
+    "network is unreachable", "broken pipe", "eof occurred", "ssl eof",
+)
+_REQUEST_RETRY_BACKOFF_SECONDS = (5, 15, 45)
+_HTTP_STATUS_PATTERN = re.compile(r"(?:http|status(?:\s+code)?)\s*[:=]?\s*(\d{3})", re.I)
+
+
+def _is_recoverable_model_error(error: Exception) -> bool:
+    if isinstance(error, ModelResponseEnvelopeError):
+        return bool(error.retryable)
+    raw_message = str(error)
+    # 明确的客户端 4xx（408/429 除外）是配置、鉴权或参数问题，不能因为错误文案
+    # 中带有“timeout”等词就重复同一请求。
+    statuses = [int(value) for value in _HTTP_STATUS_PATTERN.findall(raw_message)]
+    if any(400 <= status < 500 and status not in {408, 429} for status in statuses):
+        return False
+    message = raw_message.lower()
+    return _is_rate_limit_error(error) or any(marker in message for marker in _TRANSIENT_TRANSPORT_MARKERS)
 
 
 def _is_minimax_profile(profile: dict) -> bool:
@@ -134,6 +159,11 @@ def _prompt_input_chars(value: object) -> int:
         return len(str(value or ""))
 
 
+def _stable_prompt_json(value: object) -> str:
+    """提示词内结构化数据采用固定键序，便于支持前缀缓存的模型稳定命中。"""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
 def _task_request_profile(profile: dict, phase: str, thinking_mode: str | None = None) -> dict:
     """为小规格工作台给可恢复的综合评审请求设定边界，不改变模型档案的保存值。"""
     effective = {**profile, "thinking_mode": thinking_mode} if thinking_mode else dict(profile)
@@ -150,7 +180,7 @@ def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt
     """调用模型并只记录用量元数据，不记录正文或提示词。"""
     gate = task.get("_evaluation_request_gate")
     effective_profile = _task_request_profile(profile, phase, thinking_mode)
-    for attempt in range(3):
+    for attempt in range(len(_REQUEST_RETRY_BACKOFF_SECONDS) + 1):
         # 每一次真实请求单独落一行用量。此前重试会覆盖上一轮 usage，导致 token
         # 统计偏低，也难以区分服务暂时繁忙与模型输出触顶。
         usage: dict = {}
@@ -180,19 +210,18 @@ def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt
                 incomplete_envelope = isinstance(exc, ModelResponseEnvelopeError)
                 envelope_retryable = incomplete_envelope and exc.retryable
                 rate_limited = _is_rate_limit_error(exc)
-                # 只有明确的暂时性服务故障才退避重试。M3 因输出预算耗尽时会转化为
-                # InvalidJsonResponse(length)，交由上层拆分规则组，不能原样重发。
-                retry_limit = 2 if envelope_retryable else 1
-                should_retry = attempt < retry_limit and (
-                    rate_limited or envelope_retryable
-                )
+                # InvalidJsonResponse(length) 由上层拆分；其余可恢复网络、过载或空包
+                # 故障最多补三次。每次只重试当前调用，不会重发整份投标文件。
+                should_retry = attempt < len(_REQUEST_RETRY_BACKOFF_SECONDS) and _is_recoverable_model_error(exc)
                 if should_retry:
                     # 仅限流/超时才降低并发。响应结构异常、业务错误包与并行度无必然关系。
                     if rate_limited and gate and gate.reduce_after_rate_limit():
                         message = "模型接口限流或暂时繁忙，已自动降低并行度后继续"
                         storage.update_task(app, task["task_id"], message=message)
                     elif envelope_retryable:
-                        storage.update_task(app, task["task_id"], message=f"模型接口返回不完整响应，正在第 {attempt + 1}/{retry_limit} 次重试当前分组")
+                        storage.update_task(app, task["task_id"], message=f"模型接口返回不完整响应，正在第 {attempt + 1}/{len(_REQUEST_RETRY_BACKOFF_SECONDS)} 次重试当前分组")
+                    else:
+                        storage.update_task(app, task["task_id"], message=f"模型连接暂时中断，正在第 {attempt + 1}/{len(_REQUEST_RETRY_BACKOFF_SECONDS)} 次重试当前分组")
                     retry_after_failure = True
                 else:
                     raise
@@ -208,7 +237,7 @@ def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt
                 gate.release()
         if retry_after_failure:
             # 必须先释放并发位；否则失败请求在退避期间会无谓阻塞另一家投标人的收尾。
-            time.sleep(2 * (attempt + 1))
+            time.sleep(_REQUEST_RETRY_BACKOFF_SECONDS[attempt])
             continue
 
 
@@ -1311,14 +1340,68 @@ def _rule_signature(item: dict) -> tuple[str, str, str]:
     )
 
 
+def _normalise_rule_title(value: object) -> str:
+    text = re.sub(r"[（(]\s*(?:满分|最高(?:得)?分?)\s*\d+(?:\.\d+)?\s*分?\s*[)）]", "", str(value or ""))
+    text = re.sub(r"(?:[-—–:：\s]*)(?:满分|最高(?:得)?分?)\s*\d+(?:\.\d+)?\s*分?", "", text)
+    return re.sub(r"[\s\W_]+", "", text).casefold()
+
+
+def _score_rule_dedupe_key(item: dict) -> tuple[object, ...] | None:
+    """只合并来源、分值和对象同时一致的评分规则，避免标题相似导致漏分。"""
+    category = str(item.get("category") or "")
+    if category not in {"objective", "subjective"}:
+        return None
+    scoring = item.get("scoring") if isinstance(item.get("scoring"), dict) else {}
+    max_score = storage._valid_max_score(scoring)
+    title = _normalise_rule_title(item.get("title"))
+    clause_ids = tuple(sorted({str(value).strip() for value in item.get("source_clause_ids") or [] if str(value).strip()}))
+    source = re.sub(r"[\s\W_]+", "", str(item.get("source_text") or "")).casefold()
+    if max_score is None or not title:
+        return None
+    # 评分条款ID是最可靠锚点；没有它时，只有同一明确原文才允许合并。
+    if clause_ids:
+        return ("score", category, title, float(max_score), clause_ids)
+    if source:
+        return ("score_source", category, title, float(max_score), source)
+    return None
+
+
+def _rule_candidate_richness(item: dict) -> tuple[int, int, int]:
+    scoring = item.get("scoring") if isinstance(item.get("scoring"), dict) else {}
+    items = scoring.get("items") if isinstance(scoring.get("items"), list) else []
+    return (len(items), len(str(item.get("check_rule") or "")), len(str(item.get("source_text") or "")))
+
+
+def _merge_duplicate_score_rule(existing: dict, candidate: dict) -> dict:
+    """合并同一评分事实的互补字段，选择信息更全者为主体。"""
+    primary, secondary = (candidate, existing) if _rule_candidate_richness(candidate) > _rule_candidate_richness(existing) else (existing, candidate)
+    merged = dict(primary)
+    merged["source_clause_ids"] = list(dict.fromkeys([
+        *[str(value) for value in primary.get("source_clause_ids") or [] if str(value).strip()],
+        *[str(value) for value in secondary.get("source_clause_ids") or [] if str(value).strip()],
+    ]))
+    merged["ocr_required"] = bool(primary.get("ocr_required") or secondary.get("ocr_required"))
+    if not merged.get("source_page"):
+        merged["source_page"] = secondary.get("source_page")
+    return merged
+
+
 def _dedupe_rule_candidates(items: list[dict]) -> list[dict]:
     seen: set[tuple[str, str, str]] = set()
-    result = []
+    score_indexes: dict[tuple[object, ...], int] = {}
+    result: list[dict] = []
     for item in items:
         signature = _rule_signature(item)
         if not all(signature) or signature in seen:
             continue
         seen.add(signature)
+        score_key = _score_rule_dedupe_key(item)
+        if score_key is not None and score_key in score_indexes:
+            index = score_indexes[score_key]
+            result[index] = _merge_duplicate_score_rule(result[index], item)
+            continue
+        if score_key is not None:
+            score_indexes[score_key] = len(result)
         result.append(item)
     return result
 
@@ -1684,7 +1767,6 @@ def _protected_rules_for_quality_gate(app, project_id: str) -> list[dict]:
     protected.extend(
         {**item, "source_type": "global"}
         for item in storage.list_global_rules(app)
-        if item.get("enabled")
     )
     return protected
 
@@ -2917,11 +2999,48 @@ def _score_reason_text(raw: dict, suggested: float | None) -> str:
         parts.append(f"计分过程：{calculation}")
     if reason:
         parts.append(reason)
-    if raw.get("needs_ocr") is True:
-        parts.append("部分关键证据建议通过 OCR 进一步核验；以上为基于可见材料的暂定建议。")
     if not parts:
         parts.append("AI未返回完整理由。" if suggested is not None else "模型未返回可用建议分。")
     return "\n".join(parts)
+
+
+_SCORE_CALCULATION_RESULT_PATTERN = re.compile(r"(?:=|＝)\s*(\d+(?:\.\d+)?)\s*分?")
+_SCORE_CONCLUSION_PATTERN = re.compile(r"(?:最终|建议|得分|合计|总计|封顶).{0,16}?(\d+(?:\.\d+)?)\s*分")
+
+
+def _format_score(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def _reason_declares_conflicting_score(reason: object, suggested: float | None) -> bool:
+    if suggested is None:
+        return False
+    text = _clean_model_text(reason)
+    if not text:
+        return False
+    values = [float(value) for value in _SCORE_CALCULATION_RESULT_PATTERN.findall(text)]
+    values.extend(float(value) for value in _SCORE_CONCLUSION_PATTERN.findall(text))
+    return any(abs(value - float(suggested)) > 1e-6 for value in values)
+
+
+def _reconcile_score_reason(reason: object, suggested: float | None, *, adjusted: bool = False,
+                            source: str = "") -> str:
+    """当证据链调整最终建议分时，移除会与最终分数冲突的旧计算文字。"""
+    text = _clean_model_text(reason)
+    if suggested is None:
+        return text
+    if not adjusted and not _reason_declares_conflicting_score(text, suggested):
+        return text
+    retained = []
+    for piece in re.split(r"(?<=[。；;])\s*|\n+", text):
+        if not piece.strip():
+            continue
+        if _reason_declares_conflicting_score(piece, suggested) or "计分过程" in piece:
+            continue
+        retained.append(piece.strip())
+    origin = f"；依据{source}已确认的材料" if source else ""
+    retained.append(f"最终建议分：{_format_score(float(suggested))}分{origin}。")
+    return " ".join(dict.fromkeys(retained))[:2000]
 
 
 def _normalise_score_results(output: object, rule_payload: list[dict], score_type: str) -> list[dict]:
@@ -2952,10 +3071,11 @@ def _score_result_from_model(rule_id: str, suggested: float | None, max_score: f
     evidence = _score_evidence_text(raw)
     has_evidence = bool(evidence)
     auto_ready = suggested is not None and confidence == "high" and has_evidence and not needs_ocr
+    reason = _reconcile_score_reason(_score_reason_text(raw, suggested), suggested)
     return {"rule_id": rule_id, "suggested_score": suggested, "final_score": None,
             "effective_score": suggested if auto_ready else None, "max_score": max_score or None,
             "evidence": evidence[:2000],
-            "reason": _score_reason_text(raw, suggested)[:2000],
+            "reason": reason,
             # 仅在当前任务内供图片识别定位使用；存储层会忽略该临时字段，避免改变历史结果 API。
             "visual_page_candidates": _score_visual_page_candidates(raw),
             "confidence": confidence, "automation_status": "ready_for_batch_confirmation" if auto_ready else "needs_review",
@@ -3149,11 +3269,18 @@ def _combined_batch_prompt(app, component: str, document: dict, payload: list[di
         "字符串内不得出现未转义的英文双引号、换行或制表符；每条规则仅保留一句证据和一句理由。\n"
         if compact else ""
     )
-    return storage.render_prompt_template(
-        app, template_id, rules=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+    prompt = storage.render_prompt_template(
+        app, template_id, rules=_stable_prompt_json(payload),
         document_name=document["original_name"], bidder_name=document["bidder_name"] or "未填写", text=text,
         retry_note=retry_note,
     )
+    # 价格事实由同一任务内的本地保守解析统一提供给符合性审查和客观评分；它位于
+    # 可变尾部，不影响前面规则组与正文的既有提示词协议。
+    if document.get("_shared_price_facts") and any(_PRICE_RULE_MARKERS.search(
+        f"{item.get('title', '')} {item.get('check_rule', '')} {item.get('source_text', '')}"
+    ) for item in payload):
+        prompt += f"\n\n【已核验价格事实】\n{document['_shared_price_facts']}"
+    return prompt
 
 
 def _combined_batch_payload(component: str, rules: list[dict]) -> list[dict]:
@@ -3223,8 +3350,8 @@ def _full_scan_prompt(app, document: dict, catalog: list[dict], chunk: dict, pro
     )
     prompt = storage.render_prompt_template(
         app, "evaluate_all_full_scan_user", retry_note=retry_note,
-        project_scope=json.dumps(project_scope, ensure_ascii=False, separators=(",", ":")),
-        rules=json.dumps(catalog, ensure_ascii=False, separators=(",", ":")),
+        project_scope=_stable_prompt_json(project_scope),
+        rules=_stable_prompt_json(catalog),
         document_name=document["original_name"], bidder_name=document["bidder_name"] or "未填写",
         chunk_label=_full_scan_chunk_label(chunk), text=chunk["text"],
     )
@@ -3429,7 +3556,7 @@ def _project_scope_profile(app, task: dict, profile: dict, documents: list[dict]
         return _normalise_scope_profile(cached)
     prompt = storage.render_prompt_template(
         app, "evaluate_all_scope_profile_user", project_name=project.get("name") or "未填写",
-        rules=json.dumps(rule_packet, ensure_ascii=False, separators=(",", ":")), tender_text=tender_text,
+        rules=_stable_prompt_json(rule_packet), tender_text=tender_text,
     )
     try:
         parsed = _request_task_json(
@@ -5863,6 +5990,12 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
         # 与审查项保持一致：字段核对仅用于后续 OCR 影子验证，不能自行抬高分数。
         "visual_field_checks": [dict(item) for item in parsed.get("field_checks") or [] if isinstance(item, dict)][:12],
     }
+    previous_suggested = _bounded_model_score(result.get("suggested_score"), max_score) if max_score > 0 else None
+    merged["reason"] = _reconcile_score_reason(
+        merged.get("reason"), suggested,
+        adjusted=previous_suggested is not None and suggested is not None and abs(previous_suggested - suggested) > 1e-6,
+        source="图片/OCR",
+    )
     merged = _append_evidence_layer(
         merged, source="vision", summary=visual_evidence or visual_reason, checked_pages=checked_pages,
         evidence_pages=visual_evidence_pages, model=str(vision_profile.get("display_name") or vision_profile.get("model_name") or ""),
@@ -6176,6 +6309,52 @@ def _local_total_quote(document: dict) -> tuple[Decimal | None, str]:
     return value, excerpt
 
 
+_UPPER_PRICE_LABEL_PATTERN = re.compile(r"(?:最高限价|采购预算|预算金额|项目预算|控制价)")
+
+
+def _local_project_upper_limit(app, project_id: str) -> tuple[Decimal | None, str]:
+    """仅从招标文件中标签邻近的唯一金额提取限价，无法确认时宁可留空。"""
+    candidates: list[tuple[Decimal, str]] = []
+    for tender in storage.list_documents(app, project_id):
+        if tender.get("role") not in {"tender", "tender_attachment"}:
+            continue
+        path = str(tender.get("parsed_path") or "")
+        if not path or not Path(path).is_file():
+            continue
+        lines = Path(path).read_text(encoding="utf-8", errors="ignore").splitlines()
+        for index, line in enumerate(lines):
+            if not _UPPER_PRICE_LABEL_PATTERN.search(str(line or "")):
+                continue
+            window = " ".join(str(value or "") for value in lines[index:index + 3])
+            for match in _TOTAL_QUOTE_NUMBER_PATTERN.finditer(window):
+                try:
+                    value = Decimal(match.group(1).replace(",", ""))
+                except (InvalidOperation, AttributeError):
+                    continue
+                if value.is_finite() and value > 0:
+                    candidates.append((value, window[:260]))
+    unique = {value for value, _ in candidates}
+    if len(unique) != 1:
+        return None, ""
+    value = next(iter(unique))
+    return value, next((source for candidate, source in candidates if candidate == value), "")
+
+
+def _document_shared_price_facts(app, project_id: str, document: dict) -> str:
+    """生成可被审查和评分共同消费的最小价格事实包，不引用任一模型的自然语言结论。"""
+    quote, quote_excerpt = _local_total_quote(document)
+    limit, limit_excerpt = _local_project_upper_limit(app, project_id)
+    values = []
+    if quote is not None:
+        values.append(f"投标文件唯一总报价：{quote}元（本地定位：{quote_excerpt[:180]}）")
+    if limit is not None:
+        values.append(f"招标文件唯一最高限价/预算：{limit}元（本地定位：{limit_excerpt[:180]}）")
+    if quote is not None and limit is not None:
+        relation = "未超过" if quote <= limit else "超过"
+        values.append(f"可比口径下：投标报价{relation}该限价；仍需按具体规则核对报价口径。")
+    return "\n".join(values)
+
+
 _SME_DEDICATED_PURCHASE_PATTERN = re.compile(
     r"专门面向.{0,24}中小企业.{0,90}(?:不再执行|不执行).{0,36}价格(?:评审|评价)?优惠",
     re.DOTALL,
@@ -6415,7 +6594,7 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
     """处理一份投标文件；不同投标人可并行，单份文件内仍严格顺序执行。"""
     bidder_name = document["bidder_name"] or document["original_name"]
     progress.message(f"正在综合评审：{bidder_name}")
-    reusable = None if task.get("payload", {}).get("force_rerun") else storage.reusable_evaluation_document_results(
+    reusable = None if (task.get("payload", {}).get("force_rerun") or task.get("payload", {}).get("retry_failed_task_id")) else storage.reusable_evaluation_document_results(
         app, task["project_id"], rule_set["rule_set_id"], profile["profile_id"], document["document_id"], expected_rule_ids,
         task.get("payload", {}).get("input_fingerprint"), PROMPT_VERSION,
     )
@@ -6430,10 +6609,62 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
         progress.document_completed(document, reused=True)
         return {"reused_document_count": 1}
 
-    scan_index = _scan_document_fulltext(
-        app, task, profile, document, review_rules + objective_rules + subjective_rules, project_scope, system_prompt,
-        progress_callback=progress.advance,
-    )
+    price_fact_cache = task.setdefault("_shared_price_fact_packets", {})
+    price_fact_lock = task.setdefault("_shared_price_fact_lock", threading.Lock())
+    with price_fact_lock:
+        price_facts = price_fact_cache.get(document["document_id"])
+        if price_facts is None:
+            price_facts = _document_shared_price_facts(app, task["project_id"], document)
+            price_fact_cache[document["document_id"]] = price_facts
+    document = {
+        **document,
+        "_shared_price_facts": price_facts,
+    }
+
+    # “仅重跑失败项”不依赖上一任务整体成功：只要输入指纹、规则集和单文件均未变，
+    # 已完整结束的规则直接写入本轮 run，剩余规则再走原有全文扫描和图片补充链路。
+    resume_failed_only = bool(task.get("payload", {}).get("retry_failed_task_id"))
+    checkpoint_results = storage.get_evaluation_unit_checkpoints(
+        app, task["project_id"], rule_set["rule_set_id"], document["document_id"],
+        str(task.get("payload", {}).get("input_fingerprint") or ""),
+    ) if resume_failed_only else {"review": {}, "objective": {}, "subjective": {}}
+    completed_results: dict[str, dict[str, dict]] = {"review": {}, "objective": {}, "subjective": {}}
+    reused_rule_ids: dict[str, set[str]] = {"review": set(), "objective": set(), "subjective": set()}
+    component_specs = (("review", review_rules, review_run), ("objective", objective_rules, objective_run), ("subjective", subjective_rules, subjective_run))
+    for component, component_rules, run in component_specs:
+        snapshots = checkpoint_results.get(component, {})
+        reusable_rows = [snapshots[rule["rule_id"]] for rule in component_rules if rule["rule_id"] in snapshots]
+        if not reusable_rows:
+            continue
+        if component == "review" and run:
+            storage.save_review_results(app, run["review_run_id"], document["document_id"], reusable_rows)
+        elif run:
+            storage.save_score_results(app, run["score_run_id"], document["document_id"], reusable_rows)
+        completed_results[component].update({item["rule_id"]: item for item in reusable_rows})
+        reused_rule_ids[component].update(item["rule_id"] for item in reusable_rows)
+    pending_rules = [
+        rule for component, component_rules, _ in component_specs
+        for rule in component_rules if rule["rule_id"] not in reused_rule_ids[component]
+    ]
+    if resume_failed_only and not pending_rules:
+        progress.advance(f"已复用 {bidder_name} 的全部成功规则", scan_units + groups_per_document + visual_units)
+        progress.document_completed(document, reused=True)
+        return {"reused_document_count": 1, "reused_unit_count": sum(len(values) for values in completed_results.values()), "failed_units": []}
+
+    scan_unavailable = False
+    try:
+        scan_index = _scan_document_fulltext(
+            app, task, profile, document, pending_rules, project_scope, system_prompt,
+            progress_callback=progress.advance,
+        )
+    except ValueError as exc:
+        if not _is_recoverable_model_error(exc):
+            raise
+        # 全文扫描的远端服务短暂不可用时，不让整份文件归零：后续规则组仍按本地章节
+        # 检索运行，并在任务结果中保留恢复告警。
+        scan_index = {}
+        scan_unavailable = True
+        progress.advance(f"{bidder_name} 全文扫描暂时不可用，正在继续逐规则审查", scan_units)
     if scan_index:
         scan_index["evidence_ledger"] = _build_rule_evidence_ledger(
             scan_index, review_rules + objective_rules + subjective_rules,
@@ -6455,19 +6686,37 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
         "evidence_ledger_empty_rule_count": sum(
             1 for value in ledger.values() if not value.get("candidates")
         ) if isinstance(ledger, dict) else 0,
+        "failed_units": [],
     }
-    completed_results: dict[str, dict[str, dict]] = {"review": {}, "objective": {}, "subjective": {}}
-    components = (("review", review_rules, review_run), ("objective", objective_rules, objective_run), ("subjective", subjective_rules, subjective_run))
+    # 全文扫描临时不可用时，后续逐规则审查已经用本地章节检索继续完成；这是恢复告警
+    # 而非可单独重跑的规则失败，不能把所有已完成规则误显示为“部分完成”。
+    values["full_scan_recovery_warning"] = bool(scan_unavailable and scan_units)
+    components = component_specs
     for component, component_rules, run in components:
+        component_rules = [rule for rule in component_rules if rule["rule_id"] not in reused_rule_ids[component]]
         # 长文件已有全文扫描索引时，按重合证据页重组规则，减少不同组重复携带同一页。
         groups = _evaluation_rule_batches(component, component_rules, scan_index=scan_index)
         def run_group(group_index: int, group: list[dict]):
             label = f"{bidder_name}·{component} 第{group_index}组"
             progress.message(f"正在综合评审：{label}")
-            results, compact_count, split_count, fallback_count, _ = _run_combined_batch(
-                app, task, profile, document, component, group, system_prompt, char_limit, label, scan_index=scan_index,
-            )
-            return group_index, label, results, compact_count, split_count, fallback_count
+            try:
+                results, compact_count, split_count, fallback_count, _ = _run_combined_batch(
+                    app, task, profile, document, component, group, system_prompt, char_limit, label, scan_index=scan_index,
+                )
+                return group_index, label, results, compact_count, split_count, fallback_count, []
+            except ValueError as exc:
+                if not _is_recoverable_model_error(exc):
+                    raise
+                payload = _combined_batch_payload(component, group)
+                reason = "模型连接连续恢复失败，本规则组暂未获得可靠 AI 结论；其他规则已继续完成，可仅重跑本组。"
+                results = _combined_manual_results(component, group, payload, reason)
+                failure = {
+                    "document_id": document["document_id"], "bidder_name": bidder_name,
+                    "component": component, "rule_ids": [rule["rule_id"] for rule in group],
+                    "reason": str(exc)[:240],
+                }
+                storage.update_task(app, task["task_id"], message=f"{label} 连接恢复失败，已保留为待重跑项并继续其他规则")
+                return group_index, label, results, 0, 0, len(group), [failure]
 
         # 单一投标文件过去会把全部规则组串行执行；现在复用任务级请求闸门，在不超过
         # 当前模型并发上限的前提下并行独立规则组。小服务器只增加短生命周期线程，
@@ -6478,7 +6727,7 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
         admitted_limit = int(getattr(gate, "limit", 1) or 1)
         worker_count = min(_profile_parallel_limit(profile, len(groups)), admitted_limit, len(groups)) if groups else 0
         def persist_completed(value):
-            group_index, label, results, compact_count, split_count, fallback_count = value
+            group_index, label, results, compact_count, split_count, fallback_count, failed_units = value
             # 将全文扫描阶段已定位的页码保留给后续图片识别；此字段只在本次任务内流转，
             # 不改变既有评审结果的存储结构或对外 API。
             results = _with_scan_visual_candidates(results, scan_index, document)
@@ -6492,6 +6741,7 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
             values["split_retry_count"] += split_count
             values["manual_fallback_rule_count"] += fallback_count
             values["batch_count"] += 1
+            values["failed_units"].extend(failed_units)
             progress.advance(f"已完成综合评审：{label}")
 
         if worker_count > 1:
@@ -6516,6 +6766,8 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
     ocr_enabled = _evaluation_ocr_enabled(image_features_enabled, ocr_configuration)
     for component, component_rules, run in visual_components:
         for rule in component_rules:
+            if rule["rule_id"] in reused_rule_ids[component]:
+                continue
             trigger, level = _rule_vision_policy(rule)
             if trigger == "off" or level == "off":
                 continue
@@ -6622,6 +6874,35 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
             )
     except Exception:
         # 影子保存失败（磁盘满、DB 锁定等）仅记录日志，真实评审结果已保存，不影响完成状态。
+        traceback.print_exc()
+    try:
+        failed_rule_ids_by_component: dict[str, set[str]] = {"review": set(), "objective": set(), "subjective": set()}
+        for unit in values.get("failed_units", []):
+            if not isinstance(unit, dict):
+                continue
+            component = str(unit.get("component") or "")
+            if component not in failed_rule_ids_by_component:
+                continue
+            failed_rule_ids_by_component[component].update(
+                str(rule_id) for rule_id in unit.get("rule_ids", []) if str(rule_id)
+            )
+        checkpoint_values = {
+            component: {
+                rule_id: result for rule_id, result in by_rule.items()
+                if rule_id not in failed_rule_ids_by_component[component]
+            }
+            for component, by_rule in completed_results.items()
+        }
+        storage.delete_evaluation_unit_checkpoints(
+            app, task["project_id"], rule_set["rule_set_id"], document["document_id"],
+            str(task.get("payload", {}).get("input_fingerprint") or ""), failed_rule_ids_by_component,
+        )
+        storage.save_evaluation_unit_checkpoints(
+            app, task["project_id"], rule_set["rule_set_id"], document["document_id"],
+            str(task.get("payload", {}).get("input_fingerprint") or ""), checkpoint_values,
+        )
+    except Exception:
+        # 断点缓存只用于加速重跑；保存失败不影响本轮已落库的正式结果。
         traceback.print_exc()
     progress.document_completed(document)
     return values
@@ -6825,9 +7106,11 @@ def _evaluate_all(app, task: dict) -> dict:
     compact_retry_count = split_retry_count = 0
     manual_fallback_rule_count = 0
     evidence_ledger_rule_count = evidence_ledger_empty_rule_count = 0
+    failed_units: list[dict] = []
     reused_document_count = 0
     batch_count = 0
     full_scan_document_count = full_scan_batch_count = full_scan_failed_chunk_count = 0
+    full_scan_recovery_warning_count = 0
     groups_per_document = sum(
         len(_evaluation_rule_batches(component, component_rules))
         for component, component_rules in (("review", review_rules), ("objective", local_objective_rules), ("subjective", subjective_rules))
@@ -6882,10 +7165,12 @@ def _evaluate_all(app, task: dict) -> dict:
         manual_fallback_rule_count += value.get("manual_fallback_rule_count", 0)
         evidence_ledger_rule_count += value.get("evidence_ledger_rule_count", 0)
         evidence_ledger_empty_rule_count += value.get("evidence_ledger_empty_rule_count", 0)
+        failed_units.extend(item for item in value.get("failed_units", []) if isinstance(item, dict))
         batch_count += value.get("batch_count", 0)
         full_scan_document_count += value.get("full_scan_document_count", 0)
         full_scan_batch_count += value.get("full_scan_batch_count", 0)
         full_scan_failed_chunk_count += value.get("full_scan_failed_chunk_count", 0)
+        full_scan_recovery_warning_count += int(bool(value.get("full_scan_recovery_warning")))
     cross_bid_price = {"rule_count": 0, "result_count": 0, "retry_count": 0, "missing_count": 0}
     price_review_reconciled_count = 0
     if cross_bid_units and objective_run:
@@ -6925,10 +7210,13 @@ def _evaluate_all(app, task: dict) -> dict:
             "manual_fallback_rule_count": manual_fallback_rule_count,
             "batch_count": batch_count, "full_scan_document_count": full_scan_document_count,
             "full_scan_batch_count": full_scan_batch_count, "full_scan_failed_chunk_count": full_scan_failed_chunk_count,
+            "full_scan_recovery_warning_count": full_scan_recovery_warning_count,
             "cross_bid_price": cross_bid_price,
             "price_review_reconciled_count": price_review_reconciled_count,
             "evidence_ledger_rule_count": evidence_ledger_rule_count,
             "evidence_ledger_empty_rule_count": evidence_ledger_empty_rule_count,
+            "completion_state": "partial_success" if failed_units else "complete",
+            "failed_units": failed_units,
             "highlights": highlights, "highlight_failure_count": highlight_failure_count,
             "prompt_version": PROMPT_VERSION}
 

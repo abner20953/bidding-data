@@ -100,7 +100,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         self.assertEqual(result, {"rules": []})
         self.assertEqual(request_json.call_count, 2)
-        sleep.assert_called_once_with(2)
+        sleep.assert_called_once_with(5)
         refreshed = storage.get_task(self.app, task["task_id"])
         self.assertIn("重试当前分组", refreshed["message"])
 
@@ -123,9 +123,69 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         self.assertEqual(result, {"rules": []})
         self.assertEqual(request_json.call_count, 3)
-        self.assertEqual(sleep.call_args_list[0].args, (2,))
-        self.assertEqual(sleep.call_args_list[1].args, (4,))
+        self.assertEqual(sleep.call_args_list[0].args, (5,))
+        self.assertEqual(sleep.call_args_list[1].args, (15,))
         self.assertEqual(storage.project_token_usage(self.app, self.project["project_id"])["call_count"], 3)
+
+    def test_transient_connection_failure_retries_only_current_request(self):
+        task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
+        profile = {"profile_id": "profile-1", "display_name": "测试模型"}
+
+        with patch(
+            "dashboard.evaluation_workbench.worker.request_json",
+            side_effect=[
+                ValueError("模型连接失败：('Connection aborted.', RemoteDisconnected('remote end closed connection'))"),
+                ValueError("模型连接失败：Read timed out"),
+                {"rules": []},
+            ],
+        ) as request_json, patch("dashboard.evaluation_workbench.worker.time.sleep") as sleep:
+            result = worker._request_task_json(self.app, task, profile, "test_phase", "system", "user", max_tokens=32)
+
+        self.assertEqual(result, {"rules": []})
+        self.assertEqual(request_json.call_count, 3)
+        self.assertEqual([call.args for call in sleep.call_args_list], [(5,), (15,)])
+
+    def test_client_error_with_timeout_word_does_not_retry(self):
+        task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
+        profile = {"profile_id": "profile-1", "display_name": "测试模型"}
+
+        with patch(
+            "dashboard.evaluation_workbench.worker.request_json",
+            side_effect=ValueError("模型请求失败（HTTP 400）：invalid timeout parameter"),
+        ) as request_json, patch("dashboard.evaluation_workbench.worker.time.sleep") as sleep:
+            with self.assertRaises(ValueError):
+                worker._request_task_json(self.app, task, profile, "test_phase", "system", "user", max_tokens=32)
+
+        self.assertEqual(request_json.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_score_rule_dedupe_merges_same_clause_with_score_suffix(self):
+        rules = worker._dedupe_rule_candidates([
+            {
+                "category": "objective", "title": "商务部分-企业业绩评分", "check_rule": "每提供一份业绩得3分，最高9分",
+                "source_text": "企业业绩每份3分，满分9分", "source_clause_ids": ["SC-12"],
+                "scoring": {"max_score": 9, "kind": "manual"},
+            },
+            {
+                "category": "objective", "title": "商务部分-企业业绩评分（满分9分）", "check_rule": "每提供一份有效业绩得3分，最多3份，最高9分",
+                "source_text": "企业业绩每份3分，满分9分", "source_clause_ids": ["SC-12"],
+                "scoring": {"max_score": 9, "kind": "manual", "items": [{"name": "有效业绩", "max_score": 9}]},
+            },
+        ])
+
+        self.assertEqual(len(rules), 1)
+        self.assertIn("最多3份", rules[0]["check_rule"])
+        self.assertEqual(rules[0]["source_clause_ids"], ["SC-12"])
+
+    def test_score_reason_replaces_conflicting_calculation_with_final_score(self):
+        reason = worker._reconcile_score_reason(
+            "计分过程：3×3=9分，封顶9分。图片确认仅1项。", 3.0,
+            adjusted=True, source="图片/OCR",
+        )
+
+        self.assertIn("最终建议分：3分", reason)
+        self.assertNotIn("3×3=9分", reason)
+        self.assertNotIn("封顶9分", reason)
 
     def test_non_retryable_model_envelope_does_not_repeat_or_reduce_concurrency(self):
         task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
@@ -168,6 +228,36 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             storage.get_project_scope_checkpoint(self.app, self.project["project_id"], "scope-v1"), scope,
         )
 
+    def test_evaluation_unit_checkpoint_reuses_only_matching_execution_fingerprint(self):
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案：稳定运行。")
+        rule = storage.add_rule(self.app, self.project["project_id"], {"category": "qualification", "title": "资质", "check_rule": "核验资质"})
+        rule_set, _ = storage.list_rules(self.app, self.project["project_id"])
+        result = {"rule_id": rule["rule_id"], "status": "satisfied", "evidence": "已提供", "reason": "可核验"}
+
+        storage.save_evaluation_unit_checkpoints(
+            self.app, self.project["project_id"], rule_set["rule_set_id"], document["document_id"], "fingerprint-a",
+            {"review": {rule["rule_id"]: result}, "objective": {}, "subjective": {}},
+        )
+
+        reused = storage.get_evaluation_unit_checkpoints(
+            self.app, self.project["project_id"], rule_set["rule_set_id"], document["document_id"], "fingerprint-a",
+        )
+        self.assertEqual(reused["review"][rule["rule_id"]]["evidence"], "已提供")
+        self.assertEqual(
+            storage.get_evaluation_unit_checkpoints(
+                self.app, self.project["project_id"], rule_set["rule_set_id"], document["document_id"], "changed",
+            )["review"], {},
+        )
+        storage.delete_evaluation_unit_checkpoints(
+            self.app, self.project["project_id"], rule_set["rule_set_id"], document["document_id"], "fingerprint-a",
+            {"review": {rule["rule_id"]}, "objective": set(), "subjective": set()},
+        )
+        self.assertEqual(
+            storage.get_evaluation_unit_checkpoints(
+                self.app, self.project["project_id"], rule_set["rule_set_id"], document["document_id"], "fingerprint-a",
+            )["review"], {},
+        )
+
     def test_scope_excerpt_prioritises_business_sections_not_only_fixed_positions(self):
         text = "\n\n".join([
             "[第1页]\n前言说明。" * 80,
@@ -190,6 +280,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         usage = storage.project_token_usage(self.app, self.project["project_id"])
         self.assertEqual(usage["cache_hit_tokens"], 80)
+        self.assertEqual(usage["cache_by_phase"][0]["phase"], "test")
+        self.assertEqual(usage["cache_by_phase"][0]["cache_hit_tokens"], 80)
 
     def test_token_usage_breaks_down_vision_and_ocr_families(self):
         task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
@@ -874,7 +966,9 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             for index in range(6)
         ]
 
-        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=ValueError("模型接口繁忙")):
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=ValueError("模型接口繁忙")), patch(
+            "dashboard.evaluation_workbench.worker.time.sleep"
+        ):
             kept, stats = worker._final_rule_quality_gate(
                 self.app, task, profile, "规则提取系统提示", rules, [],
             )
@@ -2021,7 +2115,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(storage.task_prompt_template_fingerprint(self.app, "evaluate_all"), before_evaluation)
         self.assertNotEqual(storage.task_prompt_template_fingerprint(self.app, "extract_rules"), before_extraction)
 
-    def test_global_rules_require_password_and_are_automatically_imported_for_new_projects(self):
+    def test_global_rules_require_password_and_are_all_imported_with_default_selection(self):
         client = self.app.test_client()
         self.assertEqual(client.get("/api/evaluation-workbench/global-rules").status_code, 200)
         self.assertEqual(client.post("/api/evaluation-workbench/global-rules", json={"title": "无口令", "check_rule": "不应保存"}).status_code, 403)
@@ -2032,7 +2126,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         })
         self.assertEqual(created.status_code, 201)
         disabled = client.post("/api/evaluation-workbench/global-rules", json={
-            "category": "other", "title": "不导入项", "check_rule": "不应自动导入", "enabled": False, "password": "108",
+            "category": "other", "title": "默认不选项", "check_rule": "应导入但默认不选", "enabled": False, "password": "108",
         })
         self.assertEqual(disabled.status_code, 201)
 
@@ -2040,21 +2134,29 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         rule_set, rules = storage.list_rules(self.app, new_project["project_id"])
 
         self.assertEqual(rule_set["status"], "draft")
-        self.assertEqual(len(rules), 1)
-        self.assertEqual(rules[0]["source_type"], "global")
-        self.assertEqual(rules[0]["check_rule"], "核验是否提供有效营业执照")
-        self.assertEqual(rules[0]["check_mode"], "ocr")
+        self.assertEqual(len(rules), 2)
+        imported = {rule["title"]: rule for rule in rules}
+        self.assertTrue(all(rule["source_type"] == "global" for rule in rules))
+        self.assertEqual(imported["营业执照有效性"]["check_rule"], "核验是否提供有效营业执照")
+        self.assertEqual(imported["营业执照有效性"]["check_mode"], "ocr")
+        self.assertTrue(imported["营业执照有效性"]["enabled"])
+        self.assertFalse(imported["默认不选项"]["enabled"])
 
         self.assertEqual(client.patch(f"/api/evaluation-workbench/global-rules/{created.get_json()['rule']['global_rule_id']}", json={"title": "更新名称"}).status_code, 403)
         client.patch(f"/api/evaluation-workbench/global-rules/{created.get_json()['rule']['global_rule_id']}", json={"title": "更新名称", "password": "108"})
-        self.assertEqual(storage.list_rules(self.app, new_project["project_id"])[1][0]["title"], "营业执照有效性")
+        unchanged = {rule["title"] for rule in storage.list_rules(self.app, new_project["project_id"])[1]}
+        self.assertIn("营业执照有效性", unchanged)
+        self.assertNotIn("更新名称", unchanged)
 
-    def test_rule_extraction_merges_enabled_global_rules_without_exact_duplicates(self):
+    def test_rule_extraction_merges_all_global_rules_with_default_selection_without_exact_duplicates(self):
         storage.create_global_rule(self.app, {
             "category": "qualification", "title": "通用营业执照", "check_rule": "核验是否提供有效营业执照", "source_text": "通用基线",
         })
         storage.create_global_rule(self.app, {
             "category": "compliance", "title": "完全重复规则", "check_rule": "核验响应文件是否完整", "source_text": "通用基线",
+        })
+        storage.create_global_rule(self.app, {
+            "category": "other", "title": "默认不选通用项", "check_rule": "核验是否提供其他材料", "source_text": "通用基线", "enabled": False,
         })
 
         rule_set = storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-1", [
@@ -2063,10 +2165,11 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         ])
         _, rules = storage.list_rules(self.app, self.project["project_id"])
 
-        self.assertEqual(rule_set["global_rule_count"], 1)
-        self.assertEqual(len(rules), 3)
+        self.assertEqual(rule_set["global_rule_count"], 2)
+        self.assertEqual(len(rules), 4)
         self.assertEqual({item["source_type"] for item in rules}, {"ai", "global"})
         self.assertEqual(sum(item["title"] == "完全重复规则" for item in rules), 1)
+        self.assertFalse(next(item for item in rules if item["title"] == "默认不选通用项")["enabled"])
 
     def test_manual_check_rule_is_preserved_and_can_be_updated(self):
         rule = storage.add_rule(self.app, self.project["project_id"], {
@@ -2683,7 +2786,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(results[0]["suggested_score"], 5.0)
         self.assertTrue(results[0]["requires_review"])
         self.assertIsNone(results[0]["effective_score"])
-        self.assertIn("OCR", results[0]["reason"])
+        self.assertNotIn("OCR", results[0]["reason"])
+        self.assertIn("复核", results[0]["review_reason"])
 
     def test_cross_bid_price_failure_never_leaves_local_provisional_score(self):
         bid_a = self._add_pdf("price-a.pdf", "bid", "甲公司", "投标报价：100万元。")
@@ -3838,15 +3942,17 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[
             {"results": []},
-            ValueError("模型连接失败：timeout"),
-        ]):
+            *[ValueError("模型连接失败：timeout") for _ in range(4)],
+        ]), patch("dashboard.evaluation_workbench.worker.time.sleep"):
             finished = self._run_next_task()
 
         review_run, results = storage.latest_review_results(self.app, self.project["project_id"])
-        self.assertEqual(finished["status"], "error")
-        self.assertEqual(finished["progress"], 50)
-        self.assertEqual(review_run["task_status"], "error")
-        self.assertEqual(len(results), 8)
+        self.assertEqual(finished["status"], "success")
+        self.assertEqual(finished["result"]["completion_state"], "partial_success")
+        self.assertEqual(finished["progress"], 100)
+        self.assertEqual(review_run["task_status"], "success")
+        self.assertEqual(len(results), 9)
+        self.assertEqual(len(finished["result"]["failed_units"]), 1)
 
     def test_combined_evaluation_keeps_running_when_single_rule_returns_invalid_json_twice(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "投标文件包含承诺事项。")
@@ -4204,7 +4310,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(extracted_again["source_type"], "ai")
         self.assertEqual(extracted_again["enabled"], 1)
 
-    def test_reextract_defaults_visual_verification_rules_to_disabled(self):
+    def test_reextract_keeps_ai_visual_rules_disabled_but_uses_global_default_selection(self):
         storage.create_global_rule(self.app, {
             "category": "qualification", "title": "通用许可证", "check_rule": "核验许可证图像", "ocr_required": True,
         })
@@ -4218,7 +4324,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         self.assertEqual(enabled["营业执照"], 1)
         self.assertEqual(enabled["签字盖章"], 0)
-        self.assertEqual(enabled["通用许可证"], 0)
+        self.assertEqual(enabled["通用许可证"], 1)
 
     def test_force_rerun_is_persisted_in_task_payload(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "已提供资质。")

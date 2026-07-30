@@ -331,6 +331,20 @@ def init_database(app) -> None:
                 UNIQUE(task_id, document_id, rule_id, component)
             );
             CREATE INDEX IF NOT EXISTS idx_ew_evidence_packs_document ON ew_evidence_packs(document_id, rule_id, updated_at);
+            CREATE TABLE IF NOT EXISTS ew_evaluation_unit_checkpoints (
+                checkpoint_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES ew_projects(project_id) ON DELETE CASCADE,
+                rule_set_id TEXT NOT NULL REFERENCES ew_rule_sets(rule_set_id) ON DELETE CASCADE,
+                document_id TEXT NOT NULL REFERENCES ew_documents(document_id) ON DELETE CASCADE,
+                component TEXT NOT NULL CHECK(component IN ('review', 'objective', 'subjective')),
+                rule_id TEXT NOT NULL REFERENCES ew_rules(rule_id) ON DELETE CASCADE,
+                execution_fingerprint TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(rule_set_id, document_id, component, rule_id, execution_fingerprint)
+            );
+            CREATE INDEX IF NOT EXISTS idx_ew_unit_checkpoint_lookup ON ew_evaluation_unit_checkpoints(project_id, rule_set_id, document_id, execution_fingerprint);
             CREATE TABLE IF NOT EXISTS ew_project_scope_cache (
                 scope_cache_id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL REFERENCES ew_projects(project_id) ON DELETE CASCADE,
@@ -887,15 +901,15 @@ def create_project(app, name: str, project_number: str = "", section_name: str =
             "INSERT INTO ew_projects(project_id, name, project_number, section_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
             (project_id, name.strip(), project_number.strip(), section_name.strip(), timestamp, timestamp),
         )
-        _import_enabled_global_rules(conn, project_id, timestamp)
+        _import_global_rules(conn, project_id, timestamp)
     project_dir(app, project_id)
     return get_project(app, project_id)
 
 
-def _import_enabled_global_rules(conn: sqlite3.Connection, project_id: str, timestamp: str) -> None:
-    """新项目只在创建时自动复制已启用的通用规则，避免后续配置变更影响历史项目。"""
+def _import_global_rules(conn: sqlite3.Connection, project_id: str, timestamp: str) -> None:
+    """新项目复制全部通用规则；模板开关只决定项目内的默认勾选状态。"""
     templates = conn.execute(
-        "SELECT * FROM ew_global_rules WHERE enabled = 1 ORDER BY category, sort_order, created_at"
+        "SELECT * FROM ew_global_rules ORDER BY category, sort_order, created_at"
     ).fetchall()
     if not templates:
         return
@@ -908,9 +922,9 @@ def _import_enabled_global_rules(conn: sqlite3.Connection, project_id: str, time
         conn.execute(
             """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode,
                source_type, source_task_id, scoring_json, enabled, sort_order, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'global', NULL, NULL, 1, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'global', NULL, NULL, ?, ?, ?, ?)""",
             (str(uuid.uuid4()), rule_set_id, template["category"], template["title"], template["check_rule"],
-             template["source_text"], template["check_mode"], position, timestamp, timestamp),
+             template["source_text"], template["check_mode"], int(bool(template["enabled"])), position, timestamp, timestamp),
         )
 
 
@@ -1509,6 +1523,71 @@ def list_evidence_packs(app, task_id: str, document_id: str) -> list[dict]:
     return values
 
 
+def save_evaluation_unit_checkpoints(app, project_id: str, rule_set_id: str, document_id: str,
+                                     execution_fingerprint: str, values: dict[str, dict[str, dict]]) -> None:
+    """保存已完整结束的单规则结果，供“仅重跑失败项”复用。"""
+    if not execution_fingerprint:
+        return
+    timestamp = now_iso()
+    with connection(app) as conn:
+        for component, by_rule in values.items():
+            if component not in {"review", "objective", "subjective"} or not isinstance(by_rule, dict):
+                continue
+            for rule_id, result in by_rule.items():
+                if not rule_id or not isinstance(result, dict):
+                    continue
+                encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+                conn.execute(
+                    """INSERT INTO ew_evaluation_unit_checkpoints
+                       (checkpoint_id, project_id, rule_set_id, document_id, component, rule_id,
+                        execution_fingerprint, result_json, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(rule_set_id, document_id, component, rule_id, execution_fingerprint) DO UPDATE SET
+                       result_json=excluded.result_json, updated_at=excluded.updated_at""",
+                    (str(uuid.uuid4()), project_id, rule_set_id, document_id, component, rule_id,
+                     execution_fingerprint, encoded, timestamp, timestamp),
+                )
+
+
+def get_evaluation_unit_checkpoints(app, project_id: str, rule_set_id: str, document_id: str,
+                                    execution_fingerprint: str) -> dict[str, dict[str, dict]]:
+    if not execution_fingerprint:
+        return {"review": {}, "objective": {}, "subjective": {}}
+    with connection(app) as conn:
+        rows = conn.execute(
+            """SELECT component, rule_id, result_json FROM ew_evaluation_unit_checkpoints
+               WHERE project_id=? AND rule_set_id=? AND document_id=? AND execution_fingerprint=?""",
+            (project_id, rule_set_id, document_id, execution_fingerprint),
+        ).fetchall()
+    values = {"review": {}, "objective": {}, "subjective": {}}
+    for row in rows:
+        try:
+            result = json.loads(row["result_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(result, dict) and str(result.get("rule_id") or "") == str(row["rule_id"] or ""):
+            values[str(row["component"])][str(row["rule_id"])] = result
+    return values
+
+
+def delete_evaluation_unit_checkpoints(app, project_id: str, rule_set_id: str, document_id: str,
+                                       execution_fingerprint: str, values: dict[str, set[str]]) -> None:
+    """删除本轮未完成规则的旧快照，确保“仅重跑失败项”不会误复用人工兜底结果。"""
+    if not execution_fingerprint:
+        return
+    with connection(app) as conn:
+        for component, rule_ids in values.items():
+            if component not in {"review", "objective", "subjective"} or not rule_ids:
+                continue
+            placeholders = ",".join("?" for _ in rule_ids)
+            conn.execute(
+                f"""DELETE FROM ew_evaluation_unit_checkpoints
+                    WHERE project_id=? AND rule_set_id=? AND document_id=? AND execution_fingerprint=?
+                      AND component=? AND rule_id IN ({placeholders})""",
+                (project_id, rule_set_id, document_id, execution_fingerprint, component, *sorted(rule_ids)),
+            )
+
+
 def get_project_scope_checkpoint(app, project_id: str, scope_key: str) -> dict | None:
     with connection(app) as conn:
         row = conn.execute(
@@ -1558,6 +1637,17 @@ def project_token_usage(app, project_id: str) -> dict:
                FROM ew_model_calls WHERE project_id = ?
                GROUP BY family""", (project_id,),
         ).fetchall()
+        cache_phase_rows = conn.execute(
+            """SELECT phase, COUNT(*) AS call_count,
+                      COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                      COALESCE(SUM(cache_hit_tokens), 0) AS cache_hit_tokens
+               FROM ew_model_calls
+               WHERE project_id=? AND prompt_tokens IS NOT NULL
+               GROUP BY phase
+               ORDER BY cache_hit_tokens DESC, prompt_tokens DESC
+               LIMIT 12""",
+            (project_id,),
+        ).fetchall()
         ocr_row = conn.execute(
             "SELECT COALESCE(SUM(billed_units), 0) AS ocr_requests FROM ew_ocr_usage_ledger WHERE project_id = ?",
             (project_id,),
@@ -1582,6 +1672,16 @@ def project_token_usage(app, project_id: str) -> dict:
     usage["ocr_requests"] = int(ocr_row["ocr_requests"] or 0) if ocr_row else 0
     # 本地 OCR 没有额度台账；以已缓存的去重页数呈现真实处理规模（含空白页缓存）。
     usage["local_ocr_pages"] = int(local_ocr_row["local_ocr_pages"] or 0) if local_ocr_row else 0
+    # 不依赖特定厂商字段。若模型返回缓存 token，即按环节汇总，供页面和后续优化判断
+    # 哪些调用真正具备前缀复用空间；未返回该字段的模型保持 0，不误报失败。
+    usage["cache_by_phase"] = [
+        {
+            "phase": str(item["phase"] or ""), "call_count": int(item["call_count"] or 0),
+            "prompt_tokens": int(item["prompt_tokens"] or 0),
+            "cache_hit_tokens": int(item["cache_hit_tokens"] or 0),
+        }
+        for item in cache_phase_rows
+    ]
     return usage
 
 
@@ -2366,7 +2466,7 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
             )
         global_rule_count = 0
         global_rules = conn.execute(
-            "SELECT * FROM ew_global_rules WHERE enabled = 1 ORDER BY category, sort_order, created_at"
+            "SELECT * FROM ew_global_rules ORDER BY category, sort_order, created_at"
         ).fetchall()
         for position, template in enumerate(global_rules, start=preserved_rule_count + len(rules)):
             signature = (
@@ -2381,7 +2481,7 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
                    source_type, source_task_id, scoring_json, enabled, sort_order, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'global', NULL, NULL, ?, ?, ?, ?)""",
                 (str(uuid.uuid4()), rule_set["rule_set_id"], template["category"], template["title"], template["check_rule"],
-                 template["source_text"], template["check_mode"], 0 if template["check_mode"] == "ocr" else 1, position, timestamp, timestamp),
+                 template["source_text"], template["check_mode"], int(bool(template["enabled"])), position, timestamp, timestamp),
             )
             global_rule_count += 1
         rule_set["global_rule_count"] = global_rule_count

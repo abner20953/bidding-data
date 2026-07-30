@@ -313,6 +313,13 @@ PROMPT_TEMPLATES["evaluate_all_cross_bid_price_user"]["content"] += (
     "\n\n报价分为暂定建议：报价口径可识别时应输出 quoted_price；不得自行改变招标公式或提前认定资格"
     "符合性是否通过。系统会按可识别报价复算常见比例公式并由人工最终确认有效报价范围。"
 )
+PROMPT_TEMPLATES["extract_rules_quality_gate_user"]["content"] = (
+    PROMPT_TEMPLATES["extract_rules_quality_gate_user"]["content"]
+    .replace("以及已启用通用规则；", "以及全部通用规则；通用规则是否默认选择只影响项目内初始勾选，不影响本轮去重保护；")
+    .replace("评分表中的业绩、报价、人员、资质、方案、分档、公式、叶子子项、缺项/缺陷扣分和封顶逻辑优先保留。",
+             "评分表中的业绩、报价、人员、资质、方案、分档、公式、叶子子项、缺项/缺陷扣分和封顶逻辑优先保留。"
+             "同一评分条款ID、相同计分对象和满分的候选只能保留一条，选择评分子项、原文依据和检查口径更完整的一条。")
+)
 
 
 # 仅控制提示词配置界面的归类、排序和风险提示，不参与模型调用。业务原则集中
