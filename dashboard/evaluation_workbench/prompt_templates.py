@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 PROMPT_TEMPLATE_SETTING = "evaluation_workbench_prompt_templates"
-EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v27"
+EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v28"
 
 
 def _template(name: str, description: str, content: str, *placeholders: str) -> dict:
@@ -308,6 +308,10 @@ PROMPT_TEMPLATES["evaluate_all_objective_user"]["content"] += (
     " 对业绩、证书等按件计分材料，必须以每个独立项目的完整要件清单判断：已见通知书、目录或列表不等于"
     "该项目可计分；只有本规则要求的合同首页、金额、签章、明细等要件均被本次证据覆盖时才计入已确认数量。"
     "若仅补看部分页面，只报告已确认和未确认项目，不得在理由中给出与 suggested_score 不一致的最终总分。"
+)
+PROMPT_TEMPLATES["evaluate_all_subjective_user"]["content"] += (
+    " 非满分时，calculation 必须至少写明一项可定位的具体缺项、缺陷、档位差距或扣分依据；"
+    "不得仅以‘内容一般’‘不够详细’‘有待完善’等空泛表述作为扣分理由。"
 )
 PROMPT_TEMPLATES["evaluate_all_cross_bid_price_user"]["content"] += (
     "\n\n报价分为暂定建议：报价口径可识别时应输出 quoted_price；不得自行改变招标公式或提前认定资格"

@@ -2992,16 +2992,10 @@ def _score_evidence_text(raw: dict) -> str:
 
 
 def _score_reason_text(raw: dict, suggested: float | None) -> str:
-    parts = []
     calculation = _clean_model_text(raw.get("calculation"))
     reason = _clean_model_text(raw.get("reason"))
-    if calculation:
-        parts.append(f"计分过程：{calculation}")
-    if reason:
-        parts.append(reason)
-    if not parts:
-        parts.append("AI未返回完整理由。" if suggested is not None else "模型未返回可用建议分。")
-    return "\n".join(parts)
+    text = _merge_reason_text(f"计分过程：{calculation}" if calculation else "", reason)
+    return text or ("AI未返回完整理由。" if suggested is not None else "模型未返回可用建议分。")
 
 
 _SCORE_CALCULATION_RESULT_PATTERN = re.compile(r"(?:=|＝)\s*(\d+(?:\.\d+)?)\s*分?")
@@ -4700,9 +4694,87 @@ def _merge_supplement_text(base: object, supplement: object, limit: int = 2000, 
     return separator.join(value for value in values if value)[:limit]
 
 
+_REASON_LAYER_PREFIX_PATTERN = re.compile(r"【(?:腾讯OCR|本地OCR|OCR|图片识别)[^】]*】")
+
+
+def _reason_sentence_signature(value: object) -> str:
+    """忽略识别层前缀和排版差异，用于理由中的保守重复消除。"""
+    text = _REASON_LAYER_PREFIX_PATTERN.sub("", _clean_model_text(value))
+    return re.sub(r"[\s，,。；;：:！!？?（）()\[\]【】]", "", text).casefold()
+
+
+def _merge_reason_text(base: object, supplement: object, limit: int = 2000, *,
+                       supplement_first: bool = False) -> str:
+    """合并理由时仅消除同一句的重复，不合并内容不同的计分或判断依据。"""
+    values = (supplement, base) if supplement_first else (base, supplement)
+    retained: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for sentence in re.split(r"(?<=[。；;！？!?])\s*|\n+", _clean_model_text(value)):
+            sentence = sentence.strip()
+            signature = _reason_sentence_signature(sentence)
+            if not signature or signature in seen:
+                continue
+            seen.add(signature)
+            retained.append(sentence)
+    return "\n".join(retained)[:limit]
+
+
+_OCR_TABLE_HEADER_FRAGMENT_PATTERN = re.compile(
+    r"(?:序号|分项|名称|规格|型号|数量|单位|单价|总价|金额|含税|报价|合计|综合)"
+)
+_OCR_SHORT_VALUE_PATTERN = re.compile(r"(?:\d|[A-Za-z]{2,}|[¥￥%])")
+_OCR_UNIT_FRAGMENT_PATTERN = re.compile(r"^(?:套|台|份|项|个|包|张|页|年|月|日|元)$")
+
+
+def _compact_ocr_raw_evidence(text: object, limit: int = 1400) -> str:
+    """压缩 OCR 失败兜底中的表格断行，保留原 OCR 缓存和模型输入不变。"""
+    lines = []
+    for value in str(text or "").replace("\r", "").split("\n"):
+        compact = re.sub(r"\s+", "", value)
+        if compact:
+            lines.append(compact)
+    if not lines:
+        return ""
+    parts: list[str] = []
+    fragments: list[str] = []
+
+    def flush_fragments() -> None:
+        if not fragments:
+            return
+        joined = "".join(fragments)
+        header_hits = len(_OCR_TABLE_HEADER_FRAGMENT_PATTERN.findall(joined))
+        # 仅压缩明显的表格表头碎片；型号、金额、编号等短值始终保留，避免丢证据。
+        if len(fragments) >= 5 and header_hits >= 2:
+            values = []
+            has_value = False
+            for item in fragments:
+                if _OCR_SHORT_VALUE_PATTERN.search(item):
+                    values.append(item)
+                    has_value = True
+                elif has_value and _OCR_UNIT_FRAGMENT_PATTERN.fullmatch(item):
+                    values.append(item)
+            if values:
+                parts.append("表格字段：" + " ".join(values))
+            else:
+                parts.append("【表格表头碎片已折叠】")
+        else:
+            parts.append(joined)
+        fragments.clear()
+
+    for line in lines:
+        if len(line) <= 4:
+            fragments.append(line)
+            continue
+        flush_fragments()
+        parts.append(line)
+    flush_fragments()
+    return " ".join(parts)[:limit]
+
+
 def _with_ocr_raw_evidence(result: dict, prefix: str, text: str) -> dict:
     """JSON归纳失败时仍把已识别文字留作人工可核验的证据，不改变原判断。"""
-    excerpt = _clean_model_text(text)[:1400]
+    excerpt = _compact_ocr_raw_evidence(text)
     if not excerpt:
         return result
     return {
@@ -4829,7 +4901,7 @@ def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: d
         merged = _review_result_from_model({
             "evidence": _merge_supplement_text(reconciled_evidence, f"{prefix}{evidence}" if evidence else "", limit=merge_limit),
             "page_hint": "P" + "、P".join(str(page) for page in (evidence_pages or pages)),
-            "reason": _merge_supplement_text(reconciled_reason, f"{prefix}{reason}" if reason else "", limit=merge_limit),
+            "reason": _merge_reason_text(reconciled_reason, f"{prefix}{reason}" if reason else "", limit=merge_limit),
             "risk_level": parsed.get("risk_level") if scope == "full" else working_result.get("risk_level"),
             "confidence": parsed.get("confidence") if scope == "full" else working_result.get("confidence"),
             "evidence_quality": "sufficient" if scope == "full" and evidence else working_result.get("evidence_quality"),
@@ -4846,7 +4918,7 @@ def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: d
         suggested = _bounded_model_score(parsed.get("suggested_score"), max_score) if scope == "full" and max_score > 0 else working_result.get("suggested_score")
         merged = {**working_result, "suggested_score": suggested,
                   "evidence": _merge_supplement_text(reconciled_evidence, f"{prefix}{evidence}" if evidence else "", limit=merge_limit),
-                  "reason": _merge_supplement_text(reconciled_reason, f"{prefix}{reason}" if reason else "", limit=merge_limit),
+                  "reason": _merge_reason_text(reconciled_reason, f"{prefix}{reason}" if reason else "", limit=merge_limit),
                   "confidence": _enum_text(parsed.get("confidence"), {"high", "medium", "low"}, working_result.get("confidence")) if scope == "full" else working_result.get("confidence"),
                   "ocr_candidate_pages": pages, "ocr_evidence_pages": evidence_pages,
                   "requires_review": True, "automation_status": "needs_review", "review_reason": f"{service_labels} 结果已补充，需人工复核。"}
@@ -5482,7 +5554,7 @@ def _merge_usable_visual_responses(responses: list[tuple[list[int], dict]]) -> t
     selected_pages, selected = (full or usable)[-1]
     merged = dict(selected)
     evidence_values: list[str] = []
-    reason_values: list[str] = []
+    merged_reason = ""
     checked_pages: list[int] = []
     evidence_pages: list[int] = []
     field_checks: list[dict] = []
@@ -5502,8 +5574,8 @@ def _merge_usable_visual_responses(responses: list[tuple[list[int], dict]]) -> t
         reason = _clean_model_text(parsed.get("reason"))
         if evidence and evidence not in evidence_values:
             evidence_values.append(evidence)
-        if reason and reason not in reason_values:
-            reason_values.append(reason)
+        if reason:
+            merged_reason = _merge_reason_text(merged_reason, reason)
         for item in parsed.get("field_checks") or []:
             if isinstance(item, dict) and item not in field_checks:
                 field_checks.append(item)
@@ -5511,7 +5583,7 @@ def _merge_usable_visual_responses(responses: list[tuple[list[int], dict]]) -> t
         if conflict_rank[current_conflict] > conflict_rank[conflict_level]:
             conflict_level = current_conflict
     merged["evidence"] = "\n".join(evidence_values)
-    merged["reason"] = "\n".join(reason_values)
+    merged["reason"] = merged_reason
     merged["field_checks"] = field_checks
     merged["conflict_level"] = conflict_level
     conclusion_scope = "full" if full else "partial"
@@ -5941,7 +6013,7 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
         merged = _review_result_from_model({
             "evidence": _merge_supplement_text(reconciled_evidence, f"{prefix}{visual_evidence}" if visual_evidence else ""),
             "page_hint": page_hint,
-            "reason": _merge_supplement_text(
+            "reason": _merge_reason_text(
                 reconciled_reason, f"{prefix}{visual_reason}" if visual_reason else "",
                 supplement_first=has_conflict,
             ),
@@ -5976,7 +6048,7 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
         "evidence": _merge_supplement_text(
             reconciled_evidence, f"{prefix}{visual_evidence}" if visual_evidence else "", limit=merge_limit,
         ),
-        "reason": _merge_supplement_text(
+        "reason": _merge_reason_text(
             reconciled_reason, f"{prefix}{visual_reason}" if visual_reason else "",
             limit=merge_limit, supplement_first=has_conflict,
         ),

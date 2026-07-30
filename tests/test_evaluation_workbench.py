@@ -1816,6 +1816,34 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(objective["suggested_score"], 3)
         self.assertIn("身份证号码", review["evidence"])
 
+    def test_ocr_raw_evidence_compacts_fragmented_table_header_but_keeps_short_values(self):
+        raw_text = "综合\n单\n总价\n单\n价\n（含\n序号\n分项名称\nKJ11\n2\n套"
+
+        result = worker._with_ocr_raw_evidence({"evidence": "文字层已定位材料。"}, "【OCR原文·P7】", raw_text)
+
+        self.assertIn("表格字段：KJ11 2 套", result["evidence"])
+        self.assertNotIn("综合\n单\n总价", result["evidence"])
+
+    def test_reason_merge_dedupes_same_calculation_but_keeps_different_calculations(self):
+        duplicate = worker._merge_reason_text(
+            "计分过程：确认1项，建议2分。",
+            "【图片识别·standard·P8】计分过程：确认1项，建议2分。",
+        )
+        different = worker._merge_reason_text(
+            "计分过程：确认1项，建议2分。",
+            "【图片识别·standard·P8】计分过程：确认2项，建议4分。",
+        )
+
+        self.assertEqual(duplicate.count("计分过程"), 1)
+        self.assertEqual(different.count("计分过程"), 2)
+        self.assertIn("建议4分", different)
+
+    def test_subjective_prompt_requires_specific_non_full_score_basis(self):
+        template = PROMPT_TEMPLATES["evaluate_all_subjective_user"]["content"]
+
+        self.assertIn("非满分时", template)
+        self.assertIn("具体缺项", template)
+
     def test_report_compacts_legacy_objective_ocr_raw_text(self):
         value = (
             "文字层建议1分。"
