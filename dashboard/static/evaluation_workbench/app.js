@@ -189,8 +189,16 @@
       .map((card) => card.dataset.rule || card.querySelector('[data-rule]')?.dataset.rule)
       .filter(Boolean));
     const data = await request(`/projects/${activeProject}/rules`); const set = data.rule_set; const isDraft = set?.status === 'draft'; hasCurrentRules = data.rules.length > 0;
+    // 展示顺序只服务于人工确认：先看本项目人工补充，再看 AI 提取，最后看自动导入的
+    // 通用规则。不会改写 sort_order，也不会改变后端综合评审的规则执行口径。
+    const sourceRank = {manual:0, ai:1, ai_edited:1, ai_locked:1, global:2};
+    const displayRules = [...data.rules].sort((left, right) => (
+      (sourceRank[left.source_type] ?? 1) - (sourceRank[right.source_type] ?? 1)
+      || Number(left.sort_order || 0) - Number(right.sort_order || 0)
+      || String(left.title || '').localeCompare(String(right.title || ''), 'zh-CN')
+    ));
     const enabledCount = data.rules.filter((r) => Boolean(r.enabled)).length; $('rule-set-meta').textContent = set ? `版本 ${set.version} · ${set.status === 'confirmed' ? '已确认' : set.status === 'draft' ? '待确认' : '已替换'} · 已启用 ${enabledCount}/${data.rules.length} 条${set.source_task_id ? ' · AI 提取结果' : ''}` : '尚未提取或添加规则。'; $('confirm-rules').disabled = !isDraft;
-    $('rules').innerHTML = data.rules.length ? `<div class="rule-card-list">${data.rules.map((r) => {
+    $('rules').innerHTML = displayRules.length ? `<div class="rule-card-list">${displayRules.map((r) => {
       const checkContent = isDraft ? `<textarea class="rule-check-rule" data-rule="${r.rule_id}" rows="4">${escapeHtml(r.check_rule || r.title)}</textarea>` : `<div class="rule-text">${escapeHtml(r.check_rule || r.title)}</div>`;
       const visionLabel = {off:'不识图', text_fallback:'文字不足时识图', required:'必须识图'}[r.vision_trigger] || '不识图';
       const levelLabel = {off:'关闭', low:'快速', standard:'标准', high:'精细'}[r.vision_level] || '关闭';
@@ -201,7 +209,7 @@
       return `<details class="rule-card"><summary><span class="rule-card-summary">${enabledControl}<span class="tag">${categoryLabel(r.category)}</span><strong class="rule-card-title">${escapeHtml(r.title)}</strong><span class="tag">${sourceLabel}</span>${ocrCell}</span></summary><div class="rule-card-body"><div class="rule-card-grid"><label>检查规则${checkContent}</label><div class="rule-field"><span class="rule-field-label">招标原文依据</span><div class="rule-text">${escapeHtml(r.source_text || '未提供')}</div></div></div>${visionControl}${isDraft ? `<div class="actions rule-card-actions"><button class="save-check-rule primary" data-rule="${r.rule_id}">保存检查规则</button></div>` : ''}</div></details>`;
     }).join('')}</div>` : '<p class="muted">暂无规则。</p>';
     $('rules').querySelectorAll('details.rule-card').forEach((card, index) => {
-      const ruleId = data.rules[index]?.rule_id;
+      const ruleId = displayRules[index]?.rule_id;
       card.dataset.rule = ruleId || '';
       card.open = Boolean(ruleId && expandedRuleIds.has(ruleId));
     });
