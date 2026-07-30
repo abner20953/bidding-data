@@ -2839,6 +2839,11 @@ _CONCRETE_PRICE_MARKERS = re.compile(
 )
 
 
+def is_price_rule(value: object) -> bool:
+    """统一判断规则是否涉及报价，供存储回收和工作进程共享。"""
+    return bool(_PRICE_RULE_MARKERS.search(str(value or "")))
+
+
 def reconcile_price_review_results(app, review_run_id: str, objective_run_id: str) -> int:
     """用同批跨投标人报价事实撤销“报价未见”的旧文字结论。
 
@@ -2855,7 +2860,7 @@ def reconcile_price_review_results(app, review_run_id: str, objective_run_id: st
         price_documents = {
             str(row["document_id"])
             for row in score_rows
-            if _PRICE_RULE_MARKERS.search(f"{row['title'] or ''} {row['check_rule'] or ''}")
+            if is_price_rule(f"{row['title'] or ''} {row['check_rule'] or ''}")
             and _CONCRETE_PRICE_MARKERS.search(f"{row['evidence'] or ''} {row['reason'] or ''}")
         }
         if not price_documents:
@@ -2872,7 +2877,7 @@ def reconcile_price_review_results(app, review_run_id: str, objective_run_id: st
                 continue
             rule_text = f"{row['title'] or ''} {row['check_rule'] or ''}"
             current_text = f"{row['evidence'] or ''}\n{row['reason'] or ''}"
-            if not _PRICE_RULE_MARKERS.search(rule_text) or not _PRICE_ABSENCE_MARKERS.search(current_text):
+            if not is_price_rule(rule_text) or not _PRICE_ABSENCE_MARKERS.search(current_text):
                 continue
             pieces = re.split(r"(?<=[。；;])\s*|\n+", str(row["reason"] or ""))
             retained = [piece.strip() for piece in pieces if piece.strip() and not _PRICE_ABSENCE_MARKERS.search(piece)]

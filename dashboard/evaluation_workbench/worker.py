@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import re
-import sys
 import tempfile
 import threading
 import time
@@ -675,6 +674,103 @@ def _has_concrete_star_requirement(tender_text: str) -> bool:
     """仅“★号条款响应”交叉引用不代表第五章真的存在星号叶子条款。"""
     without_cross_reference = re.sub(r"★\s*号\s*条款\s*响应", "", tender_text or "")
     return "★" in without_cross_reference
+
+
+_TECHNICAL_STAR_EVIDENCE_TERMS = (
+    "证明材料", "证明文件", "技术资料", "产品资料", "技术参数", "功能截图",
+    "检测报告", "检验报告", "资质证书", "认证证书", "说明书",
+)
+_TECHNICAL_STAR_OUTCOME_TERMS = ("投标无效", "无效投标", "投标被拒绝", "响应无效", "予以否决")
+_TECHNICAL_STAR_LEAF_TERMS = ("技术参数", "产品指标", "参数表", "指标项", "技术要求", "产品规格", "硬件规格", "性能指标")
+
+
+def _technical_star_requirement_seed(tender_text: str, package_number: int | None = None) -> dict | None:
+    """为明确“技术★ + 证明材料 + 明确后果”的条款生成保守兜底候选。
+
+    这不是按“★”一律补规则：必须同时在招标原文中找到技术叶子项、证明材料要求及
+    实质性/无效后果。它只防止分段模型把这类条款误压缩进普通技术覆盖或评分规则，
+    不替代模型对具体技术内容的正常提取。
+    """
+    if not _has_concrete_star_requirement(tender_text):
+        return None
+    # 多包文件的★技术表可能完全不同，而纯本地文本无法稳定判断跨页包边界。
+    # 此时宁可只依赖已经带分包提示词的模型提取，不能把某一包的实质性技术要求
+    # 自动写入另一包；单包或未显式标出多包的文件仍可得到该兜底保障。
+    if package_number is not None and len(_package_numbers_in_text(tender_text)) > 1:
+        return None
+    pages = [value.strip() for value in _PARSED_PAGE_MARKER.split(tender_text or "") if value.strip()]
+    if not pages:
+        return None
+    compact_pages = [(page, re.sub(r"\s+", "", page)) for page in pages]
+
+    basis_page = ""
+    for page, compact in compact_pages:
+        has_star_basis = "★" in compact and any(term in compact for term in ("实质性", "必备要求", "必须满足"))
+        has_outcome = any(term in compact for term in _TECHNICAL_STAR_OUTCOME_TERMS)
+        has_evidence = any(term in compact for term in _TECHNICAL_STAR_EVIDENCE_TERMS)
+        if has_star_basis and has_outcome and has_evidence:
+            basis_page = page
+            break
+    if not basis_page:
+        return None
+
+    # 仅“资格文件带★”或格式中的★交叉引用不触发；还需在采购需求中实际定位到
+    # 带★的技术/产品叶子项，避免把普通格式要求错误升级为实质性技术规则。
+    if not any(
+        "★" in compact and any(term in compact for term in _TECHNICAL_STAR_LEAF_TERMS)
+        for _, compact in compact_pages
+    ):
+        return None
+
+    page_match = re.search(r"\[第(\d+)页\]", basis_page)
+    source_page = int(page_match.group(1)) if page_match else None
+    source_text = re.sub(r"\s+", " ", basis_page).strip()
+    # 保留原文依据的完整语义，但避免把整页表格塞进规则卡片或后续模型上下文。
+    star_index = source_text.find("★")
+    source_text = source_text[max(0, star_index - 90):max(0, star_index - 90) + 620]
+    return {
+        "category": "substantive",
+        "title": "★技术参数及证明材料响应",
+        "check_rule": (
+            "逐项核验当前采购包技术参数/产品指标表中标注“★”的全部叶子指标是否在投标文件中"
+            "作出实质响应，并针对所投型号提供相应证明材料（如产品技术资料、技术参数、功能截图、"
+            "检测报告、产品资质证书或说明书等）。任一★指标未满足、未作实质响应或未按要求提供"
+            "相应证明材料时，仅按招标文件已明确的无效/拒绝后果提示人工复核。"
+        ),
+        "source_text": source_text,
+        "source_page": source_page,
+        # 证明材料常同时含可检索文字与扫描件；默认允许先做文字审查，人工开启图片识别时
+        # 再补视觉事实，不把整条技术参数规则强制卡在 OCR 状态。
+        "ocr_required": False,
+        "execution_strategy": "section",
+        "evidence_requirements": ["text", "visual"],
+    }
+
+
+def _has_technical_star_requirement_rule(rules: list[dict]) -> bool:
+    """判断已有规则是否已完整承接技术★及其证明材料，避免兜底规则重复。"""
+    for rule in rules:
+        if not isinstance(rule, dict) or rule.get("category") not in {"compliance", "substantive", "rejection"}:
+            continue
+        combined = " ".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text"))
+        if (
+            "★" in combined
+            and any(term in combined for term in _TECHNICAL_STAR_LEAF_TERMS)
+            and any(term in combined for term in _TECHNICAL_STAR_EVIDENCE_TERMS)
+        ):
+            return True
+    return False
+
+
+def _ensure_technical_star_requirement_rule(rules: list[dict], tender_text: str,
+                                            package_number: int | None = None) -> list[dict]:
+    """仅在模型遗漏且原文存在完整强制链条时补入一条合并的技术★规则。"""
+    if _has_technical_star_requirement_rule(rules):
+        return rules
+    seed = _technical_star_requirement_seed(tender_text, package_number)
+    if not seed:
+        return rules
+    return _dedupe_rule_candidates([*rules, seed])
 
 
 def _has_explicit_import_restriction(tender_text: str) -> bool:
@@ -2027,8 +2123,6 @@ def _extract_rules(app, task: dict) -> dict:
     if not main_text:
         raise ValueError("主招标文件未提取到可用文本，扫描件需要先提供可检索版本")
     profile = storage.get_model_profile(app, task.get("payload", {}).get("profile_id"), "deepseek-v4-flash")
-    vision_profile = storage.resolve_vision_model_profile(app, profile)
-    char_limit = _prompt_char_limit(profile, 180_000, 400_000)
     source_documents = [(f"主招标文件：{tender['original_name']}", main_text)]
     attachments = [item for item in documents if item["role"] == "tender_attachment" and item.get("parse_status") == "success" and item.get("parsed_path")]
     for attachment in attachments:
@@ -2192,6 +2286,10 @@ def _extract_rules(app, task: dict) -> dict:
         app, task, profile, system_prompt, rules,
     )
     rules = _filter_inapplicable_template_rules(_filter_rules_for_package(rules, package_number), text)
+    # 模型分段提取和后续去重均可能把“技术★实质性指标 + 证明材料 + 明确无效后果”
+    # 错压缩进普通技术覆盖项。仅在三项原文条件同时存在、且规则集尚未承接时补一条；
+    # 不对一般技术参数、格式★或只有交叉引用的条款做任何推断。
+    rules = _ensure_technical_star_requirement_rule(rules, text, package_number)
     # 质量门控偶尔会遗漏“异常低价解释”等评审过程事项。它们既没有可执行分值，
     # 也不能由投标文件单独完成，不能以零分评分规则的形式进入待确认规则集。
     before_procedural_filter = len(rules)
@@ -3270,7 +3368,7 @@ def _combined_batch_prompt(app, component: str, document: dict, payload: list[di
     )
     # 价格事实由同一任务内的本地保守解析统一提供给符合性审查和客观评分；它位于
     # 可变尾部，不影响前面规则组与正文的既有提示词协议。
-    if document.get("_shared_price_facts") and any(_PRICE_RULE_MARKERS.search(
+    if document.get("_shared_price_facts") and any(storage.is_price_rule(
         f"{item.get('title', '')} {item.get('check_rule', '')} {item.get('source_text', '')}"
     ) for item in payload):
         prompt += f"\n\n【已核验价格事实】\n{document['_shared_price_facts']}"
@@ -6412,10 +6510,11 @@ def _local_project_upper_limit(app, project_id: str) -> tuple[Decimal | None, st
     return value, next((source for candidate, source in candidates if candidate == value), "")
 
 
-def _document_shared_price_facts(app, project_id: str, document: dict) -> str:
+def _document_shared_price_facts(app, project_id: str, document: dict, *,
+                                 upper_limit: tuple[Decimal | None, str] | None = None) -> str:
     """生成可被审查和评分共同消费的最小价格事实包，不引用任一模型的自然语言结论。"""
     quote, quote_excerpt = _local_total_quote(document)
-    limit, limit_excerpt = _local_project_upper_limit(app, project_id)
+    limit, limit_excerpt = upper_limit if upper_limit is not None else _local_project_upper_limit(app, project_id)
     values = []
     if quote is not None:
         values.append(f"投标文件唯一总报价：{quote}元（本地定位：{quote_excerpt[:180]}）")
@@ -6684,9 +6783,16 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
     price_fact_cache = task.setdefault("_shared_price_fact_packets", {})
     price_fact_lock = task.setdefault("_shared_price_fact_lock", threading.Lock())
     with price_fact_lock:
+        # 最高限价只来自项目招标文件，所有投标人完全相同。长招标文件只扫描一次，
+        # 避免并行评审每家投标人都重复读取和逐行匹配整份招标文件。
+        if "_shared_project_upper_limit" not in task:
+            task["_shared_project_upper_limit"] = _local_project_upper_limit(app, task["project_id"])
+        project_upper_limit = task["_shared_project_upper_limit"]
         price_facts = price_fact_cache.get(document["document_id"])
         if price_facts is None:
-            price_facts = _document_shared_price_facts(app, task["project_id"], document)
+            price_facts = _document_shared_price_facts(
+                app, task["project_id"], document, upper_limit=project_upper_limit,
+            )
             price_fact_cache[document["document_id"]] = price_facts
     document = {
         **document,

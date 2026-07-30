@@ -99,6 +99,28 @@ PROMPT_TEMPLATES["extract_rules_quality_gate_user"]["content"] += (
     "只有与另一覆盖规则重复、跨错采购包、未列具体叶子要求或完全属于投后履约时才可剔除。"
 )
 
+# 技术参数中的★并不当然构成否决项；但采购文件同时明确“★为实质性指标”、
+# 明确不满足后果、并要求当前投标文件提交相应证明材料时，普通技术覆盖规则或
+# #/△评分规则均不能替代该独立的实质性审查事实。
+_EXTRACT_RULES_TECHNICAL_STAR_EVIDENCE_GUIDANCE = (
+    "技术参数★条款的受控保留规则：只有同时能定位到（a）当前采购包产品/技术参数表存在实际"
+    "标注★的叶子指标，（b）原文明确★为实质性/必备指标且不满足会导致投标无效、被拒绝、"
+    "响应无效或其他明确后果，（c）原文要求为该类技术响应提供技术资料、参数、截图、检测报告、"
+    "证书、说明书或其他证明材料时，必须保留一条独立的 substantive 或 rejection 规则。"
+    "按连续参数表或同一设备主题合并为少量规则；check_rule 要明确核验该范围内全部★叶子指标的"
+    "逐项实质响应及与所投型号对应的证明材料，source_text 同时保留★的实质性后果和证明材料依据。"
+    "不得把它压缩为仅检查#、△得分的评分规则，也不得仅塞进无否决后果的 category=other 总覆盖规则；"
+    "更不得把每一项★拆成大量重复规则。证明材料可能同时是文字和扫描图像时，先保留文字审查并"
+    "允许后续按规则选择图片识别；只有图片外观是唯一决定性事实时才把整条设为 ocr_required=true。"
+    "若缺少上述任一条件，仍按普通技术要求或交叉引用处理，不得因★符号自行推定否决后果。"
+)
+PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += "\n\n" + _EXTRACT_RULES_TECHNICAL_STAR_EVIDENCE_GUIDANCE
+PROMPT_TEMPLATES["extract_rules_user"]["content"] += "\n\n" + _EXTRACT_RULES_TECHNICAL_STAR_EVIDENCE_GUIDANCE
+PROMPT_TEMPLATES["extract_rules_continue_user"]["content"] += "\n\n" + _EXTRACT_RULES_TECHNICAL_STAR_EVIDENCE_GUIDANCE
+PROMPT_TEMPLATES["extract_rules_compile_user"]["content"] += "\n\n" + _EXTRACT_RULES_TECHNICAL_STAR_EVIDENCE_GUIDANCE
+PROMPT_TEMPLATES["extract_rules_coverage_user"]["content"] += "\n\n" + _EXTRACT_RULES_TECHNICAL_STAR_EVIDENCE_GUIDANCE
+PROMPT_TEMPLATES["extract_rules_quality_gate_user"]["content"] += "\n\n" + _EXTRACT_RULES_TECHNICAL_STAR_EVIDENCE_GUIDANCE
+
 # 正式资格评审表的条目不是可随意删去的“资料汇总”。这一口径与项目行业无关，
 # 用于防止资格门槛被同一材料的评分项或名称一致性规则错误替代。
 _EXTRACT_RULES_QUALIFICATION_COVERAGE_GUIDANCE = (

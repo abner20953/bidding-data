@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
@@ -2068,6 +2069,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("资格业绩的最低数量", extraction_guidance)
         self.assertIn("技术/服务要求逐项响应覆盖", extraction_guidance)
         self.assertIn("通常每个采购包控制为1至3条规则", extraction_guidance)
+        self.assertIn("技术参数★条款的受控保留规则", extraction_guidance)
+        self.assertIn("技术参数★条款的受控保留规则", extraction_user)
         self.assertIn("subjective|other", extraction_user)
         self.assertIn("category=other", extraction_user)
         self.assertIn("subjective|other", extraction_continue)
@@ -2091,6 +2094,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("未找到直接证据时应返回 not_found", review_template)
         qualification_template = PROMPT_TEMPLATES["extract_rules_qualification_supplement_user"]["content"]
         self.assertIn("正式资格候选区段", qualification_template)
+
         self.assertIn("相邻非资格内容", qualification_template)
         extraction_validation = PROMPT_TEMPLATES["extract_rules_validation_guidance"]["content"]
         compile_template = PROMPT_TEMPLATES["extract_rules_compile_user"]["content"]
@@ -2128,6 +2132,29 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn("每段摘录最多 90 字", compact_scan)
         self.assertNotIn("matches 每个数组恰好六项、最多36条", compact_scan)
         self.assertNotIn("scope_anomalies 每个数组恰好五项、最多8条", compact_scan)
+
+    def test_combined_review_prompt_includes_shared_price_facts_without_name_error(self):
+        document = {
+            "original_name": "投标文件.pdf", "bidder_name": "甲公司",
+            "_shared_price_facts": "投标总报价为 628120 元，最高限价为 638913.36 元。",
+        }
+        payload = [{
+            "rule_id": "price-rule", "title": "投标报价符合性", "source_text": "报价不得超过最高限价",
+            "check_rule": "核验投标报价是否超过最高限价", "ocr_required": False,
+        }]
+        prompt = worker._combined_batch_prompt(self.app, "review", document, payload, "报价表原文", compact=False)
+        self.assertIn("【已核验价格事实】", prompt)
+        self.assertIn("628120", prompt)
+
+    def test_shared_price_facts_reuse_precomputed_project_upper_limit(self):
+        document = self._add_pdf("price.pdf", "bid", "甲公司", "投标总报价：628120 元")
+        with patch.object(worker, "_local_project_upper_limit") as project_limit:
+            facts = worker._document_shared_price_facts(
+                self.app, self.project["project_id"], document,
+                upper_limit=(Decimal("638913.36"), "最高限价：638913.36 元"),
+            )
+        project_limit.assert_not_called()
+        self.assertIn("638913.36", facts)
 
     def test_task_prompt_fingerprint_ignores_unrelated_template_changes(self):
         client = self.app.test_client()
@@ -2985,6 +3012,33 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         active_tender = "■本项目不接受进口产品。第五章：★ 音频文件必须为 WAV。"
         titles = [item["title"] for item in worker._filter_inapplicable_template_rules(rules[:2], active_tender)]
         self.assertEqual(titles, ["★号条款响应", "进口产品限制"])
+
+    def test_technical_star_material_rule_is_recovered_only_with_complete_formal_chain(self):
+        tender = """[第99页]
+指标按重要性分为“★”、“#”和“△”。★代表实质性指标，不满足该指标项将导致投标被拒绝。
+按要求提供证明材料（证明材料包括产品技术资料、技术参数、功能截图、检测报告、产品资质证书或说明书）。
+[第101页]
+3.2.1 产品指标表
+面板无线 AP  ★  硬件规格  内置智能天线系统，接口不少于2个千兆电口。
+"""
+        seed = worker._technical_star_requirement_seed(tender)
+        self.assertIsNotNone(seed)
+        self.assertEqual(seed["category"], "substantive")
+        self.assertEqual(seed["source_page"], 99)
+        self.assertIn("全部叶子指标", seed["check_rule"])
+        self.assertEqual(seed["evidence_requirements"], ["text", "visual"])
+
+        rules = worker._ensure_technical_star_requirement_rule([], tender)
+        self.assertEqual([item["title"] for item in rules], ["★技术参数及证明材料响应"])
+        normalised = worker._normalise_visual_rule_policies(rules)
+        self.assertEqual(normalised[0]["vision_trigger"], "text_fallback")
+
+        # 只有★或普通技术参数、但没有证明材料和明确后果时不得自行补成否决规则。
+        incomplete = "[第20页]\n技术参数表：★硬件规格，端口不少于2个。"
+        self.assertIsNone(worker._technical_star_requirement_seed(incomplete))
+        # 多包文件无法由本地兜底可靠判定所属包时，不得把某包的★技术要求自动带入另一包。
+        multi_package = tender + "\n采购包1：网络设备。\n采购包2：机房设备。"
+        self.assertIsNone(worker._technical_star_requirement_seed(multi_package, package_number=1))
 
     def test_visual_rule_policy_is_generic_and_default_disabled(self):
         rules = worker._normalise_visual_rule_policies([{
