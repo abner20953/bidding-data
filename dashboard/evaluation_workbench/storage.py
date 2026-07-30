@@ -2393,6 +2393,9 @@ def confirm_rule_set(app, project_id: str) -> dict:
     rule_set = current_rule_set(app, project_id)
     if not rule_set:
         raise ValueError("当前没有可确认的规则集")
+    # 先清理旧版本/异常模型输出中被误标为评分项的“评审过程规则”，再补齐真正
+    # 评分条款的明确满分。这样不会让异常低价解释等事项以 0 分规则阻塞确认。
+    disable_non_file_scoring_process_rules(app, rule_set["rule_set_id"])
     complete_missing_rule_scores(app, rule_set["rule_set_id"])
     with connection(app) as conn:
         count = conn.execute("SELECT COUNT(*) FROM ew_rules WHERE rule_set_id = ? AND enabled = 1", (rule_set["rule_set_id"],)).fetchone()[0]
@@ -2784,6 +2787,36 @@ def reconcile_price_review_results(app, review_run_id: str, objective_run_id: st
             )
             updated += 1
     return updated
+
+
+_NON_FILE_SCORING_PROCESS_PATTERN = re.compile(
+    r"异常低价|澄清(?:说明)?|补正|谈判|投诉|算术(?:更正|修正)|评审现场"
+)
+
+
+def disable_non_file_scoring_process_rules(app, rule_set_id: str) -> int:
+    """停用旧草稿中误列为评分项的评审过程规则，避免阻塞确认。
+
+    只处理“无有效满分 + 明显属于评审过程”的组合；真正漏填满分的评分项仍由
+    complete_missing_rule_scores 补全或明确提示人工补充，绝不静默删除。
+    """
+    disabled = 0
+    with connection(app) as conn:
+        rows = conn.execute(
+            """SELECT rule_id, title, check_rule, source_text, scoring_json FROM ew_rules
+               WHERE rule_set_id = ? AND enabled = 1 AND category IN ('objective', 'subjective')""",
+            (rule_set_id,),
+        ).fetchall()
+        for row in rows:
+            try:
+                scoring = json.loads(row["scoring_json"] or "{}")
+            except json.JSONDecodeError:
+                scoring = {}
+            text = " ".join(str(row[key] or "") for key in ("title", "check_rule", "source_text"))
+            if _valid_max_score(scoring) is None and _NON_FILE_SCORING_PROCESS_PATTERN.search(text):
+                conn.execute("UPDATE ew_rules SET enabled = 0, updated_at = ? WHERE rule_id = ?", (now_iso(), row["rule_id"]))
+                disabled += 1
+    return disabled
 
 
 def latest_score_results(app, project_id: str, score_type: str) -> tuple[dict | None, list[dict]]:

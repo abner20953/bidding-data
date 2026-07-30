@@ -4094,6 +4094,33 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(scoring["kind"], "manual")
         self.assertEqual(scoring["source"], "source_text_inferred")
 
+    def test_confirming_rules_disables_non_file_scoring_process_with_zero_score(self):
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "compliance", "title": "有效响应函", "check_rule": "核验响应函是否已提供。",
+        })
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "异常低价投标审查启动与处理",
+            "check_rule": "评审委员会启动异常低价审查后，要求供应商在评审现场说明报价合理性。",
+            "source_text": "供应商不能在合理时间说明报价合理性的，作无效投标处理。",
+            "scoring": {"max_score": 0, "kind": "manual"},
+        })
+
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+
+        _, rules = storage.list_rules(self.app, self.project["project_id"])
+        stored = next(item for item in rules if item["rule_id"] == rule["rule_id"])
+        self.assertFalse(stored["enabled"])
+
+    def test_extraction_filter_removes_non_file_scoring_process(self):
+        rules = [{
+            "category": "objective", "title": "异常低价投标审查启动与处理",
+            "check_rule": "在评审现场要求供应商说明报价合理性。",
+            "source_text": "异常低价投标审查后给予说明时间。",
+            "scoring": {"max_score": 0, "kind": "manual"},
+        }]
+
+        self.assertTrue(worker._is_non_file_scoring_process(rules[0]))
+
     def test_manual_objective_and_subjective_rules_preserve_explicit_scoring(self):
         objective = storage.add_rule(self.app, self.project["project_id"], {
             "category": "objective", "title": "人工补充业绩评分", "check_rule": "核验业绩数量并按规则计分。",

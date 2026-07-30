@@ -677,6 +677,26 @@ def _filter_inapplicable_template_rules(rules: list[dict], tender_text: str) -> 
     return kept
 
 
+_NON_FILE_SCORING_PROCESS_PATTERN = re.compile(
+    r"异常低价|澄清(?:说明)?|补正|谈判|投诉|算术(?:更正|修正)|评审现场"
+)
+
+
+def _is_non_file_scoring_process(rule: dict) -> bool:
+    """拦截被模型误归为评分项、但只能在评审过程处理的事项。
+
+    共同特征是没有有效分值，且触发后需要评委会、供应商解释或后续程序才能完成，
+    无法只凭已上传投标文件作出评分结论。
+    """
+    if str(rule.get("category") or "") not in {"objective", "subjective"}:
+        return False
+    scoring = rule.get("scoring") if isinstance(rule.get("scoring"), dict) else {}
+    if storage._valid_max_score(scoring) is not None:
+        return False
+    text = " ".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text"))
+    return bool(_NON_FILE_SCORING_PROCESS_PATTERN.search(text))
+
+
 def _project_package_scope_instruction(app, project: dict) -> tuple[int | None, str]:
     section_name = str(project.get("section_name") or "").strip()
     package_number = _normalise_package_number(section_name)
@@ -2090,6 +2110,11 @@ def _extract_rules(app, task: dict) -> dict:
         app, task, profile, system_prompt, rules,
     )
     rules = _filter_inapplicable_template_rules(_filter_rules_for_package(rules, package_number), text)
+    # 质量门控偶尔会遗漏“异常低价解释”等评审过程事项。它们既没有可执行分值，
+    # 也不能由投标文件单独完成，不能以零分评分规则的形式进入待确认规则集。
+    before_procedural_filter = len(rules)
+    rules = [item for item in rules if not _is_non_file_scoring_process(item)]
+    excluded_rule_count += before_procedural_filter - len(rules)
     rules = _normalise_visual_rule_policies(rules)
     for item in rules:
         if _rule_requires_visual_verification(item):
