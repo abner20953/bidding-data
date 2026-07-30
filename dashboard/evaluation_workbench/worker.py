@@ -2235,6 +2235,65 @@ _BOUNDARY_COMPARISON_PATTERN = re.compile(
 )
 
 
+_TENDER_TECHNICAL_BASELINE_CACHE: dict[tuple[str, str], str] = {}
+
+
+def _project_tender_technical_baseline(app, project_id: str) -> str:
+    """按项目缓存招标原文，供技术矛盾结论做来源归因，不增加模型调用。"""
+    try:
+        tenders = [item for item in storage.list_documents(app, project_id) if item.get("role") == "tender"]
+    except Exception:
+        return ""
+    for tender in tenders:
+        path = str(tender.get("parsed_path") or "")
+        key = (project_id, path)
+        if key in _TENDER_TECHNICAL_BASELINE_CACHE:
+            return _TENDER_TECHNICAL_BASELINE_CACHE[key]
+        if not path or not Path(path).is_file():
+            continue
+        value = Path(path).read_text(encoding="utf-8", errors="ignore")
+        # 技术参数、采购需求和评分附件都可能出现在较后位置；保留完整解析文本只作
+        # 本地字符串校验，不会发送给模型。缓存数量受限，避免小规格服务器长期占用内存。
+        if len(_TENDER_TECHNICAL_BASELINE_CACHE) >= 6:
+            _TENDER_TECHNICAL_BASELINE_CACHE.clear()
+        _TENDER_TECHNICAL_BASELINE_CACHE[key] = value
+        return value
+    return ""
+
+
+def _technical_source_provenance(evidence: object, tender_baseline: object) -> str:
+    """识别技术异常是否来自招标原文或仅变更比较符号。
+
+    只在参数矛盾类结论中使用。完全相同的数值/单位表达属于招标原文继承；仅
+    省略“≤/≥”等比较符号的表达保留为低级表述疑点，不再误称投标人自相矛盾。
+    """
+    source = _clean_model_text(tender_baseline)
+    value = _clean_model_text(evidence)
+    if not source or not value:
+        return ""
+    source_compact = re.sub(r"\s+", "", source).lower()
+    value_compact = re.sub(r"\s+", "", value).lower()
+    # 对参数异常最具判别力的是“数值＋单位/型号”的短串；同一串已出现在招标原文
+    # 即不能仅凭常识把投标人沿用的文字判成技术缺陷。
+    signatures = re.findall(
+        r"(?:[φΦ]?[0-9]+(?:\.\d+)?(?:mm|cm|m|hz|khz|℃c|℃|%|w|kw|v|a)|"
+        r"-?[0-9]+(?:\.\d+)?(?:℃c|℃|hz|khz)(?:[-~～至][0-9a-zφΦ℃.]+)+)",
+        value_compact,
+    )
+    if any(len(signature) >= 4 and signature in source_compact for signature in signatures):
+        return "inherited"
+    # 比较符号是否存在会改变技术口径，因此只降级为表述待核而不直接宣称完全一致。
+    source_without_ops = re.sub(r"[≤≥<>＝=]", "", source_compact)
+    value_without_ops = re.sub(r"[≤≥<>＝=]", "", value_compact)
+    for width in (48, 36, 28, 20):
+        for start in range(0, max(0, len(value_without_ops) - width + 1)):
+            fragment = value_without_ops[start:start + width]
+            if any(char.isdigit() for char in fragment) and fragment in source_without_ops:
+                if fragment not in source_compact:
+                    return "boundary_variant"
+    return ""
+
+
 def _satisfied_boundary_comparison(item: dict) -> str:
     """识别“响应值恰等于 ≥/≤ 边界”被模型误报为偏离的通用情形。"""
     text = "\n".join(str(item.get(key) or "") for key in ("evidence", "reason"))
@@ -2249,7 +2308,21 @@ def _satisfied_boundary_comparison(item: dict) -> str:
     return ""
 
 
-def _normalise_review_results(output: object, rules: list[dict]) -> list[dict]:
+def _is_technical_consistency_rule(rule: dict) -> bool:
+    """仅将招标原文基线用于技术参数矛盾类规则，避免干扰一般符合性结论。"""
+    text = " ".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text"))
+    has_technical_subject = any(term in text for term in ("技术参数", "技术方案", "技术响应", "技术要求"))
+    has_consistency_check = any(term in text for term in ("矛盾", "不一致", "不合理", "相互冲突", "前后不一"))
+    return has_technical_subject and has_consistency_check
+
+
+def _is_copying_only_rule(rule: dict) -> bool:
+    """逐项响应/偏离表的复述本身不是风险，避免独立“照抄”规则制造噪声。"""
+    text = " ".join(str(rule.get(key) or "") for key in ("title", "check_rule"))
+    return any(term in text for term in ("照抄", "照搬", "机械复制"))
+
+
+def _normalise_review_results(output: object, rules: list[dict], tender_baseline: object = "") -> list[dict]:
     by_id = {item["rule_id"]: item for item in rules}
     normalized = []
     for item in output if isinstance(output, list) else []:
@@ -2278,11 +2351,42 @@ def _normalise_review_results(output: object, rules: list[dict]) -> list[dict]:
             }
             if status == "not_satisfied":
                 status = "partial"
-        visual_rule = _rule_requires_visual_verification(by_id[rule_id])
+        rule = by_id[rule_id]
+        # 投标文件沿用招标参数原文（或仅在比较符号上存在版式差异）不能被当作
+        # 投标人技术自相矛盾。这里不把它改为“满足”，仅将无直接偏离证据的噪声
+        # 回落为低风险提示，保留人工复核与其他真实异常的空间。
+        if _is_technical_consistency_rule(rule):
+            provenance = _technical_source_provenance(item.get("evidence"), tender_baseline)
+            if provenance:
+                note = (
+                    "关键参数表述可在招标原文中定位，不能仅据此认定投标文件存在技术矛盾。"
+                    if provenance == "inherited"
+                    else "该参数与招标原文仅见比较符号/版式差异，作为表述核验提示，不单独认定技术偏离。"
+                )
+                item = {
+                    **item,
+                    "risk_level": "low",
+                    "confidence": "medium" if item.get("confidence") == "high" else item.get("confidence"),
+                    "reason": "；".join(value for value in (note, _clean_model_text(item.get("reason"))) if value)[:2000],
+                }
+                if status == "not_satisfied":
+                    status = "partial"
+        # 对照表逐项复述招标参数是正常编制方式。真正的边界删改、无关内容或方案
+        # 缺失仍会由对应的参数一致性/方案完整性规则检出，不在此重复放大。
+        if _is_copying_only_rule(rule):
+            item = {
+                **item,
+                "risk_level": "low",
+                "confidence": "medium" if item.get("confidence") == "high" else item.get("confidence"),
+                "reason": "技术响应或偏离表对招标参数的逐项复述属于正常对照，不单独构成照抄风险；如有实质删改或无关内容，应由对应技术规则单独核验。",
+            }
+            if status == "not_satisfied":
+                status = "partial"
+        visual_rule = _rule_requires_visual_verification(rule)
         # OCR 规则在当前流程尚未真正识别图像时，不能因文本层未命中就输出高风险
         # 不满足；模型若在理由中明确提出 OCR 缺口，也统一回落到待 OCR。
         if visual_rule or (
-            status != "satisfied" and _is_explicit_ocr_gap(item, by_id[rule_id])
+            status != "satisfied" and _is_explicit_ocr_gap(item, rule)
         ):
             status = "ocr_required"
             if original_status != "ocr_required" and visual_rule:
@@ -3930,9 +4034,10 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
     }
 
 
-def _combined_batch_results(component: str, output: object, rules: list[dict], payload: list[dict]) -> list[dict]:
+def _combined_batch_results(component: str, output: object, rules: list[dict], payload: list[dict],
+                            tender_baseline: object = "") -> list[dict]:
     if component == "review":
-        return _normalise_review_results(output, rules)
+        return _normalise_review_results(output, rules, tender_baseline)
     return _normalise_score_results(output, payload, component)
 
 
@@ -3989,6 +4094,20 @@ _VISION_FACT_TERMS = (
     "签字", "签章", "盖章", "印章", "骑缝章", "勾选", "手写", "照片", "截图", "二维码",
     "外观", "版式", "公章", "复印件", "扫描件", "原件",
 )
+
+
+def _form_bundle_page_limit(rule: dict, level: str, pages: list[int], default_limit: int) -> int:
+    """低强度固定表单也应完整覆盖紧邻的同一份表单，避免漏掉续页关键字段。
+
+    只在候选队列的开头已经是三个连续页、且规则明确要求响应表单时放宽到三页；
+    不扩展非表单规则，也不增加后续批次，因而不会把低档识别变成无边界的全文识图。
+    """
+    if level != "low" or "response_form" not in _rule_material_roles(rule) or len(pages) < 3:
+        return default_limit
+    first_three = pages[:3]
+    if first_three == list(range(first_three[0], first_three[0] + 3)):
+        return max(default_limit, 3)
+    return default_limit
 
 
 def _rule_image_strategy(rule: dict) -> str:
@@ -4108,7 +4227,8 @@ def _ocr_candidate_pages(document: dict, rule: dict, result: dict, level: str) -
         document, rule, _vision_page_candidates(document, rule, result),
         protected=result.get("ocr_evidence_pages"),
     )
-    return pages[:_OCR_PAGE_LIMITS.get(level, 1)]
+    limit = _form_bundle_page_limit(rule, level, pages, _OCR_PAGE_LIMITS.get(level, 1))
+    return pages[:limit]
 
 
 def _ocr_runtime_enabled(configuration: dict) -> bool:
@@ -5122,8 +5242,24 @@ def _reconcile_stale_pending_text(base: object, supplement: object, rule: dict, 
     return "\n".join(value for value in retained if value).strip()
 
 
+def _requires_discrete_document_evidence(rule: dict) -> bool:
+    """判断客观分是否必须按一份份材料的完整要件计分。
+
+    业绩、证书、许可等累计型评分不能仅凭目录或案例列表把未覆盖的材料一并计入。
+    该判断只基于评分规则的通用计分语义，不依赖某个项目、行业或固定页码。
+    """
+    if str(rule.get("category") or "") != "objective":
+        return False
+    text = " ".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text"))
+    has_increment = bool(re.search(r"每(?:提供|有|具备)?[^。；;]{0,18}(?:份|项|个).{0,18}得\s*\d", text))
+    has_material = any(term in text for term in (
+        "合同", "业绩", "证书", "许可证", "资质", "证明材料", "验收", "检测报告",
+    ))
+    return has_increment and has_material
+
+
 def _confirmed_partial_score(rule: dict, parsed: dict, previous: object, max_score: float,
-                             checked_pages: object = None) -> float | None:
+                             checked_pages: object = None, *, evidence_gated: bool = False) -> float | None:
     """部分图片覆盖可上调已完整证实的客观评分叶子项，绝不凭零散描述重算整条规则。"""
     prior = _bounded_model_score(previous, max_score) if max_score > 0 else None
     scoring = _rule_scoring(rule)
@@ -5176,6 +5312,12 @@ def _confirmed_partial_score(rule: dict, parsed: dict, previous: object, max_sco
     if not confirmed:
         return prior
     value = min(max_score, sum(confirmed.values()))
+    # 合同、证书等“每提供一份/项得分”的客观分必须由对应材料的完整要件支撑。
+    # 当图片阶段已经明确只确认其中部分材料时，沿用文字阶段较高的暂定分会造成
+    # “理由写 3 分、页面却保存 6 分”的自相矛盾。只对这类证据闸门评分允许下调；
+    # 主观分和普通分档规则仍沿用原有“只上调已证实事实”的稳定策略。
+    if evidence_gated:
+        return value
     return max(prior or 0.0, value)
 
 
@@ -5501,7 +5643,8 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
     # 找到候选后才发送高清目标页；快速/标准模式仍严格保持零额外图片调用。
     if not all_pages and level == "high":
         all_pages = _locate_visual_pages(app, task, document, rule, vision_profile)
-    pages = all_pages[:_VISION_LEVEL_SETTINGS[level]["max_pages"]]
+    page_limit = _form_bundle_page_limit(rule, level, all_pages, _VISION_LEVEL_SETTINGS[level]["max_pages"])
+    pages = all_pages[:page_limit]
     if not pages:
         return _with_vision_execution(
             result, "not_located", [], vision_profile, "未定位到可靠候选页，未发送图片，保留文字结论。",
@@ -5670,7 +5813,10 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
     max_score = float(_rule_scoring(rule).get("max_score") or result.get("max_score") or 0)
     suggested = _bounded_model_score(parsed.get("suggested_score"), max_score) if max_score > 0 and conclusion_scope == "full" else None
     if suggested is None:
-        suggested = _confirmed_partial_score(rule, parsed, result.get("suggested_score"), max_score, checked_pages)
+        suggested = _confirmed_partial_score(
+            rule, parsed, result.get("suggested_score"), max_score, checked_pages,
+            evidence_gated=component == "objective" and _requires_discrete_document_evidence(rule),
+        )
     merge_limit = 1_000 if component == "objective" else 2_000
     merged = {
         **result,
@@ -5770,12 +5916,13 @@ def _merge_compound_score_results(rule: dict, left: dict, right: dict) -> dict:
     }
 
 
-def _normalise_partial_combined_results(component: str, output: list[dict], rules: list[dict]) -> tuple[list[dict], list[dict]]:
+def _normalise_partial_combined_results(component: str, output: list[dict], rules: list[dict],
+                                        tender_baseline: object = "") -> tuple[list[dict], list[dict]]:
     returned_ids = {item.get("rule_id") for item in output if isinstance(item, dict)}
     present_rules = [item for item in rules if item["rule_id"] in returned_ids]
     missing_rules = [item for item in rules if item["rule_id"] not in returned_ids]
     payload = _combined_batch_payload(component, present_rules)
-    return _combined_batch_results(component, output, present_rules, payload), missing_rules
+    return _combined_batch_results(component, output, present_rules, payload, tender_baseline), missing_rules
 
 
 def _run_combined_batch(app, task: dict, profile: dict, document: dict, component: str, rules: list[dict],
@@ -5817,7 +5964,10 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
     def finish(parsed: object, retry_count: int, result_mode: str) -> tuple[list[dict], int, int, int, str]:
         if not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list):
             raise ValueError("模型返回格式不符合综合评审要求")
-        results, missing_rules = _normalise_partial_combined_results(component, parsed["results"], rules)
+        tender_baseline = str((scan_index or {}).get("tender_technical_baseline") or "")
+        results, missing_rules = _normalise_partial_combined_results(
+            component, parsed["results"], rules, tender_baseline,
+        )
         if missing_rules and results and allow_missing_retry:
             storage.update_task(app, task["task_id"], message=f"{label} 有 {len(missing_rules)} 条未返回，正在仅补评缺失规则")
             missing = _run_combined_batch(
@@ -6001,6 +6151,42 @@ def _local_total_quote(document: dict) -> tuple[Decimal | None, str]:
     return value, excerpt
 
 
+_SME_DEDICATED_PURCHASE_PATTERN = re.compile(
+    r"专门面向.{0,24}中小企业.{0,90}(?:不再执行|不执行).{0,36}价格(?:评审|评价)?优惠",
+    re.DOTALL,
+)
+
+
+def _project_price_policy_context(app, project_id: str) -> str:
+    """从招标文件读取价格优惠的项目级例外，避免通用评分表覆盖明确政策前提。"""
+    try:
+        tenders = [item for item in storage.list_documents(app, project_id) if item.get("role") == "tender"]
+    except Exception:
+        return ""
+    for tender in tenders:
+        path = str(tender.get("parsed_path") or "")
+        if not path or not Path(path).is_file():
+            continue
+        text = Path(path).read_text(encoding="utf-8", errors="ignore")
+        compact = re.sub(r"\s+", "", text)
+        if _SME_DEDICATED_PURCHASE_PATTERN.search(compact):
+            return "本采购包明确专门面向中小企业，价格评分不执行中小微企业价格扣除。"
+    return ""
+
+
+def _strip_inapplicable_price_discount_text(value: object) -> str:
+    """移除模型沿用通用政策模板产生的价格扣除提示，保留其他报价核验事实。"""
+    text = _clean_model_text(value)
+    if not text:
+        return ""
+    pieces = re.split(r"(?<=[。；;])\s*|\n+", text)
+    retained = [piece for piece in pieces if not (
+        ("小微" in piece or "小型" in piece or "微型" in piece or "中小企业" in piece)
+        and ("扣除" in piece or "优惠" in piece or "声明函" in piece)
+    )]
+    return " ".join(piece.strip() for piece in retained if piece.strip())
+
+
 def _uses_lowest_price_ratio(rule: dict) -> bool:
     text = re.sub(r"\s+", "", " ".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text")))
     return bool(re.search(r"(?:评标价|评审价|评标基准价|基准价|最低(?:评标|评审|投标)?价).{0,36}[／/]?.{0,36}投标报价", text))
@@ -6026,10 +6212,12 @@ def _run_cross_bid_price_scoring(app, task: dict, profile: dict, documents: list
     if len(documents) < 2 or not rules:
         return {"rule_count": 0, "result_count": 0, "retry_count": 0, "missing_count": 0}
     payload = _score_payload(rules)
+    price_policy_context = _project_price_policy_context(app, str(task.get("project_id") or ""))
     document_packet = _cross_bid_price_context(documents, rules)
     prompt = storage.render_prompt_template(
         app, "evaluate_all_cross_bid_price_user",
         rules=json.dumps(payload, ensure_ascii=False, separators=(",", ":")), documents=document_packet,
+        price_policy_context=price_policy_context or "未识别到项目级价格优惠例外，请仅按评分规则和已给证据判断。",
     )
     expected = {(document["document_id"], rule["rule_id"]) for document in documents for rule in rules}
 
@@ -6108,8 +6296,11 @@ def _run_cross_bid_price_scoring(app, task: dict, profile: dict, documents: list
                 rows_by_key[key] = raw
             if _decimal_price(raw.get("quoted_price")) is None:
                 raw["quoted_price"] = float(local_price)
-                raw["evidence"] = _clean_model_text(raw.get("evidence")) or f"本地解析定位总报价：{local_price}元。"
-                raw["reason"] = _clean_model_text(raw.get("reason")) or "模型报价字段缺失，已由投标文件中唯一总报价回填，仍需人工核对报价口径。"
+                # 本地唯一报价回填后，旧模型“未见总价/暂留空”已失效，不能继续混在
+                # 页面证据里。保留新的来源说明，使分数、证据和理由使用同一口径。
+                raw["_local_quote_recovered"] = True
+                raw["evidence"] = f"投标文件本地解析定位唯一总报价：{local_price}元。{excerpt[:220]}"
+                raw["reason"] = "模型报价字段缺失，已由投标文件中唯一总报价回填并参与统一公式复算。"
     prices_by_rule: dict[str, list[object]] = {}
     for raw in valid_rows:
         prices_by_rule.setdefault(str(raw.get("rule_id") or ""), []).append(raw.get("quoted_price"))
@@ -6127,11 +6318,17 @@ def _run_cross_bid_price_scoring(app, task: dict, profile: dict, documents: list
         )
         if deterministic_score is not None:
             previous_reason = _clean_model_text(raw.get("reason"))
+            if price_policy_context:
+                previous_reason = _strip_inapplicable_price_discount_text(previous_reason)
             raw = {
                 **raw,
                 "suggested_score": deterministic_score,
                 "calculation": deterministic_calculation,
-                "reason": (previous_reason + " 当前按全部可识别报价暂算，资格与符合性通过范围仍由人工最终确认。").strip(),
+                "reason": " ".join(value for value in (
+                    previous_reason,
+                    price_policy_context,
+                    "当前按全部可识别报价暂算，资格与符合性通过范围仍由人工最终确认。",
+                ) if value).strip(),
             }
         suggested = _suggested_score(rule_payload, raw, "objective", max_score)
         result = _score_result_from_model(
@@ -6216,6 +6413,9 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
         scan_index["evidence_ledger"] = _build_rule_evidence_ledger(
             scan_index, review_rules + objective_rules + subjective_rules,
         )
+        # 仅供本地结果归因使用，绝不随提示词发送给模型；避免模型把招标原文中的
+        # 参数写法误判为投标文件自身矛盾。
+        scan_index["tender_technical_baseline"] = _project_tender_technical_baseline(app, task["project_id"])
     ledger = scan_index.get("evidence_ledger", {}) if scan_index else {}
     values = {
         "reused_document_count": 0,

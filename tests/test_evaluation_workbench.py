@@ -2370,6 +2370,30 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         self.assertEqual(values[0]["highlights"][0]["level"], "attention")
 
+    def test_copying_response_rule_is_low_risk_in_review_results(self):
+        rules = [{"rule_id": "copy", "title": "技术响应照抄照搬核验", "check_rule": "检查是否照抄招标参数"}]
+        values = worker._normalise_review_results([{
+            "rule_id": "copy", "status": "not_satisfied", "risk_level": "high", "confidence": "high",
+            "evidence": "技术响应表逐项复述采购参数", "reason": "参数存在照抄。",
+        }], rules)
+
+        self.assertEqual(values[0]["status"], "partial")
+        self.assertEqual(values[0]["risk_level"], "low")
+        self.assertIn("正常对照", values[0]["reason"])
+
+    def test_technical_source_baseline_downgrades_inherited_parameter_noise(self):
+        rules = [{
+            "rule_id": "parameter", "title": "技术参数前后一致性", "check_rule": "检查技术参数是否矛盾或不一致",
+        }]
+        values = worker._normalise_review_results([{
+            "rule_id": "parameter", "status": "not_satisfied", "risk_level": "high", "confidence": "high",
+            "evidence": "频率响应 Frequency Response：40-20Hz", "reason": "参数表述异常。",
+        }], rules, "采购需求：频率响应[Frequency Response]：40-20Hz。")
+
+        self.assertEqual(values[0]["status"], "partial")
+        self.assertEqual(values[0]["risk_level"], "low")
+        self.assertIn("招标原文", values[0]["reason"])
+
     def test_latest_review_results_exposes_saved_important_highlights(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "资质材料。")
         rule = storage.add_rule(self.app, self.project["project_id"], {
@@ -2628,6 +2652,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn(315, pages)
         self.assertIn(316, pages)
         self.assertNotIn(317, pages)
+        self.assertEqual(worker._form_bundle_page_limit(rule, "low", pages, 2), 3)
 
     def test_manual_objective_score_can_be_calculated_from_matched_count(self):
         payload = [{
@@ -3265,6 +3290,16 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         self.assertEqual(worker._confirmed_partial_score(rule, parsed, 0, 3, checked_pages=[189]), 3)
         self.assertEqual(worker._confirmed_partial_score(rule, parsed, 0, 3, checked_pages=[20]), 0)
+
+    def test_evidence_gated_visual_score_can_correct_downward(self):
+        rule = {"category": "objective", "title": "同类业绩评分", "check_rule": "每提供1份有效业绩得3分，最高9分",
+                "scoring": {"max_score": 9, "items": [{"item_id": "SI-1", "max_score": 9}]}}
+        parsed = {"score_items": [{"item_id": "业绩1", "status": "confirmed", "suggested_score": 3, "evidence_pages": [12]}]}
+
+        self.assertTrue(worker._requires_discrete_document_evidence(rule))
+        self.assertEqual(worker._confirmed_partial_score(
+            rule, parsed, 6, 9, checked_pages=[12], evidence_gated=True,
+        ), 3)
 
     def test_cross_bid_price_fact_retracts_stale_price_absence_review(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "报价文件")
