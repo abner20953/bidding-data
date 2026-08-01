@@ -21,8 +21,17 @@ fi
 
 # 3. 重新构建镜像
 echo "🔨 正在重新构建 Docker 镜像..."
-# 优先复用当前镜像已有层，避免清理构建缓存后每次重新下载 PyTorch 等大依赖。
-docker build --cache-from bidding-app -f Dockerfile.tencent -t bidding-app .
+# 始终保留当前镜像为上一版：下一次构建可同时引用当前版和上一版的缓存层。
+# 首次部署尚无镜像时，直接构建即可。
+CACHE_FROM_ARGS=()
+if docker image inspect bidding-app:latest >/dev/null 2>&1; then
+    echo "📦 保留当前镜像为最近旧版缓存..."
+    docker tag bidding-app:latest bidding-app:previous
+    CACHE_FROM_ARGS=(--cache-from bidding-app:latest --cache-from bidding-app:previous)
+fi
+
+# 优先复用当前和最近旧版镜像层，避免重新下载 PyTorch、OCR 模型等大依赖。
+docker build "${CACHE_FROM_ARGS[@]}" -f Dockerfile.tencent -t bidding-app:latest .
 if [ $? -ne 0 ]; then
     echo "❌ 镜像构建失败！"
     exit 1
@@ -83,13 +92,14 @@ docker run -d \
   -v $(pwd)/dashboard/static/uploads:/app/dashboard/static/uploads \
   -v $(pwd)/data:/app/data \
   -v $(pwd):/app/tools \
-  bidding-app
+  bidding-app:latest
 
 if [ $? -eq 0 ]; then
     echo "✅ 部署成功！"
     
-    # 自动清理悬空镜像 (节省空间)
-    echo "🧹 自动清理旧镜像缓存..."
+    # 仅保留 bidding-app:latest 与 bidding-app:previous；更早版本在失去标签后会被清理。
+    # 清理放在新容器启动成功后，构建或启动失败时仍可保留旧镜像用于恢复。
+    echo "🧹 清理更早的悬空镜像，保留当前版和最近旧版缓存..."
     docker image prune -f
     
     echo "📜 正在查看日志 (按 Ctrl+C 退出)..."
