@@ -97,9 +97,20 @@ docker run -d \
 if [ $? -eq 0 ]; then
     echo "✅ 部署成功！"
     
-    # 仅保留 bidding-app:latest 与 bidding-app:previous；更早版本在失去标签后会被清理。
-    # 清理放在新容器启动成功后，构建或启动失败时仍可保留旧镜像用于恢复。
-    echo "🧹 清理更早的悬空镜像，保留当前版和最近旧版缓存..."
+    # 仅保留 bidding-app:latest 与 bidding-app:previous，移除本项目的其他历史标签。
+    # 不使用 --force：如有其他容器仍引用旧镜像，Docker 会拒绝删除并保留它。
+    echo "🧹 清理更早的 bidding-app 历史镜像，保留当前版和最近旧版缓存..."
+    mapfile -t STALE_IMAGE_TAGS < <(
+        docker image ls --format '{{.Repository}}:{{.Tag}}' | \
+        awk '$0 ~ /^bidding-app:/ && $0 != "bidding-app:latest" && $0 != "bidding-app:previous" { print $0 }'
+    )
+    for image_ref in "${STALE_IMAGE_TAGS[@]}"; do
+        [ -z "$image_ref" ] && continue
+        echo "  删除历史镜像标签: $image_ref"
+        docker image rm "$image_ref" || echo "  保留 $image_ref：仍被容器引用或删除失败。"
+    done
+
+    # 上一步失去标签的镜像会在此回收；清理放在新容器启动成功后，失败时不影响旧镜像恢复。
     docker image prune -f
     
     echo "📜 正在查看日志 (按 Ctrl+C 退出)..."
