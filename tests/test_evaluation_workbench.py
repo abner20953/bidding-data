@@ -1515,6 +1515,71 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.update_model_profile(self.app, profile["profile_id"], {"supports_vision": False})
         self.assertEqual(storage.vision_configuration(self.app), {"enabled": False, "default_profile_id": None})
 
+    def test_ocr_feature_configuration_is_independent_from_multimodal_switch(self):
+        self.assertEqual(storage.ocr_feature_configuration(self.app), {"enabled": False})
+        self.assertEqual(storage.update_ocr_feature_configuration(self.app, {"enabled": True}), {"enabled": True})
+        self.assertFalse(storage.vision_configuration(self.app)["enabled"])
+        self.assertTrue(storage.ocr_configuration(self.app)["ocr_enabled"])
+
+    def test_ocr_feature_configuration_api_requires_model_configuration_access(self):
+        client = self.app.test_client()
+        self.assertFalse(client.get("/api/evaluation-workbench/ocr-feature-configuration").get_json()["configuration"]["enabled"])
+        self.assertEqual(client.patch(
+            "/api/evaluation-workbench/ocr-feature-configuration", json={"enabled": True},
+        ).status_code, 403)
+        self._unlock_model_configuration(client)
+        response = client.patch(
+            "/api/evaluation-workbench/ocr-feature-configuration", json={"enabled": True},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["configuration"]["enabled"])
+
+    def test_rule_image_mode_round_trip_keeps_legacy_vision_fields(self):
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "扫描声明函", "check_rule": "核验声明函文字",
+            "ocr_required": True,
+        })
+        updated = storage.update_rule(self.app, self.project["project_id"], rule["rule_id"], {
+            "image_mode": "ocr_only", "vision_trigger": "text_fallback", "vision_level": "standard",
+        })
+        self.assertEqual(updated["image_mode"], "ocr_only")
+        self.assertEqual(updated["vision_trigger"], "text_fallback")
+        self.assertEqual(updated["vision_level"], "standard")
+        self.assertEqual(worker._rule_image_mode(updated), "ocr_only")
+
+    def test_evaluation_can_queue_ocr_only_rule_without_multimodal_profile(self):
+        self._add_pdf("bid.pdf", "bid", "甲公司", "扫描声明函")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "声明函", "check_rule": "核验扫描声明函文字",
+            "ocr_required": True,
+        })
+        storage.update_rule(self.app, self.project["project_id"], rule["rule_id"], {
+            "image_mode": "ocr_only", "vision_trigger": "required", "vision_level": "standard",
+        })
+        storage.update_ocr_feature_configuration(self.app, {"enabled": True})
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+
+        with patch("dashboard.blueprints.evaluation_workbench._start_worker_if_needed"):
+            response = self.app.test_client().post(
+                f"/api/evaluation-workbench/projects/{self.project['project_id']}/tasks",
+                json={"task_type": "evaluate_all"},
+            )
+
+        self.assertEqual(response.status_code, 202)
+        with patch("dashboard.evaluation_workbench.worker._evaluation_ocr_enabled", return_value=True), patch("dashboard.evaluation_workbench.worker._ocr_page_texts", return_value=(
+            [{"page": 1, "service": local_ocr_gateway.LOCAL_OCR_SERVICE, "text": "声明函内容"}], "",
+        )) as ocr_pages, patch("dashboard.evaluation_workbench.worker._run_visual_supplement") as visual, patch(
+            "dashboard.evaluation_workbench.worker.request_json",
+            return_value={"results": [{"rule_id": rule["rule_id"], "status": "ocr_required"}]},
+        ):
+            finished = self._run_next_task()
+
+        self.assertEqual(finished["status"], "success")
+        ocr_pages.assert_called()
+        visual.assert_not_called()
+
     def test_tencent_ocr_configuration_uses_hidden_credentials_and_conservative_monthly_limit(self):
         with patch.dict(os.environ, {"TENCENTCLOUD_SECRET_ID": "", "TENCENTCLOUD_SECRET_KEY": ""}, clear=False):
             configured = storage.update_ocr_configuration(self.app, {
@@ -2977,6 +3042,39 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         missing = worker._normalise_review_results([], [rules[0]])
         self.assertEqual(missing[0]["status"], "ocr_required")
+
+    def test_review_normalisation_keeps_text_partial_when_only_one_subfact_needs_ocr(self):
+        rule = {"rule_id": "coverage", "check_mode": "auto", "title": "技术服务逐项响应覆盖"}
+        output = [{
+            "rule_id": "coverage", "status": "partial", "risk_level": "medium",
+            "confidence": "high", "evidence_quality": "sufficient",
+            "evidence": "电力电缆规格与清单不匹配；认证证书复印件需 OCR 确认。",
+            "reason": "文字层已发现电缆规格串号；证书图像仍待 OCR 核验。",
+        }]
+
+        result = worker._normalise_review_results(output, [rule])[0]
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["risk_level"], "medium")
+        self.assertEqual(result["confidence"], "high")
+
+    def test_scope_rule_batch_prompt_keeps_multiple_distinct_representative_evidence(self):
+        prompt = worker._combined_batch_prompt(
+            self.app, "review", {"original_name": "投标.pdf", "bidder_name": "甲公司"},
+            [{"rule_id": "scope", "category": "other", "title": "项目范围无关内容核验",
+              "check_rule": "全文检查与本项目范围无关内容", "source_text": ""}],
+            "【项目范围偏离候选】不同施工对象。", compact=False,
+        )
+        normal_prompt = worker._combined_batch_prompt(
+            self.app, "review", {"original_name": "投标.pdf", "bidder_name": "甲公司"},
+            [{"rule_id": "license", "category": "qualification", "title": "营业执照",
+              "check_rule": "核验营业执照", "source_text": ""}],
+            "营业执照内容。", compact=False,
+        )
+
+        self.assertIn("最多四项不同类型的代表性原文", prompt)
+        self.assertIn("每类保留一条最有辨识度的原文短语", prompt)
+        self.assertNotIn("最多四项不同类型的代表性原文", normal_prompt)
 
     def test_review_normalisation_downgrades_unread_ocr_rule_instead_of_high_risk_failure(self):
         rules = [{"rule_id": "license", "check_mode": "ocr"}]

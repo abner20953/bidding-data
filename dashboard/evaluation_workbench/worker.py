@@ -2418,6 +2418,21 @@ def _is_explicit_ocr_gap(item: dict, rule: dict) -> bool:
     return any(term in text for term in ("ocr", "扫描件", "扫描图片", "图像识别", "图片识别"))
 
 
+def _implicit_ocr_is_only_pending_fact(item: dict) -> bool:
+    """非视觉规则提到 OCR 时，判断它是否只是其中一个待核验子事实。
+
+    大型逐项覆盖规则可同时包含文字可判的缺项和少量证照图片待核验；不能让后者
+    覆盖前者并把整条结论降为低风险。只有模型本身没有给出独立文字结论时，才把
+    非视觉规则隐式回落为 ocr_required。
+    """
+    status = str(item.get("status") or "").strip().lower()
+    if status in {"partial", "not_satisfied"}:
+        return False
+    if status == "not_found" and _clean_model_text(item.get("evidence")):
+        return False
+    return status in {"manual", "ocr_required", "not_found"}
+
+
 def _status_conflicts_with_positive_reason(status: str, reason: object) -> bool:
     """阻止模型把“符合/满足”的理由与“不满足”状态同时保存。"""
     if status != "not_satisfied":
@@ -2592,6 +2607,7 @@ def _normalise_review_results(output: object, rules: list[dict], tender_baseline
         # 不满足；模型若在理由中明确提出 OCR 缺口，也统一回落到待 OCR。
         if visual_rule or (
             status != "satisfied" and _is_explicit_ocr_gap(item, rule)
+            and _implicit_ocr_is_only_pending_fact(item)
         ):
             status = "ocr_required"
             if original_status != "ocr_required" and visual_rule:
@@ -3367,6 +3383,17 @@ def _combined_batch_prompt(app, component: str, document: dict, payload: list[di
         document_name=document["original_name"], bidder_name=document["bidder_name"] or "未填写", text=text,
         retry_note=retry_note,
     )
+    # 范围一致性规则需要同时呈现不同类型的偏离对象；不把该额外约束发送给其他
+    # 规则组，避免无关上下文和输出长度占用。模板本身可在提示词配置中维护。
+    if component == "review" and any(_is_scope_consistency_rule(item) for item in payload):
+        scope_guidance = storage.render_prompt_template(app, "evaluate_all_scope_anomaly_guidance")
+        prompt = (
+            "【项目范围偏离结果摘要原则】\n"
+            f"{scope_guidance}\n"
+            "本规则的 evidence 可保留最多四项不同类型的代表性原文，合计不超过300字；"
+            "其他规则仍遵守原有证据长度限制。\n\n"
+            + prompt
+        )
     # 价格事实由同一任务内的本地保守解析统一提供给符合性审查和客观评分；它位于
     # 可变尾部，不影响前面规则组与正文的既有提示词协议。
     if document.get("_shared_price_facts") and any(storage.is_price_rule(
@@ -4476,6 +4503,16 @@ def _rule_image_strategy(rule: dict) -> str:
     return "vision"
 
 
+def _rule_image_mode(rule: dict) -> str:
+    """读取人工选择的取证通道；旧规则安全保持自动策略。"""
+    try:
+        value = storage.rule_execution_meta(rule).get("image_mode")
+    except (TypeError, ValueError):
+        value = rule.get("image_mode")
+    mode = str(value or "auto")
+    return mode if mode in {"auto", "ocr_only", "vision_only", "combined", "off"} else "auto"
+
+
 def _ocr_service_candidates(rule: dict, level: str) -> list[str]:
     """按场景排列质量优先级；额度不足或接口不可用时自动顺延。"""
     text = f"{rule.get('title') or ''}\n{rule.get('check_rule') or ''}\n{rule.get('source_text') or ''}"
@@ -4576,9 +4613,9 @@ def _ocr_runtime_enabled(configuration: dict) -> bool:
     )
 
 
-def _evaluation_ocr_enabled(image_features_enabled: bool, configuration: dict) -> bool:
-    """评审中的 OCR 只受总开关和 OCR 运行环境控制，不依赖多模态模型档案。"""
-    return bool(image_features_enabled and _ocr_runtime_enabled(configuration))
+def _evaluation_ocr_enabled(ocr_features_enabled: bool, configuration: dict) -> bool:
+    """评审 OCR 只受自身总开关和运行环境控制，不依赖多模态模型档案。"""
+    return bool(ocr_features_enabled and _ocr_runtime_enabled(configuration))
 
 
 def _ocr_parser_version_for_service(service: str) -> int:
@@ -5207,6 +5244,7 @@ def _run_ocr_verification_after_vision(app, task: dict, document: dict, componen
             message = f"OCR 未形成可用文字复核（{failure[:120]}），图片结论保持不变。"
         return {
             **result,
+            "ocr_status": "ocr_failed",
             "ocr_verification_status": "unavailable",
             "ocr_verification_pages": [],
             "vision_message": "；".join(value for value in (existing_message, message) if value),
@@ -5232,6 +5270,7 @@ def _run_ocr_verification_after_vision(app, task: dict, document: dict, componen
         **result,
         "ocr_candidate_pages": checked_pages,
         "ocr_evidence_pages": updated_evidence_pages,
+        "ocr_status": "ocr_applied",
         "ocr_verification_status": "completed",
         "ocr_verification_pages": checked_pages,
         "ocr_visual_field_check": field_check,
@@ -6017,15 +6056,27 @@ def _append_evidence_layer(result: dict, *, source: str, summary: object, checke
 
 def _with_vision_execution(result: dict, status: str, pages: list[int], profile: dict, message: str,
                            *, evidence_pages: object | None = None) -> dict:
-    """记录图片流程本身的结果，区分实际检查页与真正形成证据的页。"""
+    """记录图片流程结果，并为新结果拆分 OCR 与多模态状态。
+
+    vision_status 继续保留为历史 API 字段；新增字段不会改变旧页面和外部调用的
+    取值，却能让界面准确说明本次到底执行了哪一种取证能力。
+    """
     unique_pages = _normalise_result_pages(pages)
     if evidence_pages is None:
         unique_evidence_pages = _normalise_result_pages(result.get("vision_evidence_pages"))
     else:
         unique_evidence_pages = _normalise_result_pages(evidence_pages)
+    ocr_status = str(result.get("ocr_status") or "not_requested")
+    multimodal_status = str(result.get("multimodal_status") or "not_requested")
+    if status.startswith("ocr_"):
+        ocr_status = status
+    else:
+        multimodal_status = status
     return {
         **result,
         "vision_status": status,
+        "ocr_status": ocr_status,
+        "multimodal_status": multimodal_status,
         "vision_pages": unique_pages,
         "vision_evidence_pages": unique_evidence_pages,
         "vision_model": str(profile.get("display_name") or profile.get("model_name") or ""),
@@ -6849,7 +6900,7 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
                        subjective_rules: list[dict], review_run: dict | None, objective_run: dict | None,
                        subjective_run: dict | None, project_scope: dict, system_prompt: str,
                        scan_units: int, groups_per_document: int, vision_profile: dict | None,
-                       image_features_enabled: bool, visual_units: int, progress: _EvaluationProgress) -> dict:
+                       ocr_features_enabled: bool, visual_units: int, progress: _EvaluationProgress) -> dict:
     """处理一份投标文件；不同投标人可并行，单份文件内仍严格顺序执行。"""
     bidder_name = document["bidder_name"] or document["original_name"]
     progress.message(f"正在综合评审：{bidder_name}")
@@ -7026,16 +7077,17 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
         ("objective", objective_rules, objective_run),
         ("subjective", subjective_rules, subjective_run),
     )
-    # 全系统图片/OCR 开关仍是总闸。它开启后，本地 OCR 不依赖多模态档案：腾讯关闭
-    # 或不可用时仍能完成纯文字 OCR；多模态档案只决定是否额外执行图片事实核验。
+    # OCR 与多模态是独立总开关：本地 OCR 不依赖多模态档案；腾讯关闭或不可用时
+    # 仍可完成纯文字 OCR；多模态档案只决定是否额外执行图片外观事实核验。
     ocr_configuration = storage.ocr_configuration(app)
-    ocr_enabled = _evaluation_ocr_enabled(image_features_enabled, ocr_configuration)
+    ocr_enabled = _evaluation_ocr_enabled(ocr_features_enabled, ocr_configuration)
     for component, component_rules, run in visual_components:
         for rule in component_rules:
             if rule["rule_id"] in reused_rule_ids[component]:
                 continue
             trigger, level = _rule_vision_policy(rule)
-            if trigger == "off" or level == "off":
+            image_mode = _rule_image_mode(rule)
+            if trigger == "off" or level == "off" or image_mode == "off":
                 continue
             base = completed_results[component].get(rule["rule_id"])
             if not base:
@@ -7044,8 +7096,13 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
             label = rule.get("title") or rule.get("check_rule")
             merged = base
             image_strategy = _rule_image_strategy(rule)
+            allow_ocr = image_mode in {"ocr_only", "combined"} or (
+                image_mode == "auto" and image_strategy in {"ocr", "hybrid"}
+            )
+            allow_vision = image_mode in {"vision_only", "combined"} or image_mode == "auto"
             vision_first = bool(
-                vision_profile and _prefer_vision_first(rule, component, merged, image_strategy, trigger)
+                allow_vision and vision_profile
+                and _prefer_vision_first(rule, component, merged, image_strategy, trigger)
             )
             if vision_first:
                 # 证照、证件等材料先由多模态确认“页面是否就是目标材料”，再只对已命中页
@@ -7054,13 +7111,13 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
                 progress.message(f"正在图片识别：{bidder_name} · {label}")
                 merged = _run_visual_supplement(app, task, document, component, rule, merged, vision_profile)
                 values["batch_count"] += 1
-                if ocr_enabled and _needs_post_vision_ocr_verification(rule, merged):
+                if ocr_enabled and allow_ocr and _needs_post_vision_ocr_verification(rule, merged):
                     progress.message(f"正在 OCR 复核关键页：{bidder_name} · {label}")
                     merged = _run_ocr_verification_after_vision(
                         app, task, document, component, rule, merged,
                     )
                     values["batch_count"] += 1
-                elif ocr_enabled and str(merged.get("vision_status") or "") in {"not_located", "failed", "uncovered"}:
+                elif ocr_enabled and allow_ocr and str(merged.get("vision_status") or "") in {"not_located", "failed", "uncovered"}:
                     # 视觉找页失败时回退到原 OCR 链路，不能因新增优化而降低材料覆盖率。
                     progress.message(f"图片未定位，回退 OCR：{bidder_name} · {label}")
                     merged = _run_ocr_supplement(
@@ -7068,7 +7125,7 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
                         locator_profile=vision_profile,
                     )
                     values["batch_count"] += 1
-            elif ocr_enabled and image_strategy in {"ocr", "hybrid"}:
+            elif ocr_enabled and allow_ocr:
                 progress.message(f"正在 OCR 识别：{bidder_name} · {label}")
                 merged = _run_ocr_supplement(
                     app, task, document, component, rule, merged, profile,
@@ -7076,7 +7133,8 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
                 )
                 values["batch_count"] += 1
             skip_note = "" if vision_first else _multimodal_skip_note(image_strategy, merged, rule, trigger)
-            if not vision_first and vision_profile and not skip_note and _should_run_multimodal_after_ocr(image_strategy, merged):
+            should_run_vision = image_mode == "combined" or _should_run_multimodal_after_ocr(image_strategy, merged)
+            if not vision_first and allow_vision and vision_profile and not skip_note and should_run_vision:
                 progress.message(f"正在图片识别：{bidder_name} · {label}")
                 merged = _run_visual_supplement(app, task, document, component, rule, merged, vision_profile)
                 values["batch_count"] += 1
@@ -7087,11 +7145,11 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
                     [page for page in merged.get("vision_pages") or []],
                     {"display_name": merged.get("vision_model") or ""}, skip_note,
                 )
-            elif not vision_first and image_strategy == "vision" and not vision_profile:
+            elif not vision_first and allow_vision and image_strategy == "vision" and not vision_profile:
                 merged = _with_vision_execution(
                     merged, "unavailable", [], {}, "本规则需要图片外观判断，但未获得可用的多模态模型。",
                 )
-            elif not vision_first and image_strategy == "hybrid" and not vision_profile:
+            elif not vision_first and allow_vision and image_strategy == "hybrid" and not vision_profile:
                 # 本地/Tencent OCR 已完成的文字事实必须保留；只说明未能继续核验签章、
                 # 外观等图片事实，不能把它回退为“完全未执行”。
                 existing_status = str(merged.get("vision_status") or "")
@@ -7105,9 +7163,12 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
                     merged = _with_vision_execution(
                         merged, "unavailable", [], {}, "本规则需要图片外观判断，但未获得可用的多模态模型。",
                     )
-            elif not vision_first and not ocr_enabled:
-                # 总开关关闭或两种 OCR 均不可用时，明确保留文字结论。
-                merged = _with_vision_execution(merged, "unavailable", [], {}, "本次未获得可用的多模态模型，未执行图片识别。")
+            elif not vision_first and image_mode == "ocr_only" and not ocr_enabled:
+                # 仅 OCR 是明确的人工选择；不能误报成多模态不可用。
+                merged = _with_vision_execution(merged, "ocr_failed", [], {}, "OCR 文字识别未启用或当前运行环境不可用，已保留文字结论。")
+            elif not vision_first and allow_vision and not vision_profile and not ocr_enabled:
+                # 两条图片能力均不可用时，明确保留文字结论。
+                merged = _with_vision_execution(merged, "unavailable", [], {}, "本次未获得可用的 OCR 或多模态模型，未执行图片取证。")
             completed_results[component][rule["rule_id"]] = merged
             if component == "review" and run:
                 storage.save_review_results(app, run["review_run_id"], document["document_id"], [merged])
@@ -7352,8 +7413,9 @@ def _evaluate_all(app, task: dict) -> dict:
     if not documents or any(item["parse_status"] != "success" or not item["parsed_path"] for item in documents):
         raise ValueError("请先成功解析全部投标文件")
     profile = storage.get_model_profile(app, task.get("payload", {}).get("profile_id"), "deepseek-v4-flash")
-    # 多模态档案仅服务于图片事实；本地 OCR 是否运行不再取决于它是否存在。
-    image_features_enabled = bool(storage.vision_configuration(app).get("enabled"))
+    # 两项图片能力独立读取：文字模型可在没有多模态档案时继续完成 OCR 取证。
+    vision_features_enabled = bool(storage.vision_configuration(app).get("enabled"))
+    ocr_features_enabled = bool(storage.ocr_feature_configuration(app).get("enabled"))
     vision_profile = storage.resolve_vision_model_profile(app, profile)
     char_limit = _prompt_char_limit(profile, 260_000, 600_000)
     review_run = storage.create_review_run(app, task["project_id"], task["task_id"], profile["profile_id"]) if review_rules else None
@@ -7385,7 +7447,7 @@ def _evaluate_all(app, task: dict) -> dict:
     visual_rule_count = sum(
         1 for item in (review_rules + local_objective_rules + subjective_rules)
         if _rule_vision_policy(item)[0] != "off" and _rule_vision_policy(item)[1] != "off"
-    ) if image_features_enabled else 0
+    ) if (vision_features_enabled or ocr_features_enabled) else 0
     scan_units_by_document = {
         item["document_id"]: _full_scan_chunk_count(item) if has_local_rules else 0
         for item in documents
@@ -7410,7 +7472,7 @@ def _evaluate_all(app, task: dict) -> dict:
             subjective_rules=subjective_rules, review_run=review_run, objective_run=objective_run,
             subjective_run=subjective_run, project_scope=project_scope, system_prompt=system_prompt,
             scan_units=scan_units_by_document[document["document_id"]], groups_per_document=groups_per_document,
-            vision_profile=vision_profile, image_features_enabled=image_features_enabled,
+            vision_profile=vision_profile, ocr_features_enabled=ocr_features_enabled,
             visual_units=visual_rule_count, progress=progress,
         )
 

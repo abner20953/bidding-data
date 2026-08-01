@@ -29,6 +29,9 @@ MAX_UPLOAD_MB = max(1, int(os.environ.get("EVALUATION_WORKBENCH_MAX_UPLOAD_MB", 
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 GLOBAL_RULE_CATEGORIES = {"qualification", "compliance", "substantive", "other"}
 VISION_ENABLED_SETTING = "evaluation_workbench_vision_enabled"
+# OCR 与多模态图片识别是两项独立能力。保留旧的 VISION_ENABLED_SETTING
+# 仅表示“是否允许发送图片给多模态模型”，避免文字模型也被迫具备图片能力。
+OCR_ENABLED_SETTING = "evaluation_workbench_ocr_enabled"
 DEFAULT_VISION_MODEL_SETTING = "default_vision_model_profile_id"
 TENCENT_OCR_CONFIGURATION_SETTING = "evaluation_workbench_tencent_ocr_configuration"
 TENCENT_OCR_SERVICES = {
@@ -456,6 +459,8 @@ def init_database(app) -> None:
                 reason TEXT NOT NULL DEFAULT '',
                 risk_level TEXT NOT NULL DEFAULT 'medium',
                 vision_status TEXT NOT NULL DEFAULT 'not_requested',
+                ocr_status TEXT NOT NULL DEFAULT 'not_requested',
+                multimodal_status TEXT NOT NULL DEFAULT 'not_requested',
                 vision_pages_json TEXT NOT NULL DEFAULT '[]',
                 vision_evidence_pages_json TEXT NOT NULL DEFAULT '[]',
                 evidence_layers_json TEXT NOT NULL DEFAULT '[]',
@@ -487,6 +492,8 @@ def init_database(app) -> None:
                 reason TEXT NOT NULL DEFAULT '',
                 confidence TEXT,
                 vision_status TEXT NOT NULL DEFAULT 'not_requested',
+                ocr_status TEXT NOT NULL DEFAULT 'not_requested',
+                multimodal_status TEXT NOT NULL DEFAULT 'not_requested',
                 vision_pages_json TEXT NOT NULL DEFAULT '[]',
                 vision_evidence_pages_json TEXT NOT NULL DEFAULT '[]',
                 evidence_layers_json TEXT NOT NULL DEFAULT '[]',
@@ -535,6 +542,8 @@ def init_database(app) -> None:
         _ensure_column(conn, "ew_review_results", "requires_review", "INTEGER NOT NULL DEFAULT 1")
         _ensure_column(conn, "ew_review_results", "review_reason", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "ew_review_results", "vision_status", "TEXT NOT NULL DEFAULT 'not_requested'")
+        _ensure_column(conn, "ew_review_results", "ocr_status", "TEXT NOT NULL DEFAULT 'not_requested'")
+        _ensure_column(conn, "ew_review_results", "multimodal_status", "TEXT NOT NULL DEFAULT 'not_requested'")
         _ensure_column(conn, "ew_review_results", "vision_pages_json", "TEXT NOT NULL DEFAULT '[]'")
         _ensure_column(conn, "ew_review_results", "vision_evidence_pages_json", "TEXT NOT NULL DEFAULT '[]'")
         _ensure_column(conn, "ew_review_results", "evidence_layers_json", "TEXT NOT NULL DEFAULT '[]'")
@@ -545,6 +554,8 @@ def init_database(app) -> None:
         _ensure_column(conn, "ew_score_results", "requires_review", "INTEGER NOT NULL DEFAULT 1")
         _ensure_column(conn, "ew_score_results", "review_reason", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "ew_score_results", "vision_status", "TEXT NOT NULL DEFAULT 'not_requested'")
+        _ensure_column(conn, "ew_score_results", "ocr_status", "TEXT NOT NULL DEFAULT 'not_requested'")
+        _ensure_column(conn, "ew_score_results", "multimodal_status", "TEXT NOT NULL DEFAULT 'not_requested'")
         _ensure_column(conn, "ew_score_results", "vision_pages_json", "TEXT NOT NULL DEFAULT '[]'")
         _ensure_column(conn, "ew_score_results", "vision_evidence_pages_json", "TEXT NOT NULL DEFAULT '[]'")
         _ensure_column(conn, "ew_score_results", "evidence_layers_json", "TEXT NOT NULL DEFAULT '[]'")
@@ -563,6 +574,7 @@ def init_database(app) -> None:
         conn.execute("UPDATE ew_rules SET check_rule = title WHERE check_rule IS NULL OR check_rule = ''")
         conn.execute("UPDATE ew_rules SET source_type = CASE WHEN rule_set_id IN (SELECT rule_set_id FROM ew_rule_sets WHERE source_task_id IS NOT NULL) THEN 'ai' ELSE 'manual' END WHERE source_type IS NULL OR source_type = ''")
         _migrate_known_legacy_prompt_override(conn)
+        _seed_ocr_feature_setting(conn)
         _seed_default_profiles(conn)
         _seed_default_model_setting(conn)
     app.extensions["evaluation_workbench_database"] = marker
@@ -645,6 +657,20 @@ def _seed_default_model_setting(conn: sqlite3.Connection) -> None:
             "INSERT INTO ew_settings(setting_key, setting_value, updated_at) VALUES ('default_model_profile_id', ?, ?)",
             (row["profile_id"], now_iso()),
         )
+
+
+def _seed_ocr_feature_setting(conn: sqlite3.Connection) -> None:
+    """首次升级时继承旧图片总开关，之后 OCR 与多模态独立维护。"""
+    if conn.execute("SELECT 1 FROM ew_settings WHERE setting_key=?", (OCR_ENABLED_SETTING,)).fetchone():
+        return
+    legacy = conn.execute(
+        "SELECT setting_value FROM ew_settings WHERE setting_key=?", (VISION_ENABLED_SETTING,)
+    ).fetchone()
+    inherited = "1" if legacy and str(legacy["setting_value"]) == "1" else "0"
+    conn.execute(
+        "INSERT INTO ew_settings(setting_key, setting_value, updated_at) VALUES (?, ?, ?)",
+        (OCR_ENABLED_SETTING, inherited, now_iso()),
+    )
 
 
 def project_dir(app, project_id: str) -> Path:
@@ -783,11 +809,39 @@ def ocr_configuration(app) -> dict:
         # enabled 保留给既有前端/API 调用方；tencent_enabled 是当前更明确的语义字段。
         "enabled": tencent_enabled,
         "tencent_enabled": tencent_enabled,
+        "ocr_enabled": ocr_feature_configuration(app)["enabled"],
         "region": str(raw.get("region") or "ap-guangzhou"),
         "credentials_configured": (manual_id and manual_key) or env_ready,
         "credentials_source": "manual" if manual_id and manual_key else "environment" if env_ready else "none",
         "month_key": month_key, "services": values, "local": local,
     }
+
+
+def ocr_feature_configuration(app) -> dict:
+    """读取评审流程是否允许 OCR 文字取证。
+
+    这是独立于腾讯云开关和多模态模型的总开关：关闭腾讯云时可继续使用
+    RapidOCR，关闭多模态时也可继续使用 OCR。旧部署首次初始化时会继承当时
+    的图片功能状态，避免升级后意外改变既有项目行为。
+    """
+    with connection(app) as conn:
+        row = conn.execute(
+            "SELECT setting_value FROM ew_settings WHERE setting_key=?", (OCR_ENABLED_SETTING,)
+        ).fetchone()
+    return {"enabled": str(row["setting_value"] if row else "0") == "1"}
+
+
+def update_ocr_feature_configuration(app, payload: dict) -> dict:
+    enabled = payload.get("enabled")
+    if not isinstance(enabled, bool):
+        raise ValueError("OCR 文字识别总开关必须为布尔值")
+    with connection(app) as conn:
+        conn.execute(
+            "INSERT INTO ew_settings(setting_key, setting_value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value, updated_at=excluded.updated_at",
+            (OCR_ENABLED_SETTING, "1" if enabled else "0", now_iso()),
+        )
+    return ocr_feature_configuration(app)
 
 
 def update_ocr_configuration(app, payload: dict) -> dict:
@@ -1155,6 +1209,7 @@ def task_input_fingerprint(app, project_id: str, task_type: str, profile_id: str
     rule_set = current_rule_set(app, project_id)
     profile = get_model_profile(app, profile_id, "deepseek-v4-flash")
     vision_profile = resolve_vision_model_profile(app, profile) if task_type == "evaluate_all" else None
+    ocr_config = ocr_configuration(app) if task_type == "evaluate_all" else {}
     relevant_roles = {
         "compare_documents": {"tender", "bid"},
         "extract_rules": {"tender", "tender_attachment"},
@@ -1175,6 +1230,15 @@ def task_input_fingerprint(app, project_id: str, task_type: str, profile_id: str
         "profile": (profile.get("profile_id"), profile.get("model_name"), profile.get("base_url"), profile.get("updated_at"), profile.get("json_mode"), profile.get("thinking_mode")),
         # 共同删改的分段伪删除校验与编辑簇降权改变了查重结论，不能复用旧版本结果。
         "comparison_version": "cross-bid-signals-v4" if task_type == "compare_documents" else None,
+        "ocr_feature_configuration": ocr_feature_configuration(app) if task_type == "evaluate_all" else None,
+        # 仅记录会改变实际取证路径的公开配置，不记录凭据或随每次调用变化的额度余额。
+        "ocr_execution_configuration": {
+            "tencent_enabled": bool(ocr_config.get("tencent_enabled")),
+            "region": str(ocr_config.get("region") or ""),
+            "services": sorted((item.get("service"), bool(item.get("enabled")), int(item.get("monthly_limit") or 0))
+                               for item in ocr_config.get("services", []) if isinstance(item, dict)),
+            "local_runtime_available": bool((ocr_config.get("local") or {}).get("runtime_available")),
+        } if task_type == "evaluate_all" else None,
         "vision_configuration": vision_configuration(app) if task_type == "evaluate_all" else None,
         "vision_profile": (vision_profile.get("profile_id"), vision_profile.get("model_name"), vision_profile.get("base_url"), vision_profile.get("updated_at")) if vision_profile else None,
         "prompt_templates": task_prompt_template_fingerprint(app, task_type),
@@ -2166,6 +2230,9 @@ _RULE_EXECUTION_STRATEGIES = {"point", "counting", "section", "consistency", "cr
 _RULE_EVIDENCE_TYPES = {"text", "visual", "cross_bid", "external"}
 _VISION_TRIGGERS = {"off", "text_fallback", "required"}
 _VISION_LEVELS = {"off", "low", "standard", "high"}
+# image_mode 仅控制图片取证通道；保持 vision_trigger / vision_level 的旧字段，
+# 使已有 API、历史规则与外部调用方无需迁移即可继续工作。
+_IMAGE_MODES = {"auto", "ocr_only", "vision_only", "combined", "off"}
 
 
 def rule_execution_meta(rule: dict) -> dict:
@@ -2192,12 +2259,16 @@ def rule_execution_meta(rule: dict) -> dict:
     level = str(value.get("vision_level") or "")
     if level not in _VISION_LEVELS:
         level = "off"
+    image_mode = str(value.get("image_mode") or "auto")
+    if image_mode not in _IMAGE_MODES:
+        image_mode = "auto"
     return {
         "execution_strategy": strategy if strategy in _RULE_EXECUTION_STRATEGIES else "",
         "evidence_requirements": list(dict.fromkeys(requirements)),
         "applicability": applicability,
         "vision_trigger": trigger,
         "vision_level": level,
+        "image_mode": image_mode,
     }
 
 
@@ -2231,11 +2302,17 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
             "text_fallback" if "text" in normalized else "required"
         )
     level = str(payload.get("vision_level", base["vision_level"]) or "off")
+    image_mode = str(payload.get("image_mode", base["image_mode"]) or "auto")
     if trigger not in _VISION_TRIGGERS:
         raise ValueError("图片识别条件不正确")
     if level not in _VISION_LEVELS:
         raise ValueError("图片识别强度不正确")
+    if image_mode not in _IMAGE_MODES:
+        raise ValueError("图片取证方式不正确")
     if trigger == "off":
+        level = "off"
+    if image_mode == "off":
+        trigger = "off"
         level = "off"
     value = {
         "execution_strategy": strategy if strategy in _RULE_EXECUTION_STRATEGIES else "",
@@ -2243,6 +2320,7 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
         "applicability": applicability,
         "vision_trigger": trigger,
         "vision_level": level,
+        "image_mode": image_mode,
     }
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
@@ -2585,6 +2663,23 @@ def _vision_evidence_pages_json(item: dict) -> str:
     return _pages_json(item, "vision_evidence_pages", "vision_evidence_pages_json")
 
 
+def _ocr_status_value(item: dict) -> str:
+    """新增字段；没有它的历史结果仍可从旧 vision_status 推断 OCR 状态。"""
+    value = str(item.get("ocr_status") or "")
+    if value:
+        return value
+    legacy = str(item.get("vision_status") or "")
+    return legacy if legacy.startswith("ocr_") else "not_requested"
+
+
+def _multimodal_status_value(item: dict) -> str:
+    value = str(item.get("multimodal_status") or "")
+    if value:
+        return value
+    legacy = str(item.get("vision_status") or "")
+    return "not_requested" if legacy.startswith("ocr_") else legacy
+
+
 def _evidence_layers_json(item: dict) -> str:
     """持久化可展示的证据层；异常输入退化为空数组，不能影响评审主流程。"""
     values = item.get("evidence_layers")
@@ -2629,6 +2724,8 @@ def _public_vision_result(value: dict) -> dict:
 
     value["vision_pages"] = public_pages("vision_pages_json")
     value["vision_evidence_pages"] = public_pages("vision_evidence_pages_json")
+    value["ocr_status"] = _ocr_status_value(value)
+    value["multimodal_status"] = _multimodal_status_value(value)
     raw_layers = value.pop("evidence_layers_json", "[]")
     try:
         layers = json.loads(raw_layers or "[]")
@@ -2645,13 +2742,14 @@ def save_review_results(app, review_run_id: str, document_id: str, results: list
             conn.execute(
                 """INSERT INTO ew_review_results(review_result_id, review_run_id, document_id, rule_id, status, evidence, page_hint, reason, risk_level,
                    confidence, evidence_quality, automation_status, requires_review, review_reason,
-                   vision_status, vision_pages_json, vision_evidence_pages_json, evidence_layers_json, vision_model, vision_message, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   vision_status, ocr_status, multimodal_status, vision_pages_json, vision_evidence_pages_json, evidence_layers_json, vision_model, vision_message, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(review_run_id, document_id, rule_id) DO UPDATE SET
                 status=excluded.status, evidence=excluded.evidence, page_hint=excluded.page_hint, reason=excluded.reason,
                 risk_level=excluded.risk_level, confidence=excluded.confidence, evidence_quality=excluded.evidence_quality,
                 automation_status=excluded.automation_status, requires_review=excluded.requires_review,
                 review_reason=excluded.review_reason, vision_status=excluded.vision_status,
+                ocr_status=excluded.ocr_status, multimodal_status=excluded.multimodal_status,
                 vision_pages_json=excluded.vision_pages_json, vision_evidence_pages_json=excluded.vision_evidence_pages_json,
                 evidence_layers_json=excluded.evidence_layers_json, vision_model=excluded.vision_model,
                 vision_message=excluded.vision_message, final_status=NULL, confirmed_at=NULL, created_at=excluded.created_at""",
@@ -2659,7 +2757,8 @@ def save_review_results(app, review_run_id: str, document_id: str, results: list
                  item.get("page_hint"), item.get("reason", ""), item.get("risk_level", "medium"), item.get("confidence", "medium"),
                  item.get("evidence_quality", "limited"), item.get("automation_status", "needs_review"),
                  1 if item.get("requires_review", True) else 0, item.get("review_reason", ""),
-                 item.get("vision_status", "not_requested"), _vision_pages_json(item), _vision_evidence_pages_json(item), _evidence_layers_json(item),
+                 item.get("vision_status", "not_requested"), _ocr_status_value(item), _multimodal_status_value(item),
+                 _vision_pages_json(item), _vision_evidence_pages_json(item), _evidence_layers_json(item),
                  item.get("vision_model", ""), item.get("vision_message", ""), timestamp),
             )
 
@@ -2758,7 +2857,7 @@ def reusable_evaluation_document_results(app, project_id: str, rule_set_id: str,
                         break
                     rows = conn.execute(
                         """SELECT rule_id, status, evidence, page_hint, reason, risk_level, confidence, evidence_quality,
-                           automation_status, requires_review, review_reason, vision_status, vision_pages_json,
+                           automation_status, requires_review, review_reason, vision_status, ocr_status, multimodal_status, vision_pages_json,
                            vision_evidence_pages_json, evidence_layers_json,
                            vision_model, vision_message FROM ew_review_results
                            WHERE review_run_id=? AND document_id=?""",
@@ -2774,7 +2873,7 @@ def reusable_evaluation_document_results(app, project_id: str, rule_set_id: str,
                         break
                     rows = conn.execute(
                         """SELECT rule_id, suggested_score, effective_score, max_score, evidence, reason, confidence,
-                           automation_status, requires_review, review_reason, vision_status, vision_pages_json,
+                           automation_status, requires_review, review_reason, vision_status, ocr_status, multimodal_status, vision_pages_json,
                            vision_evidence_pages_json, evidence_layers_json,
                            vision_model, vision_message FROM ew_score_results
                            WHERE score_run_id=? AND document_id=?""",
@@ -2839,20 +2938,22 @@ def save_score_results(app, score_run_id: str, document_id: str, results: list[d
             conn.execute(
                 """INSERT INTO ew_score_results(score_result_id, score_run_id, document_id, rule_id, suggested_score, final_score, effective_score, max_score,
                    evidence, reason, confidence, automation_status, requires_review, review_reason,
-                   vision_status, vision_pages_json, vision_evidence_pages_json, evidence_layers_json, vision_model, vision_message, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   vision_status, ocr_status, multimodal_status, vision_pages_json, vision_evidence_pages_json, evidence_layers_json, vision_model, vision_message, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(score_run_id, document_id, rule_id) DO UPDATE SET
                 suggested_score=excluded.suggested_score, final_score=excluded.final_score, effective_score=excluded.effective_score,
                 max_score=excluded.max_score, evidence=excluded.evidence, reason=excluded.reason, confidence=excluded.confidence,
                 automation_status=excluded.automation_status, requires_review=excluded.requires_review,
                 review_reason=excluded.review_reason, vision_status=excluded.vision_status,
+                ocr_status=excluded.ocr_status, multimodal_status=excluded.multimodal_status,
                 vision_pages_json=excluded.vision_pages_json, vision_evidence_pages_json=excluded.vision_evidence_pages_json,
                 evidence_layers_json=excluded.evidence_layers_json, vision_model=excluded.vision_model,
                 vision_message=excluded.vision_message, updated_at=excluded.updated_at""",
                 (str(uuid.uuid4()), score_run_id, document_id, item["rule_id"], item.get("suggested_score"), item.get("final_score"),
                  item.get("effective_score"), item.get("max_score"), item.get("evidence", ""), item.get("reason", ""), item.get("confidence"),
                  item.get("automation_status", "needs_review"), 1 if item.get("requires_review", True) else 0,
-                 item.get("review_reason", ""), item.get("vision_status", "not_requested"), _vision_pages_json(item), _vision_evidence_pages_json(item), _evidence_layers_json(item),
+                 item.get("review_reason", ""), item.get("vision_status", "not_requested"), _ocr_status_value(item), _multimodal_status_value(item),
+                 _vision_pages_json(item), _vision_evidence_pages_json(item), _evidence_layers_json(item),
                  item.get("vision_model", ""), item.get("vision_message", ""), timestamp, timestamp),
             )
 
