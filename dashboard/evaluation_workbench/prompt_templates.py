@@ -323,6 +323,10 @@ PROMPT_TEMPLATES["evaluate_all_review_user"]["content"] += (
     "表格分区标题和相似设备不得误作缺项或替代证据；大段复述只有替代自主方案时才判照抄。"
     "status、风险与理由必须相互一致。"
 )
+PROMPT_TEMPLATES["evaluate_all_review_user"]["content"] += (
+    " 若输入附有‘机器可读文本覆盖不足’提示，文本未命中不能作为材料缺失或规则满足依据；"
+    "除非本轮证据包已包含实际 OCR/图片识别的直接事实，否则返回 ocr_required、low 风险和 missing 证据。"
+)
 PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += (
     " 评分表跨页时，下一页以“（X分）、……”开头的文字通常是上一页评分项的续行：必须与上一页标题、"
     "全部子项和扣分逻辑合并为同一规则，不得另起通用的“服务/应急方案”等错误规则。"
@@ -332,9 +336,17 @@ PROMPT_TEMPLATES["evaluate_all_objective_user"]["content"] += (
     "该项目可计分；只有本规则要求的合同首页、金额、签章、明细等要件均被本次证据覆盖时才计入已确认数量。"
     "若仅补看部分页面，只报告已确认和未确认项目，不得在理由中给出与 suggested_score 不一致的最终总分。"
 )
+PROMPT_TEMPLATES["evaluate_all_objective_user"]["content"] += (
+    " 若输入附有‘机器可读文本覆盖不足’提示，不能把文本未命中直接计为0分或满分；"
+    "应设置 needs_ocr=true、suggested_score=null，并说明待核验的材料要件。"
+)
 PROMPT_TEMPLATES["evaluate_all_subjective_user"]["content"] += (
     " 非满分时，calculation 必须至少写明一项可定位的具体缺项、缺陷、档位差距或扣分依据；"
     "不得仅以‘内容一般’‘不够详细’‘有待完善’等空泛表述作为扣分理由。"
+)
+PROMPT_TEMPLATES["evaluate_all_subjective_user"]["content"] += (
+    " 若输入附有‘机器可读文本覆盖不足’提示，未见方案文字不等于方案缺失；"
+    "应设置 needs_ocr=true、suggested_score=null，待 OCR 或图片识别取得实际方案内容后再建议评分。"
 )
 PROMPT_TEMPLATES["evaluate_all_cross_bid_price_user"]["content"] += (
     "\n\n报价分为暂定建议：报价口径可识别时应输出 quoted_price；不得自行改变招标公式或提前认定资格"

@@ -3383,6 +3383,13 @@ def _combined_batch_prompt(app, component: str, document: dict, payload: list[di
         document_name=document["original_name"], bidder_name=document["bidder_name"] or "未填写", text=text,
         retry_note=retry_note,
     )
+    if _document_text_coverage_status(document) == "uncovered":
+        # 将扫描件边界直接告诉模型；后端仍有独立守卫，二者互为校验，避免模型把
+        # “全文未命中”误写成“未提供”或“满足”。
+        prompt += (
+            "\n\n【机器可读文本覆盖不足】本文件大部分页面可能为扫描件，当前文本包未覆盖整份材料。"
+            "文本未命中不等于材料缺失，也不等于规则满足；未含实际 OCR/图片证据时须按提示词返回待 OCR 结论。"
+        )
     # 范围一致性规则需要同时呈现不同类型的偏离对象；不把该额外约束发送给其他
     # 规则组，避免无关上下文和输出长度占用。模板本身可在提示词配置中维护。
     if component == "review" and any(_is_scope_consistency_rule(item) for item in payload):
@@ -5043,11 +5050,11 @@ def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: d
     values, failure = _ocr_page_texts(app, task, document, rule, working_result, level)
     if not values:
         status = "ocr_quota_exhausted" if "额度" in failure else "ocr_not_located" if "定位" in failure else "ocr_failed"
-        return _with_vision_execution(working_result, status, [], {}, failure or "OCR 未获得可用文字，已保留原文字结论。")
+        return _set_result_coverage(_with_vision_execution(working_result, status, [], {}, failure or "OCR 未获得可用文字，已保留原文字结论。"), "uncovered")
     pages = [int(value["page"]) for value in values]
     ocr_text = _pack_ocr_page_texts(values, rule=rule)
     if not ocr_text.strip():
-        return _with_vision_execution(working_result, "ocr_failed", pages, {}, "OCR 未识别到可用文字，已保留原文字结论。")
+        return _set_result_coverage(_with_vision_execution(working_result, "ocr_failed", pages, {}, "OCR 未识别到可用文字，已保留原文字结论。"), "uncovered")
     service_labels = "、".join(dict.fromkeys(_ocr_service_label(str(value.get("service") or "")) for value in values))
     local_only = bool(values) and all(str(value.get("service") or "") == LOCAL_OCR_SERVICE for value in values)
     prompt = storage.render_prompt_template(
@@ -5078,12 +5085,12 @@ def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: d
             if component == "objective"
             else f"{service_labels} 已识别文字并附入证据；OCR结论规范化失败，已保留原结论。"
         )
-        return _with_vision_execution(fallback, "ocr_applied_partial", pages, {}, message)
+        return _set_result_coverage(_with_vision_execution(fallback, "ocr_applied_partial", pages, {}, message), "partial")
     if not isinstance(parsed, dict) or _ocr_response_coverage(parsed) != "covered":
         fallback = _with_ocr_fallback_evidence(
             working_result, component, service_labels, pages, ocr_text, uncovered=True,
         )
-        return _with_vision_execution(fallback, "ocr_uncovered", pages, {}, f"{service_labels} 已识别候选页，但未覆盖可形成结论的关键文字，已保留原结论。")
+        return _set_result_coverage(_with_vision_execution(fallback, "ocr_uncovered", pages, {}, f"{service_labels} 已识别候选页，但未覆盖可形成结论的关键文字，已保留原结论。"), "uncovered")
     scope = _ocr_response_scope(parsed)
     if incomplete_pages:
         # 单页本地推理异常不能被其他页的正面文字“掩盖”；视觉模型仍可在下一步补看。
@@ -5150,7 +5157,7 @@ def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: d
         evidence_pages=evidence_pages, service=service_labels,
     )
     return _with_vision_execution(
-        merged, status, pages, {"display_name": service_labels},
+        _set_result_coverage(merged, "covered" if scope == "full" else "partial"), status, pages, {"display_name": service_labels},
         f"{service_labels} 已识别候选页并{'采纳到规则结论' if scope == 'full' else '补充部分文字事实'}"
         + (f"；{failure}" if incomplete_pages else "。"),
         evidence_pages=evidence_pages,
@@ -5302,6 +5309,61 @@ def _needs_visual_fallback(component: str, result: dict) -> bool:
     if component == "review":
         return result.get("status") in {"ocr_required", "manual", "not_found", "partial"} or result.get("evidence_quality") != "sufficient"
     return result.get("suggested_score") is None or result.get("confidence") != "high" or "OCR" in str(result.get("reason") or "")
+
+
+_SPARSE_TEXT_CHARS_PER_PAGE = 80
+
+
+def _document_text_coverage_status(document: dict) -> str:
+    """判断电子文件的机器可读文本是否足以单独支撑结论。
+
+    这是文件质量门槛，不涉及项目、行业、材料名称或模型。PDF 大量为扫描页时，
+    仅靠文本层“未命中”既不能推导材料缺失，也不能推导规则满足。
+    """
+    try:
+        pages = int(document.get("page_count") or 0)
+        text_length = int(document.get("text_length") or 0)
+    except (TypeError, ValueError):
+        return "covered"
+    if pages >= 3 and text_length / max(1, pages) < _SPARSE_TEXT_CHARS_PER_PAGE:
+        return "uncovered"
+    return "covered"
+
+
+def _set_result_coverage(result: dict, status: str) -> dict:
+    """统一保存规则级证据覆盖状态，避免 OCR/图片层各自解释同一语义。"""
+    if status not in {"covered", "partial", "uncovered"}:
+        status = "partial"
+    return {**result, "coverage_status": status}
+
+
+def _apply_document_evidence_guard(document: dict, component: str, rule: dict, result: dict) -> dict:
+    """对扫描型文件禁止用“未覆盖”替代“材料缺失”或“规则满足”。
+
+    OCR/图片层已明确完整覆盖该规则时允许正常结论；否则审查项回落为待 OCR，
+    评分项不保留任何暂定分。该守卫在文字初评、OCR 失败及图片补充后均可重复调用。
+    """
+    if _document_text_coverage_status(document) != "uncovered":
+        return _set_result_coverage(result, str(result.get("coverage_status") or "covered"))
+    if str(result.get("coverage_status") or "") == "covered":
+        return result
+    title = str(rule.get("title") or rule.get("check_rule") or "该规则")[:80]
+    note = f"文件机器可读文本覆盖不足，尚未通过 OCR 或图片识别完整核验“{title}”；未覆盖不等同于材料缺失或规则满足。"
+    if component == "review":
+        return {
+            **_set_result_coverage(result, "uncovered"),
+            "status": "ocr_required", "risk_level": "low", "confidence": "low", "evidence_quality": "missing",
+            "requires_review": True, "automation_status": "needs_review",
+            "review_reason": "扫描型文件尚未形成该规则的完整证据覆盖，需 OCR 或图片识别后复核。",
+            "reason": note,
+        }
+    return {
+        **_set_result_coverage(result, "uncovered"),
+        "suggested_score": None, "effective_score": None, "confidence": "low",
+        "requires_review": True, "automation_status": "needs_review",
+        "review_reason": "扫描型文件尚未形成该评分规则的完整证据覆盖，暂不建议计分。",
+        "reason": note,
+    }
 
 
 def _should_run_multimodal_after_ocr(strategy: str, result: dict) -> bool:
@@ -6184,10 +6246,10 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
     # 混入最终理由。原有文字结论和“需 OCR”提示会完整保留。
     if not parsed:
         page_text = "、".join(f"P{page}" for page in attempted_pages)
-        return _with_vision_execution(
+        return _set_result_coverage(_with_vision_execution(
             result, "uncovered", attempted_pages, vision_profile,
             f"已检查{page_text or '候选页'}，但尚未覆盖可形成结论的关键材料，已保留文字结论。",
-        )
+        ), "uncovered")
     conflict_level = _visual_response_conflict_level(parsed)
     # 仅 material（影响合规/计分的实质字段冲突）才升级为 conflict 状态并冻结结论；
     # possible 是一般疑似线索，保留图片补充成果，仅以文字形式提示人工留意，
@@ -6268,7 +6330,7 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
             evidence_pages=visual_evidence_pages, model=str(vision_profile.get("display_name") or vision_profile.get("model_name") or ""),
         )
         return _with_vision_execution(
-            merged, vision_status, attempted_pages, vision_profile, vision_message,
+            _set_result_coverage(merged, "covered" if conclusion_scope == "full" else "partial"), vision_status, attempted_pages, vision_profile, vision_message,
             evidence_pages=all_evidence_pages,
         )
     max_score = float(_rule_scoring(rule).get("max_score") or result.get("max_score") or 0)
@@ -6310,7 +6372,7 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
         evidence_pages=visual_evidence_pages, model=str(vision_profile.get("display_name") or vision_profile.get("model_name") or ""),
     )
     return _with_vision_execution(
-        merged, vision_status, attempted_pages, vision_profile, vision_message,
+        _set_result_coverage(merged, "covered" if conclusion_scope == "full" else "partial"), vision_status, attempted_pages, vision_profile, vision_message,
         evidence_pages=all_evidence_pages,
     )
 
@@ -6904,7 +6966,12 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
     """处理一份投标文件；不同投标人可并行，单份文件内仍严格顺序执行。"""
     bidder_name = document["bidder_name"] or document["original_name"]
     progress.message(f"正在综合评审：{bidder_name}")
-    reusable = None if (task.get("payload", {}).get("force_rerun") or task.get("payload", {}).get("retry_failed_task_id")) else storage.reusable_evaluation_document_results(
+    # 扫描型文件需要重新应用当前 OCR/图片覆盖策略；不得复用早期仅凭稀疏文本得出的结论。
+    reusable = None if (
+        task.get("payload", {}).get("force_rerun")
+        or task.get("payload", {}).get("retry_failed_task_id")
+        or _document_text_coverage_status(document) == "uncovered"
+    ) else storage.reusable_evaluation_document_results(
         app, task["project_id"], rule_set["rule_set_id"], profile["profile_id"], document["document_id"], expected_rule_ids,
         task.get("payload", {}).get("input_fingerprint"), PROMPT_VERSION,
     )
@@ -7011,6 +7078,7 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
     components = component_specs
     for component, component_rules, run in components:
         component_rules = [rule for rule in component_rules if rule["rule_id"] not in reused_rule_ids[component]]
+        rules_by_id = {str(rule["rule_id"]): rule for rule in component_rules}
         # 长文件已有全文扫描索引时，按重合证据页重组规则，减少不同组重复携带同一页。
         groups = _evaluation_rule_batches(component, component_rules, scan_index=scan_index)
         def run_group(group_index: int, group: list[dict]):
@@ -7048,6 +7116,10 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
             # 将全文扫描阶段已定位的页码保留给后续图片识别；此字段只在本次任务内流转，
             # 不改变既有评审结果的存储结构或对外 API。
             results = _with_scan_visual_candidates(results, scan_index, document)
+            results = [
+                _apply_document_evidence_guard(document, component, rules_by_id[str(item["rule_id"])], item)
+                for item in results if str(item.get("rule_id") or "") in rules_by_id
+            ]
             # 每个规则组成功后立即持久化；后续组异常时，页面仍能获得已完成部分。
             if component == "review" and run:
                 storage.save_review_results(app, run["review_run_id"], document["document_id"], results)
@@ -7169,6 +7241,7 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
             elif not vision_first and allow_vision and not vision_profile and not ocr_enabled:
                 # 两条图片能力均不可用时，明确保留文字结论。
                 merged = _with_vision_execution(merged, "unavailable", [], {}, "本次未获得可用的 OCR 或多模态模型，未执行图片取证。")
+            merged = _apply_document_evidence_guard(document, component, rule, merged)
             completed_results[component][rule["rule_id"]] = merged
             if component == "review" and run:
                 storage.save_review_results(app, run["review_run_id"], document["document_id"], [merged])

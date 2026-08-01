@@ -171,7 +171,9 @@ def _report_presentation(documents: list[dict], rule_set: dict | None, rules: li
         if score:
             value["suggested_score_label"] = value.get("suggested_score")
             if value["suggested_score_label"] is None:
-                value["suggested_score_label"] = "需 OCR 后评分" if value.get("check_mode") == "ocr" else "-"
+                value["suggested_score_label"] = "待 OCR 后评分" if value.get("coverage_status") == "uncovered" else (
+                    "需 OCR 后评分" if value.get("check_mode") == "ocr" else "-"
+                )
         else:
             value["status_label"] = _report_label(_REPORT_STATUS_LABELS, value.get("status"))
             value["risk_label"] = _report_label(_REPORT_RISK_LABELS, value.get("risk_level"))

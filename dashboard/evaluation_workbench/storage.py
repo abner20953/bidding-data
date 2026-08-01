@@ -458,6 +458,7 @@ def init_database(app) -> None:
                 page_hint TEXT,
                 reason TEXT NOT NULL DEFAULT '',
                 risk_level TEXT NOT NULL DEFAULT 'medium',
+                coverage_status TEXT NOT NULL DEFAULT 'covered',
                 vision_status TEXT NOT NULL DEFAULT 'not_requested',
                 ocr_status TEXT NOT NULL DEFAULT 'not_requested',
                 multimodal_status TEXT NOT NULL DEFAULT 'not_requested',
@@ -491,6 +492,7 @@ def init_database(app) -> None:
                 evidence TEXT NOT NULL DEFAULT '',
                 reason TEXT NOT NULL DEFAULT '',
                 confidence TEXT,
+                coverage_status TEXT NOT NULL DEFAULT 'covered',
                 vision_status TEXT NOT NULL DEFAULT 'not_requested',
                 ocr_status TEXT NOT NULL DEFAULT 'not_requested',
                 multimodal_status TEXT NOT NULL DEFAULT 'not_requested',
@@ -538,6 +540,7 @@ def init_database(app) -> None:
         _ensure_column(conn, "ew_model_profiles", "vision_protocol", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "ew_review_results", "confidence", "TEXT")
         _ensure_column(conn, "ew_review_results", "evidence_quality", "TEXT")
+        _ensure_column(conn, "ew_review_results", "coverage_status", "TEXT NOT NULL DEFAULT 'covered'")
         _ensure_column(conn, "ew_review_results", "automation_status", "TEXT NOT NULL DEFAULT 'needs_review'")
         _ensure_column(conn, "ew_review_results", "requires_review", "INTEGER NOT NULL DEFAULT 1")
         _ensure_column(conn, "ew_review_results", "review_reason", "TEXT NOT NULL DEFAULT ''")
@@ -553,6 +556,7 @@ def init_database(app) -> None:
         _ensure_column(conn, "ew_score_results", "automation_status", "TEXT NOT NULL DEFAULT 'needs_review'")
         _ensure_column(conn, "ew_score_results", "requires_review", "INTEGER NOT NULL DEFAULT 1")
         _ensure_column(conn, "ew_score_results", "review_reason", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "ew_score_results", "coverage_status", "TEXT NOT NULL DEFAULT 'covered'")
         _ensure_column(conn, "ew_score_results", "vision_status", "TEXT NOT NULL DEFAULT 'not_requested'")
         _ensure_column(conn, "ew_score_results", "ocr_status", "TEXT NOT NULL DEFAULT 'not_requested'")
         _ensure_column(conn, "ew_score_results", "multimodal_status", "TEXT NOT NULL DEFAULT 'not_requested'")
@@ -2741,12 +2745,12 @@ def save_review_results(app, review_run_id: str, document_id: str, results: list
         for item in results:
             conn.execute(
                 """INSERT INTO ew_review_results(review_result_id, review_run_id, document_id, rule_id, status, evidence, page_hint, reason, risk_level,
-                   confidence, evidence_quality, automation_status, requires_review, review_reason,
+                   confidence, evidence_quality, coverage_status, automation_status, requires_review, review_reason,
                    vision_status, ocr_status, multimodal_status, vision_pages_json, vision_evidence_pages_json, evidence_layers_json, vision_model, vision_message, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(review_run_id, document_id, rule_id) DO UPDATE SET
                 status=excluded.status, evidence=excluded.evidence, page_hint=excluded.page_hint, reason=excluded.reason,
-                risk_level=excluded.risk_level, confidence=excluded.confidence, evidence_quality=excluded.evidence_quality,
+                risk_level=excluded.risk_level, confidence=excluded.confidence, evidence_quality=excluded.evidence_quality, coverage_status=excluded.coverage_status,
                 automation_status=excluded.automation_status, requires_review=excluded.requires_review,
                 review_reason=excluded.review_reason, vision_status=excluded.vision_status,
                 ocr_status=excluded.ocr_status, multimodal_status=excluded.multimodal_status,
@@ -2755,7 +2759,7 @@ def save_review_results(app, review_run_id: str, document_id: str, results: list
                 vision_message=excluded.vision_message, final_status=NULL, confirmed_at=NULL, created_at=excluded.created_at""",
                 (str(uuid.uuid4()), review_run_id, document_id, item["rule_id"], item["status"], item.get("evidence", ""),
                  item.get("page_hint"), item.get("reason", ""), item.get("risk_level", "medium"), item.get("confidence", "medium"),
-                 item.get("evidence_quality", "limited"), item.get("automation_status", "needs_review"),
+                 item.get("evidence_quality", "limited"), item.get("coverage_status", "covered"), item.get("automation_status", "needs_review"),
                  1 if item.get("requires_review", True) else 0, item.get("review_reason", ""),
                  item.get("vision_status", "not_requested"), _ocr_status_value(item), _multimodal_status_value(item),
                  _vision_pages_json(item), _vision_evidence_pages_json(item), _evidence_layers_json(item),
@@ -2856,7 +2860,7 @@ def reusable_evaluation_document_results(app, project_id: str, rule_set_id: str,
                         valid = False
                         break
                     rows = conn.execute(
-                        """SELECT rule_id, status, evidence, page_hint, reason, risk_level, confidence, evidence_quality,
+                        """SELECT rule_id, status, evidence, page_hint, reason, risk_level, confidence, evidence_quality, coverage_status,
                            automation_status, requires_review, review_reason, vision_status, ocr_status, multimodal_status, vision_pages_json,
                            vision_evidence_pages_json, evidence_layers_json,
                            vision_model, vision_message FROM ew_review_results
@@ -2872,7 +2876,7 @@ def reusable_evaluation_document_results(app, project_id: str, rule_set_id: str,
                         valid = False
                         break
                     rows = conn.execute(
-                        """SELECT rule_id, suggested_score, effective_score, max_score, evidence, reason, confidence,
+                        """SELECT rule_id, suggested_score, effective_score, max_score, evidence, reason, confidence, coverage_status,
                            automation_status, requires_review, review_reason, vision_status, ocr_status, multimodal_status, vision_pages_json,
                            vision_evidence_pages_json, evidence_layers_json,
                            vision_model, vision_message FROM ew_score_results
@@ -2937,12 +2941,12 @@ def save_score_results(app, score_run_id: str, document_id: str, results: list[d
         for item in results:
             conn.execute(
                 """INSERT INTO ew_score_results(score_result_id, score_run_id, document_id, rule_id, suggested_score, final_score, effective_score, max_score,
-                   evidence, reason, confidence, automation_status, requires_review, review_reason,
+                   evidence, reason, confidence, coverage_status, automation_status, requires_review, review_reason,
                    vision_status, ocr_status, multimodal_status, vision_pages_json, vision_evidence_pages_json, evidence_layers_json, vision_model, vision_message, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(score_run_id, document_id, rule_id) DO UPDATE SET
                 suggested_score=excluded.suggested_score, final_score=excluded.final_score, effective_score=excluded.effective_score,
-                max_score=excluded.max_score, evidence=excluded.evidence, reason=excluded.reason, confidence=excluded.confidence,
+                max_score=excluded.max_score, evidence=excluded.evidence, reason=excluded.reason, confidence=excluded.confidence, coverage_status=excluded.coverage_status,
                 automation_status=excluded.automation_status, requires_review=excluded.requires_review,
                 review_reason=excluded.review_reason, vision_status=excluded.vision_status,
                 ocr_status=excluded.ocr_status, multimodal_status=excluded.multimodal_status,
@@ -2950,7 +2954,7 @@ def save_score_results(app, score_run_id: str, document_id: str, results: list[d
                 evidence_layers_json=excluded.evidence_layers_json, vision_model=excluded.vision_model,
                 vision_message=excluded.vision_message, updated_at=excluded.updated_at""",
                 (str(uuid.uuid4()), score_run_id, document_id, item["rule_id"], item.get("suggested_score"), item.get("final_score"),
-                 item.get("effective_score"), item.get("max_score"), item.get("evidence", ""), item.get("reason", ""), item.get("confidence"),
+                 item.get("effective_score"), item.get("max_score"), item.get("evidence", ""), item.get("reason", ""), item.get("confidence"), item.get("coverage_status", "covered"),
                  item.get("automation_status", "needs_review"), 1 if item.get("requires_review", True) else 0,
                  item.get("review_reason", ""), item.get("vision_status", "not_requested"), _ocr_status_value(item), _multimodal_status_value(item),
                  _vision_pages_json(item), _vision_evidence_pages_json(item), _evidence_layers_json(item),

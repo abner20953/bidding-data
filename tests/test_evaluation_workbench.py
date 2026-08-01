@@ -4641,6 +4641,48 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("评标辅助汇总报告", response.get_data(as_text=True))
         self.assertIn("不构成串通投标认定", response.get_data(as_text=True))
 
+    def test_sparse_scan_document_does_not_turn_missing_text_into_negative_or_positive_conclusions(self):
+        document = {"page_count": 110, "text_length": 1652}
+        rule = {"rule_id": "license", "title": "资格证书", "check_rule": "核验证书是否有效"}
+
+        review = worker._apply_document_evidence_guard(document, "review", rule, {
+            "rule_id": "license", "status": "satisfied", "risk_level": "low", "confidence": "low",
+            "evidence_quality": "missing", "reason": "未定位直接证据。",
+        })
+        score = worker._apply_document_evidence_guard(document, "objective", rule, {
+            "rule_id": "license", "suggested_score": 0.0, "effective_score": None, "confidence": "low",
+            "reason": "未提供证书。",
+        })
+
+        self.assertEqual(review["status"], "ocr_required")
+        self.assertEqual(review["risk_level"], "low")
+        self.assertEqual(review["coverage_status"], "uncovered")
+        self.assertIn("未覆盖不等同于材料缺失", review["reason"])
+        self.assertIsNone(score["suggested_score"])
+        self.assertEqual(score["coverage_status"], "uncovered")
+
+    def test_sparse_scan_document_accepts_rule_after_complete_ocr_or_vision_coverage(self):
+        document = {"page_count": 110, "text_length": 1652}
+        rule = {"rule_id": "cert", "title": "管理体系认证", "check_rule": "核验三项认证"}
+        result = worker._apply_document_evidence_guard(document, "objective", rule, {
+            "rule_id": "cert", "suggested_score": 3.0, "confidence": "high", "coverage_status": "covered",
+            "reason": "已核验三项证书。",
+        })
+
+        self.assertEqual(result["suggested_score"], 3.0)
+        self.assertEqual(result["coverage_status"], "covered")
+
+    def test_machine_readable_document_keeps_normal_text_conclusion(self):
+        document = {"page_count": 55, "text_length": 37935}
+        rule = {"rule_id": "scope", "title": "项目范围", "check_rule": "核验项目范围一致性"}
+        result = worker._apply_document_evidence_guard(document, "review", rule, {
+            "rule_id": "scope", "status": "satisfied", "risk_level": "low", "confidence": "high",
+            "evidence_quality": "sufficient", "reason": "范围一致。",
+        })
+
+        self.assertEqual(result["status"], "satisfied")
+        self.assertEqual(result["coverage_status"], "covered")
+
 
 if __name__ == "__main__":
     unittest.main()
