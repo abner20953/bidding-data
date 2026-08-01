@@ -4006,6 +4006,24 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         right = {"category": "objective", "title": "企业业绩评分", "check_rule": "业绩评分", "source_clause_ids": ["SC-1"], "scoring": {"max_score": 9}}
         self.assertEqual(len(worker._dedupe_rule_candidates([left, right])), 1)
 
+    def test_score_aggregate_prunes_only_its_provable_child_scores(self):
+        aggregate = {
+            "category": "subjective", "title": "服务方案29分评分", "source_type": "ai",
+            "scoring": {"max_score": 29, "items": [
+                {"name": "培训方案", "max_score": 5}, {"name": "售后服务方案", "max_score": 6},
+                {"name": "组织实施保障方案", "max_score": 6}, {"name": "整体实施方案", "max_score": 6},
+                {"name": "保障措施", "max_score": 1.5}, {"name": "应急预案", "max_score": 1.5},
+                {"name": "项目化保障补充", "max_score": 3},
+            ]},
+        }
+        children = [
+            {"category": "subjective", "title": "培训方案5分评分", "source_type": "ai", "scoring": {"max_score": 5}},
+            {"category": "subjective", "title": "售后服务方案6分评分", "source_type": "ai", "scoring": {"max_score": 6}},
+        ]
+        manual = {"category": "subjective", "title": "培训方案5分评分", "source_type": "ai_edited", "scoring": {"max_score": 5}}
+        result = worker._prune_overlapping_score_aggregates([aggregate, *children, manual])
+        self.assertEqual([item["title"] for item in result], ["服务方案29分评分", "培训方案5分评分"])
+
     def test_coverage_rule_catalog_keeps_leaf_requirements(self):
         rule = {
             "rule_id": "coverage", "category": "other", "title": "采购需求逐项响应覆盖",

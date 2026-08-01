@@ -1505,6 +1505,77 @@ def _dedupe_rule_candidates(items: list[dict]) -> list[dict]:
     return result
 
 
+def _score_label_key(value: object) -> str:
+    """提取评分对象的稳定名称，忽略“评分/满分/分”等导航文字。"""
+    text = _normalise_rule_title(value)
+    text = re.sub(r"(?:评分|得分|分值|满分|最高分|分)$", "", text)
+    text = re.sub(r"\d+(?:\.\d+)?$", "", text)
+    return text
+
+
+def _score_item_max(item: object) -> float | None:
+    if not isinstance(item, dict):
+        return None
+    try:
+        value = float(item.get("max_score"))
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def _score_child_matches_parent_item(child: dict, item: dict) -> bool:
+    """只以明确名称与分值对应父项叶子项，避免把相近评分项误收进总分项。"""
+    child_score = storage._valid_max_score(child.get("scoring"))
+    item_score = _score_item_max(item)
+    if child_score is None or item_score is None or abs(float(child_score) - item_score) > 0.001:
+        return False
+    child_label = _score_label_key(child.get("title"))
+    item_label = _score_label_key(item.get("name"))
+    if len(child_label) < 3 or len(item_label) < 3:
+        return False
+    return child_label in item_label or item_label in child_label
+
+
+def _prune_overlapping_score_aggregates(rules: list[dict]) -> list[dict]:
+    """移除被同一评分父项完整包含的重复子项。
+
+    评分表常同时出现“服务部分29分”与培训、售后、实施等已计入该29分的分项。若两
+    者并存，综合评审会重复计分。只有父项至少明确列出两个子项、子项名称与分值均能
+    一一对应时才压缩；单一子项、相近名称或用户手工规则均不触碰。
+    """
+    values = [dict(item) for item in rules if isinstance(item, dict)]
+    removable: set[int] = set()
+    for parent_index, parent in enumerate(values):
+        if parent.get("category") not in {"objective", "subjective"}:
+            continue
+        if str(parent.get("source_type") or "") in {"manual", "ai_edited", "global"}:
+            continue
+        scoring = parent.get("scoring") if isinstance(parent.get("scoring"), dict) else {}
+        items = [item for item in scoring.get("items") or [] if isinstance(item, dict) and _score_item_max(item) is not None]
+        parent_max = storage._valid_max_score(scoring)
+        if parent_max is None or len(items) < 2:
+            continue
+        # 只有叶子合计确实构成父项满分时才认为它是可替代的总分父项。
+        if abs(sum(float(_score_item_max(item) or 0) for item in items) - float(parent_max)) > 0.01:
+            continue
+        matched_children: list[int] = []
+        matched_items: set[int] = set()
+        for child_index, child in enumerate(values):
+            if child_index == parent_index or child_index in removable:
+                continue
+            if child.get("category") != parent.get("category") or str(child.get("source_type") or "") in {"manual", "ai_edited", "global"}:
+                continue
+            for item_index, item in enumerate(items):
+                if item_index not in matched_items and _score_child_matches_parent_item(child, item):
+                    matched_children.append(child_index)
+                    matched_items.add(item_index)
+                    break
+        # 至少两个叶子项同时重合才删除子项，单条偶然相似的评分规则绝不自动移除。
+        if len(matched_children) >= 2:
+            removable.update(matched_children)
+    return [item for index, item in enumerate(values) if index not in removable]
+
+
 # 这些模式描述的是“必须看图像外观才能核验”的证据形态，而不是某个项目的业务词。
 # AI 仍负责理解规则；这里仅作为保守兜底，避免把未执行 OCR 的证照、签章或凭证
 # 因文本未命中直接判成高风险不满足。
@@ -2294,6 +2365,9 @@ def _extract_rules(app, task: dict) -> dict:
     rules, scoring_reconciliation = _reconcile_scoring_rules(
         app, task, profile, system_prompt, rules, score_packets,
     )
+    # 结构复核可能同时返回总分父项和其已包含的分项；在进入后续门控前先做可证明
+    # 的父子重叠消除，避免同一评分事实被综合评审重复执行和重复计分。
+    rules = _prune_overlapping_score_aggregates(rules)
     rules = _filter_inapplicable_template_rules(_filter_rules_for_package(rules, package_number), text)
     rules, quality_gate = _final_rule_quality_gate(
         app, task, profile, system_prompt, rules, score_packets,
@@ -2301,6 +2375,7 @@ def _extract_rules(app, task: dict) -> dict:
     rules, finalisation = _finalise_rule_operations(
         app, task, profile, system_prompt, rules,
     )
+    rules = _prune_overlapping_score_aggregates(rules)
     rules = _filter_inapplicable_template_rules(_filter_rules_for_package(rules, package_number), text)
     # 模型分段提取和后续去重均可能把“技术★实质性指标 + 证明材料 + 明确无效后果”
     # 错压缩进普通技术覆盖项。仅在三项原文条件同时存在、且规则集尚未承接时补一条；
