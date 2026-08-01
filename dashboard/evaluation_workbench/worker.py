@@ -3196,6 +3196,7 @@ FULL_SCAN_CHUNK_CHARS = 11_000
 # 首轮只建立候选证据索引：每个页块携带一次完整的精简规则目录。正常情况下
 # 不再形成“页块 × 规则批次”的矩阵；若模型确实输出超长，才仅拆规则目录一次。
 FULL_SCAN_CATALOG_RULE_CHARS = 220
+SCOPE_ANOMALY_CACHE_VERSION = "scope-anomaly-candidates-v1"
 EVIDENCE_MANIFEST_VERSION = "page-chunks-v1"
 # 二次复核上下文上限。全文首轮已覆盖所有页面，此处只装入候选证据和重点原文。
 EVALUATION_BATCH_CONTEXT_CHARS = 64_000
@@ -3447,6 +3448,10 @@ def _full_scan_prompt(app, document: dict, catalog: list[dict], chunk: dict, pro
         document_name=document["original_name"], bidder_name=document["bidder_name"] or "未填写",
         chunk_label=_full_scan_chunk_label(chunk), text=chunk["text"],
     )
+    # 范围判断原则独立于用户可能保留的旧版全文扫描模板，既可在右上角查看和编辑，
+    # 又能保证规则目录变动后仍执行相同的“上位主题/具体对象”两层判断。
+    scope_guidance = storage.render_prompt_template(app, "evaluate_all_scope_anomaly_guidance")
+    prompt = f"【项目范围偏离独立判断原则】\n{scope_guidance}\n\n{prompt}"
     # 同步兼容云端尚未恢复默认的旧自定义模板。正常扫描的输出上限从 36 收为 24，
     # 但每条规则仍有本地章节召回兜底；这样减少 M3 因长 JSON 截断而触发的整块拆分。
     prompt = prompt.replace("最多36条", "最多24条").replace("最多 36 条", "最多 24 条")
@@ -3500,6 +3505,49 @@ def _normalise_scan_findings(output: object, allowed_ids: set[str], chunk: dict)
     return findings
 
 
+_SCOPE_NON_ANOMALY_PATTERNS = tuple(re.compile(pattern) for pattern in (
+    r"(?:与|和)(?:本|该|当前)?项目(?:范围|需求|采购内容|技术要求)(?:完全)?(?:一致|相符|匹配)(?:[，。；;]|$)",
+    r"(?<!不)(?<!未)(?:属于|符合|契合|对应)(?:本|该|当前)?项目(?:范围|需求|采购内容|技术要求)(?!之外|以外)(?:[，。；;]|$)",
+    r"(?:未发现|未见|没有发现).{0,12}(?:偏离|异常|无关|不一致)",
+    r"(?:不构成|无需作为|不应视为).{0,12}(?:偏离|异常|无关|问题)",
+    r"(?:合理|正常)(?:出现|引用|列示|使用).{0,12}(?:不作为|不构成|不是|非)(?:范围)?(?:异常|偏离)",
+))
+
+
+def _scope_candidate_is_actionable(candidate: dict) -> bool:
+    """滤掉模型误放进异常数组的明确正常项，不对具体业务名词作硬编码判断。"""
+    if not str(candidate.get("evidence") or "").strip():
+        return False
+    conclusion = "；".join(str(candidate.get(field) or "") for field in ("relation", "observation"))
+    return not any(pattern.search(conclusion) for pattern in _SCOPE_NON_ANOMALY_PATTERNS)
+
+
+def _merge_scope_anomalies(current: list[dict], previous: list[dict]) -> list[dict]:
+    """合并当前与历史候选；历史项仅作为待复核线索，并只恢复中高优先级。"""
+    merged: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for source, values in (("current_scan", current), ("prior_scan", previous)):
+        for raw in values if isinstance(values, list) else []:
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            if source == "prior_scan" and item.get("candidate_priority") not in {"high", "medium"}:
+                continue
+            if not _scope_candidate_is_actionable(item):
+                continue
+            signature = (
+                str(item.get("chunk_id") or "").split(".", 1)[0],
+                re.sub(r"\s+", "", str(item.get("evidence") or ""))[:180],
+            )
+            if signature in seen:
+                continue
+            seen.add(signature)
+            item["candidate_source"] = source
+            merged.append(item)
+    priority_rank = {"high": 0, "medium": 1, "low": 2}
+    return sorted(merged, key=lambda item: priority_rank.get(item.get("candidate_priority"), 1))[:24]
+
+
 def _normalise_scope_anomalies(output: object, chunk: dict) -> list[dict]:
     """范围偏离为独立候选通道，不强制映射到任何既有规则或预设类型。"""
     candidates = []
@@ -3532,7 +3580,8 @@ def _normalise_scope_anomalies(output: object, chunk: dict) -> list[dict]:
         observation = _clean_model_text(observation)[:120]
         if observation:
             candidate["observation"] = observation
-        candidates.append(candidate)
+        if _scope_candidate_is_actionable(candidate):
+            candidates.append(candidate)
     return candidates
 
 
@@ -3780,6 +3829,13 @@ def _scan_document_fulltext(app, task: dict, profile: dict, document: dict, rule
         "system": system_prompt,
         "template": storage.prompt_template(app, "evaluate_all_full_scan_user"),
     }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    # 范围候选的稳定缓存不绑定评审规则目录。规则变化仍会重新生成规则证据，但不会
+    # 让同一原文中已经发现的高价值范围线索消失；候选会在最终规则中重新判断。
+    scope_scan_key = hashlib.sha256(json.dumps({
+        "version": SCOPE_ANOMALY_CACHE_VERSION,
+        "project_scope": project_scope,
+        "scope_guidance": storage.prompt_template(app, "evaluate_all_scope_anomaly_guidance"),
+    }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
     findings: list[dict] = []
     scope_anomalies: list[dict] = []
     failed_chunks: list[dict] = []
@@ -3796,21 +3852,39 @@ def _scan_document_fulltext(app, task: dict, profile: dict, document: dict, rule
             progress = int((progress_offset + completed - 1) * 100 / max(1, progress_total))
             storage.update_task(app, task["task_id"], progress=progress, message=message)
         checkpoint = storage.get_evaluation_scan_checkpoint(app, document["document_id"], scan_key, chunk["chunk_id"], chunk_hash)
+        stable_scope = storage.get_evaluation_scan_checkpoint(
+            app, document["document_id"], scope_scan_key, chunk["chunk_id"], chunk_hash,
+        )
+        stable_candidates = stable_scope.get("scope_anomalies", []) if isinstance(stable_scope, dict) else []
+        historical_candidates = storage.previous_scope_anomalies(
+            app, document["document_id"], chunk["chunk_id"], chunk_hash,
+        )
         if checkpoint is not None:
             # 兼容 v3 已落库的纯 findings 检查点，避免升级时浪费一次扫描。
             if isinstance(checkpoint, list):
                 findings.extend(checkpoint)
+                scope_anomalies.extend(_merge_scope_anomalies([], stable_candidates + historical_candidates))
             elif isinstance(checkpoint, dict):
                 findings.extend(checkpoint.get("findings") or [])
-                scope_anomalies.extend(checkpoint.get("scope_anomalies") or [])
+                scope_anomalies.extend(_merge_scope_anomalies(
+                    checkpoint.get("scope_anomalies") or [], stable_candidates + historical_candidates,
+                ))
             continue
         result = _run_full_scan_piece(app, task, profile, document, catalog, chunk, project_scope, system_prompt)
         findings.extend(result[0]["findings"])
-        scope_anomalies.extend(result[0]["scope_anomalies"])
+        merged_scope = _merge_scope_anomalies(
+            result[0]["scope_anomalies"], stable_candidates + historical_candidates,
+        )
+        result[0]["scope_anomalies"] = merged_scope
+        scope_anomalies.extend(merged_scope)
         compact_retry_count += result[1]
         split_retry_count += result[2]
         failed_chunks.extend(result[3])
         if not result[3]:
+            storage.save_evaluation_scan_checkpoint(
+                app, task["project_id"], document["document_id"], scope_scan_key,
+                chunk["chunk_id"], chunk_hash, {"scope_anomalies": merged_scope},
+            )
             storage.save_evaluation_scan_checkpoint(
                 app, task["project_id"], document["document_id"], scan_key, chunk["chunk_id"], chunk_hash, result[0],
             )
@@ -4054,6 +4128,19 @@ def _build_rule_evidence_ledger(scan: dict, rules: list[dict]) -> dict[str, dict
     return ledger
 
 
+_SCOPE_RULE_MARKERS = (
+    "项目范围", "范围无关", "无关内容", "无关信息", "无关技术", "无关项目",
+    "项目无关", "范围偏离", "范围一致", "混包", "其他项目",
+)
+
+
+def _is_scope_consistency_rule(rule: dict) -> bool:
+    text = f"{rule.get('title') or ''} {rule.get('check_rule') or ''}"
+    return any(marker in text for marker in _SCOPE_RULE_MARKERS) or (
+        "全文" in text and "无关" in text
+    ) or ("本项目" in text and "不一致" in text)
+
+
 def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *, targeted: bool = False) -> dict:
     rule_ids = {item["rule_id"] for item in rules}
     findings = [item for item in scan.get("findings", []) if item.get("rule_id") in rule_ids]
@@ -4119,6 +4206,7 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
             selected_ids.append(chunk_id)
     review_categories = {"qualification", "compliance", "substantive", "rejection", "other"}
     is_review_group = any(item.get("category") in review_categories for item in rules)
+    has_scope_rule = any(_is_scope_consistency_rule(item) for item in rules)
     scope_anomalies, seen_scope = [], set()
     for item in scan.get("scope_anomalies", []):
         signature = (
@@ -4130,7 +4218,7 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
         seen_scope.add(signature)
         scope_anomalies.append(item)
     scope_anomalies.sort(key=lambda item: priority_rank.get(item.get("candidate_priority"), 1))
-    if is_review_group:
+    if is_review_group and has_scope_rule:
         # 该通道不依赖“地区、项目名”等固定关键词：任何范围偏离候选的原页都会
         # 进入审查组，最终是否构成问题仍完全由 AI 结合规则和原文判断。
         anomaly_ids = []
@@ -4171,7 +4259,7 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
                 "priority": item.get("evidence_priority"), "evidence_origin": item.get("observation"),
             })
     scope_packet = ""
-    if is_review_group:
+    if is_review_group and has_scope_rule:
         scope_packet = (
             "\n\n【项目范围画像（来自招标文件和已确认规则）】\n"
             + json.dumps(scan.get("project_scope", {}), ensure_ascii=False, separators=(",", ":"))

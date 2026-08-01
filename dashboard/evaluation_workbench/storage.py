@@ -139,7 +139,7 @@ def task_prompt_template_fingerprint(app, task_type: str) -> str | None:
         "score_subjective": {"score_subjective", "score_subjective_user", "json_repair", "json_repair_user"},
         "evaluate_all": {
             "evaluate_all", "evaluate_all_guidance", "evaluate_all_highlights", "evaluate_all_scope_profile", "evaluate_all_scope_profile_user",
-            "evaluate_all_full_scan_user", "evaluate_all_review_user", "evaluate_all_objective_user",
+            "evaluate_all_scope_anomaly_guidance", "evaluate_all_full_scan_user", "evaluate_all_review_user", "evaluate_all_objective_user",
             "evaluate_all_subjective_user", "evaluate_all_cross_bid_price_user", "evaluate_all_highlights_user",
             "evaluate_all_visual_user", "evaluate_all_ocr_user", "evaluate_all_visual_contract", "evaluate_all_ocr_contract",
             "evaluate_all_visual_locator_user",
@@ -304,6 +304,7 @@ def init_database(app) -> None:
                 UNIQUE(document_id, scan_key, chunk_id, chunk_hash)
             );
             CREATE INDEX IF NOT EXISTS idx_ew_scan_cache_document ON ew_evaluation_scan_cache(document_id, scan_key);
+            CREATE INDEX IF NOT EXISTS idx_ew_scan_cache_chunk ON ew_evaluation_scan_cache(document_id, chunk_id, chunk_hash, updated_at);
             CREATE TABLE IF NOT EXISTS ew_document_evidence_manifests (
                 manifest_id TEXT PRIMARY KEY,
                 document_id TEXT NOT NULL REFERENCES ew_documents(document_id) ON DELETE CASCADE,
@@ -1467,6 +1468,37 @@ def save_document_evidence_manifest(app, document_id: str, document_sha256: str,
             (str(uuid.uuid4()), document_id, document_sha256, parser_version,
              json.dumps(manifest, ensure_ascii=False, separators=(",", ":")), timestamp, timestamp),
         )
+
+
+def previous_scope_anomalies(app, document_id: str, chunk_id: str, chunk_hash: str,
+                             *, limit: int = 32) -> list[dict]:
+    """读取相同原文页块在旧扫描中发现的范围候选，供新一轮重新判断。
+
+    这里只复用可定位的候选线索，不复用最终结论；因此规则目录或模型变化不会让
+    已发现的高价值原文静默消失，当前项目范围仍由最终评审重新判断。
+    """
+    with connection(app) as conn:
+        rows = conn.execute(
+            """SELECT findings_json FROM ew_evaluation_scan_cache
+               WHERE document_id=? AND chunk_id=? AND chunk_hash=?
+               ORDER BY updated_at DESC LIMIT 24""",
+            (document_id, chunk_id, chunk_hash),
+        ).fetchall()
+    values: list[dict] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["findings_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        candidates = payload.get("scope_anomalies") if isinstance(payload, dict) else None
+        if not isinstance(candidates, list):
+            continue
+        for candidate in candidates:
+            if isinstance(candidate, dict) and candidate.get("evidence"):
+                values.append(dict(candidate))
+                if len(values) >= max(1, limit):
+                    return values
+    return values
 
 
 def save_evidence_packs(app, project_id: str, task_id: str, document_id: str, document_sha256: str,

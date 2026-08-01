@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import os
 import re
@@ -2017,7 +2018,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual({item["configuration_group"] for item in templates}, {"business", "workflow", "system"})
         self.assertEqual(
             [item["template_id"] for item in templates if item["configuration_group"] == "business"],
-            ["compare_ai_assessment", "extract_rules_guidance", "extract_rules_package_scope", "extract_rules_validation_guidance", "evaluate_all_guidance"],
+            ["compare_ai_assessment", "extract_rules_guidance", "extract_rules_package_scope",
+             "extract_rules_validation_guidance", "evaluate_all_guidance", "evaluate_all_scope_anomaly_guidance"],
         )
         self.assertTrue(all(item["section"] and item["change_level"] for item in templates))
         extraction_template = next(item for item in templates if item["template_id"] == "extract_rules_user")
@@ -2890,6 +2892,24 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         context = worker._full_scan_review_context(scan, rules, 20_000)
         self.assertIn("锅炉燃烧控制设备安装", context["text"])
         self.assertIn("chunk_12", context["pages"])
+
+    def test_scope_anomaly_context_is_not_injected_into_unrelated_review_group(self):
+        scan = {
+            "chunks": [{"chunk_id": "chunk_9", "start_page": 81, "end_page": 90,
+                        "text": "锅炉燃烧控制设备安装与蒸汽管网调试方案。"}],
+            "findings": [], "failed_chunks": [], "chunk_count": 1,
+            "project_scope": {"scope_summary": "无人机航测服务"},
+            "scope_anomalies": [{"chunk_id": "chunk_9", "dimension": "技术对象偏离",
+                                  "candidate_priority": "high", "evidence": "锅炉燃烧控制设备安装",
+                                  "relation": "项目范围未包含该设备"}],
+        }
+        rules = [{"rule_id": "license", "category": "qualification", "title": "营业执照",
+                  "check_rule": "检查营业执照", "source_text": ""}]
+
+        context = worker._full_scan_review_context(scan, rules, 8_000)
+
+        self.assertNotIn("项目范围偏离候选", context["text"])
+        self.assertNotIn("锅炉燃烧控制设备安装", context["text"])
 
     def test_full_scan_context_reserves_raw_evidence_for_each_rule(self):
         late_a = "资质证书编号A-2026，满足资格条件。"
@@ -3874,6 +3894,89 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(candidates[0]["dimension"], "无关设备与工艺")
         self.assertEqual(candidates[0]["candidate_priority"], "high")
         self.assertEqual(candidates[0]["page_range"], "第121-130页")
+
+    def test_scope_anomaly_filters_explicit_normal_items_but_keeps_outside_scope(self):
+        candidates = worker._normalise_scope_anomalies([
+            ["12", "设备", "low", "网络交换机安装", "与本项目技术要求一致，无异常"],
+            ["13", "施工工艺", "high", "蒸汽管网吹扫", "属于本项目范围之外，需结合原页核验"],
+            ["14", "历史业绩", "low", "外地项目名称", "合理出现，不构成范围偏离"],
+        ], {"chunk_id": "chunk_2", "start_page": 11, "end_page": 20})
+
+        self.assertEqual([item["evidence"] for item in candidates], ["蒸汽管网吹扫"])
+
+    def test_scope_anomaly_merge_recovers_only_actionable_medium_high_history(self):
+        current = [{"chunk_id": "chunk_2", "candidate_priority": "low", "evidence": "当前低风险线索",
+                    "relation": "具体工作对象缺少范围依据"}]
+        previous = [
+            {"chunk_id": "chunk_2", "candidate_priority": "high", "evidence": "历史高价值线索",
+             "relation": "具体工艺与采购范围不一致"},
+            {"chunk_id": "chunk_2", "candidate_priority": "low", "evidence": "历史低价值线索",
+             "relation": "题材存在差异"},
+            {"chunk_id": "chunk_2", "candidate_priority": "high", "evidence": "明确正常内容",
+             "relation": "与本项目范围一致，无异常"},
+        ]
+
+        merged = worker._merge_scope_anomalies(current, previous)
+
+        self.assertEqual([item["evidence"] for item in merged], ["历史高价值线索", "当前低风险线索"])
+        self.assertEqual(merged[0]["candidate_source"], "prior_scan")
+
+    def test_previous_scope_anomalies_survive_scan_key_change_as_candidates(self):
+        document = self._add_pdf("scope-history.pdf", "bid", "甲公司", "投标方案正文")
+        old_candidate = {"chunk_id": "chunk_1", "candidate_priority": "high",
+                         "evidence": "与采购对象不同的实施工艺", "relation": "缺少项目范围依据"}
+        storage.save_evaluation_scan_checkpoint(
+            self.app, self.project["project_id"], document["document_id"], "old-rule-catalog",
+            "chunk_1", "same-content-hash", {"findings": [], "scope_anomalies": [old_candidate]},
+        )
+
+        recovered = storage.previous_scope_anomalies(
+            self.app, document["document_id"], "chunk_1", "same-content-hash",
+        )
+
+        self.assertEqual(recovered[0]["evidence"], old_candidate["evidence"])
+
+    def test_full_scan_reruns_rule_evidence_but_rechecks_previous_scope_candidate(self):
+        document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")
+        document.update({"text_length": 30_000, "parsed_path": str(self.temp_dir / "unused.txt")})
+        chunk = {"chunk_id": "chunk_1", "start_page": 1, "end_page": 10,
+                 "text": "本轮模型未重新报告范围候选。"}
+        chunk_hash = hashlib.sha256(chunk["text"].encode("utf-8")).hexdigest()
+        old_candidate = {"chunk_id": "chunk_1", "page_range": "第1-10页", "page_hint": "8",
+                         "dimension": "工作对象偏离", "candidate_priority": "high",
+                         "evidence": "旧轮已定位的具体工艺", "relation": "缺少项目范围依据"}
+        storage.save_evaluation_scan_checkpoint(
+            self.app, self.project["project_id"], document["document_id"], "old-rule-catalog",
+            "chunk_1", chunk_hash, {"findings": [], "scope_anomalies": [old_candidate]},
+        )
+        task = {"task_id": "fresh-task", "project_id": self.project["project_id"],
+                "payload": {"force_rerun": True}}
+        profile = {"profile_id": "model-a", "model_name": "generic-model"}
+        rules = [{"rule_id": "scope", "category": "other", "title": "项目范围无关内容核验",
+                  "check_rule": "全文检查与本项目无关的内容", "source_text": ""}]
+
+        with patch.object(worker, "_document_evidence_chunks", return_value=[chunk]), patch.object(
+            worker, "_run_full_scan_piece",
+            return_value=({"findings": [], "scope_anomalies": []}, 0, 0, []),
+        ) as scan_piece:
+            result = worker._scan_document_fulltext(
+                self.app, task, profile, document, rules, {"scope_summary": "信息系统建设"}, "system",
+            )
+
+        scan_piece.assert_called_once()
+        self.assertEqual(result["scope_anomalies"][0]["evidence"], old_candidate["evidence"])
+        self.assertEqual(result["scope_anomalies"][0]["candidate_source"], "prior_scan")
+
+    def test_full_scan_prompt_requires_topic_and_concrete_object_scope_checks(self):
+        prompt = worker._full_scan_prompt(
+            self.app, {"original_name": "投标.pdf", "bidder_name": "甲公司"}, [],
+            {"chunk_id": "chunk_1", "start_page": 1, "end_page": 10, "text": "安全施工方案"},
+            {"scope_summary": "信息系统建设"}, compact=False,
+        )
+
+        self.assertIn("先判断章节上位主题是否相关", prompt)
+        self.assertIn("具体对象或工艺", prompt)
+        self.assertNotIn("青铅", prompt)
 
     def test_combined_evaluation_splits_review_rules_into_small_groups(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "投标文件包含全部承诺。")
