@@ -1439,6 +1439,9 @@ def _rule_signature(item: dict) -> tuple[str, str, str]:
 def _normalise_rule_title(value: object) -> str:
     text = re.sub(r"[（(]\s*(?:满分|最高(?:得)?分?)\s*\d+(?:\.\d+)?\s*分?\s*[)）]", "", str(value or ""))
     text = re.sub(r"(?:[-—–:：\s]*)(?:满分|最高(?:得)?分?)\s*\d+(?:\.\d+)?\s*分?", "", text)
+    # 分段提取时，模型有时会把“商务部分-”“评分-”这类章节标签写进标题，另一次
+    # 又只保留实际计分对象。它们不是两个评分事实，归一化时去掉这些纯导航前缀。
+    text = re.sub(r"^\s*(?:(?:商务|技术|价格|服务|资格)部分|(?:客观|主观)?评分|评分项?)\s*[-—–:：_]*\s*", "", text)
     return re.sub(r"[\s\W_]+", "", text).casefold()
 
 
@@ -2032,7 +2035,14 @@ def _finalise_rule_operations_pass(app, task: dict, profile: dict, system_prompt
             keep_index = id_to_index.get(str(operation.get("keep_rule_id") or ""))
             if len(indexes) < 2 or keep_index not in indexes or used_merge_indexes.intersection(indexes):
                 continue
-            if any(rules[index].get("category") in {"objective", "subjective"} for index in indexes):
+            score_merge = any(rules[index].get("category") in {"objective", "subjective"} for index in indexes)
+            # 评分规则只允许合并可由本地结构证明的重复项：同一类别、同一归一化
+            # 评分锚点（同一条款ID/来源、对象与满分）。不同子项绝不因模型建议合并。
+            if score_merge and (
+                len({rules[index].get("category") for index in indexes}) != 1
+                or any(_score_rule_dedupe_key(rules[index]) is None for index in indexes)
+                or len({_score_rule_dedupe_key(rules[index]) for index in indexes}) != 1
+            ):
                 continue
             title = str(operation.get("title") or "").strip()
             check_rule = str(operation.get("check_rule") or "").strip()
@@ -2047,6 +2057,12 @@ def _finalise_rule_operations_pass(app, task: dict, profile: dict, system_prompt
                 for clause_id in rules[index].get("source_clause_ids") or []:
                     if clause_id not in clause_ids:
                         clause_ids.append(clause_id)
+            if score_merge:
+                merged_score = dict(working[keep_index])
+                for index in indexes:
+                    if index != keep_index:
+                        merged_score = _merge_duplicate_score_rule(merged_score, working[index])
+                working[keep_index] = merged_score
             working[keep_index]["title"] = title
             working[keep_index]["check_rule"] = check_rule
             working[keep_index]["source_text"] = " / ".join(source_texts)[:1_500]
@@ -2914,11 +2930,21 @@ def _directory_material_candidates(page_texts: dict[int, str], rule: dict, page_
             break
     candidates: list[int] = []
     for page in sorted(directory_pages):
+        # PDF 表格、双栏目录常将“材料名称”和页码拆到相邻行。按逻辑条目累积到
+        # 出现页码后再匹配，避免目录本身可读却漏掉证书/附件本体页。
+        entry_lines: list[str] = []
         for line in str(page_texts.get(page) or "").splitlines():
-            refs = _directory_line_page_references(line, page_count)
+            clean_line = str(line or "").strip()
+            if not clean_line:
+                continue
+            entry_lines.append(clean_line)
+            if len(entry_lines) > 4:
+                entry_lines.pop(0)
+            entry = " ".join(entry_lines)
+            refs = _directory_line_page_references(entry, page_count)
             if not refs:
                 continue
-            material_text = re.sub(r"[\s\W_]+", "", _DIRECTORY_TRAILING_PAGE_PATTERN.sub("", line))
+            material_text = re.sub(r"[\s\W_]+", "", _DIRECTORY_TRAILING_PAGE_PATTERN.sub("", entry))
             matches = [term for term in terms if term in material_text]
             # 一个较长的共同材料名，或两个独立的四字片段，才将目录页码提升为首选。
             if not matches or (max(map(len, matches)) < 5 and len([term for term in matches if len(term) >= 4]) < 2):
@@ -2927,6 +2953,9 @@ def _directory_material_candidates(page_texts: dict[int, str], rule: dict, page_
                 actual = printed_page + printed_offset if printed_offset and 1 <= printed_page + printed_offset <= page_count else printed_page
                 if actual not in candidates:
                     candidates.append(actual)
+            # 本条已闭合，下一行开始新的目录项；但保留本行可兼容“页码 + 下一项标题”
+            # 被解析在同一文本行的情形。
+            entry_lines = [clean_line]
     return candidates
 
 
@@ -3477,7 +3506,7 @@ def _full_scan_prompt(app, document: dict, catalog: list[dict], chunk: dict, pro
     )
     prompt = storage.render_prompt_template(
         app, "evaluate_all_full_scan_user", retry_note=retry_note,
-        project_scope=_stable_prompt_json(project_scope),
+        project_scope=_stable_prompt_json(_scope_prompt_profile(project_scope)),
         rules=_stable_prompt_json(catalog),
         document_name=document["original_name"], bidder_name=document["bidder_name"] or "未填写",
         chunk_label=_full_scan_chunk_label(chunk), text=chunk["text"],
@@ -3554,6 +3583,49 @@ def _scope_candidate_is_actionable(candidate: dict) -> bool:
         return False
     conclusion = "；".join(str(candidate.get(field) or "") for field in ("relation", "observation"))
     return not any(pattern.search(conclusion) for pattern in _SCOPE_NON_ANOMALY_PATTERNS)
+
+
+def _scope_candidate_matches_tender_material(candidate: dict, tender_baseline: object) -> bool:
+    """排除招标清单/技术需求已明确允许的对象，避免范围画像抽样造成误报。
+
+    不维护行业词表，而是只比对本项目招标文件的完整机器可读文本。候选中至少有一个
+    五字以上的具体对象短语原样出现，才将其视为已在采购范围内；地区、项目名或泛化
+    词不会触发该保护，因此真正的跨项目、跨技术或无关内容仍会进入模型复核。
+    """
+    baseline = re.sub(r"[\s\W_]+", "", str(tender_baseline or ""))
+    if len(baseline) < 4:
+        return False
+    evidence = " ".join(str(candidate.get(key) or "") for key in ("evidence", "observation"))
+    stop = {"投标文件", "响应文件", "招标文件", "采购项目", "技术要求", "项目范围", "无关内容", "相关内容"}
+    for token in re.findall(r"[\u4e00-\u9fffA-Za-z0-9]{4,}", evidence):
+        compact = re.sub(r"[\s\W_]+", "", token)
+        if compact in stop:
+            continue
+        # 优先完整对象名；较长句子再滑窗，覆盖“设备名称 + 描述”被模型一并摘录。
+        widths = range(min(18, len(compact)), 4, -1)
+        for width in widths:
+            for index in range(0, len(compact) - width + 1):
+                if compact[index:index + width] in baseline:
+                    return True
+    return False
+
+
+def _tender_scope_baseline(documents: list[dict]) -> str:
+    """供本地范围误报回收使用的完整招标文本，不发送给模型、不额外占用 token。"""
+    parts: list[str] = []
+    for document in documents:
+        if document.get("role") not in {"tender", "tender_attachment"}:
+            continue
+        path = Path(str(document.get("parsed_path") or ""))
+        if path.is_file():
+            parts.append(path.read_text(encoding="utf-8", errors="ignore"))
+    # 正常招标文件远低于此上限；上限仅防止异常解析文件在 2GB 服务器上占用过多内存。
+    return "\n".join(parts)[:1_500_000]
+
+
+def _scope_prompt_profile(value: dict) -> dict:
+    """去掉仅供本地回收使用的字段，保持发送给模型的范围画像紧凑且稳定。"""
+    return {key: value.get(key) for key in SCOPE_PROFILE_FIELDS if key in value}
 
 
 def _merge_scope_anomalies(current: list[dict], previous: list[dict]) -> list[dict]:
@@ -4251,6 +4323,13 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
             continue
         seen_scope.add(signature)
         scope_anomalies.append(item)
+    scan_scope = scan.get("project_scope") if isinstance(scan.get("project_scope"), dict) else {}
+    tender_baseline = scan_scope.get("_tender_scope_baseline")
+    if tender_baseline:
+        scope_anomalies = [
+            item for item in scope_anomalies
+            if not _scope_candidate_matches_tender_material(item, tender_baseline)
+        ]
     scope_anomalies.sort(key=lambda item: priority_rank.get(item.get("candidate_priority"), 1))
     if is_review_group and has_scope_rule:
         # 该通道不依赖“地区、项目名”等固定关键词：任何范围偏离候选的原页都会
@@ -4296,7 +4375,7 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
     if is_review_group and has_scope_rule:
         scope_packet = (
             "\n\n【项目范围画像（来自招标文件和已确认规则）】\n"
-            + json.dumps(scan.get("project_scope", {}), ensure_ascii=False, separators=(",", ":"))
+            + json.dumps(_scope_prompt_profile(scan.get("project_scope", {})), ensure_ascii=False, separators=(",", ":"))
             + "\n\n【项目范围偏离候选（仅供结合原页和规则核验，不是既成结论）】\n"
             + json.dumps(scope_anomalies[:(4 if targeted else 12)], ensure_ascii=False, separators=(",", ":"))
         )
@@ -5092,6 +5171,11 @@ def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: d
         )
         return _set_result_coverage(_with_vision_execution(fallback, "ocr_uncovered", pages, {}, f"{service_labels} 已识别候选页，但未覆盖可形成结论的关键文字，已保留原结论。"), "uncovered")
     scope = _ocr_response_scope(parsed)
+    # 新协议把“文字事实已覆盖”与“仍需核验签章/外观”拆开：OCR 可以为文字性
+    # 条件提供明确建议，但绝不能冒充完成图片真实性或签章核验。旧自定义模板没有
+    # content_coverage 时维持原有仅 full 才采纳的严格行为。
+    content_covered = str(parsed.get("content_coverage") or "").lower() == "covered"
+    can_apply_text_conclusion = not incomplete_pages and (scope == "full" or content_covered)
     if incomplete_pages:
         # 单页本地推理异常不能被其他页的正面文字“掩盖”；视觉模型仍可在下一步补看。
         scope = "partial"
@@ -5125,16 +5209,16 @@ def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: d
         working_result.get("reason"), f"{evidence}\n{reason}", rule, full=scope == "full",
     )
     if component == "review":
-        selected_status = str(parsed.get("status") or working_result.get("status") or "manual") if scope == "full" else str(working_result.get("status") or "manual")
+        selected_status = str(parsed.get("status") or working_result.get("status") or "manual") if can_apply_text_conclusion else str(working_result.get("status") or "manual")
         if selected_status not in {"satisfied", "not_satisfied", "partial", "not_found", "manual"}:
             selected_status = "manual"
         merged = _review_result_from_model({
             "evidence": _merge_supplement_text(reconciled_evidence, f"{prefix}{evidence}" if evidence else "", limit=merge_limit),
             "page_hint": "P" + "、P".join(str(page) for page in (evidence_pages or pages)),
             "reason": _merge_reason_text(reconciled_reason, f"{prefix}{reason}" if reason else "", limit=merge_limit),
-            "risk_level": parsed.get("risk_level") if scope == "full" else working_result.get("risk_level"),
-            "confidence": parsed.get("confidence") if scope == "full" else working_result.get("confidence"),
-            "evidence_quality": "sufficient" if scope == "full" and evidence else working_result.get("evidence_quality"),
+            "risk_level": parsed.get("risk_level") if can_apply_text_conclusion else working_result.get("risk_level"),
+            "confidence": parsed.get("confidence") if can_apply_text_conclusion else working_result.get("confidence"),
+            "evidence_quality": "sufficient" if can_apply_text_conclusion and evidence else working_result.get("evidence_quality"),
         }, rule["rule_id"], selected_status)
         # 标准化审查结果只保留业务字段，这些内部路由元数据需显式带到下一层图片识别。
         merged = {
@@ -5145,11 +5229,11 @@ def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: d
         }
     else:
         max_score = float(_rule_scoring(rule).get("max_score") or working_result.get("max_score") or 0)
-        suggested = _bounded_model_score(parsed.get("suggested_score"), max_score) if scope == "full" and max_score > 0 else working_result.get("suggested_score")
+        suggested = _bounded_model_score(parsed.get("suggested_score"), max_score) if can_apply_text_conclusion and max_score > 0 else working_result.get("suggested_score")
         merged = {**working_result, "suggested_score": suggested,
                   "evidence": _merge_supplement_text(reconciled_evidence, f"{prefix}{evidence}" if evidence else "", limit=merge_limit),
                   "reason": _merge_reason_text(reconciled_reason, f"{prefix}{reason}" if reason else "", limit=merge_limit),
-                  "confidence": _enum_text(parsed.get("confidence"), {"high", "medium", "low"}, working_result.get("confidence")) if scope == "full" else working_result.get("confidence"),
+                  "confidence": _enum_text(parsed.get("confidence"), {"high", "medium", "low"}, working_result.get("confidence")) if can_apply_text_conclusion else working_result.get("confidence"),
                   "ocr_candidate_pages": pages, "ocr_evidence_pages": evidence_pages,
                   "requires_review": True, "automation_status": "needs_review", "review_reason": f"{service_labels} 结果已补充，需人工复核。"}
     merged = _append_evidence_layer(
@@ -5157,8 +5241,8 @@ def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: d
         evidence_pages=evidence_pages, service=service_labels,
     )
     return _with_vision_execution(
-        _set_result_coverage(merged, "covered" if scope == "full" else "partial"), status, pages, {"display_name": service_labels},
-        f"{service_labels} 已识别候选页并{'采纳到规则结论' if scope == 'full' else '补充部分文字事实'}"
+        _set_result_coverage(merged, "covered" if can_apply_text_conclusion else "partial"), status, pages, {"display_name": service_labels},
+        f"{service_labels} 已识别候选页并{'采纳到规则结论' if can_apply_text_conclusion else '补充部分文字事实'}"
         + (f"；{failure}" if incomplete_pages else "。"),
         evidence_pages=evidence_pages,
     )
@@ -5526,6 +5610,27 @@ def _form_continuation_pages(page_texts: dict[int, str], rule: dict, pages: list
     return expanded
 
 
+def _rule_text_anchor_pages(page_texts: dict[int, str], rule: dict, page_count: int) -> list[int]:
+    """从本地解析文本直接召回规则材料页，作为目录/模型页码的补充。
+
+    这是零外部调用的精确词锚：只使用规则中四字以上的材料名，按命中词长度和数量
+    排序。它尤其适合承诺函、型号响应表等文字可见但全文扫描未恰好返回页码的材料，
+    不会替代既有 OCR、目录或模型候选来源。
+    """
+    terms = [term for term in _rule_material_terms(rule) if len(term) >= 4][:80]
+    if not terms:
+        return []
+    ranked: list[tuple[int, int]] = []
+    for page, raw_text in page_texts.items():
+        if not (1 <= int(page) <= page_count):
+            continue
+        text = re.sub(r"[\s\W_]+", "", str(raw_text or ""))
+        hits = [term for term in terms if term in text]
+        if hits:
+            ranked.append((max(map(len, hits)) * 10 + len(hits), int(page)))
+    return [page for _, page in sorted(ranked, key=lambda item: (-item[0], item[1]))[:8]]
+
+
 def _vision_page_candidates(document: dict, rule: dict, result: dict) -> list[int]:
     """OCR已命中页、图片缺口语境、裸结构化页码按可靠度生成候选。"""
     if document.get("extension") != ".pdf" or not document.get("page_count"):
@@ -5544,6 +5649,11 @@ def _vision_page_candidates(document: dict, rule: dict, result: dict) -> list[in
     # 先剥掉【腾讯OCR·…·P…】【本地OCR·…·P…】【图片识别·…·P…】等系统前缀：其中的页码是“已处理页清单”，
     # 不是“材料所在页”，混入候选会把 OCR 实际命中页（如正文“证书在P144明确”）挤出预算。
     pages: list[int] = list(directory_pages)
+    # 目录没有列页码、或材料位于响应表/承诺函时，直接文本锚可避免把图片预算先
+    # 花在正文开头。目录显式页仍保持第一优先级。
+    for page in _rule_text_anchor_pages(page_texts, rule, page_count) if page_texts else []:
+        if page not in pages:
+            pages.append(page)
     # 腾讯 OCR 归纳模型明确标出的命中页，是后续核对签章、勾选、版式和图片字段的
     # 最可靠入口；与仅表示“处理过哪些页”的 ocr_candidate_pages 严格分开。
     for source in result.get("ocr_evidence_pages") or []:
@@ -6763,23 +6873,78 @@ def _strip_inapplicable_price_discount_text(value: object) -> str:
     return " ".join(piece.strip() for piece in retained if piece.strip())
 
 
-def _uses_lowest_price_ratio(rule: dict) -> bool:
+def _price_formula_kind(rule: dict) -> str | None:
+    """只识别原文完整写明的通用价格公式，避免把任意“基准价”误算成最低价法。"""
     text = re.sub(r"\s+", "", " ".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text")))
-    return bool(re.search(r"(?:评标价|评审价|评标基准价|基准价|最低(?:评标|评审|投标)?价).{0,36}[／/]?.{0,36}投标报价", text))
+    # 最低价比例法必须同时有“最低价为基准”和“基准价/本投标报价”的方向证据。
+    lowest_base = re.search(r"最低(?:评标|评审|投标)?(?:报价)?价.{0,40}(?:为|作为|确定为).{0,24}(?:评标|评审)?基准价", text)
+    lowest_ratio = re.search(r"(?:评标|评审)?基准价.{0,20}[／/].{0,20}(?:本|投标人)?(?:投标|响应)?报价", text)
+    if lowest_ratio and (lowest_base or re.search(r"最低(?:评标|评审|投标)?(?:报价)?价", text)):
+        return "lowest_ratio"
+    # 算术平均值乘固定系数、并按高低偏离分别扣分的公式可以稳定复算；只有四个
+    # 关键要素都明确出现才接管模型结果，其他价格公式继续由模型给出建议。
+    average = "算术平均" in text and bool(re.search(r"(?:评标|评审)?基准价.{0,36}(?:算术平均|平均值)", text))
+    factor = re.search(r"(?:算术平均值|平均值).{0,28}(?:[×x*]|的)\s*(0?\.\s*\d+|\d+\s*%)", text)
+    high = re.search(r"高于.{0,24}基准价.{0,24}(?:每|每高).{0,12}1%?.{0,16}扣\s*(\d+(?:\.\d+)?)\s*分", text)
+    low = re.search(r"低于.{0,24}基准价.{0,24}(?:每|每低).{0,12}1%?.{0,16}扣\s*(\d+(?:\.\d+)?)\s*分", text)
+    if average and factor and high and low:
+        raw_factor = factor.group(1).replace(" ", "")
+        try:
+            value = Decimal(raw_factor[:-1]) / Decimal("100") if raw_factor.endswith("%") else Decimal(raw_factor)
+        except InvalidOperation:
+            value = Decimal("0")
+        if Decimal("0") < value <= Decimal("1"):
+            return "average_factor_deviation"
+    return None
+
+
+def _uses_lowest_price_ratio(rule: dict) -> bool:
+    """兼容既有调用方：只有明确最低价比例法才返回真。"""
+    return _price_formula_kind(rule) == "lowest_ratio"
 
 
 def _deterministic_price_score(rule: dict, quoted_price: object, quoted_prices: list[object], max_score: float) -> tuple[float | None, str]:
-    """只复算招标原文明确的最低价比例公式，其他价格评分仍保留模型判断。"""
-    if not _uses_lowest_price_ratio(rule) or max_score <= 0:
+    """复算明确的通用价格公式；信息不完整或公式不匹配时保留模型建议。"""
+    kind = _price_formula_kind(rule)
+    if not kind or max_score <= 0:
         return None, ""
     current = _decimal_price(quoted_price)
     prices = [value for value in (_decimal_price(item) for item in quoted_prices) if value is not None]
     if current is None or len(prices) < 2:
         return None, ""
-    base = min(prices)
-    score = (base / current * Decimal(str(max_score))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    bounded = min(Decimal(str(max_score)), max(Decimal("0"), score))
-    return float(bounded), f"系统复算：评标基准价{base}；{base}／{current}×{max_score}={bounded}（四舍五入保留两位小数）。"
+    maximum = Decimal(str(max_score))
+    if kind == "lowest_ratio":
+        base = min(prices)
+        score = (base / current * maximum).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        bounded = min(maximum, max(Decimal("0"), score))
+        return float(bounded), f"系统复算：评标基准价{base}；{base}／{current}×{max_score}={bounded}（四舍五入保留两位小数）。"
+
+    text = re.sub(r"\s+", "", " ".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text")))
+    factor_match = re.search(r"(?:算术平均值|平均值).{0,28}(?:[×x*]|的)\s*(0?\.\s*\d+|\d+\s*%)", text)
+    high_match = re.search(r"高于.{0,24}基准价.{0,24}(?:每|每高).{0,12}1%?.{0,16}扣\s*(\d+(?:\.\d+)?)\s*分", text)
+    low_match = re.search(r"低于.{0,24}基准价.{0,24}(?:每|每低).{0,12}1%?.{0,16}扣\s*(\d+(?:\.\d+)?)\s*分", text)
+    if not (factor_match and high_match and low_match):
+        return None, ""
+    raw_factor = factor_match.group(1).replace(" ", "")
+    factor = Decimal(raw_factor[:-1]) / Decimal("100") if raw_factor.endswith("%") else Decimal(raw_factor)
+    # 常见规则在投标人不少于五家时去掉 20% 的最高、最低报价；原文未明确该条件时
+    # 不擅自剔除，直接使用全部可识别报价。
+    averaged = list(prices)
+    if len(prices) >= 5 and re.search(r"(?:去掉|剔除).{0,24}(?:最高|最低).{0,24}(?:20%|百分之二十)", text):
+        trim = max(1, int(len(prices) * 0.2))
+        if len(prices) > trim * 2:
+            averaged = sorted(prices)[trim:-trim]
+    base = (sum(averaged) / Decimal(len(averaged))) * factor
+    delta_percent = abs(current - base) / base * Decimal("100")
+    deduction_rate = Decimal(high_match.group(1)) if current >= base else Decimal(low_match.group(1))
+    score = (maximum - delta_percent * deduction_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    bounded = min(maximum, max(Decimal("0"), score))
+    side = "高于" if current >= base else "低于"
+    return float(bounded), (
+        f"系统复算：可识别报价算术平均值{sum(averaged) / Decimal(len(averaged))}×{factor}="
+        f"评标基准价{base.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}；本报价{side}基准价"
+        f"{delta_percent.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}%，按每1%扣{deduction_rate}分，建议{bounded}分。"
+    )
 
 
 def _run_cross_bid_price_scoring(app, task: dict, profile: dict, documents: list[dict], rules: list[dict],
@@ -7504,6 +7669,9 @@ def _evaluate_all(app, task: dict) -> dict:
     project_scope = _project_scope_profile(
         app, task, profile, all_documents, review_rules + objective_rules + subjective_rules,
     )
+    # 范围画像供模型理解项目；完整招标文本只供本地校验“该对象是否已列入采购范围”，
+    # 不进入任何提示词，既避免长清单抽样遗漏，也不增加模型输入 token。
+    project_scope["_tender_scope_baseline"] = _tender_scope_baseline(all_documents)
     compact_retry_count = split_retry_count = 0
     manual_fallback_rule_count = 0
     evidence_ledger_rule_count = evidence_ledger_empty_rule_count = 0

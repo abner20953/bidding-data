@@ -3974,6 +3974,38 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(score, 19.96)
         self.assertIn("19.96", calculation)
 
+    def test_average_factor_price_formula_is_recalculated_only_when_all_terms_are_explicit(self):
+        rule = {
+            "title": "价格评分", "check_rule": "评标基准价为有效报价算术平均值的97%。投标报价高于基准价的，每高于1%扣1分；低于基准价的，每低于1%扣0.5分。",
+            "source_text": "价格分满分45分。",
+        }
+        score, calculation = worker._deterministic_price_score(rule, 1_720_000, [1_720_000, 1_835_000, 1_925_000, 1_909_660], 45)
+        self.assertEqual(score, 42.99)
+        self.assertIn("评标基准价", calculation)
+        ambiguous = {"title": "价格评分", "check_rule": "按评标基准价计算价格得分", "source_text": "满分45分"}
+        self.assertIsNone(worker._deterministic_price_score(ambiguous, 100, [100, 120], 45)[0])
+
+    def test_directory_candidates_join_split_material_name_and_page_reference(self):
+        pages = {
+            2: "目录\n精密空调节能产品认证\n证书复印件……564\n",
+            564: "节能产品认证证书扫描件",
+        }
+        rule = {"title": "精密空调节能产品认证证书", "check_rule": "核验证书复印件"}
+        self.assertEqual(worker._directory_material_candidates(pages, rule, 600, 0), [564])
+
+    def test_scope_candidate_known_to_tender_is_not_routed_as_off_topic(self):
+        candidate = {"evidence": "响应清单列有移动储物柜及配件", "observation": "疑似与项目无关"}
+        tender = "采购清单：移动储物柜，规格详见技术需求。"
+        self.assertTrue(worker._scope_candidate_matches_tender_material(candidate, tender))
+        self.assertFalse(worker._scope_candidate_matches_tender_material(
+            {"evidence": "井道作业安全方案", "observation": "疑似无关"}, tender,
+        ))
+
+    def test_score_dedupe_ignores_section_navigation_prefix(self):
+        left = {"category": "objective", "title": "商务部分-企业业绩评分（满分9分）", "check_rule": "业绩评分", "source_clause_ids": ["SC-1"], "scoring": {"max_score": 9}}
+        right = {"category": "objective", "title": "企业业绩评分", "check_rule": "业绩评分", "source_clause_ids": ["SC-1"], "scoring": {"max_score": 9}}
+        self.assertEqual(len(worker._dedupe_rule_candidates([left, right])), 1)
+
     def test_coverage_rule_catalog_keeps_leaf_requirements(self):
         rule = {
             "rule_id": "coverage", "category": "other", "title": "采购需求逐项响应覆盖",

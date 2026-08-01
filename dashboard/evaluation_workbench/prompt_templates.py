@@ -239,7 +239,9 @@ PROMPT_TEMPLATES["evaluate_all_ocr_user"] = _template(
     "\"conclusion_scope\":\"full|partial|none\",\"coverage\":\"covered|not_covered|uncertain\","
     "\"evidence_pages\":[实际形成证据的PDF页码]}。"
     "coverage=covered 仅表示OCR文字覆盖到规则相关材料；只有OCR文字足以完成整条文字性规则判断时 conclusion_scope 才可为 full。"
-    "若规则关键事实仍取决于签章、勾选、图片外观或表格版式，必须使用 partial，不得直接改写已有结论或建议分。"
+    "若OCR文字已经覆盖计分/资格的文字条件、但签章、勾选、图片外观或表格版式仍待核验，仍可给出明确的文字性 status 或 suggested_score，"
+    "同时必须使用 conclusion_scope=partial，并额外返回 content_coverage:\"covered\"、visual_review_required:true、visual_review_reason:\"待核验的外观事实\"；"
+    "这表示“文字建议可供人工复核”，绝不表示外观核验已完成。若OCR连文字条件也未覆盖，content_coverage 必须为 not_covered 且不得改写已有结论或建议分。"
     "证据与理由不得复述规则。\n规则：{{rule}}\n投标文件：{{document_name}}；投标人：{{bidder_name}}\n"
     "已有文字结论：{{text_result}}\nOCR接口：{{ocr_service}}；已识别页：{{ocr_pages}}\nOCR文字：\n{{ocr_text}}",
     "rule", "document_name", "bidder_name", "text_result", "ocr_service", "ocr_pages", "ocr_text",
@@ -331,6 +333,14 @@ PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += (
     " 评分表跨页时，下一页以“（X分）、……”开头的文字通常是上一页评分项的续行：必须与上一页标题、"
     "全部子项和扣分逻辑合并为同一规则，不得另起通用的“服务/应急方案”等错误规则。"
 )
+PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += (
+    " 评分规则编译必须以评分表的一个完整行/一个明确总分为边界：同一评分条款ID、同一计分对象和同一满分"
+    "只能保留一条规则，标题的“商务部分/评分/满分X分”等导航文字不是独立评分事实；应把分档、证书类别、"
+    "数量、封顶和跨页续行收进该规则的 scoring.items。反之，不同计分对象、不同满分或独立可累计子项不得误合并。"
+    "不得使用“接续子项”“第X页续”等占位标题，必须回溯相邻页的最近明确编号/标题。"
+    "“允许代理商投标”“可接受某种方式”等许可性表述本身不等于须提供授权/证明；只有原文明确要求当前投标文件"
+    "提交某份材料时才生成相应规则。政策、管理要求或采购背景也只有明确要求投标人当前声明、承诺或提交材料时才成为审查点。"
+)
 PROMPT_TEMPLATES["evaluate_all_objective_user"]["content"] += (
     " 对业绩、证书等按件计分材料，必须以每个独立项目的完整要件清单判断：已见通知书、目录或列表不等于"
     "该项目可计分；只有本规则要求的合同首页、金额、签章、明细等要件均被本次证据覆盖时才计入已确认数量。"
@@ -358,6 +368,12 @@ PROMPT_TEMPLATES["extract_rules_quality_gate_user"]["content"] = (
     .replace("评分表中的业绩、报价、人员、资质、方案、分档、公式、叶子子项、缺项/缺陷扣分和封顶逻辑优先保留。",
              "评分表中的业绩、报价、人员、资质、方案、分档、公式、叶子子项、缺项/缺陷扣分和封顶逻辑优先保留。"
              "同一评分条款ID、相同计分对象和满分的候选只能保留一条，选择评分子项、原文依据和检查口径更完整的一条。")
+)
+PROMPT_TEMPLATES["extract_rules_finalise_user"]["content"] = (
+    PROMPT_TEMPLATES["extract_rules_finalise_user"]["content"]
+    .replace("6. objective/subjective 评分规则不得删除、合并或改写；同一材料同时承担资格门槛和独立评分时两条均保留；",
+             "6. objective/subjective 评分规则原则上不得删除、合并或改写；但同一评分条款ID、同一计分对象、同一满分的重复候选必须合并为一条，"
+             "保留更完整的 scoring.items、原文依据和计分口径；不同独立分值、不同计分对象或资格门槛与独立评分不得合并；同一材料同时承担资格门槛和独立评分时两条均保留；")
 )
 
 
