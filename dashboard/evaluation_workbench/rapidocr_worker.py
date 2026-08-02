@@ -9,7 +9,13 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
+
+try:  # Linux 容器提供 resource；Windows 本地开发环境安全退化为未知。
+    import resource
+except ImportError:  # pragma: no cover - 仅 Windows
+    resource = None
 
 
 def _detector_limit_side_len() -> int:
@@ -69,6 +75,7 @@ def _result_for_page(engine, item: dict) -> dict:
 
 
 def main() -> int:
+    started = time.perf_counter()
     try:
         if "--warmup" in sys.argv[1:]:
             _engine()
@@ -80,7 +87,21 @@ def main() -> int:
             raise ValueError("未提供本地 OCR 页面")
         engine = _engine()
         values = [_result_for_page(engine, item) for item in pages if isinstance(item, dict)]
-        print(json.dumps({"ok": True, "pages": values}, ensure_ascii=False), flush=True)
+        peak_rss_kb = None
+        if resource is not None:
+            try:
+                peak_rss_kb = max(0, int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss))
+            except (AttributeError, OSError, ValueError):
+                peak_rss_kb = None
+        print(json.dumps({
+            "ok": True, "pages": values,
+            "metrics": {
+                "elapsed_ms": max(0, int((time.perf_counter() - started) * 1000)),
+                "peak_rss_kb": peak_rss_kb,
+                "model": "PP-OCRv5-mobile-onnx",
+                "limit_side_len": _detector_limit_side_len(),
+            },
+        }, ensure_ascii=False), flush=True)
         return 0
     except Exception as exc:  # noqa: BLE001 - 调用方会转为回退状态
         print(json.dumps({"ok": False, "error": str(exc)[:400]}, ensure_ascii=False), flush=True)

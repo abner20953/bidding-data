@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -46,13 +47,29 @@ def _runtime_env() -> dict[str, str]:
     return value
 
 
-def request_local_ocr(pages: list[dict]) -> tuple[list[dict], dict | None]:
+def request_local_ocr(pages: list[dict], *, metrics: dict | None = None) -> tuple[list[dict], dict | None]:
     """一次短进程识别一批临时 JPEG；无常驻模型、无网络请求。
 
     每个 page 仅允许 ``page`` 和调用方创建的临时 ``path``。子进程只收到这些
     临时文件路径，结果只回传文字与置信度；调用方负责用 TemporaryDirectory 清理。
     """
+    started = time.perf_counter()
+    telemetry = metrics if isinstance(metrics, dict) else {}
+    telemetry.clear()
+
+    def finish_metrics(status: str, error_kind: str = "", child: object = None) -> None:
+        value = child if isinstance(child, dict) else {}
+        telemetry.update({
+            "elapsed_ms": max(0, int((time.perf_counter() - started) * 1000)),
+            "peak_rss_kb": value.get("peak_rss_kb"),
+            "status": status,
+            "error_kind": error_kind,
+            "model": str(value.get("model") or "PP-OCRv5-mobile-onnx")[:80],
+            "limit_side_len": value.get("limit_side_len"),
+        })
+
     if not pages:
+        finish_metrics("error", "input")
         return [], _error("input", "未提供本地 OCR 页面")
     try:
         inputs = []
@@ -68,6 +85,7 @@ def request_local_ocr(pages: list[dict]) -> tuple[list[dict], dict | None]:
                 continue
             inputs.append({"page": page, "path": str(path)})
         if not inputs:
+            finish_metrics("error", "input")
             return [], _error("input", "未获得可识别的本地 OCR 图片")
         completed = subprocess.run(
             [sys.executable, "-m", "dashboard.evaluation_workbench.rapidocr_worker"],
@@ -77,8 +95,10 @@ def request_local_ocr(pages: list[dict]) -> tuple[list[dict], dict | None]:
             check=False,
         )
     except subprocess.TimeoutExpired:
+        finish_metrics("timeout", "timeout")
         return [], _error("timeout", "本地 RapidOCR 识别超时，已自动释放子进程")
     except OSError as exc:
+        finish_metrics("unavailable", "unavailable")
         return [], _error("unavailable", exc)
     payload = {}
     # 第三方推理库可能在初始化时输出 INFO；只把最后一条合法 JSON 视为子进程协议。
@@ -92,6 +112,7 @@ def request_local_ocr(pages: list[dict]) -> tuple[list[dict], dict | None]:
             break
     if completed.returncode != 0 or not isinstance(payload, dict) or not payload.get("ok"):
         detail = payload.get("error") if isinstance(payload, dict) else ""
+        finish_metrics("unavailable", "unavailable", payload.get("metrics") if isinstance(payload, dict) else None)
         return [], _error("unavailable", detail or completed.stderr or "RapidOCR 子进程未返回有效结果")
     # 保留每个页面的结果状态，不能把“空白/单页失败”悄悄丢掉。调用方据此
     # 决定是否只能形成部分 OCR 结论；这对腾讯关闭后的本地直连路径尤其重要。
@@ -129,4 +150,9 @@ def request_local_ocr(pages: list[dict]) -> tuple[list[dict], dict | None]:
             "page": page,
             "state": "recognized",
         })
+    failed = sum(1 for item in values if item.get("state") == "failed")
+    recognized = sum(1 for item in values if item.get("state") == "recognized")
+    finish_metrics("partial" if failed else "success", "page_error" if failed else "", payload.get("metrics"))
+    telemetry.update({"recognized_pages": recognized, "failed_pages": failed,
+                      "empty_pages": sum(1 for item in values if item.get("state") == "empty")})
     return values, None

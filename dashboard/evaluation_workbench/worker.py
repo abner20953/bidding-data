@@ -3892,6 +3892,58 @@ def _project_scope_profile(app, task: dict, profile: dict, documents: list[dict]
     return scope
 
 
+def _full_scan_output_risk(catalog: list[dict], chunk: dict, max_tokens: int) -> dict:
+    """估算全文扫描发生输出格式异常的风险，仅用于影子观测。
+
+    评分只依赖规则目录和页块长度等元数据，不读取或保存正文。当前结果绝不参与
+    拆分、重试或 Token 预算决策；积累足够云端样本后才能评估是否值得灰度启用。
+    """
+    rule_count = len(catalog)
+    chunk_chars = len(str(chunk.get("text") or ""))
+    catalog_chars = len(_stable_prompt_json(catalog))
+    complex_rules = sum(
+        1 for item in catalog
+        if item.get("coverage") or item.get("score_hint") or len(item.get("evidence_requirements") or []) >= 3
+    )
+    score = 0
+    score += min(42, rule_count * 2)
+    score += min(24, chunk_chars // 550)
+    score += min(16, catalog_chars // 1_200)
+    score += min(12, complex_rules * 2)
+    if max_tokens <= 2_200 and rule_count >= 16:
+        score += 8
+    score = max(0, min(100, int(score)))
+    return {
+        "score": score,
+        "recommend_split": score >= 70 and rule_count > 12,
+        "input_chars": chunk_chars + catalog_chars,
+        "rule_count": rule_count,
+    }
+
+
+def _record_full_scan_risk(app, task: dict, document: dict, phase: str, context_mode: str,
+                           max_tokens: int, risk: dict, *, actual_format_error: bool,
+                           finish_reason: str = "", error_kind: str = "",
+                           recovery_action: str = "none") -> None:
+    """影子台账失败不能影响真实评审。"""
+    try:
+        storage.record_output_risk_observation(
+            app, task["task_id"], task["project_id"], phase,
+            document_id=document.get("document_id"), context_mode=context_mode,
+            input_chars=risk.get("input_chars") or 0,
+            rule_count=risk.get("rule_count") or 0,
+            requested_max_tokens=max_tokens,
+            predicted_risk_score=risk.get("score") or 0,
+            shadow_split_recommended=bool(risk.get("recommend_split")),
+            actual_format_error=actual_format_error,
+            actual_finish_reason=finish_reason,
+            actual_error_kind=error_kind,
+            recovery_action=recovery_action,
+        )
+    except Exception:
+        traceback.print_exc()
+
+
 def _run_full_scan_piece(app, task: dict, profile: dict, document: dict, catalog: list[dict], chunk: dict,
                           project_scope: dict, system_prompt: str, depth: int = 0) -> tuple[dict, int, int, list[dict]]:
     """扫描一个连续页块；只在输出异常时拆分规则目录，绝不递归重发全文。"""
@@ -3899,6 +3951,8 @@ def _run_full_scan_piece(app, task: dict, profile: dict, document: dict, catalog
     # 首轮只输出紧凑候选索引。24 条短证据的预算足以闭合 JSON，又比旧的 36 条
     # 结构显著减少长度截断；最终结论仍读取本地全文片段，不以此处的条数代替覆盖率。
     max_tokens = _output_token_budget(profile, min(3_200, max(1_800, 900 + len(catalog) * 48)))
+    output_risk = _full_scan_output_risk(catalog, chunk, max_tokens)
+    context_mode = f"full_scan:{chunk['chunk_id']}"
 
     def findings_from(parsed: object) -> dict:
         values = parsed.get("matches") if isinstance(parsed, dict) else None
@@ -3922,12 +3976,28 @@ def _run_full_scan_piece(app, task: dict, profile: dict, document: dict, catalog
         parsed = _request_task_json(
             app, task, profile, "evaluate_all_full_scan", system_prompt,
             _full_scan_prompt(app, document, catalog, chunk, project_scope, compact=False),
-            document_id=document["document_id"], context_mode=f"full_scan:{chunk['chunk_id']}",
+            document_id=document["document_id"], context_mode=context_mode,
             max_tokens=max_tokens, thinking_mode="disabled",
         )
-        return findings_from(parsed), 0, 0, []
+        findings = findings_from(parsed)
+        _record_full_scan_risk(
+            app, task, document, "evaluate_all_full_scan", context_mode, max_tokens, output_risk,
+            actual_format_error=False,
+        )
+        return findings, 0, 0, []
     except InvalidJsonResponse as exc:
         format_error = exc
+        recovery_action = (
+            "split_catalog" if exc.finish_reason.lower() in {"length", "max_tokens"}
+            and len(catalog) > 12 and depth < 1 else
+            "json_repair" if exc.finish_reason.lower() not in {"length", "max_tokens"} else
+            "compact_retry"
+        )
+        _record_full_scan_risk(
+            app, task, document, "evaluate_all_full_scan", context_mode, max_tokens, output_risk,
+            actual_format_error=True, finish_reason=exc.finish_reason,
+            error_kind=type(exc).__name__, recovery_action=recovery_action,
+        )
         if exc.finish_reason.lower() not in {"length", "max_tokens"}:
             storage.update_task(app, task["task_id"], message=f"{document['bidder_name'] or document['original_name']} {_full_scan_chunk_label(chunk)} 扫描结果正在规范化")
             try:
@@ -3944,6 +4014,10 @@ def _run_full_scan_piece(app, task: dict, profile: dict, document: dict, catalog
         if not _is_model_format_error(exc) and not str(exc).startswith("模型返回格式不符合全文扫描要求"):
             raise
         format_error = exc
+        _record_full_scan_risk(
+            app, task, document, "evaluate_all_full_scan", context_mode, max_tokens, output_risk,
+            actual_format_error=True, error_kind=type(exc).__name__, recovery_action="compact_retry",
+        )
 
     # 截断说明候选目录过密，直接拆目录比完整重发同一页块更快。
     if isinstance(format_error, InvalidJsonResponse) and format_error.finish_reason.lower() in {"length", "max_tokens"} and len(catalog) > 12 and depth < 1:
@@ -3958,16 +4032,30 @@ def _run_full_scan_piece(app, task: dict, profile: dict, document: dict, catalog
 
     storage.update_task(app, task["task_id"], message=f"{document['bidder_name'] or document['original_name']} {_full_scan_chunk_label(chunk)} 全文扫描正在按紧凑结构继续")
     try:
+        compact_context_mode = f"full_scan_compact:{chunk['chunk_id']}"
         parsed = _request_task_json(
             app, task, profile, "evaluate_all_full_scan_compact_retry", system_prompt,
             _full_scan_prompt(app, document, catalog, chunk, project_scope, compact=True),
-            document_id=document["document_id"], context_mode=f"full_scan_compact:{chunk['chunk_id']}",
+            document_id=document["document_id"], context_mode=compact_context_mode,
             max_tokens=max_tokens, thinking_mode="disabled",
         )
-        return findings_from(parsed), 1, 0, []
+        findings = findings_from(parsed)
+        _record_full_scan_risk(
+            app, task, document, "evaluate_all_full_scan_compact_retry", compact_context_mode,
+            max_tokens, output_risk, actual_format_error=False,
+        )
+        return findings, 1, 0, []
     except ValueError as retry_exc:
         if not _is_model_format_error(retry_exc) and not str(retry_exc).startswith("模型返回格式不符合全文扫描要求"):
             raise
+        _record_full_scan_risk(
+            app, task, document, "evaluate_all_full_scan_compact_retry",
+            f"full_scan_compact:{chunk['chunk_id']}", max_tokens, output_risk,
+            actual_format_error=True,
+            finish_reason=retry_exc.finish_reason if isinstance(retry_exc, InvalidJsonResponse) else "",
+            error_kind=type(retry_exc).__name__,
+            recovery_action="split_catalog" if len(catalog) > 12 and depth < 1 else "failed_chunk",
+        )
         if len(catalog) > 12 and depth < 1:
             midpoint = len(catalog) // 2
             storage.update_task(app, task["task_id"], message=f"{document['bidder_name'] or document['original_name']} {_full_scan_chunk_label(chunk)} 扫描仍异常，正在仅拆分规则目录")
@@ -4867,7 +4955,7 @@ def _ocr_parser_version_for_service(service: str) -> int:
 
 
 def _local_ocr_page_texts(app, document: dict, pages: list[int], *, rule: dict | None = None,
-                          level: str = "standard") -> tuple[list[dict], str]:
+                          level: str = "standard", task: dict | None = None) -> tuple[list[dict], str]:
     """在腾讯 OCR 无法执行时，用短生命周期 RapidOCR 子进程补充文字。
 
     这里只接收已经由原有候选页逻辑筛出的页面；不会扩张页面范围，也不替代
@@ -4910,8 +4998,27 @@ def _local_ocr_page_texts(app, document: dict, pages: list[int], *, rule: dict |
                 message_parts.append("本地 RapidOCR 未在候选页识别到文字")
             return values, "；".join(message_parts)
         # 绝不并行启动 ONNX Runtime；其余投标文件会在此短暂排队，避免小规格服务器 OOM。
+        runtime_metrics: dict = {}
         with _LOCAL_OCR_REQUEST_GATE:
-            local_values, error = request_local_ocr(pending)
+            local_values, error = request_local_ocr(pending, metrics=runtime_metrics)
+        try:
+            storage.record_local_ocr_run(
+                app,
+                task_id=str((task or {}).get("task_id") or "") or None,
+                project_id=str((task or {}).get("project_id") or document.get("project_id") or "") or None,
+                document_id=str(document.get("document_id") or "") or None,
+                requested_pages=len(pending),
+                recognized_pages=int(runtime_metrics.get("recognized_pages") or 0),
+                empty_pages=int(runtime_metrics.get("empty_pages") or 0),
+                failed_pages=int(runtime_metrics.get("failed_pages") or 0),
+                elapsed_ms=int(runtime_metrics.get("elapsed_ms") or 0),
+                peak_rss_kb=runtime_metrics.get("peak_rss_kb"),
+                status=str(runtime_metrics.get("status") or ("error" if error else "success")),
+                error_kind=str(runtime_metrics.get("error_kind") or ((error or {}).get("kind") if isinstance(error, dict) else "")),
+            )
+        except Exception:
+            # 监测台账绝不能影响 OCR 主结果；数据库短暂锁定时只放弃本条指标。
+            traceback.print_exc()
     if error:
         return values, str(error.get("message") or "本地 RapidOCR 未获得可用文字")
     for value in local_values:
@@ -4962,7 +5069,7 @@ def _ocr_page_texts(app, task: dict, document: dict, rule: dict, result: dict, l
     if not tencent_ready:
         if not local_enabled:
             return [], "本地 RapidOCR 运行环境不可用，且腾讯云 OCR 未启用"
-        local_values, local_failure = _local_ocr_page_texts(app, document, pages, rule=rule, level=level)
+        local_values, local_failure = _local_ocr_page_texts(app, document, pages, rule=rule, level=level, task=task)
         # 成功直连时返回空错误；调用方才能准确区分“本地已完成”与“仅部分页面失败”。
         return local_values, local_failure
     values: list[dict] = []
@@ -5040,7 +5147,7 @@ def _ocr_page_texts(app, task: dict, document: dict, rule: dict, result: dict, l
             local_fallback_pages.append(page)
     if local_enabled and local_fallback_pages:
         local_values, local_failure = _local_ocr_page_texts(
-            app, document, local_fallback_pages, rule=rule, level=level,
+            app, document, local_fallback_pages, rule=rule, level=level, task=task,
         )
         if local_values:
             values.extend(local_values)

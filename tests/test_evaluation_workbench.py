@@ -319,6 +319,66 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         # 汇总口径保持不变，新增字段不影响既有调用方。
         self.assertEqual(usage["call_count"], 4)
 
+    def test_observability_tables_do_not_change_existing_usage_totals(self):
+        task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        document = self._add_pdf("metrics.pdf", "bid", "甲公司", "扫描页")
+        storage.record_local_ocr_run(
+            self.app, task_id=task["task_id"], project_id=self.project["project_id"],
+            document_id=document["document_id"], requested_pages=3, recognized_pages=2,
+            empty_pages=1, failed_pages=0, elapsed_ms=4_500, peak_rss_kb=256_000,
+            status="success",
+        )
+        storage.record_output_risk_observation(
+            self.app, task["task_id"], self.project["project_id"], "evaluate_all_full_scan",
+            document_id=document["document_id"], input_chars=12_000, rule_count=20,
+            requested_max_tokens=2_000, predicted_risk_score=80,
+            shadow_split_recommended=True, actual_format_error=True,
+            actual_finish_reason="length", actual_error_kind="InvalidJsonResponse",
+            recovery_action="split_catalog",
+        )
+
+        usage = storage.project_token_usage(self.app, self.project["project_id"])
+
+        self.assertEqual(usage["call_count"], 0)
+        self.assertEqual(usage["local_ocr_performance"]["run_count"], 1)
+        self.assertEqual(usage["local_ocr_performance"]["average_ms_per_page"], 1500)
+        self.assertEqual(usage["local_ocr_performance"]["peak_rss_kb"], 256_000)
+        self.assertEqual(usage["output_risk_shadow"]["observations"], 1)
+        self.assertEqual(usage["output_risk_shadow"]["true_positives"], 1)
+
+    def test_full_scan_output_risk_is_observational_only(self):
+        low = worker._full_scan_output_risk(
+            [{"id": "r1", "evidence_requirements": []}], {"text": "短页块"}, 3_200,
+        )
+        high_catalog = [
+            {"id": f"r{index}", "score_hint": "复杂计分", "evidence_requirements": ["a", "b", "c"]}
+            for index in range(24)
+        ]
+        high = worker._full_scan_output_risk(high_catalog, {"text": "长" * 11_000}, 2_000)
+
+        self.assertFalse(low["recommend_split"])
+        self.assertTrue(high["recommend_split"])
+        self.assertGreater(high["score"], low["score"])
+
+    def test_successful_full_scan_records_shadow_risk_without_changing_result(self):
+        task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        document = self._add_pdf("shadow.pdf", "bid", "甲公司", "技术方案完整")
+        catalog = [{"id": "rule-1", "rule_id": "rule-1", "q": "核验技术方案", "type": "other"}]
+        chunk = {"chunk_id": "chunk_1", "start_page": 1, "end_page": 1, "text": "技术方案完整"}
+        with patch("dashboard.evaluation_workbench.worker._request_task_json", return_value={
+            "matches": [["rule-1", "1", "技术方案完整", "supports"]],
+            "scope_anomalies": [],
+        }):
+            value, compact_retries, splits, failed = worker._run_full_scan_piece(
+                self.app, task, {"context_window": 32_000}, document, catalog, chunk, {}, "system",
+            )
+
+        self.assertEqual(value["findings"][0]["rule_id"], "rule-1")
+        self.assertEqual((compact_retries, splits, failed), (0, 0, []))
+        shadow = storage.project_token_usage(self.app, self.project["project_id"])["output_risk_shadow"]
+        self.assertEqual(shadow["observations"], 1)
+        self.assertEqual(shadow["format_errors"], 0)
+
     def test_document_evidence_manifest_is_reusable_without_storing_document_text(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案：稳定运行。")
         manifest = [{"chunk_id": "chunk_1", "start_page": 1, "end_page": 1, "chars": 12, "text_hash": "abc"}]
@@ -1762,16 +1822,27 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             image_path.write_bytes(b"jpeg")
             completed = type("Completed", (), {
                 "returncode": 0,
-                "stdout": "RapidOCR initializing\n" + json.dumps({"ok": True, "pages": [{"page": 3, "text": "本地识别文字", "line_count": 1, "confidence": 96.5}]}, ensure_ascii=False),
+                "stdout": "RapidOCR initializing\n" + json.dumps({
+                    "ok": True,
+                    "pages": [{"page": 3, "text": "本地识别文字", "line_count": 1, "confidence": 96.5}],
+                    "metrics": {"elapsed_ms": 1234, "peak_rss_kb": 321000,
+                                "model": "PP-OCRv5-mobile-onnx", "limit_side_len": 960},
+                }, ensure_ascii=False),
                 "stderr": "",
             })()
+            metrics = {}
             with patch("dashboard.evaluation_workbench.local_ocr_gateway.subprocess.run", return_value=completed) as run:
-                values, error = local_ocr_gateway.request_local_ocr([{"page": 3, "path": str(image_path)}])
+                values, error = local_ocr_gateway.request_local_ocr(
+                    [{"page": 3, "path": str(image_path)}], metrics=metrics,
+                )
 
         self.assertIsNone(error)
         self.assertEqual(values[0]["service"], local_ocr_gateway.LOCAL_OCR_SERVICE)
         self.assertEqual(values[0]["parser_version"], local_ocr_gateway.LOCAL_OCR_PARSER_VERSION)
         self.assertEqual(values[0]["state"], "recognized")
+        self.assertEqual(metrics["recognized_pages"], 1)
+        self.assertEqual(metrics["peak_rss_kb"], 321000)
+        self.assertEqual(metrics["limit_side_len"], 960)
         run.assert_called_once()
 
     def test_local_ocr_gateway_retains_empty_and_failed_page_states(self):
@@ -1818,7 +1889,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         active = maximum = 0
         lock = threading.Lock()
 
-        def fake_local_ocr(pages):
+        def fake_local_ocr(pages, *, metrics=None):
             nonlocal active, maximum
             with lock:
                 active += 1
@@ -1826,6 +1897,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             time.sleep(0.04)
             with lock:
                 active -= 1
+            if isinstance(metrics, dict):
+                metrics.update({"status": "success", "recognized_pages": 1, "elapsed_ms": 40})
             return ([{"page": pages[0]["page"], "service": local_ocr_gateway.LOCAL_OCR_SERVICE,
                       "state": "recognized", "text": "本地识别文字"}], None)
 

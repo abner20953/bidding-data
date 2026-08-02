@@ -294,6 +294,42 @@ def init_database(app) -> None:
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_ew_model_calls_project ON ew_model_calls(project_id, created_at);
+            CREATE TABLE IF NOT EXISTS ew_output_risk_observations (
+                observation_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES ew_tasks(task_id) ON DELETE CASCADE,
+                project_id TEXT NOT NULL REFERENCES ew_projects(project_id) ON DELETE CASCADE,
+                document_id TEXT REFERENCES ew_documents(document_id) ON DELETE SET NULL,
+                phase TEXT NOT NULL,
+                context_mode TEXT NOT NULL DEFAULT '',
+                input_chars INTEGER NOT NULL DEFAULT 0,
+                rule_count INTEGER NOT NULL DEFAULT 0,
+                requested_max_tokens INTEGER,
+                predicted_risk_score INTEGER NOT NULL DEFAULT 0,
+                predicted_risk_level TEXT NOT NULL DEFAULT 'low',
+                shadow_split_recommended INTEGER NOT NULL DEFAULT 0,
+                actual_format_error INTEGER NOT NULL DEFAULT 0,
+                actual_finish_reason TEXT NOT NULL DEFAULT '',
+                actual_error_kind TEXT NOT NULL DEFAULT '',
+                recovery_action TEXT NOT NULL DEFAULT 'none',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ew_output_risk_project ON ew_output_risk_observations(project_id, phase, created_at);
+            CREATE TABLE IF NOT EXISTS ew_local_ocr_runs (
+                run_id TEXT PRIMARY KEY,
+                task_id TEXT REFERENCES ew_tasks(task_id) ON DELETE SET NULL,
+                project_id TEXT REFERENCES ew_projects(project_id) ON DELETE CASCADE,
+                document_id TEXT REFERENCES ew_documents(document_id) ON DELETE SET NULL,
+                requested_pages INTEGER NOT NULL DEFAULT 0,
+                recognized_pages INTEGER NOT NULL DEFAULT 0,
+                empty_pages INTEGER NOT NULL DEFAULT 0,
+                failed_pages INTEGER NOT NULL DEFAULT 0,
+                elapsed_ms INTEGER NOT NULL DEFAULT 0,
+                peak_rss_kb INTEGER,
+                status TEXT NOT NULL DEFAULT 'unknown',
+                error_kind TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ew_local_ocr_runs_project ON ew_local_ocr_runs(project_id, created_at);
             CREATE TABLE IF NOT EXISTS ew_evaluation_scan_cache (
                 cache_id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL REFERENCES ew_projects(project_id) ON DELETE CASCADE,
@@ -1543,6 +1579,55 @@ def save_document_evidence_manifest(app, document_id: str, document_sha256: str,
         )
 
 
+def record_output_risk_observation(app, task_id: str, project_id: str, phase: str, *,
+                                   document_id: str | None = None, context_mode: str = "",
+                                   input_chars: int = 0, rule_count: int = 0,
+                                   requested_max_tokens: int | None = None,
+                                   predicted_risk_score: int = 0,
+                                   shadow_split_recommended: bool = False,
+                                   actual_format_error: bool = False,
+                                   actual_finish_reason: str = "", actual_error_kind: str = "",
+                                   recovery_action: str = "none") -> None:
+    """记录全文扫描输出风险的影子预测；不保存正文，也不改变真实拆分行为。"""
+    score = max(0, min(100, int(predicted_risk_score or 0)))
+    level = "high" if score >= 70 else "medium" if score >= 45 else "low"
+    with connection(app) as conn:
+        conn.execute(
+            """INSERT INTO ew_output_risk_observations
+               (observation_id, task_id, project_id, document_id, phase, context_mode,
+                input_chars, rule_count, requested_max_tokens, predicted_risk_score,
+                predicted_risk_level, shadow_split_recommended, actual_format_error,
+                actual_finish_reason, actual_error_kind, recovery_action, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (str(uuid.uuid4()), task_id, project_id, document_id, phase, str(context_mode or "")[:160],
+             max(0, int(input_chars or 0)), max(0, int(rule_count or 0)),
+             _safe_positive_int(requested_max_tokens), score, level,
+             1 if shadow_split_recommended else 0, 1 if actual_format_error else 0,
+             str(actual_finish_reason or "")[:64], str(actual_error_kind or "")[:96],
+             str(recovery_action or "none")[:64], now_iso()),
+        )
+
+
+def record_local_ocr_run(app, *, task_id: str | None, project_id: str | None,
+                         document_id: str | None, requested_pages: int,
+                         recognized_pages: int, empty_pages: int, failed_pages: int,
+                         elapsed_ms: int, peak_rss_kb: int | None,
+                         status: str, error_kind: str = "") -> None:
+    """保存本地 OCR 的轻量性能与状态指标；不保存图片或识别文字。"""
+    with connection(app) as conn:
+        conn.execute(
+            """INSERT INTO ew_local_ocr_runs
+               (run_id, task_id, project_id, document_id, requested_pages, recognized_pages,
+                empty_pages, failed_pages, elapsed_ms, peak_rss_kb, status, error_kind, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (str(uuid.uuid4()), task_id or None, project_id or None, document_id or None,
+             max(0, int(requested_pages or 0)), max(0, int(recognized_pages or 0)),
+             max(0, int(empty_pages or 0)), max(0, int(failed_pages or 0)),
+             max(0, int(elapsed_ms or 0)), _safe_positive_int(peak_rss_kb),
+             str(status or "unknown")[:40], str(error_kind or "")[:80], now_iso()),
+        )
+
+
 def previous_scope_anomalies(app, document_id: str, chunk_id: str, chunk_hash: str,
                              *, limit: int = 32) -> list[dict]:
     """读取相同原文页块在旧扫描中发现的范围候选，供新一轮重新判断。
@@ -1809,6 +1894,26 @@ def project_token_usage(app, project_id: str) -> dict:
                WHERE d.project_id=? AND c.service='rapidocr_local'""",
             (project_id,),
         ).fetchone()
+        local_ocr_performance_row = conn.execute(
+            """SELECT COUNT(*) AS run_count, COALESCE(SUM(requested_pages), 0) AS requested_pages,
+                      COALESCE(SUM(recognized_pages), 0) AS recognized_pages,
+                      COALESCE(SUM(empty_pages), 0) AS empty_pages,
+                      COALESCE(SUM(failed_pages), 0) AS failed_pages,
+                      COALESCE(SUM(elapsed_ms), 0) AS elapsed_ms,
+                      MAX(peak_rss_kb) AS peak_rss_kb
+               FROM ew_local_ocr_runs WHERE project_id=?""",
+            (project_id,),
+        ).fetchone()
+        output_risk_row = conn.execute(
+            """SELECT COUNT(*) AS observation_count,
+                      COALESCE(SUM(shadow_split_recommended), 0) AS recommended_count,
+                      COALESCE(SUM(actual_format_error), 0) AS format_error_count,
+                      COALESCE(SUM(CASE WHEN shadow_split_recommended=1 AND actual_format_error=1 THEN 1 ELSE 0 END), 0) AS true_positive_count,
+                      COALESCE(SUM(CASE WHEN shadow_split_recommended=1 AND actual_format_error=0 THEN 1 ELSE 0 END), 0) AS false_positive_count,
+                      COALESCE(SUM(CASE WHEN shadow_split_recommended=0 AND actual_format_error=1 THEN 1 ELSE 0 END), 0) AS missed_count
+               FROM ew_output_risk_observations WHERE project_id=?""",
+            (project_id,),
+        ).fetchone()
     usage = dict(row)
     # 图片识别与腾讯 OCR 的独立消耗分项，帮助用户评估识图预算；OCR 页数来自
     # 额度台账，不计入模型 token。
@@ -1823,6 +1928,20 @@ def project_token_usage(app, project_id: str) -> dict:
     usage["ocr_requests"] = int(ocr_row["ocr_requests"] or 0) if ocr_row else 0
     # 本地 OCR 没有额度台账；以已缓存的去重页数呈现真实处理规模（含空白页缓存）。
     usage["local_ocr_pages"] = int(local_ocr_row["local_ocr_pages"] or 0) if local_ocr_row else 0
+    performance = dict(local_ocr_performance_row) if local_ocr_performance_row else {}
+    performance["average_ms_per_page"] = round(
+        int(performance.get("elapsed_ms") or 0) / max(1, int(performance.get("requested_pages") or 0)), 1,
+    ) if performance.get("requested_pages") else 0
+    usage["local_ocr_performance"] = performance
+    risk_values = dict(output_risk_row) if output_risk_row else {}
+    usage["output_risk_shadow"] = {
+        "observations": int(risk_values.get("observation_count") or 0),
+        "recommended": int(risk_values.get("recommended_count") or 0),
+        "format_errors": int(risk_values.get("format_error_count") or 0),
+        "true_positives": int(risk_values.get("true_positive_count") or 0),
+        "false_positives": int(risk_values.get("false_positive_count") or 0),
+        "missed": int(risk_values.get("missed_count") or 0),
+    }
     # 不依赖特定厂商字段。若模型返回缓存 token，即按环节汇总，供页面和后续优化判断
     # 哪些调用真正具备前缀复用空间；未返回该字段的模型保持 0，不误报失败。
     usage["cache_by_phase"] = [
