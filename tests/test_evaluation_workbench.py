@@ -2354,7 +2354,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(score_rows[0]["vision_pages"], [8])
         self.assertEqual(score_rows[0]["vision_status"], "applied_partial")
 
-    def test_evidence_pack_is_shadow_only_and_records_page_provenance(self):
+    def test_evidence_pack_reuses_only_confirmed_candidate_pages_and_records_provenance(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "认证证书见第12页。")
         rule = storage.add_rule(self.app, self.project["project_id"], {
             "category": "objective", "title": "认证评分", "check_rule": "核验认证证书", "scoring": {"max_score": 2},
@@ -2379,9 +2379,17 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(len(saved), 1)
         payload = saved[0]["payload"]
         self.assertTrue(payload["decision_participation"] is False)
-        self.assertEqual(payload["mode"], "shadow_only")
+        self.assertEqual(payload["mode"], "candidate_pages_only")
         self.assertIn({"source": "ocr_evidence", "page": 12}, payload["page_provenance"])
         self.assertEqual(payload["ocr_findings"][0]["evidence_pages"], [12])
+        self.assertEqual(
+            storage.evidence_pack_pages(self.app, document["document_id"], document["sha256"], pack["material_key"]),
+            [12],
+        )
+        # 证据包页码仅作为候选，不携带上一次的分数、状态或理由。
+        reused = worker._with_evidence_pack_candidates(self.app, document, rule, {"status": "manual"})
+        self.assertEqual(reused["evidence_pack_candidate_pages"], [12])
+        self.assertEqual(reused["status"], "manual")
 
     def test_deleting_project_removes_files_and_related_records(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案：稳定运行。")
@@ -2507,6 +2515,27 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(saved["applicability"]["package_ids"], [2])
         self.assertEqual(worker._rule_execution_strategy(saved), "section")
         self.assertFalse(worker._rule_requires_visual_verification(saved))
+
+    def test_material_and_field_evidence_requirements_preserve_text_route(self):
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "检测报告评分", "check_rule": "核验检测报告编号和日期",
+            "evidence_requirements": ["document", "field"], "scoring": {"max_score": 2},
+        })
+        _, rules = storage.list_rules(self.app, self.project["project_id"])
+        saved = next(item for item in rules if item["rule_id"] == rule["rule_id"])
+
+        self.assertEqual(saved["evidence_requirements"], ["document", "field", "text"])
+        self.assertEqual(worker._rule_image_strategy(saved), "ocr")
+
+    def test_ocr_discovery_does_not_early_stop_counting_or_form_rules(self):
+        values = [{"page": 3, "text": "检测报告 编号 ABC-2026"}]
+        normal = {"title": "检测报告核验", "check_rule": "核验检测报告编号", "category": "qualification"}
+        counting = {**normal, "category": "objective", "scoring_json": json.dumps({"kind": "manual", "max_score": 3, "items": [{"name": "报告", "max_score": 3}]})}
+
+        self.assertTrue(worker._ocr_discovery_is_sufficient(normal, values))
+        self.assertFalse(worker._ocr_discovery_is_sufficient(counting, values))
+        self.assertEqual(worker._ocr_discovery_page_count(normal, "standard", [1, 2, 3, 4]), 3)
+        self.assertEqual(worker._ocr_discovery_page_count(counting, "standard", [1, 2, 3, 4]), 4)
 
     def test_structured_score_items_participate_in_page_retrieval(self):
         chunks = [

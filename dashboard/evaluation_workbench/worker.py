@@ -4105,7 +4105,7 @@ def _scan_strategy(rules: list[dict]) -> str:
     return "point"
 
 
-_EVIDENCE_PACK_VERSION = "shadow-v1"
+_EVIDENCE_PACK_VERSION = "candidate-v2"
 
 
 def _shadow_rule_fingerprint(rule: dict) -> str:
@@ -4116,6 +4116,48 @@ def _shadow_rule_fingerprint(rule: dict) -> str:
         "execution": storage.rule_execution_meta(rule),
     }
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _evidence_pack_material_key(rule: dict) -> str:
+    """为可复用的“材料事实”生成保守键，不把不同规则的最终结论混在一起。
+
+    键同时包含材料角色、规则要求的证据维度及若干长材料锚点。这样同一文件重跑时，
+    例如同一张证书/检测报告可优先回到已确认页；相同的泛化词（如“材料”“证明”）
+    则不会把无关规则错误关联。它只影响选页优先级，绝不复用分数、状态或理由。
+    """
+    try:
+        requirements = storage.rule_execution_meta(rule).get("evidence_requirements") or []
+    except (TypeError, ValueError):
+        requirements = rule.get("evidence_requirements") or []
+    roles = sorted(_rule_material_roles(rule))
+    terms = [value for value in _rule_material_terms(rule) if len(value) >= 4][:6]
+    if not roles and not terms:
+        return ""
+    value = {
+        "roles": roles,
+        "requirements": sorted(str(item) for item in requirements if str(item) in {"document", "field", "visual", "text"}),
+        "terms": terms,
+    }
+    return hashlib.sha256(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _with_evidence_pack_candidates(app, document: dict, rule: dict, result: dict) -> dict:
+    """在同一文件重跑时优先放入已被直接取证的页；失败安全回退原候选链。"""
+    key = _evidence_pack_material_key(rule)
+    if not key or not document.get("sha256"):
+        return result
+    try:
+        pages = storage.evidence_pack_pages(app, str(document.get("document_id") or ""), str(document.get("sha256") or ""), key)
+    except Exception:
+        return result
+    page_count = int(document.get("page_count") or 0)
+    pages = [page for page in _normalise_result_pages(pages) if not page_count or page <= page_count]
+    if not pages:
+        return result
+    existing = _normalise_result_pages(result.get("evidence_pack_candidate_pages"))
+    return {**result, "evidence_pack_candidate_pages": list(dict.fromkeys([*pages, *existing]))}
 
 
 def _shadow_material_checklist(rule: dict) -> list[dict]:
@@ -4242,14 +4284,17 @@ def _build_shadow_evidence_pack(task: dict, document: dict, component: str, rule
                 for item in cross_modal.get("items") or [] if isinstance(item, dict)
             ][:12],
         }
+    material_key = _evidence_pack_material_key(rule)
     payload = {
-        "pack_version": _EVIDENCE_PACK_VERSION, "mode": "shadow_only", "decision_participation": False,
+        "pack_version": _EVIDENCE_PACK_VERSION, "mode": "candidate_pages_only", "decision_participation": False,
         "document_sha256": str(document.get("sha256") or ""), "rule_id": rule_id, "component": component,
+        "material_key": material_key,
         "text_findings": findings, "ocr_findings": ocr_findings[:4], "vision_findings": vision_findings[:4],
         "material_checklist": _shadow_material_checklist(rule), "page_provenance": provenance[:80],
         "result_snapshot": snapshot, "ocr_visual_field_check": cross_modal,
     }
-    return {"rule_id": rule_id, "component": component, "rule_fingerprint": _shadow_rule_fingerprint(rule), "payload": payload}
+    return {"rule_id": rule_id, "component": component, "rule_fingerprint": _shadow_rule_fingerprint(rule),
+            "material_key": material_key, "payload": payload}
 
 
 def _build_rule_evidence_ledger(scan: dict, rules: list[dict]) -> dict[str, dict]:
@@ -4761,6 +4806,44 @@ def _ocr_candidate_pages(document: dict, rule: dict, result: dict, level: str) -
     return pages[:limit]
 
 
+def _ocr_discovery_page_count(rule: dict, level: str, pages: list[int]) -> int:
+    """第一阶段只做足以判断“候选是否相关”的小批 OCR。
+
+    计分累计、分段/表单规则不提前停止，避免少看一页导致少计材料；普通单一证照、
+    声明或字段核验则先看 2–4 页，命中后无需把明显无关的尾页全部送去 OCR。
+    """
+    if level == "low":
+        return min(len(pages), 2)
+    scoring = _rule_scoring(rule)
+    if (scoring.get("kind") == "manual" or scoring.get("items")
+            or _rule_execution_strategy(rule) in {"counting", "section", "consistency"}
+            or "response_form" in _rule_material_roles(rule)):
+        return len(pages)
+    return min(len(pages), 3 if level == "standard" else 4)
+
+
+def _ocr_discovery_is_sufficient(rule: dict, values: list[dict]) -> bool:
+    """保守判断首轮 OCR 是否已触及规则材料；只用于非计数、非表单规则早停。"""
+    if not values:
+        return False
+    scoring = _rule_scoring(rule)
+    if (scoring.get("kind") == "manual" or scoring.get("items")
+            or _rule_execution_strategy(rule) in {"counting", "section", "consistency"}
+            or "response_form" in _rule_material_roles(rule)):
+        return False
+    text = "\n".join(str(item.get("text") or "") for item in values)
+    compact = re.sub(r"[\s\W_]+", "", text)
+    # 证书/检测报告首页常只有名称、编号和二维码，不能因文字总长很短而强迫
+    # 再扫描无关尾页；仍要求至少足以承载一个材料名称的长度。
+    if len(compact) < 8:
+        return False
+    # 使用规则中可复用的材料长词和材料类别词作命中，不对任何行业/项目打补丁。
+    terms = [term for term in _rule_material_terms(rule) if len(term) >= 4][:48]
+    for role in _rule_material_roles(rule):
+        terms.extend(term for term in _MATERIAL_ROLE_TERMS.get(role, ()) if len(term) >= 2)
+    return any(re.sub(r"[\s\W_]+", "", term) in compact for term in dict.fromkeys(terms))
+
+
 def _ocr_runtime_enabled(configuration: dict) -> bool:
     """判断当前图片审查是否至少有一个可用 OCR 路径。
 
@@ -5201,7 +5284,23 @@ def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: d
             # 一次低清找页结果同时交给 OCR 与后续高清图片复核；OCR失败时也要
             # 保留候选，避免图片阶段再次调用找页模型。
             working_result = {**result, "visual_page_candidates": located}
-    values, failure = _ocr_page_texts(app, task, document, rule, working_result, level)
+    candidate_pages = _ocr_candidate_pages(document, rule, working_result, level)
+    discovery_count = _ocr_discovery_page_count(rule, level, candidate_pages)
+    discovery_pages = candidate_pages[:discovery_count]
+    values, failure = _ocr_page_texts(
+        app, task, document, rule, working_result, level, pages=discovery_pages,
+    )
+    # 两阶段 OCR：先小范围确认是否真正触及材料。计分、表单和分段规则始终完整
+    # 覆盖；普通单一材料仅在首轮已明确命中时早停。这样不会用“未命中”推导缺失，
+    # 只减少与规则无关页的外部 OCR 调用。
+    remaining_pages = candidate_pages[discovery_count:]
+    if remaining_pages and not _ocr_discovery_is_sufficient(rule, values):
+        followup_values, followup_failure = _ocr_page_texts(
+            app, task, document, rule, working_result, level, pages=remaining_pages,
+        )
+        values.extend(followup_values)
+        if followup_failure:
+            failure = "；".join(value for value in (failure, followup_failure) if value)
     if not values:
         status = "ocr_quota_exhausted" if "额度" in failure else "ocr_not_located" if "定位" in failure else "ocr_failed"
         return _set_result_coverage(_with_vision_execution(working_result, status, [], {}, failure or "OCR 未获得可用文字，已保留原文字结论。"), "uncovered")
@@ -5723,7 +5822,15 @@ def _vision_page_candidates(document: dict, rule: dict, result: dict) -> list[in
     # 按印刷页码偏移换算为 PDF 页序，是可靠性最高的候选来源，排在最前。
     # 先剥掉【腾讯OCR·…·P…】【本地OCR·…·P…】【图片识别·…·P…】等系统前缀：其中的页码是“已处理页清单”，
     # 不是“材料所在页”，混入候选会把 OCR 实际命中页（如正文“证书在P144明确”）挤出预算。
-    pages: list[int] = list(directory_pages)
+    # 已完成过直接 OCR/图片取证的页是稳定事实来源，重跑时可优先复用为候选；
+    # 它只来自相同文件哈希和相同材料键，仍会与目录、文本锚点一同保留。
+    pages: list[int] = []
+    for page in _normalise_result_pages(result.get("evidence_pack_candidate_pages")):
+        if page <= page_count and page not in pages:
+            pages.append(page)
+    for page in directory_pages:
+        if page not in pages:
+            pages.append(page)
     # 目录没有列页码、或材料位于响应表/承诺函时，直接文本锚可避免把图片预算先
     # 花在正文开头。目录显式页仍保持第一优先级。
     for page in _rule_text_anchor_pages(page_texts, rule, page_count) if page_texts else []:
@@ -7405,6 +7512,9 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
             if not base:
                 progress.advance(f"跳过未产生文字结果的图片识别：{bidder_name}")
                 continue
+            # 只取同文件、同材料事实的已确认页作为候选优先级；不读取旧状态、分数或理由，
+            # 所以重新提取/重新评审仍会独立产生本轮结论。
+            base = _with_evidence_pack_candidates(app, document, rule, base)
             label = rule.get("title") or rule.get("check_rule")
             merged = base
             image_strategy = _rule_image_strategy(rule)

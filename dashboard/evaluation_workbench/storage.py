@@ -328,6 +328,7 @@ def init_database(app) -> None:
                 component TEXT NOT NULL CHECK(component IN ('review', 'objective', 'subjective')),
                 document_sha256 TEXT NOT NULL,
                 rule_fingerprint TEXT NOT NULL,
+                material_key TEXT NOT NULL DEFAULT '',
                 pack_version TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -569,6 +570,10 @@ def init_database(app) -> None:
         _ensure_column(conn, "ew_rules", "source_task_id", "TEXT")
         _ensure_column(conn, "ew_rules", "check_rule", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "ew_rules", "execution_meta_json", "TEXT")
+        _ensure_column(conn, "ew_evidence_packs", "material_key", "TEXT NOT NULL DEFAULT ''")
+        # 旧数据库先补列，再建索引；把索引放在 CREATE TABLE 脚本里会导致升级时
+        # 因旧表尚无 material_key 而中断整个初始化。
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ew_evidence_packs_material ON ew_evidence_packs(document_id, material_key, updated_at)")
         _ensure_column(conn, "ew_model_calls", "requested_max_tokens", "INTEGER")
         _ensure_column(conn, "ew_model_calls", "finish_reason", "TEXT")
         _ensure_column(conn, "ew_model_calls", "response_chars", "INTEGER")
@@ -1571,7 +1576,11 @@ def previous_scope_anomalies(app, document_id: str, chunk_id: str, chunk_hash: s
 
 def save_evidence_packs(app, project_id: str, task_id: str, document_id: str, document_sha256: str,
                         packs: list[dict]) -> None:
-    """仅保存 EvidencePack 影子记录，不参与候选页、模型调用或最终结论。"""
+    """保存可追溯 EvidencePack。
+
+    EvidencePack 不保存 OCR 原文，也不保存可直接复用的最终结论；material_key 只用于
+    后续同一文件、同一材料事实的候选页优先级，避免旧结论污染新一轮评审。
+    """
     timestamp = now_iso()
     with connection(app) as conn:
         for pack in packs:
@@ -1580,6 +1589,7 @@ def save_evidence_packs(app, project_id: str, task_id: str, document_id: str, do
             rule_id = str(pack.get("rule_id") or "")
             component = str(pack.get("component") or "")
             fingerprint = str(pack.get("rule_fingerprint") or "")
+            material_key = str(pack.get("material_key") or "")[:360]
             payload = pack.get("payload")
             if not rule_id or component not in {"review", "objective", "subjective"} or not fingerprint or not isinstance(payload, dict):
                 continue
@@ -1595,13 +1605,14 @@ def save_evidence_packs(app, project_id: str, task_id: str, document_id: str, do
             conn.execute(
                 """INSERT INTO ew_evidence_packs
                    (evidence_pack_id, project_id, task_id, document_id, rule_id, component, document_sha256,
-                    rule_fingerprint, pack_version, payload_json, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    rule_fingerprint, material_key, pack_version, payload_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(task_id, document_id, rule_id, component) DO UPDATE SET
                    document_sha256=excluded.document_sha256, rule_fingerprint=excluded.rule_fingerprint,
-                   pack_version=excluded.pack_version, payload_json=excluded.payload_json, updated_at=excluded.updated_at""",
+                   material_key=excluded.material_key, pack_version=excluded.pack_version,
+                   payload_json=excluded.payload_json, updated_at=excluded.updated_at""",
                 (str(uuid.uuid4()), project_id, task_id, document_id, rule_id, component, document_sha256,
-                 fingerprint, str(payload.get("pack_version") or "shadow-v1"), encoded, timestamp, timestamp),
+                 fingerprint, material_key, str(payload.get("pack_version") or "shadow-v1"), encoded, timestamp, timestamp),
             )
 
 
@@ -1621,6 +1632,46 @@ def list_evidence_packs(app, task_id: str, document_id: str) -> list[dict]:
             value["payload"] = {}
         values.append(value)
     return values
+
+
+def evidence_pack_pages(app, document_id: str, document_sha256: str, material_key: str, *, limit: int = 12) -> list[int]:
+    """返回同一文件、同一材料事实在历史运行中已直接命中的页。
+
+    这是候选页的保守提示而不是结论复用：仅接受 OCR/图片层明确标记为 evidence 的页，
+    且要求文件哈希与材料键均一致。旧版没有 material_key 的影子包自动忽略。
+    """
+    if not document_id or not document_sha256 or not material_key:
+        return []
+    with connection(app) as conn:
+        rows = conn.execute(
+            """SELECT payload_json FROM ew_evidence_packs
+               WHERE document_id=? AND document_sha256=? AND material_key=?
+               ORDER BY updated_at DESC LIMIT 24""",
+            (document_id, document_sha256, material_key),
+        ).fetchall()
+    pages: list[int] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        for collection in (payload.get("ocr_findings"), payload.get("vision_findings")):
+            if not isinstance(collection, list):
+                continue
+            for finding in collection:
+                if not isinstance(finding, dict):
+                    continue
+                values = finding.get("evidence_pages")
+                if not isinstance(values, list):
+                    continue
+                for value in values:
+                    if isinstance(value, (int, float)) and not isinstance(value, bool) and int(value) > 0:
+                        page = int(value)
+                        if page not in pages:
+                            pages.append(page)
+                            if len(pages) >= max(1, limit):
+                                return pages
+    return pages
 
 
 def save_evaluation_unit_checkpoints(app, project_id: str, rule_set_id: str, document_id: str,
@@ -2231,7 +2282,10 @@ def current_rule_set(app, project_id: str, create: bool = False) -> dict | None:
 
 
 _RULE_EXECUTION_STRATEGIES = {"point", "counting", "section", "consistency", "cross_bid", "visual", "external"}
-_RULE_EVIDENCE_TYPES = {"text", "visual", "cross_bid", "external"}
+# document/field 描述的是“需要什么证据”，而不是新的评审结论类型：
+# document 用于材料存在性，field 用于材料内的编号、日期、金额等可读字段。
+# 保留旧类型，确保已有规则及外部 API 的元数据可继续使用。
+_RULE_EVIDENCE_TYPES = {"text", "document", "field", "visual", "cross_bid", "external"}
 _VISION_TRIGGERS = {"off", "text_fallback", "required"}
 _VISION_LEVELS = {"off", "low", "standard", "high"}
 # image_mode 仅控制图片取证通道；保持 vision_trigger / vision_level 的旧字段，
@@ -2253,6 +2307,8 @@ def rule_execution_meta(rule: dict) -> dict:
     if not isinstance(requirements, list):
         requirements = []
     requirements = [str(item) for item in requirements if str(item) in _RULE_EVIDENCE_TYPES]
+    if any(item in requirements for item in {"document", "field"}) and "text" not in requirements:
+        requirements.append("text")
     applicability = value.get("applicability")
     if not isinstance(applicability, dict):
         applicability = {}
@@ -2283,6 +2339,10 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
     if not isinstance(requirements, list):
         requirements = base["evidence_requirements"]
     normalized = [str(item) for item in requirements if str(item) in _RULE_EVIDENCE_TYPES]
+    # “材料本体/关键字段”通常先依赖可读文字或 OCR；显式补齐 text 只影响取证路由，
+    # 不把它们误当成独立审查规则，也不改变旧 visual 选择。
+    if any(item in normalized for item in {"document", "field"}) and "text" not in normalized:
+        normalized.append("text")
     if payload.get("ocr_required") or payload.get("check_mode") == "ocr":
         if "visual" not in normalized:
             normalized.append("visual")

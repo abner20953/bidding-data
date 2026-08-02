@@ -334,6 +334,12 @@ PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += (
     "全部子项和扣分逻辑合并为同一规则，不得另起通用的“服务/应急方案”等错误规则。"
 )
 PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += (
+    " 每条规则应同时在 evidence_requirements 标明结论所需的证据维度：text=可检索文字或表格，"
+    "document=材料本体是否提供，field=材料内编号/日期/金额/型号等关键字段，visual=签章、版式、扫描图片或外观，"
+    "cross_bid=需横向比较，external=需外部核验。它们只说明取证计划，不生成新的重复规则；"
+    "同一结论规则的材料存在、字段和图片要求应写在同一条 check_rule 中，避免拆成多条重复审查点。"
+)
+PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += (
     " 评分规则编译必须以评分表的一个完整行/一个明确总分为边界：同一评分条款ID、同一计分对象和同一满分"
     "只能保留一条规则，标题的“商务部分/评分/满分X分”等导航文字不是独立评分事实；应把分档、证书类别、"
     "数量、封顶和跨页续行收进该规则的 scoring.items。反之，不同计分对象、不同满分或独立可累计子项不得误合并。"
@@ -375,6 +381,17 @@ PROMPT_TEMPLATES["extract_rules_finalise_user"]["content"] = (
              "6. objective/subjective 评分规则原则上不得删除、合并或改写；但同一评分条款ID、同一计分对象、同一满分的重复候选必须合并为一条，"
              "保留更完整的 scoring.items、原文依据和计分口径；不同独立分值、不同计分对象或资格门槛与独立评分不得合并；同一材料同时承担资格门槛和独立评分时两条均保留；")
 )
+
+# 证据维度是规则的取证元数据，不改变旧 JSON 字段或既有规则；通过追加式变换，
+# 可保证用户已有的提示词版本仍能在界面中清楚看到并按默认模板恢复。
+for _rule_template_id in ("extract_rules_user", "extract_rules_continue_user"):
+    PROMPT_TEMPLATES[_rule_template_id]["content"] = (
+        PROMPT_TEMPLATES[_rule_template_id]["content"]
+        .replace('"ocr_required":false,"scoring"', '"ocr_required":false,"evidence_requirements":["text|document|field|visual|cross_bid|external"],"scoring"')
+        + "\n\n取证元数据：每条规则可返回 evidence_requirements。text=文字/表格；document=材料本体；"
+          "field=材料内编号、日期、金额、型号等字段；visual=签章、勾选、图片或外观；cross_bid=横向比较；external=外部核验。"
+          "它们只服务同一条结论规则的取证计划，不得把同一材料拆成多条重复规则。"
+    )
 
 
 # 仅控制提示词配置界面的归类、排序和风险提示，不参与模型调用。业务原则集中
