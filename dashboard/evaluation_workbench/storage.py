@@ -982,6 +982,34 @@ def get_ocr_page_cache(app, document_id: str, page_number: int, image_hash: str,
     return value if isinstance(value, dict) else None
 
 
+def list_ocr_cached_page_texts(app, document_id: str) -> list[dict]:
+    """列出一份文件在页级缓存中已识别的非空文字页，供本地事实兜底复用。
+
+    只读已有缓存，绝不触发新的 OCR 调用；同页存在多个服务结果时按更新时间
+    取最新一条，与“精确复核覆盖同页基础识别”的口径一致。
+    """
+    with connection(app) as conn:
+        rows = conn.execute(
+            "SELECT page_number, result_json FROM ew_ocr_page_cache "
+            "WHERE document_id=? ORDER BY page_number, updated_at",
+            (document_id,),
+        ).fetchall()
+    by_page: dict[int, dict] = {}
+    for row in rows:
+        try:
+            value = json.loads(row["result_json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        text = str(value.get("text") or "").strip()
+        if not text or value.get("empty"):
+            continue
+        by_page[int(row["page_number"])] = {"page": int(row["page_number"]), "text": text,
+                                            "service": str(value.get("service") or "")}
+    return [by_page[page] for page in sorted(by_page)]
+
+
 def save_ocr_page_cache(app, document_id: str, page_number: int, image_hash: str, service: str, value: dict) -> None:
     timestamp = now_iso()
     with connection(app) as conn:
@@ -3010,6 +3038,27 @@ def confirm_rule_set(app, project_id: str) -> dict:
     return current_rule_set(app, project_id)
 
 
+def _score_rule_title_core(value: object) -> str:
+    """预检用的评分对象名归一化：去分值括注与章节导航前缀，与提取去重口径一致。"""
+    text = re.sub(r"[（(][^()（）]*\d+(?:\.\d+)?\s*分[^()（）]*[)）]\s*$", "", str(value or ""))
+    text = re.sub(r"^\s*(?:(?:商务|技术|价格|服务|资格)部分|(?:客观|主观)?评分|评分项?)\s*[-—–:：_]*\s*", "", text)
+    return re.sub(r"[\s\W_]+", "", text).casefold()
+
+
+def _score_rule_max_value(rule: dict) -> float | None:
+    scoring = rule.get("scoring")
+    if not isinstance(scoring, dict):
+        try:
+            scoring = json.loads(rule.get("scoring_json") or "{}")
+        except (AttributeError, TypeError, json.JSONDecodeError):
+            return None
+    try:
+        value = float(scoring.get("max_score"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
 def rule_set_acquisition_validation(app, project_id: str) -> dict:
     """检查图片取证配置是否自洽，仅返回提示而不改写规则或阻断业务。
 
@@ -3052,6 +3101,24 @@ def rule_set_acquisition_validation(app, project_id: str) -> dict:
         if mode == "auto" and not ocr_enabled and not vision_enabled:
             issues.append({"severity": "warning", "code": "all_image_capabilities_off", "rule_id": key, "title": label,
                            "message": "该规则设为智能取证，但 OCR 与多模态均未启用；本次只执行文字审查。"})
+    # 疑似重复评分规则预检：同一评分对象、同一分值出现多条启用规则时，综合评审会
+    # 重复计分导致总分虚高。只提示不自动停用，由人工核对后决定保留哪一条。
+    score_groups: dict[tuple[str, str, float], list[dict]] = {}
+    for rule in rules:
+        if not rule.get("enabled") or str(rule.get("category") or "") not in {"objective", "subjective"}:
+            continue
+        core = _score_rule_title_core(rule.get("title"))
+        max_value = _score_rule_max_value(rule)
+        if len(core) < 4 or max_value is None:
+            continue
+        score_groups.setdefault((str(rule.get("category") or ""), core, max_value), []).append(rule)
+    for (category, core, max_value), group in score_groups.items():
+        if len(group) < 2:
+            continue
+        titles = "；".join(str(item.get("title") or "未命名规则") for item in group[:4])
+        issues.append({"severity": "warning", "code": "duplicate_score_rule",
+                       "rule_id": str(group[0].get("rule_id") or ""), "title": str(group[0].get("title") or "评分规则"),
+                       "message": f"疑似同一评分事实的重复规则（均 {max_value:g} 分）：{titles}。重复计分会导致总分虚高，请核对后仅保留一条。"})
     return {
         "rule_set_id": rule_set["rule_set_id"], "issues": issues,
         "summary": {"enabled": sum(1 for rule in rules if rule.get("enabled")), "active": active},

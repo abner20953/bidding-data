@@ -1668,6 +1668,68 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         ).status_code, 200)
         self.assertEqual(storage.confirm_rule_set(self.app, self.project["project_id"])["status"], "confirmed")
 
+    def test_acquisition_validation_warns_about_duplicate_score_rules(self):
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "商务部分-企业业绩评分（满分9分）",
+            "check_rule": "按有效业绩数量计分", "scoring": {"max_score": 9, "kind": "manual"},
+        })
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "企业业绩评分（9分）",
+            "check_rule": "按有效业绩数量计分", "scoring": {"max_score": 9, "kind": "manual"},
+        })
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "价格部分评分（30分）",
+            "check_rule": "按基准价公式计分", "scoring": {"max_score": 30, "kind": "manual"},
+        })
+        validation = storage.rule_set_acquisition_validation(self.app, self.project["project_id"])
+        duplicate = [item for item in validation["issues"] if item["code"] == "duplicate_score_rule"]
+        self.assertEqual(len(duplicate), 1)
+        self.assertIn("企业业绩", duplicate[0]["message"])
+
+    def test_score_rule_dedupe_merges_truncated_duplicate_clause(self):
+        full = {"category": "objective", "title": "商务部分-企业业绩评分（满分9分）",
+                "check_rule": "按有效业绩数量计分",
+                "scoring": {"max_score": 9},
+                "source_text": "投标供应商近三年完成的同类项目案例，每提供一份得3分，最高得9分。本款仅指供应商自身业绩。"}
+        truncated = {"category": "objective", "title": "企业业绩评分（9分）",
+                     "check_rule": "按有效业绩合同要件计分",
+                     "scoring": {"max_score": 9},
+                     "source_text": "投标供应商近三年完成的同类项目案例，每提供一份得3分，最高得9分。"}
+        merged = worker._dedupe_rule_candidates([full, truncated])
+        self.assertEqual(len(merged), 1)
+        # 同名同分值但原文真正不同的规则不合并，留给确认前预检提示人工核对。
+        detailed = {"category": "subjective", "title": "售后服务方案评分（6分）",
+                    "check_rule": "核验售后服务体系", "scoring": {"max_score": 6},
+                    "source_text": "供应商提供完善的售后服务体系、售后服务响应机制（1.5分）。"}
+        compressed = {"category": "subjective", "title": "售后服务方案评分（6分，含保障措施）",
+                      "check_rule": "核验售后保障与应急预案", "scoring": {"max_score": 6},
+                      "source_text": "保障措施（1.5分）、应急预案（1.5分）。上述方案无缺陷得6分。"}
+        self.assertEqual(len(worker._dedupe_rule_candidates([detailed, compressed])), 2)
+
+    def test_ocr_cached_pages_backfill_unique_total_quote(self):
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "只有文字层目录，没有报价。")
+        value, _ = worker._local_total_quote_with_ocr(self.app, document)
+        self.assertIsNone(value)
+        storage.save_ocr_page_cache(self.app, document["document_id"], 50, "hash-50", "local_rapidocr", {
+            "text": "开标一览表" + chr(10) + "总报价（小写）：628120.00元" + chr(10) + "总报价（大写）：陆拾贰万捌仟壹佰贰拾元整",
+        })
+        value, excerpt = worker._local_total_quote_with_ocr(self.app, document)
+        self.assertEqual(str(value), "628120.00")
+        self.assertIn("OCR", excerpt)
+        # OCR 页文字出现两个不同报价时同样宁可留空。
+        storage.save_ocr_page_cache(self.app, document["document_id"], 51, "hash-51", "local_rapidocr", {
+            "text": "另一页" + chr(10) + "总报价：599000.00元",
+        })
+        value, _ = worker._local_total_quote_with_ocr(self.app, document)
+        self.assertIsNone(value)
+
+    def test_clean_model_text_strips_ocr_replacement_chars(self):
+        noisy = "第56页载明：单位负责�为同���存在直接控股关系"
+        cleaned = worker._clean_model_text(noisy)
+        self.assertNotIn("�", cleaned)
+        self.assertIn("…", cleaned)
+        self.assertEqual(worker._clean_model_text("正常文字"), "正常文字")
+
     def test_evaluation_can_queue_ocr_only_rule_without_multimodal_profile(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "扫描声明函")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
@@ -3458,7 +3520,12 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         rules = worker._ensure_technical_star_requirement_rule([], tender)
         self.assertEqual([item["title"] for item in rules], ["★技术参数及证明材料响应"])
         normalised = worker._normalise_visual_rule_policies(rules)
-        self.assertEqual(normalised[0]["vision_trigger"], "text_fallback")
+        # 提取默认均为“仅基础识别”；★规则的 visual 证据需求仍保留，本地 OCR 基线与系统建议据此工作，
+        # 是否升级增强通道由人工确认规则时选择。
+        self.assertEqual(normalised[0]["vision_trigger"], "off")
+        self.assertEqual(normalised[0]["acquisition_preset"], "off")
+        self.assertEqual(normalised[0]["evidence_requirements"], ["text", "visual"])
+        self.assertEqual(storage.rule_acquisition_recommendation(normalised[0])["acquisition_preset"], "visual")
 
         # 只有★或普通技术参数、但没有证明材料和明确后果时不得自行补成否决规则。
         incomplete = "[第20页]\n技术参数表：★硬件规格，端口不少于2个。"
@@ -3474,10 +3541,14 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             "check_mode": "ocr", "evidence_requirements": ["visual"],
         }])
         self.assertEqual(len(rules), 1)
-        self.assertEqual(rules[0]["vision_trigger"], "required")
-        self.assertEqual(rules[0]["vision_level"], "standard")
-        self.assertEqual(rules[0]["acquisition_preset"], "visual")
+        # 默认“仅基础识别”：增强通道全部关闭，但 OCR 需求与证据维度保留，
+        # 本地 OCR 基线仍会运行；AI 升级建议保持原有判断，供人工选择。
+        self.assertEqual(rules[0]["vision_trigger"], "off")
+        self.assertEqual(rules[0]["vision_level"], "off")
+        self.assertEqual(rules[0]["acquisition_preset"], "off")
         self.assertTrue(rules[0]["ocr_required"])
+        # check_mode=ocr 被推荐逻辑视为材料/字段类，混合视觉事实时建议“智能升级”而非纯视觉通道。
+        self.assertEqual(storage.rule_acquisition_recommendation(rules[0])["acquisition_preset"], "smart")
 
     def test_rule_policy_keeps_text_verifiable_material_out_of_forced_ocr(self):
         material, plain = worker._normalise_visual_rule_policies([{
@@ -3491,7 +3562,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         }])
         self.assertFalse(material["ocr_required"])
         self.assertEqual(material["check_mode"], "auto")
-        self.assertEqual(material["vision_trigger"], "text_fallback")
+        self.assertEqual(material["vision_trigger"], "off")
         self.assertEqual(material["baseline_ocr_mode"], "auto")
         self.assertFalse(plain["ocr_required"])
         self.assertEqual(plain["baseline_ocr_mode"], "auto")

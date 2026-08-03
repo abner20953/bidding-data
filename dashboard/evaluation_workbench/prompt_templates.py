@@ -274,11 +274,19 @@ PROMPT_TEMPLATES["evaluate_all_visual_user"]["content"] += (
     "对“每提供一份/项得分”的合同、业绩、证书、许可、检测报告等客观分：只有合同首页、金额页、签章页、明细页等规则要求的要件"
     "已被本轮或前序图片直接覆盖时，该材料才可标 confirmed 并计入 suggested_score；目录、案例列表、章节标题、仅出现材料名称或未覆盖的附件必须标 unresolved，"
     "不得把未覆盖材料按清单数量预先计分。conclusion_scope=partial 时 suggested_score 只能是已 confirmed 材料的可直接计算合计，不得沿用文字阶段更高的暂定分。"
+    "suggested_score 与文字必须一致：calculation 或 reason 中给出确定分值结论（如“建议X分”“暂计X分”“应为X分”）时，suggested_score 不得为 null；"
+    "suggested_score 为 null 时不得写任何确定分值结论，只写已核验事实与待核验事项。"
+    "规则含多个独立子项（evidence_items）时，每个子项只写一句“对象+结论+页码+未决项”，不复述规格参数或原文明细；"
+    "evidence 合计最多400字，reason 合计最多160字。"
 )
 PROMPT_TEMPLATES["evaluate_all_ocr_user"]["content"] += (
     "\n\n识别层级：本地 RapidOCR 是候选页的基础文字层；腾讯 OCR 仅用于关键字段、证照证件或基础识别不完整页的精确复核。"
     "无论来源，Pn 仅指系统实际 PDF 页；关键字段逐字引用，模糊字不得补全。"
     "客观分只总结材料类别、数量、有效性和计分结论，不得逐行抄录OCR全文。"
+    "suggested_score 与文字必须一致：calculation 或 reason 中给出确定分值结论（如“建议X分”“暂计X分”）时，suggested_score 不得为 null；"
+    "suggested_score 为 null 时不得写任何确定分值结论，只写已核验事实与待核验事项。"
+    "规则含多个独立子项（evidence_items）时，每个子项只写一句“对象+结论+页码+未决项”，不复述规格参数或原文明细；"
+    "evidence 合计最多400字，reason 合计最多160字。"
 )
 PROMPT_TEMPLATES["evaluate_all_visual_contract"] = _template(
     "综合评审 · 图片识别结果协议",

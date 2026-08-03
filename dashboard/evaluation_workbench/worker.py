@@ -1480,7 +1480,17 @@ def _normalise_rule_title(value: object) -> str:
     # 分段提取时，模型有时会把“商务部分-”“评分-”这类章节标签写进标题，另一次
     # 又只保留实际计分对象。它们不是两个评分事实，归一化时去掉这些纯导航前缀。
     text = re.sub(r"^\s*(?:(?:商务|技术|价格|服务|资格)部分|(?:客观|主观)?评分|评分项?)\s*[-—–:：_]*\s*", "", text)
+    # “（9分）”“（6分，含服务团队/响应时间）”等带分值括注也只是分值的另一种写法，
+    # 去掉后同一评分对象的标题才有一致锚点；不含数字分值的括注保持原样。
+    text = re.sub(r"[（(][^()（）]*\d+(?:\.\d+)?\s*分[^()（）]*[)）]\s*$", "", text)
     return re.sub(r"[\s\W_]+", "", text).casefold()
+
+
+def _score_source_fingerprint(value: object) -> str:
+    """评分原文的截断容忍指纹：省略号只是压缩标记，截断副本与完整原文共享前缀。"""
+    text = re.sub(r"(?:…|\.\.\.|......)+", "", str(value or ""))
+    text = re.sub(r"[\s\W_]+", "", text).casefold()
+    return text[:60]
 
 
 def _score_rule_dedupe_key(item: dict) -> tuple[object, ...] | None:
@@ -1492,10 +1502,11 @@ def _score_rule_dedupe_key(item: dict) -> tuple[object, ...] | None:
     max_score = storage._valid_max_score(scoring)
     title = _normalise_rule_title(item.get("title"))
     clause_ids = tuple(sorted({str(value).strip() for value in item.get("source_clause_ids") or [] if str(value).strip()}))
-    source = re.sub(r"[\s\W_]+", "", str(item.get("source_text") or "")).casefold()
+    source = _score_source_fingerprint(item.get("source_text"))
     if max_score is None or not title:
         return None
-    # 评分条款ID是最可靠锚点；没有它时，只有同一明确原文才允许合并。
+    # 评分条款ID是最可靠锚点；没有它时，以“同一原文前缀 + 同一对象 + 同一分值”合并，
+    # 使同一条款的完整版与被截断/带括注版不会被重复计分。
     if clause_ids:
         return ("score", category, title, float(max_score), clause_ids)
     if source:
@@ -1523,6 +1534,33 @@ def _merge_duplicate_score_rule(existing: dict, candidate: dict) -> dict:
     return merged
 
 
+def _score_rule_soft_key(item: dict) -> tuple[object, ...] | None:
+    """评分软键：只看对象与分值，用于第二趟的截断/完整原文合并。"""
+    category = str(item.get("category") or "")
+    if category not in {"objective", "subjective"}:
+        return None
+    scoring = item.get("scoring") if isinstance(item.get("scoring"), dict) else {}
+    max_score = storage._valid_max_score(scoring)
+    title = _normalise_rule_title(item.get("title"))
+    if max_score is None or not title:
+        return None
+    return (category, title, float(max_score))
+
+
+def _score_sources_compatible(left: object, right: object) -> bool:
+    """两段评分原文是否同源：一方为另一方去省略号后的完整前缀（截断副本）。
+
+    至少要求 20 个归一化字符的完整前缀重合，且必须由标题软键先行限定同一对象
+    与同一分值；缺原文或仅有松散相似时不合并，留待确认前预检提示人工核对。
+    """
+    def normalised(value: object) -> str:
+        text = re.sub(r"(?:…|\.\.\.|……)+", "", str(value or ""))
+        return re.sub(r"[\s\W_]+", "", text).casefold()
+
+    shorter, longer = sorted((normalised(left), normalised(right)), key=len)
+    return len(shorter) >= 20 and longer.startswith(shorter)
+
+
 def _dedupe_rule_candidates(items: list[dict]) -> list[dict]:
     seen: set[tuple[str, str, str]] = set()
     score_indexes: dict[tuple[object, ...], int] = {}
@@ -1540,7 +1578,26 @@ def _dedupe_rule_candidates(items: list[dict]) -> list[dict]:
         if score_key is not None:
             score_indexes[score_key] = len(result)
         result.append(item)
-    return result
+    # 第二趟：同一评分对象、同一分值且原文互为“完整版/截断版”的规则合并。
+    # 分段提取常把同一条评分条款一次带全原文、一次只带截断原文或不同分值括注，
+    # 精确键抓不住它们，但软键加完整前缀重合可以证明同源；售后等原文真正不同
+    # 的同名规则不会合并，由确认前预检提示人工核对。
+    merged: list[dict] = []
+    for item in result:
+        soft_key = _score_rule_soft_key(item)
+        target_index = None
+        if soft_key is not None:
+            for index, existing in enumerate(merged):
+                if _score_rule_soft_key(existing) != soft_key:
+                    continue
+                if _score_sources_compatible(existing.get("source_text"), item.get("source_text")):
+                    target_index = index
+                    break
+        if target_index is not None:
+            merged[target_index] = _merge_duplicate_score_rule(merged[target_index], item)
+        else:
+            merged.append(item)
+    return merged
 
 
 def _score_label_key(value: object) -> str:
@@ -1716,23 +1773,15 @@ def _normalise_visual_rule_policies(rules: list[dict]) -> list[dict]:
             value for value in ("text", "document", "field", "visual", "cross_bid", "external")
             if value in requirements
         ]
-        if force_ocr:
-            rule.update({
-                "baseline_ocr_mode": "auto", "acquisition_preset": "visual",
-                "image_mode": "vision_only", "vision_trigger": "required", "vision_level": "standard",
-            })
-        elif visual:
-            rule.update({
-                "baseline_ocr_mode": "auto", "acquisition_preset": "smart",
-                "image_mode": "auto", "vision_trigger": "text_fallback", "vision_level": "standard",
-            })
-        else:
-            # 所有 AI 建议均以文字优先；材料/字段或整页扫描导致文字不足时，才启动
-            # 有限本地 OCR。只有人工明确选择 text_only 才完全禁止 OCR。
-            rule.update({
-                "baseline_ocr_mode": "auto",
-                "acquisition_preset": "off", "image_mode": "off", "vision_trigger": "off", "vision_level": "off",
-            })
+        # 提取出的规则默认均为“仅基础识别”：全文文字审查优先，材料/字段或整页扫描
+        # 导致文字不足时最多启动有限本地 OCR（baseline_ocr_mode=auto），不默认消耗
+        # 腾讯云额度或多模态 token。AI 对增强通道的建议仍由 acquisition_recommendation
+        # 按 evidence_requirements 动态给出并展示为“系统建议”，是否升级由人工在
+        # 规则确认时逐条选择。只有人工明确选择 text_only 才完全禁止 OCR。
+        rule.update({
+            "baseline_ocr_mode": "auto",
+            "acquisition_preset": "off", "image_mode": "off", "vision_trigger": "off", "vision_level": "off",
+        })
         result.append(rule)
     return result
 
@@ -2842,6 +2891,10 @@ def _clean_model_text(value: object) -> str:
     """移除只供内部编排使用的标记，保留模型的业务判断。"""
     text = str(value or "")
     text = re.sub(r"\bcontext_unmatched\s*=\s*true\b[，,。；;：:\s]*", "", text, flags=re.IGNORECASE)
+    # OCR 对不可辨认字符会输出替换符（U+FFFD）。连续乱码没有阅读价值，折叠为省略号；
+    # 单个替换符直接移除，避免证据里出现无法理解的碎片。
+    text = re.sub(r"\ufffd{2,}", "…", text)
+    text = text.replace("\ufffd", "")
     return text.strip()
 
 
@@ -7384,16 +7437,8 @@ _TOTAL_QUOTE_NUMBER_PATTERN = re.compile(
 )
 
 
-def _local_total_quote(document: dict) -> tuple[Decimal | None, str]:
-    """从本地已解析文本保守提取唯一总报价，作为横向价格模型漏项的回填兜底。
-
-    仅接受“总报价/投标报价/开标一览表”近邻窗口内唯一的数字金额；出现多个候选
-    或无法确认口径时返回空，绝不猜测，更不会替代模型对资格扣除口径的判断。
-    """
-    path = str(document.get("parsed_path") or "")
-    if not path or not Path(path).is_file():
-        return None, ""
-    lines = Path(path).read_text(encoding="utf-8", errors="ignore").splitlines()
+def _total_quote_from_lines(lines: list) -> tuple[Decimal | None, str]:
+    """在给定文本行中保守提取唯一总报价；多个候选或口径不明时返回空。"""
     candidates: list[tuple[Decimal, str]] = []
     for index, line in enumerate(lines):
         if not _TOTAL_QUOTE_LABEL_PATTERN.search(str(line or "")):
@@ -7412,6 +7457,40 @@ def _local_total_quote(document: dict) -> tuple[Decimal | None, str]:
     value = next(iter(unique))
     excerpt = next((source for candidate, source in candidates if candidate == value), "")
     return value, excerpt
+
+
+def _local_total_quote(document: dict) -> tuple[Decimal | None, str]:
+    """从本地已解析文本保守提取唯一总报价，作为横向价格模型漏项的回填兜底。
+
+    仅接受“总报价/投标报价/开标一览表”近邻窗口内唯一的数字金额；出现多个候选
+    或无法确认口径时返回空，绝不猜测，更不会替代模型对资格扣除口径的判断。
+    """
+    path = str(document.get("parsed_path") or "")
+    if not path or not Path(path).is_file():
+        return None, ""
+    lines = Path(path).read_text(encoding="utf-8", errors="ignore").splitlines()
+    return _total_quote_from_lines(lines)
+
+
+def _local_total_quote_with_ocr(app, document: dict) -> tuple[Decimal | None, str]:
+    """文本层找不到唯一总报价时，复用同任务已缓存的 OCR 页文字再试一次。
+
+    只读页级缓存（开标一览表等规则已识别的候选页），不触发任何新的 OCR 调用；
+    仍坚持“唯一金额”约束，OCR 文字出现多个不同报价时同样宁可留空。
+    """
+    value, excerpt = _local_total_quote(document)
+    if value is not None:
+        return value, excerpt
+    cached_pages = storage.list_ocr_cached_page_texts(app, str(document.get("document_id") or ""))
+    if not cached_pages:
+        return None, ""
+    ocr_lines: list = []
+    for page in cached_pages:
+        ocr_lines.extend(str(page.get("text") or "").splitlines())
+    value, excerpt = _total_quote_from_lines(ocr_lines)
+    if value is None:
+        return None, ""
+    return value, f"OCR页文字：{excerpt[:200]}"
 
 
 _UPPER_PRICE_LABEL_PATTERN = re.compile(r"(?:最高限价|采购预算|预算金额|项目预算|控制价)")
@@ -7448,7 +7527,7 @@ def _local_project_upper_limit(app, project_id: str) -> tuple[Decimal | None, st
 def _document_shared_price_facts(app, project_id: str, document: dict, *,
                                  upper_limit: tuple[Decimal | None, str] | None = None) -> str:
     """生成可被审查和评分共同消费的最小价格事实包，不引用任一模型的自然语言结论。"""
-    quote, quote_excerpt = _local_total_quote(document)
+    quote, quote_excerpt = _local_total_quote_with_ocr(app, document)
     limit, limit_excerpt = upper_limit if upper_limit is not None else _local_project_upper_limit(app, project_id)
     values = []
     if quote is not None:
@@ -7649,7 +7728,7 @@ def _run_cross_bid_price_scoring(app, task: dict, profile: dict, documents: list
         for raw in valid_rows
     }
     for document in documents:
-        local_price, excerpt = _local_total_quote(document)
+        local_price, excerpt = _local_total_quote_with_ocr(app, document)
         if local_price is None:
             continue
         for rule in rules:
