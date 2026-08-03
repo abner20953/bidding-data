@@ -4925,17 +4925,24 @@ def _rule_evidence_requirements(rule: dict) -> list[str]:
 def _local_ocr_baseline_required(rule: dict, result: dict, component: str = "review") -> bool:
     """判断规则是否需要本地 OCR 基础取证，不受“增强核验”开关影响。
 
-    只对材料、字段、扫描/外观事实或原文字证据不完整的规则调用，绝不扩张成
-    全文逐页 OCR。旧规则仍通过关键词和 ``ocr_required`` 获得等价保护。
+    基础能力不等于每条规则都调用：只有明确要求 OCR，或文字结论已显示证据不足
+    （包括扫描型文件经守卫回落）时才处理有限候选页。这样不会把“材料/字段”这类
+    普通文字规则仅因名称相符就重复 OCR，仍不扩张成全文逐页 OCR。
     """
+    if bool(rule.get("ocr_required")) or str(rule.get("check_mode") or "") == "ocr":
+        return True
+    # 文字证据已足以支撑当前结论时，材料名称、字段名称或视觉元数据只用于将来
+    # 的增强核验，不额外消耗本地 OCR CPU；扫描件/缺证据会在此处继续向下判断。
+    if not _needs_visual_fallback(component, result):
+        return False
     requirements = set(_rule_evidence_requirements(rule))
     if requirements & {"document", "field", "visual"}:
         return True
-    if bool(rule.get("ocr_required")) or _rule_material_roles(rule):
+    if _rule_material_roles(rule):
         return True
     if _rule_image_strategy(rule) in {"ocr", "hybrid"}:
         return True
-    return _needs_visual_fallback(component, result)
+    return False
 
 
 def _form_bundle_page_limit(rule: dict, level: str, pages: list[int], default_limit: int) -> int:

@@ -1837,6 +1837,10 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             "evidence_requirements": ["document", "field"],
         }
         self.assertTrue(worker._local_ocr_baseline_required(rule, {"status": "manual"}))
+        # 普通文字结论已充分时，材料/字段元数据本身不能导致重复 OCR。
+        self.assertFalse(worker._local_ocr_baseline_required(rule, {
+            "status": "satisfied", "evidence_quality": "sufficient", "confidence": "high",
+        }))
 
     def test_tencent_remains_fallback_if_local_runtime_returns_no_text(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "扫描件候选页")
