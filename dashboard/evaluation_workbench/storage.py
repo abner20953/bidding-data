@@ -865,28 +865,25 @@ def ocr_configuration(app) -> dict:
 
 
 def ocr_feature_configuration(app) -> dict:
-    """读取评审流程是否允许 OCR 文字取证。
+    """本地 RapidOCR 是评审的固定基础能力。
 
-    这是独立于腾讯云开关和多模态模型的总开关：关闭腾讯云时可继续使用
-    RapidOCR，关闭多模态时也可继续使用 OCR。旧部署首次初始化时会继承当时
-    的图片功能状态，避免升级后意外改变既有项目行为。
+    ``enabled`` 保留给已发布的 API 调用方；从本版本起它恒为 True，避免配置
+    状态意外关闭全部图片文字取证。腾讯 OCR 与多模态仍是独立、可关闭的增强层。
     """
-    with connection(app) as conn:
-        row = conn.execute(
-            "SELECT setting_value FROM ew_settings WHERE setting_key=?", (OCR_ENABLED_SETTING,)
-        ).fetchone()
-    return {"enabled": str(row["setting_value"] if row else "0") == "1"}
+    return {"enabled": True, "fixed": True, "provider": "local_rapidocr"}
 
 
 def update_ocr_feature_configuration(app, payload: dict) -> dict:
     enabled = payload.get("enabled")
     if not isinstance(enabled, bool):
         raise ValueError("OCR 文字识别总开关必须为布尔值")
+    # 兼容旧客户端的 PATCH 请求：接受 false，但本地基础能力不允许被关闭。
+    # 同时把历史库中的 0 迁移为 1，避免旧任务指纹、管理脚本读到相反状态。
     with connection(app) as conn:
         conn.execute(
             "INSERT INTO ew_settings(setting_key, setting_value, updated_at) VALUES (?, ?, ?) "
             "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value, updated_at=excluded.updated_at",
-            (OCR_ENABLED_SETTING, "1" if enabled else "0", now_iso()),
+            (OCR_ENABLED_SETTING, "1", now_iso()),
         )
     return ocr_feature_configuration(app)
 
@@ -2483,6 +2480,55 @@ _IMAGE_MODES = {"auto", "ocr_only", "vision_only", "combined", "off"}
 _ACQUISITION_PRESETS = {"smart", "always", "text", "visual", "dual", "off", "custom"}
 
 
+def _normalise_evidence_items(value: object) -> list[dict]:
+    """保留复合规则的可独立取证子项，未知或旧格式安全忽略。
+
+    子项只服务于候选页均衡和取证可追溯，不会拆分现有规则、改变其启用状态，
+    更不会独立生成结论或分数。字段刻意保持通用，避免将某一类证书、参数或行业
+    固化进存储结构。
+    """
+    if not isinstance(value, list):
+        return []
+    items: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for index, raw in enumerate(value, start=1):
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or raw.get("title") or "").strip()[:180]
+        requirement = str(raw.get("requirement") or raw.get("check_rule") or raw.get("criterion") or "").strip()[:600]
+        if not name and not requirement:
+            continue
+        key = (re.sub(r"\s+", "", name).casefold(), re.sub(r"\s+", "", requirement).casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        page = raw.get("source_page")
+        if isinstance(page, bool):
+            page = None
+        elif isinstance(page, (int, float)) and int(page) > 0:
+            page = int(page)
+        elif isinstance(page, str) and page.strip().isdigit() and int(page.strip()) > 0:
+            page = int(page.strip())
+        else:
+            page = None
+        requirements = raw.get("evidence_requirements")
+        if not isinstance(requirements, list):
+            requirements = []
+        requirements = [str(item) for item in requirements if str(item) in _RULE_EVIDENCE_TYPES]
+        items.append({
+            "item_id": str(raw.get("item_id") or raw.get("id") or f"item_{index}").strip()[:80] or f"item_{index}",
+            "name": name or requirement[:100],
+            "requirement": requirement,
+            "source_page": page,
+            "evidence_requirements": list(dict.fromkeys(requirements)),
+        })
+        # 与规则提取提示词、候选页轮转上限保持一致，避免模型可输出但存储层静默
+        # 截断不同数量的子项。
+        if len(items) >= 12:
+            break
+    return items
+
+
 def _preset_from_legacy_image_mode(image_mode: object) -> str:
     return {
         "ocr_only": "text",
@@ -2559,6 +2605,7 @@ def rule_execution_meta(rule: dict) -> dict:
         "vision_level": level,
         "image_mode": image_mode,
         "acquisition_preset": acquisition_preset,
+        "evidence_items": _normalise_evidence_items(value.get("evidence_items")),
     }
 
 
@@ -2641,6 +2688,7 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
         "vision_level": level,
         "image_mode": image_mode,
         "acquisition_preset": preset,
+        "evidence_items": _normalise_evidence_items(payload.get("evidence_items", base.get("evidence_items"))),
     }
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
@@ -2828,7 +2876,7 @@ def update_rule(app, project_id: str, rule_id: str, payload: dict) -> dict:
             )
         if any(key in payload for key in (
             "execution_strategy", "evidence_requirements", "applicability", "ocr_required", "check_mode",
-            "image_mode", "vision_trigger", "vision_level", "acquisition_preset",
+            "image_mode", "vision_trigger", "vision_level", "acquisition_preset", "evidence_items",
         )):
             conn.execute(
                 "UPDATE ew_rules SET execution_meta_json = ?, updated_at = ? WHERE rule_id = ?",

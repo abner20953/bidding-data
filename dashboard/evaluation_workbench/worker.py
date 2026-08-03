@@ -684,6 +684,43 @@ _TECHNICAL_STAR_OUTCOME_TERMS = ("投标无效", "无效投标", "投标被拒�
 _TECHNICAL_STAR_LEAF_TERMS = ("技术参数", "产品指标", "参数表", "指标项", "技术要求", "产品规格", "硬件规格", "性能指标")
 
 
+def _technical_star_evidence_items(tender_text: str) -> list[dict]:
+    """从本地已定位的★叶子行保留取证清单，作为模型遗漏时的安全回退。
+
+    它不判断是否满足、不新增规则，也不从相邻普通参数推导★项；只把原文实际带有
+    星号且看起来是具体参数/产品指标的行保存为同一父规则的子项。
+    """
+    values: list[dict] = []
+    seen: set[str] = set()
+    for page in [value.strip() for value in _PARSED_PAGE_MARKER.split(tender_text or "") if value.strip()]:
+        page_match = re.search(r"\[第(\d+)页\]", page)
+        source_page = int(page_match.group(1)) if page_match else None
+        for raw_line in page.splitlines():
+            line = re.sub(r"\s+", " ", raw_line).strip()
+            compact = re.sub(r"\s+", "", line)
+            if "★" not in compact or len(compact) < 10:
+                continue
+            # “★代表实质性指标”等总则不属于待逐项找材料的叶子项。
+            if any(term in compact for term in ("代表实质性", "重要性分为", "★号条款响应")):
+                continue
+            if not any(term in compact for term in _TECHNICAL_STAR_LEAF_TERMS) and not re.search(r"(?:型号|规格|参数|性能|接口|功能|支持|不少于|不低于)", compact):
+                continue
+            key = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", compact).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            clean = line.replace("★", "").strip(" ：:；;")
+            name = clean[:100] or "★技术叶子项"
+            values.append({
+                "item_id": f"star_{len(values) + 1}", "name": name,
+                "requirement": line[:500], "source_page": source_page,
+                "evidence_requirements": ["text", "document", "field", "visual"],
+            })
+            if len(values) >= 12:
+                return values
+    return values
+
+
 def _technical_star_requirement_seed(tender_text: str, package_number: int | None = None) -> dict | None:
     """为明确“技术★ + 证明材料 + 明确后果”的条款生成保守兜底候选。
 
@@ -744,6 +781,7 @@ def _technical_star_requirement_seed(tender_text: str, package_number: int | Non
         "ocr_required": False,
         "execution_strategy": "section",
         "evidence_requirements": ["text", "visual"],
+        "evidence_items": _technical_star_evidence_items(tender_text),
     }
 
 
@@ -1228,7 +1266,7 @@ def _rule_recovery_continue_prompt(app, text: str, recovered_rules: list[dict], 
             "category": item.get("category"), "title": item.get("title"),
             "check_rule": item.get("check_rule"), "source_text": item.get("source_text"),
             "source_page": item.get("source_page"), "source_clause_ids": item.get("source_clause_ids"),
-            "ocr_required": item.get("ocr_required"), "scoring": item.get("scoring"),
+            "ocr_required": item.get("ocr_required"), "evidence_items": item.get("evidence_items"), "scoring": item.get("scoring"),
         }
         for item in recovered_rules if isinstance(item, dict)
     ]
@@ -1671,6 +1709,7 @@ def _rule_compilation_packet(items: list[dict], char_limit: int) -> str:
             "ocr_required": bool(item.get("ocr_required") or item.get("check_mode") == "ocr"),
             "execution_strategy": item.get("execution_strategy"),
             "evidence_requirements": item.get("evidence_requirements"),
+            "evidence_items": item.get("evidence_items"),
             "applicability": item.get("applicability"),
             "source_clause_ids": item.get("source_clause_ids") if isinstance(item.get("source_clause_ids"), list) else [],
             "scoring": item.get("scoring"),
@@ -3520,7 +3559,8 @@ def _combined_batch_payload(component: str, rules: list[dict]) -> list[dict]:
                  "check_rule": item.get("check_rule") or item["title"], "source_text": item["source_text"],
                  "ocr_required": _rule_requires_visual_verification(item),
                  "execution_strategy": _rule_execution_strategy(item),
-                 "evidence_requirements": item.get("evidence_requirements") or []} for item in rules]
+                 "evidence_requirements": item.get("evidence_requirements") or [],
+                 "evidence_items": _rule_evidence_items(item)} for item in rules]
     return _score_payload(rules)
 
 
@@ -3529,6 +3569,14 @@ def _full_scan_catalog(rules: list[dict]) -> list[dict]:
     catalog = []
     for rule in rules:
         query = re.sub(r"\s+", " ", f"{rule.get('title') or ''}；{rule.get('check_rule') or rule.get('title') or ''}").strip()
+        evidence_items = _rule_evidence_items(rule)
+        if evidence_items:
+            item_text = "；".join(
+                _clean_model_text(item.get("name") or item.get("requirement"))[:100]
+                for item in evidence_items[:12]
+            )
+            if item_text:
+                query = f"{query}；逐项取证清单：{item_text}"
         # 主观评分表常把多个有独立分值的子项写在一条规则中。首轮只截取通用长度
         # 会丢掉末尾的子项，导致后续评分只能看到“总分”而不能看到完整评分维度。
         is_coverage_rule = rule["category"] == "other" and (
@@ -4251,9 +4299,29 @@ def _with_evidence_pack_candidates(app, document: dict, rule: dict, result: dict
 
 def _shadow_material_checklist(rule: dict) -> list[dict]:
     """从既有规则结构生成观察清单，不让模型自由生成材料需求并反向影响评审。"""
+    try:
+        evidence_items = storage.rule_execution_meta(rule).get("evidence_items") or []
+    except (TypeError, ValueError):
+        evidence_items = []
+    # 规则提取阶段已明确保留的复合规则子项，优先作为观察分支。它们只是父规则
+    # 的取证清单，不会成为独立规则、独立结论或独立评分。
+    values = []
+    for index, item in enumerate(evidence_items, start=1):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("requirement") or "").strip()
+        if not name:
+            continue
+        values.append({
+            "material_id": str(item.get("item_id") or f"evidence_item_{index}")[:80],
+            "name": name[:240], "criterion": str(item.get("requirement") or "").strip()[:500],
+            "status": "unassessed",
+        })
+    if values:
+        return values[:24]
     scoring = _rule_scoring(rule)
     items = scoring.get("items") if isinstance(scoring.get("items"), list) else []
-    values: list[dict] = []
+    values = []
     for index, item in enumerate(items, start=1):
         if not isinstance(item, dict) or not str(item.get("name") or "").strip():
             continue
@@ -4464,20 +4532,6 @@ def _build_shadow_evidence_pack(task: dict, document: dict, component: str, rule
         "page_hint": result.get("page_hint"), "evidence": _clean_model_text(result.get("evidence"))[:900],
         "reason": _clean_model_text(result.get("reason"))[:700],
     }
-    cross_modal = result.get("ocr_visual_field_check")
-    if isinstance(cross_modal, dict):
-        cross_modal = {
-            "mode": str(cross_modal.get("mode") or "shadow_only")[:40],
-            "matched_count": int(cross_modal.get("matched_count") or 0),
-            "item_count": int(cross_modal.get("item_count") or 0),
-            "items": [
-                {
-                    "field": _clean_model_text(item.get("field"))[:80],
-                    "ocr_status": str(item.get("ocr_status") or "")[:30],
-                }
-                for item in cross_modal.get("items") or [] if isinstance(item, dict)
-            ][:12],
-        }
     material_key = _evidence_pack_material_key(rule)
     payload = {
         "pack_version": _EVIDENCE_PACK_VERSION, "mode": "candidate_pages_only", "decision_participation": False,
@@ -4486,7 +4540,7 @@ def _build_shadow_evidence_pack(task: dict, document: dict, component: str, rule
         "text_findings": findings, "ocr_findings": ocr_findings[:4], "vision_findings": vision_findings[:4],
         "material_checklist": _shadow_material_checklist(rule), "page_provenance": provenance[:80],
         "acquisition_plan": _build_shadow_acquisition_plan(document, rule, result),
-        "result_snapshot": snapshot, "ocr_visual_field_check": cross_modal,
+        "result_snapshot": snapshot,
     }
     return {"rule_id": rule_id, "component": component, "rule_fingerprint": _shadow_rule_fingerprint(rule),
             "material_key": material_key, "payload": payload}
@@ -4856,6 +4910,34 @@ _VISION_FACT_TERMS = (
 )
 
 
+def _rule_evidence_requirements(rule: dict) -> list[str]:
+    """统一读取新旧规则的证据需求，避免各链路各自解释元数据。"""
+    try:
+        meta = storage.rule_execution_meta(rule)
+    except (TypeError, ValueError):
+        meta = {}
+    values = rule.get("evidence_requirements")
+    if not isinstance(values, list):
+        values = meta.get("evidence_requirements") or []
+    return [str(value) for value in values if str(value) in {"text", "document", "field", "visual"}]
+
+
+def _local_ocr_baseline_required(rule: dict, result: dict, component: str = "review") -> bool:
+    """判断规则是否需要本地 OCR 基础取证，不受“增强核验”开关影响。
+
+    只对材料、字段、扫描/外观事实或原文字证据不完整的规则调用，绝不扩张成
+    全文逐页 OCR。旧规则仍通过关键词和 ``ocr_required`` 获得等价保护。
+    """
+    requirements = set(_rule_evidence_requirements(rule))
+    if requirements & {"document", "field", "visual"}:
+        return True
+    if bool(rule.get("ocr_required")) or _rule_material_roles(rule):
+        return True
+    if _rule_image_strategy(rule) in {"ocr", "hybrid"}:
+        return True
+    return _needs_visual_fallback(component, result)
+
+
 def _form_bundle_page_limit(rule: dict, level: str, pages: list[int], default_limit: int) -> int:
     """低强度固定表单也应完整覆盖紧邻的同一份表单，避免漏掉续页关键字段。
 
@@ -4872,14 +4954,7 @@ def _form_bundle_page_limit(rule: dict, level: str, pages: list[int], default_li
 
 def _rule_image_strategy(rule: dict) -> str:
     """优先使用规则提取出的证据类型；旧规则才回退到文本关键词。"""
-    try:
-        meta = storage.rule_execution_meta(rule)
-    except (TypeError, ValueError):
-        meta = {}
-    requirements = rule.get("evidence_requirements")
-    if not isinstance(requirements, list):
-        requirements = meta.get("evidence_requirements") or []
-    requirements = {str(value) for value in requirements if value}
+    requirements = set(_rule_evidence_requirements(rule))
     if "visual" in requirements and "text" in requirements:
         return "hybrid"
     if "visual" in requirements:
@@ -5010,11 +5085,108 @@ def _ocr_response_scope(value: dict) -> str:
 
 def _ocr_candidate_pages(document: dict, rule: dict, result: dict, level: str) -> list[int]:
     pages = _prioritise_material_pages(
-        document, rule, _vision_page_candidates(document, rule, result),
+        document, rule, _acquisition_candidate_pages(document, rule, result),
         protected=result.get("ocr_evidence_pages"),
     )
-    limit = _form_bundle_page_limit(rule, level, pages, _OCR_PAGE_LIMITS.get(level, 1))
+    limit = _form_bundle_page_limit(
+        rule, level, pages, _compound_acquisition_page_limit(rule, level, "ocr", _OCR_PAGE_LIMITS.get(level, 1)),
+    )
     return pages[:limit]
+
+
+def _rule_evidence_items(rule: dict) -> list[dict]:
+    """读取已提取的复合规则子项；缺失时严格回退到原规则级链路。"""
+    try:
+        values = storage.rule_execution_meta(rule).get("evidence_items") or []
+    except (TypeError, ValueError):
+        values = []
+    return [
+        dict(item) for item in values
+        if isinstance(item, dict) and str(item.get("name") or item.get("requirement") or "").strip()
+    ]
+
+
+def _evidence_item_rule(rule: dict, item: dict) -> dict:
+    """以父规则为底座构造临时定位视图，不改变规则正文或评审语义。"""
+    name = _clean_model_text(item.get("name"))[:180]
+    requirement = _clean_model_text(item.get("requirement"))[:600]
+    requirements = item.get("evidence_requirements")
+    return {
+        **rule,
+        # 选页词应以子项本身为前缀。若把父规则的长篇总要求放在前面，通用片段会
+        # 先耗尽本地材料词预算，反而压掉后部真正区分材料的叶子名称。
+        "title": name or str(rule.get("title") or ""),
+        "check_rule": requirement or str(rule.get("check_rule") or rule.get("title") or ""),
+        "source_text": "；".join(value for value in (name, requirement, str(rule.get("source_text") or "")) if value),
+        # 子项若明确证据类型，定位可以更贴近该材料；未声明时保留父规则全部维度。
+        "evidence_requirements": requirements if isinstance(requirements, list) and requirements else rule.get("evidence_requirements"),
+    }
+
+
+def _compound_acquisition_plan(document: dict, rule: dict, result: dict) -> dict:
+    """为一个复合规则按子项均衡候选页，旧规则返回空计划。
+
+    此计划只改变 OCR/视觉的候选页顺序和受控上限；全文审查、结果合并、评分及已有
+    页级缓存均不改写。因此子项元数据缺失、候选定位失败或旧规则均会自然退回原链路。
+    """
+    items = _rule_evidence_items(rule)
+    if len(items) < 2:
+        return {"items": [], "candidate_pages": []}
+    base_pages = _vision_page_candidates(document, rule, result)
+    branches: list[dict] = []
+    for index, item in enumerate(items[:12], start=1):
+        child_rule = _evidence_item_rule(rule, item)
+        pages = _prioritise_material_pages(document, child_rule, _vision_page_candidates(document, child_rule, result))
+        if not pages:
+            pages = list(base_pages)
+        branches.append({
+            "item_id": str(item.get("item_id") or f"item_{index}")[:80],
+            "name": _clean_model_text(item.get("name") or item.get("requirement"))[:180],
+            "candidate_pages": pages[:12],
+        })
+    # 轮转而非“第一项吃完再看第二项”：即使总预算受限，每个独立材料也优先获得
+    # 一个候选机会。随后接回父规则的通用候选，避免因子项定位不精确丢掉旧命中页。
+    selected: list[int] = []
+    for depth in range(12):
+        progressed = False
+        for branch in branches:
+            pages = branch["candidate_pages"]
+            if depth >= len(pages):
+                continue
+            progressed = True
+            page = pages[depth]
+            if page not in selected:
+                selected.append(page)
+        if not progressed:
+            break
+    for page in base_pages:
+        if page not in selected:
+            selected.append(page)
+    return {"items": branches, "candidate_pages": selected}
+
+
+def _acquisition_candidate_pages(document: dict, rule: dict, result: dict) -> list[int]:
+    """在复合规则存在明确子项时使用均衡候选；否则逐字保留原候选链。"""
+    plan = _compound_acquisition_plan(document, rule, result)
+    if plan["candidate_pages"]:
+        return plan["candidate_pages"]
+    return _vision_page_candidates(document, rule, result)
+
+
+def _compound_acquisition_page_limit(rule: dict, level: str, channel: str, default_limit: int) -> int:
+    """给已结构化的独立子项少量公平配额，同时守住 2C/2G 的硬上限。"""
+    count = len(_rule_evidence_items(rule))
+    if count < 2 or level == "low":
+        return default_limit
+    if channel == "ocr":
+        cap = {"standard": 8, "high": 12}.get(level, default_limit)
+        per_item = 2
+    else:
+        # 图片首批保持小批量；标准档最多由4页增至6页，高档最多由6页增至8页，
+        # 后续补页仍沿用既有设置，避免并发/内存行为发生突变。
+        cap = {"standard": 6, "high": 8}.get(level, default_limit)
+        per_item = 1
+    return min(cap, max(default_limit, count * per_item))
 
 
 def _ocr_discovery_page_count(rule: dict, level: str, pages: list[int]) -> int:
@@ -5076,15 +5248,17 @@ def _ocr_runtime_enabled(configuration: dict) -> bool:
     服务异常时，具体页面级回退仍由 _ocr_page_texts 处理。
     """
     local = configuration.get("local") if isinstance(configuration, dict) else {}
-    return bool(
-        (isinstance(configuration, dict) and configuration.get("tencent_enabled", configuration.get("enabled")))
-        or (isinstance(local, dict) and local.get("enabled") and local.get("runtime_available"))
+    tencent_ready = bool(
+        isinstance(configuration, dict)
+        and configuration.get("tencent_enabled", configuration.get("enabled"))
+        and configuration.get("credentials_configured")
     )
+    return bool(tencent_ready or (isinstance(local, dict) and local.get("enabled") and local.get("runtime_available")))
 
 
 def _evaluation_ocr_enabled(ocr_features_enabled: bool, configuration: dict) -> bool:
-    """评审 OCR 只受自身总开关和运行环境控制，不依赖多模态模型档案。"""
-    return bool(ocr_features_enabled and _ocr_runtime_enabled(configuration))
+    """本地 OCR 是固定基线；保留第一个参数仅兼容旧任务与测试调用。"""
+    return bool(_ocr_runtime_enabled(configuration))
 
 
 def _ocr_parser_version_for_service(service: str) -> int:
@@ -5189,11 +5363,13 @@ def _local_ocr_page_texts(app, document: dict, pages: list[int], *, rule: dict |
     return values, "；".join(message_parts) if message_parts else ""
 
 
-def _ocr_page_texts(app, task: dict, document: dict, rule: dict, result: dict, level: str,
-                    *, pages: list[int] | None = None) -> tuple[list[dict], str]:
+def _tencent_ocr_page_texts(app, task: dict, document: dict, rule: dict, result: dict, level: str,
+                            *, pages: list[int] | None = None) -> tuple[list[dict], str]:
+    """腾讯 OCR 的精确复核层；调用方必须先完成本地 OCR 基线。"""
     configuration = storage.ocr_configuration(app)
     service_configs = {item["service"]: item for item in configuration["services"]}
-    local_enabled = bool((configuration.get("local") or {}).get("enabled"))
+    # 本函数只负责腾讯云，不在这里回退本地，避免未来的路由又被反转。
+    local_enabled = False
     # 图片优先链路会在视觉模型已确认材料页后，仅复核这些目标页；普通链路仍使用
     # 原有候选页逻辑。显式页码必须经过规范化，防止模型页码或旧结果污染 OCR 调用。
     if pages is None:
@@ -5204,11 +5380,7 @@ def _ocr_page_texts(app, task: dict, document: dict, rule: dict, result: dict, l
         return [], "未定位到可靠 OCR 候选页"
     tencent_ready = bool(configuration["enabled"] and configuration["credentials_configured"])
     if not tencent_ready:
-        if not local_enabled:
-            return [], "本地 RapidOCR 运行环境不可用，且腾讯云 OCR 未启用"
-        local_values, local_failure = _local_ocr_page_texts(app, document, pages, rule=rule, level=level, task=task)
-        # 成功直连时返回空错误；调用方才能准确区分“本地已完成”与“仅部分页面失败”。
-        return local_values, local_failure
+        return [], "腾讯 OCR 未启用或凭据不可用"
     values: list[dict] = []
     failure = ""
     unavailable_services: set[str] = set()
@@ -5293,6 +5465,91 @@ def _ocr_page_texts(app, task: dict, document: dict, rule: dict, result: dict, l
         elif local_failure:
             failure = local_failure
     return values, failure
+
+
+def _tencent_upgrade_pages(rule: dict, local_values: list[dict], local_failure: str,
+                           level: str) -> list[int]:
+    """仅把本地 OCR 不足或关键字段页送腾讯高精度复核。
+
+    该判断宁可保守升级，也不以节省额度换取漏检：高强度、证照/证件、明确字段
+    核验，以及本地失败/低置信页都会升级；普通可读正文则停在本地基线。
+    """
+    pages = _normalise_result_pages([value.get("page") for value in local_values])
+    if not pages:
+        return []
+    roles = _rule_material_roles(rule)
+    requirements = set(_rule_evidence_requirements(rule))
+    critical = bool(roles & {"certificate", "business_license", "identity", "personnel"}) or bool(
+        requirements & {"field", "document"}
+    )
+    if level == "high" or critical or local_failure:
+        return pages
+    selected: list[int] = []
+    for value in local_values:
+        try:
+            confidence = float(value.get("confidence"))
+        except (TypeError, ValueError):
+            confidence = 1.0
+        if confidence < 0.72:
+            selected.append(value.get("page"))
+    return _normalise_result_pages(selected)
+
+
+def _ocr_page_texts(app, task: dict, document: dict, rule: dict, result: dict, level: str,
+                    *, pages: list[int] | None = None, allow_tencent: bool = True) -> tuple[list[dict], str]:
+    """本地 RapidOCR 先行，腾讯 OCR 仅作为可选精确复核。
+
+    无论腾讯凭据、额度或网络状态如何，本地可用时都会先产生可复用的页级文字。
+    腾讯结果若成功则替换同页本地文本作为该页的权威文字，避免双份原文进入模型。
+    """
+    configuration = storage.ocr_configuration(app)
+    if pages is None:
+        pages = _ocr_candidate_pages(document, rule, result, level)
+    else:
+        pages = _normalise_result_pages(pages)
+    if not pages:
+        return [], "未定位到可靠 OCR 候选页"
+    local_enabled = bool((configuration.get("local") or {}).get("enabled"))
+    local_values: list[dict] = []
+    local_failure = ""
+    if local_enabled:
+        local_values, local_failure = _local_ocr_page_texts(
+            app, document, pages, rule=rule, level=level, task=task,
+        )
+    tencent_ready = bool(configuration.get("tencent_enabled", configuration.get("enabled")) and configuration.get("credentials_configured"))
+    # “仅基础识别”不用于常规腾讯升级；但本地运行环境或子进程异常时，已配置
+    # 的腾讯 OCR 仍作为容错路径，不能让单点本地故障中断本可完成的规则。
+    local_runtime_failure = (not local_enabled) or any(
+        marker in str(local_failure or "") for marker in ("运行环境", "未完成", "超时", "异常", "不可用", "请求失败")
+    )
+    if not allow_tencent and not local_runtime_failure:
+        if local_values:
+            return local_values, local_failure
+        return [], local_failure or ("本地 RapidOCR 运行环境不可用" if not local_enabled else "本地 RapidOCR 未获得可用文字")
+    # 本地运行环境临时不可用或候选页完全不可读时，腾讯仍可作为容错路径；不能因
+    # “本地先行”把原有可用的云端能力一并阻断。
+    if not local_values:
+        if tencent_ready:
+            tencent_values, tencent_failure = _tencent_ocr_page_texts(
+                app, task, document, rule, result, level, pages=pages,
+            )
+            return tencent_values, "；".join(part for part in (local_failure, tencent_failure) if part)
+        if not local_enabled:
+            return [], "本地 RapidOCR 运行环境不可用"
+        return [], local_failure or "本地 RapidOCR 未获得可用文字"
+    upgrade_pages = _tencent_upgrade_pages(rule, local_values, local_failure, level)
+    if not tencent_ready or not upgrade_pages:
+        return local_values, local_failure
+    tencent_values, tencent_failure = _tencent_ocr_page_texts(
+        app, task, document, rule, result, level, pages=upgrade_pages,
+    )
+    merged_by_page = {int(value["page"]): value for value in local_values if value.get("page")}
+    for value in tencent_values:
+        page = int(value.get("page") or 0)
+        if page:
+            merged_by_page[page] = value
+    failure = "；".join(part for part in (local_failure, tencent_failure) if part)
+    return [merged_by_page[page] for page in sorted(merged_by_page)], failure
 
 
 _OCR_CONTEXT_STOP_TERMS = {"投标", "文件", "规则", "检查", "要求", "是否", "提供", "相关", "材料", "内容", "本项目"}
@@ -5514,12 +5771,14 @@ def _with_ocr_fallback_evidence(result: dict, component: str, service_labels: st
 
 
 def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: dict, result: dict,
-                        profile: dict, locator_profile: dict | None = None) -> dict:
+                        profile: dict, locator_profile: dict | None = None, *,
+                        baseline: bool = False, allow_tencent: bool = True) -> dict:
     """OCR先补足可读文字；失败/额度不足只记录原因，后续仍可进入原多模态路径。"""
-    trigger, level = _rule_vision_policy(rule)
-    if trigger == "off" or level == "off":
+    trigger, configured_level = _rule_vision_policy(rule)
+    level = configured_level if configured_level in {"low", "standard", "high"} else "standard"
+    if not baseline and (trigger == "off" or configured_level == "off"):
         return result
-    if trigger == "text_fallback" and not _needs_visual_fallback(component, result):
+    if not baseline and trigger == "text_fallback" and not _needs_visual_fallback(component, result):
         return _with_vision_execution(result, "ocr_skipped_text_sufficient", [], {}, "文字证据已足够，本次无需调用 OCR。")
     working_result = result
     if level == "high" and locator_profile and not _vision_page_candidates(document, rule, result):
@@ -5533,6 +5792,7 @@ def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: d
     discovery_pages = candidate_pages[:discovery_count]
     values, failure = _ocr_page_texts(
         app, task, document, rule, working_result, level, pages=discovery_pages,
+        allow_tencent=allow_tencent,
     )
     # 两阶段 OCR：先小范围确认是否真正触及材料。计分、表单和分段规则始终完整
     # 覆盖；普通单一材料仅在首轮已明确命中时早停。这样不会用“未命中”推导缺失，
@@ -5541,6 +5801,7 @@ def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: d
     if remaining_pages and not _ocr_discovery_is_sufficient(rule, values):
         followup_values, followup_failure = _ocr_page_texts(
             app, task, document, rule, working_result, level, pages=remaining_pages,
+            allow_tencent=allow_tencent,
         )
         values.extend(followup_values)
         if followup_failure:
@@ -5663,139 +5924,6 @@ def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: d
         f"{service_labels} 已识别候选页并{'采纳到规则结论' if can_apply_text_conclusion else '补充部分文字事实'}"
         + (f"；{failure}" if incomplete_pages else "。"),
         evidence_pages=evidence_pages,
-    )
-
-
-_VISION_FIRST_MATERIAL_ROLES = {
-    "certificate", "business_license", "identity", "personnel", "platform_screenshot",
-}
-_OCR_VERIFICATION_TERMS = (
-    "证书", "证件", "营业执照", "执照", "许可证", "资质", "身份证", "编号", "有效期",
-    "日期", "金额", "型号", "数量", "查询截图", "统一社会信用代码",
-)
-
-
-def _prefer_vision_first(rule: dict, component: str, result: dict, strategy: str, trigger: str) -> bool:
-    """仅让“材料本体需要看图”的混合规则走视觉优先。
-
-    普通文字、表格和声明类规则继续沿用腾讯 OCR 优先路径，避免以一次较贵的图片调用
-    取代原本稳定的文字审查。证照/证件/平台截图的目标材料则通常先要确认页面是否
-    真正相关，先视觉判断可避免目录、承诺函等候选页消耗腾讯 OCR 额度。
-    """
-    if strategy != "hybrid" or trigger == "off":
-        return False
-    if trigger == "text_fallback" and not _needs_visual_fallback(component, result):
-        return False
-    # 第三轮受控启用：用户明确选择的“材料＋关键字段”规则先走 OCR。若 OCR
-    # 未形成充分证据，既有后续多模态路径仍会完整回退；只有纯视觉事实继续视觉优先。
-    if _uses_explicit_field_acquisition_plan(rule) and not _rule_has_visual_only_terms(rule):
-        return False
-    roles = _rule_material_roles(rule)
-    return bool(roles & _VISION_FIRST_MATERIAL_ROLES)
-
-
-def _needs_post_vision_ocr_verification(rule: dict, result: dict) -> bool:
-    """只对视觉已命中的、确有精确文字字段的材料做 OCR 复核。"""
-    status = str(result.get("vision_status") or "")
-    if status not in {"applied", "applied_partial"}:
-        return False
-    if not _normalise_result_pages(result.get("vision_evidence_pages")):
-        return False
-    text = "\n".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text"))
-    return bool(_rule_material_roles(rule) & _VISION_FIRST_MATERIAL_ROLES) or any(
-        term in text for term in _OCR_VERIFICATION_TERMS
-    )
-
-
-def _normalise_cross_modal_value(value: object) -> str:
-    """用于影子核对的保守规范化：不改写字符，只忽略空白、标点和大小写。"""
-    return re.sub(r"[^0-9a-z\u4e00-\u9fff]", "", _clean_model_text(value).lower())
-
-
-def _shadow_ocr_visual_field_check(field_checks: object, values: list[dict]) -> dict:
-    """只记录 OCR 是否独立命中图片可见字段，不据此改结论或制造冲突。"""
-    ocr_text = _normalise_cross_modal_value("\n".join(str(value.get("text") or "") for value in values))
-    items: list[dict] = []
-    for item in field_checks if isinstance(field_checks, list) else []:
-        if not isinstance(item, dict):
-            continue
-        image_value = _clean_model_text(item.get("image_value"))[:180]
-        normalized = _normalise_cross_modal_value(image_value)
-        if len(normalized) < 3:
-            continue
-        items.append({
-            "field": _clean_model_text(item.get("field"))[:80] or "关键字段",
-            "image_value": image_value,
-            # OCR 未命中只表示字体、版式或接口未覆盖，绝不是字段冲突。
-            "ocr_status": "matched" if normalized in ocr_text else "unconfirmed",
-        })
-    matched = sum(1 for item in items if item["ocr_status"] == "matched")
-    return {"mode": "shadow_only", "matched_count": matched, "item_count": len(items), "items": items[:12]}
-
-
-def _run_ocr_verification_after_vision(app, task: dict, document: dict, component: str, rule: dict,
-                                       result: dict) -> dict:
-    """对图片已经命中的关键页做 OCR 文字复核，不再二次发送文本模型。
-
-    视觉模型仍负责一次性给出规则结论；OCR 只提供独立的逐字文字来源，避免
-    旧链路“先 OCR 整批候选页、再视觉复核”在目录或无关附件上同时消耗额度和 token。
-    OCR 的原文保留在结构化证据层和缓存，不拼进客观分的展示结论。
-    """
-    evidence_pages = _normalise_result_pages(result.get("vision_evidence_pages"))
-    if not evidence_pages:
-        return result
-    _, level = _rule_vision_policy(rule)
-    # 图片证据页可能来自首轮和补页；OCR 复核仍必须服从人工选择的强度预算，
-    # 不能因视觉优先路径绕过原有 OCR 页数上限并额外消耗免费额度。
-    evidence_pages = evidence_pages[:_OCR_PAGE_LIMITS.get(level, 1)]
-    values, failure = _ocr_page_texts(app, task, document, rule, result, level, pages=evidence_pages)
-    checked_pages = _normalise_result_pages([value.get("page") for value in values])
-    existing_message = _clean_model_text(result.get("vision_message"))
-    if not values:
-        message = "OCR 未形成可用文字复核，图片结论保持不变。"
-        if failure:
-            message = f"OCR 未形成可用文字复核（{failure[:120]}），图片结论保持不变。"
-        return {
-            **result,
-            "ocr_status": "ocr_failed",
-            "ocr_verification_status": "unavailable",
-            "ocr_verification_pages": [],
-            "vision_message": "；".join(value for value in (existing_message, message) if value),
-        }
-    services = "、".join(dict.fromkeys(
-        _ocr_service_label(str(value.get("service") or "")) for value in values
-    ))
-    local_only = bool(values) and all(str(value.get("service") or "") == LOCAL_OCR_SERVICE for value in values)
-    page_text = "、".join(f"P{page}" for page in checked_pages)
-    field_check = _shadow_ocr_visual_field_check(result.get("visual_field_checks"), values)
-    matched_count = int(field_check.get("matched_count") or 0)
-    summary = f"已对图片确认材料页完成关键文字复核（{services}，{page_text}）。"
-    if matched_count:
-        summary += f"图片可见字段中有{matched_count}项被 OCR 独立命中（影子核对，不改变本次结论）。"
-    # 结果展示只给简短复核摘要，完整 OCR 文本仍位于服务器缓存和 evidence_layers，
-    # 既便于人工追溯，又不会让客观分结论重复抄写证书字段。
-    prefix = f"【{'本地OCR' if local_only else 'OCR'}关键文字复核·{page_text}】已完成。"
-    updated_evidence_pages = _normalise_result_pages(result.get("ocr_evidence_pages"))
-    for page in checked_pages:
-        if page not in updated_evidence_pages:
-            updated_evidence_pages.append(page)
-    merged = {
-        **result,
-        "ocr_candidate_pages": checked_pages,
-        "ocr_evidence_pages": updated_evidence_pages,
-        "ocr_status": "ocr_applied",
-        "ocr_verification_status": "completed",
-        "ocr_verification_pages": checked_pages,
-        "ocr_visual_field_check": field_check,
-        "evidence": _merge_supplement_text(result.get("evidence"), prefix),
-        "vision_message": "；".join(value for value in (
-            existing_message,
-            f"已对图片确认的关键页完成 OCR 文字复核{f'，其中{matched_count}项可见字段独立命中' if matched_count else ''}。",
-        ) if value),
-    }
-    return _append_evidence_layer(
-        merged, source="local_ocr" if local_only else "tencent_ocr", summary=summary, checked_pages=checked_pages,
-        evidence_pages=checked_pages, service=services,
     )
 
 
@@ -6088,6 +6216,11 @@ def _vision_page_candidates(document: dict, rule: dict, result: dict) -> list[in
     # 最可靠入口；与仅表示“处理过哪些页”的 ocr_candidate_pages 严格分开。
     for source in result.get("ocr_evidence_pages") or []:
         _append_unique_pages(pages, source, page_count)
+    # 本地 OCR 已实际处理过的候选页是稳定的“可读文字入口”。它的可靠度低于直接
+    # 形成证据的页，故只作为后备，不挤占目录、证据语境或 OCR 明确命中页。
+    local_candidate_pages: list[int] = []
+    for source in result.get("ocr_candidate_pages") or []:
+        _append_unique_pages(local_candidate_pages, source, page_count)
     ordinary: list[int] = []
     for source in (result.get("evidence"), result.get("reason")):
         clean_source = re.sub(r"【(?:腾讯OCR|本地OCR|OCR|图片识别)[^】]*】", " ", str(source or ""))
@@ -6107,6 +6240,9 @@ def _vision_page_candidates(document: dict, rule: dict, result: dict) -> list[in
         # OCR 合并后 page_hint 记录的是“OCR 已处理页清单”而非材料所在页，不作为候选。
         _append_unique_pages(structured_pages, result.get("page_hint"), page_count)
     for page in structured_pages:
+        if page not in pages:
+            pages.append(page)
+    for page in local_candidate_pages:
         if page not in pages:
             pages.append(page)
     # 全文扫描可能命中同组附件的首尾页而漏掉中间纯扫描页；密集、稳定间隔序列可安全补齐。
@@ -6621,6 +6757,7 @@ def _visual_rule_packet(rule: dict) -> dict:
     return {
         "rule_id": rule["rule_id"], "category": rule.get("category"), "title": rule.get("title"),
         "check_rule": rule.get("check_rule") or rule.get("title"), "source_text": rule.get("source_text"),
+        "evidence_items": _rule_evidence_items(rule),
         "scoring": scoring if scoring else None,
     }
 
@@ -6699,14 +6836,17 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
             result, "skipped_text_sufficient", [], vision_profile, "文字证据已足够，本次无需调用图片模型。",
         )
     all_pages = _prioritise_material_pages(
-        document, rule, _vision_page_candidates(document, rule, result),
+        document, rule, _acquisition_candidate_pages(document, rule, result),
         protected=result.get("ocr_evidence_pages"),
     )
     # 纯扫描件可能没有可供文字流程定位的页码。仅精细模式进入低清联系表找页，
     # 找到候选后才发送高清目标页；快速/标准模式仍严格保持零额外图片调用。
     if not all_pages and level == "high":
         all_pages = _locate_visual_pages(app, task, document, rule, vision_profile)
-    page_limit = _form_bundle_page_limit(rule, level, all_pages, _VISION_LEVEL_SETTINGS[level]["max_pages"])
+    page_limit = _form_bundle_page_limit(
+        rule, level, all_pages,
+        _compound_acquisition_page_limit(rule, level, "vision", _VISION_LEVEL_SETTINGS[level]["max_pages"]),
+    )
     pages = all_pages[:page_limit]
     if not pages:
         return _with_vision_execution(
@@ -7754,8 +7894,6 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
                 continue
             trigger, level = _rule_vision_policy(rule)
             image_mode = _rule_image_mode(rule)
-            if trigger == "off" or level == "off" or image_mode == "off":
-                continue
             base = completed_results[component].get(rule["rule_id"])
             if not base:
                 progress.advance(f"跳过未产生文字结果的图片识别：{bidder_name}")
@@ -7766,45 +7904,30 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
             label = rule.get("title") or rule.get("check_rule")
             merged = base
             image_strategy = _rule_image_strategy(rule)
-            allow_ocr = image_mode in {"ocr_only", "combined"} or (
-                image_mode == "auto" and image_strategy in {"ocr", "hybrid"}
+            baseline_required = ocr_enabled and _local_ocr_baseline_required(rule, merged, component)
+            enhancement_requested = trigger != "off" and level != "off" and image_mode != "off"
+            # “智能升级”不因规则属于证书/字段类就无条件消耗腾讯额度；只有原文字
+            # 证据不足，或人工选择“每次均升级”时才开放高精度复核。
+            tencent_upgrade_requested = enhancement_requested and (
+                trigger == "required" or _needs_visual_fallback(component, merged)
             )
-            allow_vision = image_mode in {"vision_only", "combined"} or image_mode == "auto"
-            vision_first = bool(
-                allow_vision and vision_profile
-                and _prefer_vision_first(rule, component, merged, image_strategy, trigger)
-            )
-            if vision_first:
-                # 证照、证件等材料先由多模态确认“页面是否就是目标材料”，再只对已命中页
-                # 调 OCR。这样不改变普通文字规则的成熟 OCR 链路，却能避开目录和无关附件
-                # 上的双重调用。
-                progress.message(f"正在图片识别：{bidder_name} · {label}")
-                merged = _run_visual_supplement(app, task, document, component, rule, merged, vision_profile)
-                values["batch_count"] += 1
-                if ocr_enabled and allow_ocr and _needs_post_vision_ocr_verification(rule, merged):
-                    progress.message(f"正在 OCR 复核关键页：{bidder_name} · {label}")
-                    merged = _run_ocr_verification_after_vision(
-                        app, task, document, component, rule, merged,
-                    )
-                    values["batch_count"] += 1
-                elif ocr_enabled and allow_ocr and str(merged.get("vision_status") or "") in {"not_located", "failed", "uncovered"}:
-                    # 视觉找页失败时回退到原 OCR 链路，不能因新增优化而降低材料覆盖率。
-                    progress.message(f"图片未定位，回退 OCR：{bidder_name} · {label}")
-                    merged = _run_ocr_supplement(
-                        app, task, document, component, rule, merged, profile,
-                        locator_profile=vision_profile,
-                    )
-                    values["batch_count"] += 1
-            elif ocr_enabled and allow_ocr:
-                progress.message(f"正在 OCR 识别：{bidder_name} · {label}")
+            if not baseline_required and not enhancement_requested:
+                continue
+            # 固定顺序：本地 OCR 先给出可复用的基础文字，再根据人工策略和规则事实
+            # 升级腾讯精确字段核验或多模态外观核验。这样非多模态模型也能稳定运行。
+            if baseline_required:
+                progress.message(f"正在本地 OCR 识别：{bidder_name} · {label}")
                 merged = _run_ocr_supplement(
                     app, task, document, component, rule, merged, profile,
-                    locator_profile=vision_profile,
+                    # 高强度纯扫描件在文字锚点失效时，可借助已配置的多模态模型
+                    # 做一次低清找页；即使专家模式仅选择腾讯 OCR，也不丢失旧能力。
+                    locator_profile=vision_profile, baseline=True, allow_tencent=tencent_upgrade_requested,
                 )
                 values["batch_count"] += 1
-            skip_note = "" if vision_first else _multimodal_skip_note(image_strategy, merged, rule, trigger)
+            allow_vision = enhancement_requested and (image_mode in {"vision_only", "combined"} or image_mode == "auto")
+            skip_note = _multimodal_skip_note(image_strategy, merged, rule, trigger) if enhancement_requested else ""
             should_run_vision = image_mode == "combined" or _should_run_multimodal_after_ocr(image_strategy, merged)
-            if not vision_first and allow_vision and vision_profile and not skip_note and should_run_vision:
+            if allow_vision and vision_profile and not skip_note and should_run_vision:
                 progress.message(f"正在图片识别：{bidder_name} · {label}")
                 merged = _run_visual_supplement(app, task, document, component, rule, merged, vision_profile)
                 values["batch_count"] += 1
@@ -7815,11 +7938,11 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
                     [page for page in merged.get("vision_pages") or []],
                     {"display_name": merged.get("vision_model") or ""}, skip_note,
                 )
-            elif not vision_first and allow_vision and image_strategy == "vision" and not vision_profile:
+            elif allow_vision and image_strategy == "vision" and not vision_profile:
                 merged = _with_vision_execution(
                     merged, "unavailable", [], {}, "本规则需要图片外观判断，但未获得可用的多模态模型。",
                 )
-            elif not vision_first and allow_vision and image_strategy == "hybrid" and not vision_profile:
+            elif allow_vision and image_strategy == "hybrid" and not vision_profile:
                 # 本地/Tencent OCR 已完成的文字事实必须保留；只说明未能继续核验签章、
                 # 外观等图片事实，不能把它回退为“完全未执行”。
                 existing_status = str(merged.get("vision_status") or "")
@@ -7833,10 +7956,10 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
                     merged = _with_vision_execution(
                         merged, "unavailable", [], {}, "本规则需要图片外观判断，但未获得可用的多模态模型。",
                     )
-            elif not vision_first and image_mode == "ocr_only" and not ocr_enabled:
+            elif image_mode == "ocr_only" and not ocr_enabled:
                 # 仅 OCR 是明确的人工选择；不能误报成多模态不可用。
                 merged = _with_vision_execution(merged, "ocr_failed", [], {}, "OCR 文字识别未启用或当前运行环境不可用，已保留文字结论。")
-            elif not vision_first and allow_vision and not vision_profile and not ocr_enabled:
+            elif allow_vision and not vision_profile and not ocr_enabled:
                 # 两条图片能力均不可用时，明确保留文字结论。
                 merged = _with_vision_execution(merged, "unavailable", [], {}, "本次未获得可用的 OCR 或多模态模型，未执行图片取证。")
             merged = _apply_document_evidence_guard(document, component, rule, merged)

@@ -87,7 +87,8 @@ PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += "\n\n" + _EXTRACT_RULES
 PROMPT_TEMPLATES["extract_rules_compile_user"]["content"] += (
     "\n\n技术/服务覆盖规则编译补充：category=other 的逐项响应覆盖候选应按当前采购包和连续主题"
     "合并为少量规则，完整保留原编号与叶子要求；不得与概括性“全部响应”规则并存，也不得改写为"
-    "qualification/compliance/substantive/rejection 或添加原文没有的否决、扣分后果。"
+    "qualification/compliance/substantive/rejection 或添加原文没有的否决、扣分后果。合并候选已有 evidence_items 时，"
+    "须合并、去重并保留其独立叶子取证清单；不得因合并展示而把多个独立材料压成一个泛化材料。"
 )
 PROMPT_TEMPLATES["extract_rules_coverage_user"]["content"] += (
     "\n\n覆盖审计补充：除会改变正式结论或分值的条款外，还要核对当前采购包成组、编号、可由投标文件"
@@ -141,6 +142,25 @@ _EXTRACT_RULE_EXECUTION_METADATA_GUIDANCE = """
 每条 AI 规则还应尽量补充 execution_strategy、evidence_requirements、applicability 三个字段；它们只描述后续取证方式，不得改变规则本身。execution_strategy 只能是 point（单点材料）、counting（需要逐项累计/去重）、section（需要通读完整章节或方案）、consistency（需要全文前后/范围一致性核验）、cross_bid（必须横向比较多家投标文件）、visual（关键结论仅靠图片外观）或 external（需外部核验）。evidence_requirements 是 text、visual、cross_bid、external 的数组：文字和图片都可分别支持同一规则时同时写 text、visual；不要把“可能附有证照”误写为仅 visual。applicability 形如 {"scope":"all|package|conditional|unknown","package_ids":[数字]}，包别无法从原文可靠判断时写 unknown。新增字段缺失时系统会兼容旧规则，但不得因节省篇幅省略评分、资格或否决条款的既有内容。
 """.strip()
 PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += "\n\n" + _EXTRACT_RULE_EXECUTION_METADATA_GUIDANCE
+
+# 规则集可以为人工阅读合并展示，但合并不能让多个可独立核验的材料在图片取证时
+# 争抢同一个候选页预算。该字段是可选的、纯取证元数据：旧提示词和旧规则没有它时
+# 完全走既有链路，不把输出协议升级成阻断条件。
+_EXTRACT_RULE_COMPOUND_EVIDENCE_GUIDANCE = (
+    "当一条规则为了避免重复而合并了两个及以上可独立核验的叶子事实（例如不同编号参数、"
+    "不同材料、不同设备主题或同一规则下彼此独立的证明要求）时，除完整 check_rule 外，应额外返回"
+    "可选 evidence_items 数组，最多12项。每项形如 {\"item_id\":\"稳定短ID\",\"name\":\"简短叶子名称\","
+    "\"requirement\":\"该项需核验的明确事实或证明材料\",\"source_page\":数字或null,"
+    "\"evidence_requirements\":[\"text|document|field|visual\"]}。它只用于在同一父规则内均衡定位"
+    "文字、OCR 或图片证据，不生成子规则、不单独给分、不改变原文后果。只有确有两个以上独立叶子事实时才返回；"
+    "单一材料、概括性章节或无法从原文可靠拆开的要求不要凑项。"
+)
+PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += "\n\n" + _EXTRACT_RULE_COMPOUND_EVIDENCE_GUIDANCE
+for _compound_template_id in (
+    "extract_rules_user", "extract_rules_continue_user", "extract_rules_compile_user",
+    "extract_rules_coverage_user", "extract_rules_supplement_user", "extract_rules_qualification_supplement_user",
+):
+    PROMPT_TEMPLATES[_compound_template_id]["content"] += "\n\n" + _EXTRACT_RULE_COMPOUND_EVIDENCE_GUIDANCE
 
 # 证据性质是综合评审的业务判断口径，供全文扫描、规则审查和评分子流程共同使用。
 _EVALUATE_ALL_EVIDENCE_GUIDANCE = (
@@ -256,7 +276,8 @@ PROMPT_TEMPLATES["evaluate_all_visual_user"]["content"] += (
     "不得把未覆盖材料按清单数量预先计分。conclusion_scope=partial 时 suggested_score 只能是已 confirmed 材料的可直接计算合计，不得沿用文字阶段更高的暂定分。"
 )
 PROMPT_TEMPLATES["evaluate_all_ocr_user"]["content"] += (
-    "\n\n补充：Pn 仅指系统实际 PDF 页；关键字段逐字引用，模糊字不得补全。"
+    "\n\n识别层级：本地 RapidOCR 是候选页的基础文字层；腾讯 OCR 仅用于关键字段、证照证件或基础识别不完整页的精确复核。"
+    "无论来源，Pn 仅指系统实际 PDF 页；关键字段逐字引用，模糊字不得补全。"
     "客观分只总结材料类别、数量、有效性和计分结论，不得逐行抄录OCR全文。"
 )
 PROMPT_TEMPLATES["evaluate_all_visual_contract"] = _template(

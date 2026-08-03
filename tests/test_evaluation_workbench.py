@@ -1576,14 +1576,17 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(storage.vision_configuration(self.app), {"enabled": False, "default_profile_id": None})
 
     def test_ocr_feature_configuration_is_independent_from_multimodal_switch(self):
-        self.assertEqual(storage.ocr_feature_configuration(self.app), {"enabled": False})
-        self.assertEqual(storage.update_ocr_feature_configuration(self.app, {"enabled": True}), {"enabled": True})
+        configuration = storage.ocr_feature_configuration(self.app)
+        self.assertTrue(configuration["enabled"])
+        self.assertTrue(configuration["fixed"])
+        # 兼容旧 PATCH，但 false 不能关闭固定的本地 OCR 基线。
+        self.assertTrue(storage.update_ocr_feature_configuration(self.app, {"enabled": False})["enabled"])
         self.assertFalse(storage.vision_configuration(self.app)["enabled"])
         self.assertTrue(storage.ocr_configuration(self.app)["ocr_enabled"])
 
     def test_ocr_feature_configuration_api_requires_model_configuration_access(self):
         client = self.app.test_client()
-        self.assertFalse(client.get("/api/evaluation-workbench/ocr-feature-configuration").get_json()["configuration"]["enabled"])
+        self.assertTrue(client.get("/api/evaluation-workbench/ocr-feature-configuration").get_json()["configuration"]["enabled"])
         self.assertEqual(client.patch(
             "/api/evaluation-workbench/ocr-feature-configuration", json={"enabled": True},
         ).status_code, 403)
@@ -1802,7 +1805,12 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             "tencent_enabled": False, "local": {"enabled": True, "runtime_available": True},
         }))
         self.assertTrue(worker._ocr_runtime_enabled({
-            "tencent_enabled": True, "local": {"enabled": True, "runtime_available": False},
+            "tencent_enabled": True, "credentials_configured": True,
+            "local": {"enabled": True, "runtime_available": False},
+        }))
+        self.assertFalse(worker._ocr_runtime_enabled({
+            "tencent_enabled": True, "credentials_configured": False,
+            "local": {"enabled": True, "runtime_available": False},
         }))
         self.assertFalse(worker._ocr_runtime_enabled({
             "tencent_enabled": False, "local": {"enabled": True, "runtime_available": False},
@@ -1812,7 +1820,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         configuration = {"tencent_enabled": False, "local": {"enabled": True, "runtime_available": True}}
 
         self.assertTrue(worker._evaluation_ocr_enabled(True, configuration))
-        self.assertFalse(worker._evaluation_ocr_enabled(False, configuration))
+        self.assertTrue(worker._evaluation_ocr_enabled(False, configuration))
 
     def test_legacy_ocr_rule_uses_hybrid_chain_instead_of_skipping_local_ocr(self):
         legacy_rule = {
@@ -1822,7 +1830,31 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         self.assertEqual(worker._rule_image_strategy(legacy_rule), "hybrid")
 
-    def test_tencent_ocr_success_never_starts_local_fallback(self):
+    def test_material_rule_keeps_local_baseline_when_enhancement_is_off(self):
+        rule = {
+            "title": "认证证书", "check_rule": "核验证书编号和有效期",
+            "image_mode": "off", "vision_trigger": "off", "vision_level": "off",
+            "evidence_requirements": ["document", "field"],
+        }
+        self.assertTrue(worker._local_ocr_baseline_required(rule, {"status": "manual"}))
+
+    def test_tencent_remains_fallback_if_local_runtime_returns_no_text(self):
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "扫描件候选页")
+        storage.update_ocr_configuration(self.app, {
+            "enabled": True, "secret_id": "AKID-example", "secret_key": "secret-example", "region": "ap-guangzhou",
+            "services": {"accurate": {"enabled": True, "monthly_limit": 10}},
+        })
+        rule = {"title": "证书编号", "check_rule": "核验证书编号", "vision_level": "standard"}
+        response = {"service": "accurate", "text": "证书编号 A123", "parser_version": ocr_gateway.OCR_PARSER_VERSION}
+        with patch("dashboard.evaluation_workbench.worker._local_ocr_page_texts", return_value=([], "本地 RapidOCR 运行环境不可用")), \
+             patch("dashboard.evaluation_workbench.worker.request_tencent_ocr", return_value=(response, "")):
+            values, _ = worker._ocr_page_texts(
+                self.app, {"task_id": "task", "project_id": self.project["project_id"]}, document, rule, {}, "standard", pages=[1],
+                allow_tencent=False,
+            )
+        self.assertEqual(values[0]["service"], "accurate")
+
+    def test_tencent_ocr_is_a_second_pass_after_local_ocr(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "扫描件候选页")
         storage.update_ocr_configuration(self.app, {
             "enabled": True, "secret_id": "AKID-example", "secret_key": "secret-example", "region": "ap-guangzhou",
@@ -1830,13 +1862,14 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         })
         rule = {"title": "证书编号", "check_rule": "核验证书编号", "vision_level": "standard"}
         response = {"service": "accurate", "text": "证书编号 A123", "parser_version": ocr_gateway.OCR_PARSER_VERSION}
+        local_response = [{"page": 1, "service": local_ocr_gateway.LOCAL_OCR_SERVICE, "text": "本地证书编号 A123", "confidence": 0.95}]
         with patch("dashboard.evaluation_workbench.worker.request_tencent_ocr", return_value=(response, "")), \
-             patch("dashboard.evaluation_workbench.worker._local_ocr_page_texts") as local_pages:
+             patch("dashboard.evaluation_workbench.worker._local_ocr_page_texts", return_value=(local_response, "")) as local_pages:
             values, failure = worker._ocr_page_texts(self.app, {"task_id": "task", "project_id": self.project["project_id"]}, document, rule, {}, "standard", pages=[1])
 
         self.assertEqual(failure, "")
         self.assertEqual(values[0]["text"], "证书编号 A123")
-        local_pages.assert_not_called()
+        local_pages.assert_called_once()
 
     def test_local_ocr_page_cache_avoids_starting_a_subprocess_again(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "扫描件候选页")
@@ -2554,29 +2587,6 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("关键字段", plan["stop_condition"])
         self.assertEqual(result, before)
 
-    def test_explicit_material_field_policy_prefers_ocr_but_keeps_visual_fallback(self):
-        """第三轮只改变显式新策略，旧 OCR/视觉规则的顺序不能被升级改变。"""
-        explicit = {
-            "rule_id": "generic-material", "title": "证明材料字段核验",
-            "check_rule": "核验所需材料本体、编号、日期和型号",
-            "execution_meta_json": json.dumps({
-                "acquisition_preset": "smart", "image_mode": "auto",
-                "vision_trigger": "text_fallback", "vision_level": "standard",
-                "evidence_requirements": ["document", "field", "text", "visual"],
-            }),
-        }
-        legacy = {
-            "rule_id": "legacy-material", "title": "认证证书字段核验",
-            "check_rule": "核验所需材料本体、编号、日期和型号",
-            "check_mode": "ocr", "ocr_required": True, "vision_level": "standard",
-        }
-        result = {"status": "manual", "vision_status": "not_requested"}
-        self.assertFalse(worker._prefer_vision_first(explicit, "review", result, "hybrid", "text_fallback"))
-        self.assertTrue(worker._prefer_vision_first(legacy, "review", result, "hybrid", "required"))
-
-        visual = {**explicit, "title": "认证证书签字盖章核验"}
-        self.assertTrue(worker._prefer_vision_first(visual, "review", result, "hybrid", "required"))
-
     def test_explicit_material_field_policy_only_early_stops_after_multiple_field_signals(self):
         explicit = {
             "rule_id": "generic-certificate", "title": "认证证书核验",
@@ -2727,6 +2737,46 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         self.assertEqual(saved["evidence_requirements"], ["document", "field", "text"])
         self.assertEqual(worker._rule_image_strategy(saved), "ocr")
+
+    def test_compound_rule_evidence_items_are_persisted_without_creating_child_rules(self):
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "substantive", "title": "关键参数及证明材料",
+            "check_rule": "逐项核验两个独立参数及对应证明材料",
+            "evidence_items": [
+                {"item_id": "a", "name": "参数A", "requirement": "核验参数A的检测报告", "source_page": 12, "evidence_requirements": ["text", "document", "field", "visual"]},
+                {"item_id": "b", "name": "参数B", "requirement": "核验参数B的检测报告", "source_page": "13", "evidence_requirements": ["text", "visual"]},
+            ],
+        })
+        _, rules = storage.list_rules(self.app, self.project["project_id"])
+        saved = next(item for item in rules if item["rule_id"] == rule["rule_id"])
+
+        self.assertEqual(len(saved["evidence_items"]), 2)
+        self.assertEqual(saved["evidence_items"][0]["item_id"], "a")
+        self.assertEqual(saved["evidence_items"][1]["source_page"], 13)
+        self.assertEqual(len(rules), 1)
+
+    def test_compound_rule_acquisition_rotates_pages_across_evidence_items(self):
+        rule = {
+            "title": "复合技术参数", "check_rule": "核验各项参数和证明材料",
+            "execution_meta_json": json.dumps({"evidence_items": [
+                {"item_id": "a", "name": "参数A", "requirement": "参数A 检测报告"},
+                {"item_id": "b", "name": "参数B", "requirement": "参数B 检测报告"},
+                {"item_id": "c", "name": "参数C", "requirement": "参数C 检测报告"},
+            ]}, ensure_ascii=False),
+        }
+        candidates = {"复合技术参数": [9, 10], "参数A": [3, 4], "参数B": [6, 7], "参数C": [8, 9]}
+        with patch.object(worker, "_vision_page_candidates", side_effect=lambda _doc, view, _result: candidates.get(view["title"], [])), \
+             patch.object(worker, "_prioritise_material_pages", side_effect=lambda _doc, _rule, pages, **_kwargs: pages):
+            plan = worker._compound_acquisition_plan({"extension": ".pdf", "page_count": 12}, rule, {})
+
+        self.assertEqual(plan["candidate_pages"][:3], [3, 6, 8])
+        self.assertEqual(worker._compound_acquisition_page_limit(rule, "standard", "ocr", 6), 6)
+        six_items = [
+            {"item_id": f"item_{index}", "name": f"参数{index}", "requirement": f"核验参数{index}"}
+            for index in range(1, 7)
+        ]
+        expanded_rule = {**rule, "execution_meta_json": json.dumps({"evidence_items": six_items}, ensure_ascii=False)}
+        self.assertEqual(worker._compound_acquisition_page_limit(expanded_rule, "standard", "ocr", 6), 8)
 
     def test_ocr_discovery_does_not_early_stop_counting_or_form_rules(self):
         values = [{"page": 3, "text": "检测报告 编号 ABC-2026"}]
@@ -3760,48 +3810,6 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn("biz_license", wrong_page)
         self.assertEqual(actual_license[0], "biz_license")
 
-    def test_visual_first_is_limited_to_material_pages_that_need_picture_judgment(self):
-        certificate = {
-            "title": "认证证书评分", "check_rule": "核验证书扫描件、编号和有效期",
-            "vision_trigger": "required", "vision_level": "standard",
-        }
-        declaration = {
-            "title": "中小企业声明函", "check_rule": "核对所属行业和企业类型填写内容",
-            "vision_trigger": "required", "vision_level": "standard",
-        }
-        base = {"suggested_score": None, "confidence": "low"}
-
-        self.assertTrue(worker._prefer_vision_first(certificate, "objective", base, "hybrid", "required"))
-        self.assertFalse(worker._prefer_vision_first(declaration, "objective", base, "ocr", "required"))
-        self.assertFalse(worker._prefer_vision_first(certificate, "objective", base, "hybrid", "off"))
-
-    def test_post_vision_ocr_only_verifies_image_evidence_pages_and_keeps_objective_concise(self):
-        document = {"document_id": "doc", "extension": ".pdf", "page_count": 200,
-                    "original_name": "投标.pdf", "bidder_name": "甲"}
-        rule = {"rule_id": "cert", "title": "认证证书评分", "check_rule": "核验证书编号与有效期",
-                "vision_trigger": "required", "vision_level": "standard", "scoring": {"max_score": 2}}
-        visual = {
-            "rule_id": "cert", "suggested_score": 2, "max_score": 2, "confidence": "high",
-            "evidence": "【图片识别·standard·P144】证书名称、编号和有效期可见。",
-            "reason": "证书满足计分条件。", "vision_status": "applied",
-            "vision_pages": [7, 144], "vision_evidence_pages": [144], "vision_message": "图片识别已形成完整补充。",
-        }
-        values = [{"page": 144, "service": "accurate", "text": "证书编号A123，有效期至2029-12-31"}]
-
-        with patch("dashboard.evaluation_workbench.worker._ocr_page_texts", return_value=(values, "")) as ocr_pages:
-            result = worker._run_ocr_verification_after_vision(
-                self.app, {"task_id": "task"}, document, "objective", rule, visual,
-            )
-
-        self.assertEqual(ocr_pages.call_args.kwargs["pages"], [144])
-        self.assertEqual(result["suggested_score"], 2)
-        self.assertEqual(result["ocr_verification_status"], "completed")
-        self.assertEqual(result["ocr_verification_pages"], [144])
-        self.assertIn("OCR关键文字复核", result["evidence"])
-        self.assertNotIn("A123", result["evidence"])
-        layer = next(item for item in result["evidence_layers"] if item["source"] == "tencent_ocr")
-        self.assertEqual(layer["evidence_pages"], [144])
-
     def test_partial_visual_score_uses_confirmed_leaf_items_only(self):
         rule = {"scoring": {"max_score": 3, "items": [
             {"item_id": "SI-1", "max_score": 1}, {"item_id": "SI-2", "max_score": 2},
@@ -3940,33 +3948,6 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(single_scope, "full")
         self.assertEqual(single_checked, [12])
         self.assertEqual(single_evidence, [12])
-
-    def test_post_vision_ocr_verification_respects_selected_page_budget(self):
-        document = {"document_id": "doc", "extension": ".pdf", "page_count": 50,
-                    "original_name": "投标.pdf", "bidder_name": "甲"}
-        rule = {"rule_id": "cert", "title": "认证证书", "check_rule": "核验证书编号与有效期",
-                "vision_trigger": "required", "vision_level": "high"}
-        result = {"vision_status": "applied", "vision_evidence_pages": list(range(1, 13)),
-                  "vision_message": "图片识别已完成。", "evidence": "证书可见"}
-
-        with patch("dashboard.evaluation_workbench.worker._ocr_page_texts", return_value=([], "未识别到文字")) as ocr_pages:
-            updated = worker._run_ocr_verification_after_vision(
-                self.app, {"task_id": "task"}, document, "objective", rule, result,
-            )
-
-        self.assertEqual(ocr_pages.call_args.kwargs["pages"], list(range(1, 11)))
-        self.assertEqual(updated["ocr_verification_status"], "unavailable")
-
-    def test_ocr_visual_field_shadow_check_only_confirms_direct_text_hits(self):
-        check = worker._shadow_ocr_visual_field_check([
-            {"field": "证书编号", "image_value": "ISO-14001-2025"},
-            {"field": "有效期", "image_value": "2030-12-31"},
-        ], [{"text": "证书编号：ISO-14001-2025\n有效期至2029-12-31"}])
-
-        self.assertEqual(check["mode"], "shadow_only")
-        self.assertEqual(check["matched_count"], 1)
-        self.assertEqual(check["items"][0]["ocr_status"], "matched")
-        self.assertEqual(check["items"][1]["ocr_status"], "unconfirmed")
 
     def test_vision_render_scale_has_preflight_pixel_ceiling(self):
         class Page:

@@ -592,7 +592,7 @@ def vision_configuration_api():
 
 @evaluation_workbench_bp.route("/api/evaluation-workbench/ocr-feature-configuration", methods=["GET", "PATCH"])
 def ocr_feature_configuration_api():
-    """OCR 文字识别总开关，与腾讯 OCR 服务开关及多模态模型独立。"""
+    """保留兼容的本地 OCR 基线配置 API；腾讯和多模态仍独立配置。"""
     _init()
     if request.method == "PATCH":
         access_error = _model_configuration_access_error()
