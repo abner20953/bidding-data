@@ -200,9 +200,19 @@
     if (['smart', 'text'].includes(preset) || (mode === 'auto' && trigger === 'text_fallback')) return 'smart';
     return 'custom';
   }
+  function baseVerificationSummary(rule) {
+    const requirements = new Set(Array.isArray(rule?.evidence_requirements) ? rule.evidence_requirements.map(String) : []);
+    if (rule?.check_mode === 'ocr' || Boolean(rule?.ocr_required)) {
+      return {label:'本地 OCR 核验', detail:'该规则明确需要读取扫描件或图片文字；不作增强时仍会按有限候选页执行本地 OCR。'};
+    }
+    if (['document', 'field', 'visual'].some((item) => requirements.has(item))) {
+      return {label:'按需本地 OCR 核验', detail:'常规先审全文文字；仅在扫描型文件或文字证据不足时，才按有限候选页调用本地 OCR。'};
+    }
+    return {label:'纯文字核验', detail:'常规仅使用已解析全文文字；没有扫描型文件或证据不足信号时不调用本地 OCR。'};
+  }
   function acquisitionSummary(rule) {
     const level = String(rule?.vision_level || 'off'); const choice = simpleAcquisitionMode(rule);
-    if (choice === 'off') return {label:'不作增强核验', state:'off', detail:'先进行全文文字审查；仅在明确需 OCR 或文字证据不足时才按需运行本地 OCR'};
+    if (choice === 'off') { const base = baseVerificationSummary(rule); return {label:`不作增强 · ${base.label}`, state:'off', detail:base.detail}; }
     if (choice === 'custom') return {label:`专家自定义 · ${acquisitionLevelLabels[level] || '标准'}强度`, state:'warning', detail:'已由专家模式单独指定通道或启动方式'};
     return {label:`${acquisitionPresetLabels[choice]} · ${acquisitionLevelLabels[level] || '标准'}强度`, state:'active', detail:choice === 'always' ? '不因文字已充分而跳过，仍会取证候选材料' : '先审全文文字，仅在确有必要时取证'};
   }
@@ -221,7 +231,7 @@
   }
   function acquisitionPreview(rule) {
     const mode = String(rule?.image_mode || 'auto'); const trigger = String(rule?.vision_trigger || 'off'); const level = String(rule?.vision_level || 'off');
-    if (mode === 'off' || trigger === 'off' || level === 'off') return '先进行全文文字审查；仅在规则明确需 OCR、文件为扫描型或文字证据不足时，才按需使用本地 OCR 识别候选页。不进行腾讯 OCR 或多模态增强核验。';
+    if (mode === 'off' || trigger === 'off' || level === 'off') { const base = baseVerificationSummary(rule); return `${base.label}：${base.detail}不进行腾讯 OCR 或多模态增强核验。`; }
     const itemCount = Array.isArray(rule?.evidence_items) ? rule.evidence_items.length : 0;
     const compound = itemCount > 1;
     const ocrLimit = compound && level !== 'low' ? Math.min(level === 'high' ? 12 : 8, Math.max(level === 'high' ? 10 : 6, itemCount * 2)) : (level === 'high' ? 10 : 6);
@@ -286,13 +296,14 @@
       const simpleChoice = simpleAcquisitionMode(r);
       const selectionLevel = ['low', 'standard', 'high'].includes(r.vision_level) ? r.vision_level : 'standard';
       const isCustomAcquisition = simpleChoice === 'custom';
+      const basePath = simpleChoice === 'off' ? `<p class="hint rule-base-verification"><strong>当前基础路径：</strong>${escapeHtml(baseVerificationSummary(r).label)}。${escapeHtml(baseVerificationSummary(r).detail)}</p>` : '';
       const strengthControl = ['smart', 'always'].includes(simpleChoice) ? `<label>取证强度<select class="rule-simple-coverage" data-rule="${r.rule_id}"><option value="low" ${selectionLevel === 'low' ? 'selected' : ''}>快速：单页材料或快速抽查</option><option value="standard" ${selectionLevel === 'standard' ? 'selected' : ''}>标准（推荐）：覆盖常见材料与必要补页</option><option value="high" ${selectionLevel === 'high' ? 'selected' : ''}>充分：材料分散、页数较多或风险较高</option></select></label>` : '';
       const choiceControl = isCustomAcquisition ? `<div class="rule-acquisition-custom-state"><strong>专家自定义生效中</strong><button class="open-rule-expert" data-rule="${r.rule_id}" type="button">查看/调整专家模式</button></div>` : `<label>增强核验<select class="rule-simple-acquisition" data-rule="${r.rule_id}"><option value="off" ${simpleChoice === 'off' ? 'selected' : ''}>不作增强核验</option><option value="smart" ${simpleChoice === 'smart' ? 'selected' : ''}>智能升级（推荐）</option><option value="always" ${simpleChoice === 'always' ? 'selected' : ''}>每次都升级</option></select></label>`;
       const recommendationPayload = presetPayload(recommendation.acquisition_preset, recommendation.vision_level, r);
       const matchesRecommendation = ['image_mode', 'vision_trigger', 'vision_level'].every((key) => String(r[key] || '') === String(recommendationPayload[key] || ''));
       const ruleIssues = acquisitionIssuesByRule.get(r.rule_id) || [];
       const acquisitionWarning = ruleIssues.length ? `<div class="rule-acquisition-warning"><strong>当前设置提示：</strong>${escapeHtml(ruleIssues.map((issue) => issue.message).join('；'))}</div>` : '';
-      const visionControl = isDraft ? `<div class="rule-vision-controls"><div class="rule-vision-heading"><strong>增强核验</strong><small>本地 OCR 仅在明确需要或文字证据不足时运行；这里控制是否追加腾讯 OCR 或多模态复核。</small></div>${choiceControl}${strengthControl}<div class="rule-acquisition-preview"><strong>执行预览</strong><span>${escapeHtml(acquisitionPreview(r))}</span></div>${acquisitionWarning}<div class="rule-acquisition-actions"><button class="restore-rule-acquisition" data-rule="${r.rule_id}" type="button" ${matchesRecommendation ? 'disabled title="当前已采用系统建议"' : ''}>采用系统建议</button><small>系统建议：${escapeHtml(acquisitionPresetLabels[recommendation.acquisition_preset] || '智能升级')} · ${escapeHtml(acquisitionLevelLabels[recommendation.vision_level] || '标准')}强度</small></div><details class="rule-image-advanced"><summary>专家模式：增强通道与启动方式</summary><p class="hint">一般无需修改。本地 OCR 不会因规则名称自动重复运行；仅当需限定腾讯精确复核、多模态外观核验或双通道时使用。</p><div class="rule-image-advanced-grid"><label>增强通道<select class="rule-image-mode" data-rule="${r.rule_id}"><option value="auto" ${r.image_mode === 'auto' ? 'selected' : ''}>系统自动选择（推荐）</option><option value="ocr_only" ${r.image_mode === 'ocr_only' ? 'selected' : ''}>腾讯 OCR：精确字段复核</option><option value="vision_only" ${r.image_mode === 'vision_only' ? 'selected' : ''}>多模态：签章、外观等</option><option value="combined" ${r.image_mode === 'combined' ? 'selected' : ''}>腾讯 OCR＋多模态：双重复核</option><option value="off" ${r.image_mode === 'off' ? 'selected' : ''}>不作增强核验</option></select></label><label>启动方式<select class="rule-vision-trigger" data-rule="${r.rule_id}"><option value="off" ${r.vision_trigger === 'off' ? 'selected' : ''}>不升级</option><option value="text_fallback" ${r.vision_trigger === 'text_fallback' ? 'selected' : ''}>基础证据不足时升级</option><option value="required" ${r.vision_trigger === 'required' ? 'selected' : ''}>每次均升级</option></select></label></div></details></div>` : '';
+      const visionControl = isDraft ? `<div class="rule-vision-controls"><div class="rule-vision-heading"><strong>增强核验</strong><small>本地 OCR 仅在明确需要或文字证据不足时运行；这里控制是否追加腾讯 OCR 或多模态复核。</small></div>${choiceControl}${strengthControl}${basePath}<div class="rule-acquisition-preview"><strong>执行预览</strong><span>${escapeHtml(acquisitionPreview(r))}</span></div>${acquisitionWarning}<div class="rule-acquisition-actions"><button class="restore-rule-acquisition" data-rule="${r.rule_id}" type="button" ${matchesRecommendation ? 'disabled title="当前已采用系统建议"' : ''}>采用系统建议</button><small>系统建议：${escapeHtml(acquisitionPresetLabels[recommendation.acquisition_preset] || '智能升级')} · ${escapeHtml(acquisitionLevelLabels[recommendation.vision_level] || '标准')}强度</small></div><details class="rule-image-advanced"><summary>专家模式：增强通道与启动方式</summary><p class="hint">一般无需修改。本地 OCR 不会因规则名称自动重复运行；仅当需限定腾讯精确复核、多模态外观核验或双通道时使用。</p><div class="rule-image-advanced-grid"><label>增强通道<select class="rule-image-mode" data-rule="${r.rule_id}"><option value="auto" ${r.image_mode === 'auto' ? 'selected' : ''}>系统自动选择（推荐）</option><option value="ocr_only" ${r.image_mode === 'ocr_only' ? 'selected' : ''}>腾讯 OCR：精确字段复核</option><option value="vision_only" ${r.image_mode === 'vision_only' ? 'selected' : ''}>多模态：签章、外观等</option><option value="combined" ${r.image_mode === 'combined' ? 'selected' : ''}>腾讯 OCR＋多模态：双重复核</option><option value="off" ${r.image_mode === 'off' ? 'selected' : ''}>不作增强核验</option></select></label><label>启动方式<select class="rule-vision-trigger" data-rule="${r.rule_id}"><option value="off" ${r.vision_trigger === 'off' ? 'selected' : ''}>不升级</option><option value="text_fallback" ${r.vision_trigger === 'text_fallback' ? 'selected' : ''}>基础证据不足时升级</option><option value="required" ${r.vision_trigger === 'required' ? 'selected' : ''}>每次均升级</option></select></label></div></details></div>` : '';
       return `<details class="rule-card"><summary><span class="rule-card-summary">${enabledControl}<span class="tag">${categoryLabel(r.category)}</span><strong class="rule-card-title">${escapeHtml(r.title)}</strong><span class="tag">${sourceLabel}</span>${ocrCell}</span></summary><div class="rule-card-body"><div class="rule-card-grid"><label>检查规则${checkContent}</label><div class="rule-field"><span class="rule-field-label">招标原文依据</span><div class="rule-text">${escapeHtml(r.source_text || '未提供')}</div></div></div>${visionControl}${isDraft ? `<div class="actions rule-card-actions"><button class="save-check-rule primary" data-rule="${r.rule_id}">保存检查规则</button></div>` : ''}</div></details>`;
     }).join('')}</div>` : '<p class="muted">暂无规则。</p>';
     $('rules').querySelectorAll('details.rule-card').forEach((card, index) => {
