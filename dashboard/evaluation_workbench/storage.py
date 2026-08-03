@@ -2567,21 +2567,39 @@ def _preset_from_legacy_image_mode(image_mode: object) -> str:
     }.get(str(image_mode or "auto"), "smart")
 
 
+RULE_VISUAL_SUGGESTION_TERMS = (
+    # 建议层外观词汇全集：覆盖 worker 执行级 DECISIVE_VISUAL_FACT_PATTERN 的全部词
+    # （图片外观/照片外观/版式外观由“外观”“照片”“版式”子串吸收），并补充图纸、
+    # 截图等图像载体词。执行级判定保持更窄的集合不变；建议层取并集，保证凡是被
+    # 标记 ocr_required 的规则，建议档位不会自相矛盾地落回“仅基础识别”。
+    "签字", "签章", "盖章", "公章", "印章", "骑缝章", "手写", "指印", "勾选", "涂改",
+    "外观", "版式", "照片", "截图", "图纸",
+)
+
+
 def rule_acquisition_recommendation(rule: dict) -> dict:
     """为前台提供可恢复的通用建议，不擅自改写当前规则的执行口径。
 
-    recommendation 只根据证据类型和材料角色判断，避免为某一行业、某一种证书或
-    具体项目写补丁。"""
+    recommendation 只根据证据类型（模型语义判断）和统一的外观词汇表判断，避免为
+    某一行业、某一种证书或具体项目写补丁；模型已标记 ocr_required 的规则，建议
+    档位至少为 smart，保持与规则自身标记一致。"""
     meta = rule_execution_meta(rule)
     requirements = set(meta.get("evidence_requirements") or [])
     text = "\n".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text"))
-    visual_terms = ("签字", "签章", "盖章", "勾选", "外观", "版式", "图纸", "截图", "印章")
-    has_visual_fact = "visual" in requirements or any(term in text for term in visual_terms)
+    has_visual_fact = "visual" in requirements or any(term in text for term in RULE_VISUAL_SUGGESTION_TERMS)
     has_document_field = bool(requirements & {"document", "field"}) or str(rule.get("check_mode") or "") == "ocr"
+    ocr_marked = (
+        str(rule.get("check_mode") or "") == "ocr"
+        or bool(rule.get("ocr_required")) or bool(meta.get("ocr_required"))
+    )
     if has_visual_fact and (has_document_field or "text" in requirements):
         preset = "smart"
     elif has_visual_fact:
         preset = "visual"
+    elif ocr_marked:
+        # 模型已判定决定性证据在 OCR/图像层（如证书编号、骑缝章等不含外观词的
+        # 场景），建议不能低于“智能取证”，否则与规则自身的 ocr_required 矛盾。
+        preset = "smart"
     else:
         preset = "off"
     # 本地 OCR 是基础层，不再等同于腾讯 OCR 增强。纯文字规则明确跳过 OCR；

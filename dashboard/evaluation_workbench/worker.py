@@ -2667,6 +2667,9 @@ _BOUNDARY_COMPARISON_PATTERN = re.compile(
     r"(?:Φ|φ)?\s*(\d+(?:\.\d+)?)\s*\3",
     flags=re.IGNORECASE,
 )
+# 执行级决定性外观判定：刻意保持比 storage.RULE_VISUAL_SUGGESTION_TERMS 更窄的集合，
+# 只有确凿的外观事实才把整条规则标为强制 OCR；建议层词汇是该集合的超集，保证
+# 凡被此正则命中的规则，rule_acquisition_recommendation 不会落回“仅基础识别”。
 DECISIVE_VISUAL_FACT_PATTERN = re.compile(
     r"签字|签章|盖章|公章|印章|骑缝章|手写|指印|勾选|涂改|图片外观|照片外观|版式外观",
     flags=re.IGNORECASE,

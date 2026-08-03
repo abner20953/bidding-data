@@ -3706,6 +3706,29 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         # check_mode=ocr 被推荐逻辑视为材料/字段类，混合视觉事实时建议“智能升级”而非纯视觉通道。
         self.assertEqual(storage.rule_acquisition_recommendation(rules[0])["acquisition_preset"], "smart")
 
+    def test_acquisition_recommendation_stays_consistent_with_ocr_marking(self):
+        # 模型判定决定性证据在 OCR 层但不含外观词（证书编号核验）：建议不低于 smart。
+        rec = storage.rule_acquisition_recommendation({
+            "title": "认证证书编号核验", "check_rule": "核验证书编号与有效期", "source_text": "提供认证证书复印件",
+            "check_mode": "ocr", "ocr_required": True,
+            "execution_meta_json": {"evidence_requirements": ["document", "field"]},
+        })
+        self.assertEqual(rec["acquisition_preset"], "smart")
+        # 执行级外观词（骑缝章/手写等）在统一建议词汇表内，建议不能落回 off。
+        for term in ("骑缝章", "手写"):
+            rec = storage.rule_acquisition_recommendation({
+                "title": "签章核验", "check_rule": f"核验{term}是否完整", "source_text": "",
+                "check_mode": "ocr", "ocr_required": True,
+            })
+            self.assertNotEqual(rec["acquisition_preset"], "off")
+        # 纯文字规则建议保持 off，不误升级。
+        rec = storage.rule_acquisition_recommendation({
+            "title": "服务期限", "check_rule": "核验服务期限是否为30日", "source_text": "服务期限30日",
+            "check_mode": "auto",
+            "execution_meta_json": {"evidence_requirements": ["text"]},
+        })
+        self.assertEqual(rec["acquisition_preset"], "off")
+
     def test_rule_policy_keeps_text_verifiable_material_out_of_forced_ocr(self):
         material, plain = worker._normalise_visual_rule_policies([{
             "rule_id": "certificate", "category": "objective", "title": "认证证书评分",
