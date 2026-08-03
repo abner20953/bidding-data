@@ -5052,6 +5052,36 @@ def _local_ocr_baseline_required(rule: dict, result: dict, component: str = "rev
     return False
 
 
+def _visual_advance_estimated(rule: dict) -> bool:
+    """估算视觉取证循环中会产生进度推进的规则（静态上界）。
+
+    本地 OCR 基础化后，启动方式为关闭的规则也可能因基础 OCR 而推进进度；分母
+    只按增强规则估算会让进度提前封顶 100%，剩余 OCR 批次仍在刷新中间态文案。
+    此处按规则元数据取静态上界：增强规则必推进；auto 基础模式是否真正 OCR
+    取决于运行时文字充分性，按“可能执行”计入。宁可进度略滞后，也不可提前
+    到 100%。
+    """
+    trigger, level = _rule_vision_policy(rule)
+    if trigger != "off" and level != "off":
+        return True
+    try:
+        baseline_mode = str(storage.rule_execution_meta(rule).get("baseline_ocr_mode") or "auto")
+    except (TypeError, ValueError):
+        baseline_mode = str(rule.get("baseline_ocr_mode") or "auto")
+    if baseline_mode == "text_only":
+        return False
+    if baseline_mode == "local_ocr":
+        return True
+    if bool(rule.get("ocr_required")) or str(rule.get("check_mode") or "") == "ocr":
+        return True
+    requirements = set(_rule_evidence_requirements(rule))
+    if requirements & {"document", "field", "visual"}:
+        return True
+    if _rule_material_roles(rule):
+        return True
+    return _rule_image_strategy(rule) in {"ocr", "hybrid"}
+
+
 def _form_bundle_page_limit(rule: dict, level: str, pages: list[int], default_limit: int) -> int:
     """低强度固定表单也应完整覆盖紧邻的同一份表单，避免漏掉续页关键字段。
 
@@ -7607,9 +7637,9 @@ def _price_formula_kind(rule: dict) -> str | None:
     """只识别原文完整写明的通用价格公式，避免把任意“基准价”误算成最低价法。"""
     text = re.sub(r"\s+", "", " ".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text")))
     # 最低价比例法必须同时有“最低价为基准”和“基准价/本投标报价”的方向证据。
-    lowest_base = re.search(r"最低(?:评标|评审|投标)?(?:报价)?价.{0,40}(?:为|作为|确定为).{0,24}(?:评标|评审)?基准价", text)
+    lowest_base = re.search(r"最低[一-龥]{0,8}?(?:报价|价格|价).{0,40}(?:为|作为|确定为).{0,24}(?:评标|评审)?基准价", text)
     lowest_ratio = re.search(r"(?:评标|评审)?基准价.{0,20}[／/].{0,20}(?:本|投标人)?(?:投标|响应)?报价", text)
-    if lowest_ratio and (lowest_base or re.search(r"最低(?:评标|评审|投标)?(?:报价)?价", text)):
+    if lowest_ratio and (lowest_base or re.search(r"价格最低|最低[一-龥]{0,8}?(?:报价|价格|价)", text)):
         return "lowest_ratio"
     # 算术平均值乘固定系数、并按高低偏离分别扣分的公式可以稳定复算；只有四个
     # 关键要素都明确出现才接管模型结果，其他价格公式继续由模型给出建议。
@@ -7771,7 +7801,7 @@ def _run_cross_bid_price_scoring(app, task: dict, profile: dict, documents: list
                 # 页面证据里。保留新的来源说明，使分数、证据和理由使用同一口径。
                 raw["_local_quote_recovered"] = True
                 raw["evidence"] = f"投标文件本地解析定位唯一总报价：{local_price}元。{excerpt[:220]}"
-                raw["reason"] = "模型报价字段缺失，已由投标文件中唯一总报价回填并参与统一公式复算。"
+                raw["reason"] = "模型报价字段缺失，已由投标文件中唯一总报价回填。"
     prices_by_rule: dict[str, list[object]] = {}
     for raw in valid_rows:
         prices_by_rule.setdefault(str(raw.get("rule_id") or ""), []).append(raw.get("quoted_price"))
@@ -7801,6 +7831,11 @@ def _run_cross_bid_price_scoring(app, task: dict, profile: dict, documents: list
                     "当前按全部可识别报价暂算，资格与符合性通过范围仍由人工最终确认。",
                 ) if value).strip(),
             }
+        elif raw.get("_local_quote_recovered"):
+            raw["reason"] = " ".join(value for value in (
+                _clean_model_text(raw.get("reason")),
+                "本规则价格公式未达到自动复算条件，价格分需人工核对。",
+            ) if value).strip()
         suggested = _suggested_score(rule_payload, raw, "objective", max_score)
         result = _score_result_from_model(
             key[1], suggested, max_score, raw,
@@ -8416,7 +8451,7 @@ def _evaluate_all(app, task: dict) -> dict:
     has_local_rules = bool(review_rules or local_objective_rules or subjective_rules)
     visual_rule_count = sum(
         1 for item in (review_rules + local_objective_rules + subjective_rules)
-        if _rule_vision_policy(item)[0] != "off" and _rule_vision_policy(item)[1] != "off"
+        if _visual_advance_estimated(item)
     ) if (vision_features_enabled or ocr_features_enabled) else 0
     scan_units_by_document = {
         item["document_id"]: _full_scan_chunk_count(item) if has_local_rules else 0

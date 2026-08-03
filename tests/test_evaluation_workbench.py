@@ -4500,6 +4500,26 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         ambiguous = {"title": "价格评分", "check_rule": "按评标基准价计算价格得分", "source_text": "满分45分"}
         self.assertIsNone(worker._deterministic_price_score(ambiguous, 100, [100, 120], 45)[0])
 
+    def test_lowest_price_formula_matches_common_chinese_phrasing(self):
+        rule = {
+            "title": "投标报价评分（10分）", "check_rule": "",
+            "source_text": "投标价格最低的投标报价为评标基准价，其价格分为满分。其他投标人的价格分统一按照下列公式计算：投标报价得分=（评标基准价/投标报价）×10。（1）最低报价不作为中标的唯一保证。",
+        }
+        self.assertEqual(worker._price_formula_kind(rule), "lowest_ratio")
+        score, calculation = worker._deterministic_price_score(rule, 550000, [500000, 550000, 580000], 10)
+        self.assertEqual(score, 9.09)
+        self.assertIn("评标基准价", calculation)
+
+    def test_visual_advance_estimated_covers_baseline_ocr_rules(self):
+        enhancement = {"title": "证书图片核验", "vision_trigger": "text_fallback", "vision_level": "standard"}
+        self.assertTrue(worker._visual_advance_estimated(enhancement))
+        baseline = {"title": "报价字段核验", "execution_meta_json": json.dumps({"baseline_ocr_mode": "local_ocr"})}
+        self.assertTrue(worker._visual_advance_estimated(baseline))
+        required = {"title": "营业执照", "ocr_required": True}
+        self.assertTrue(worker._visual_advance_estimated(required))
+        text_only = {"title": "售后服务方案评分", "execution_meta_json": json.dumps({"baseline_ocr_mode": "text_only"})}
+        self.assertFalse(worker._visual_advance_estimated(text_only))
+
     def test_directory_candidates_join_split_material_name_and_page_reference(self):
         pages = {
             2: "目录\n精密空调节能产品认证\n证书复印件……564\n",
@@ -5157,6 +5177,41 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotEqual(extracted_again["rule_id"], original["rule_id"])
         self.assertEqual(extracted_again["source_type"], "ai")
         self.assertEqual(extracted_again["enabled"], 1)
+
+    def test_reextract_skips_ai_duplicate_of_edited_score_rule(self):
+        storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-1", [{
+            "category": "objective", "title": "相关证书评分（5分）",
+            "check_rule": "满分5分，按证书类别独立计分：①质量管理体系认证证书有效得1分",
+            "source_text": "（1）投标人具有有效的质量管理体系认证证书，得1分",
+            "scoring": {"max_score": 5},
+        }])
+        _, rules = storage.list_rules(self.app, self.project["project_id"])
+        ai_rule = next(item for item in rules if item["title"] == "相关证书评分（5分）")
+        edited = storage.update_rule(self.app, self.project["project_id"], ai_rule["rule_id"], {
+            "check_rule": "核验投标文件是否附有效期内管理体系认证证书复印件：(1)质量管理体系认证证书得1分",
+        })
+        self.assertEqual(edited["source_type"], "ai_edited")
+
+        storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-2", [{
+            "category": "objective", "title": "相关证书评分（5分）",
+            "check_rule": "满分5分，按证书类别独立计分：①质量管理体系认证证书有效得1分",
+            "source_text": "（1）投标人具有有效的质量管理体系认证证书，得1分",
+            "scoring": {"max_score": 5},
+        }, {
+            "category": "objective", "title": "相关业绩评分（8分）",
+            "check_rule": "满分8分，按同类项目合同案例计分",
+            "source_text": "投标人提供同类项目合同案例，每个得2分，满分8分",
+            "scoring": {"max_score": 8},
+        }])
+        _, refreshed = storage.list_rules(self.app, self.project["project_id"])
+
+        certificate_rules = [item for item in refreshed if item["title"] == "相关证书评分（5分）"]
+        self.assertEqual(len(certificate_rules), 1)
+        self.assertEqual(certificate_rules[0]["source_type"], "ai_edited")
+        self.assertEqual(certificate_rules[0]["check_rule"], "核验投标文件是否附有效期内管理体系认证证书复印件：(1)质量管理体系认证证书得1分")
+        performance_rules = [item for item in refreshed if item["title"] == "相关业绩评分（8分）"]
+        self.assertEqual(len(performance_rules), 1)
+        self.assertEqual(performance_rules[0]["source_type"], "ai")
 
     def test_reextract_keeps_ai_visual_rules_disabled_but_uses_global_default_selection(self):
         storage.create_global_rule(self.app, {

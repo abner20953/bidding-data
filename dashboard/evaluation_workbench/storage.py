@@ -2966,8 +2966,15 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
         conn.execute("UPDATE ew_rule_sets SET status = 'superseded', updated_at = ? WHERE project_id = ? AND status != 'superseded'", (timestamp, project_id))
         conn.execute("INSERT INTO ew_rule_sets(rule_set_id, project_id, version, status, source_task_id, created_at, updated_at) VALUES (:rule_set_id, :project_id, :version, :status, :source_task_id, :created_at, :updated_at)", rule_set)
         signatures = set()
+        preserved_score_keys = set()
         preserved_rule_count = 0
         for index, row in enumerate(preserved):
+            row_category = str(row["category"] or "")
+            if row_category in {"objective", "subjective"}:
+                row_core = _score_rule_title_core(row["title"])
+                row_max = _score_rule_max_value(dict(row))
+                if len(row_core) >= 4 and row_max is not None:
+                    preserved_score_keys.add((row_category, row_core, row_max))
             signature = (
                 row["category"], re.sub(r"\s+", "", row["title"]).casefold(),
                 re.sub(r"\s+", "", row["check_rule"] or row["title"]).casefold(),
@@ -2991,6 +2998,12 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
                 continue
             check_rule = str(item.get("check_rule", "")).strip() or title
             signature = (category, re.sub(r"\s+", "", title).casefold(), re.sub(r"\s+", "", check_rule).casefold())
+            if category in {"objective", "subjective"}:
+                item_core = _score_rule_title_core(title)
+                item_max = _score_rule_max_value(item)
+                if len(item_core) >= 4 and item_max is not None and (category, item_core, item_max) in preserved_score_keys:
+                    # 人工修改/补充过的同名同分评分规则已保留，跳过重复提取，避免重复计分。
+                    continue
             if signature in signatures:
                 continue
             signatures.add(signature)
