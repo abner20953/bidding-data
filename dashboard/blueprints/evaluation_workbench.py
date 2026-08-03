@@ -794,6 +794,16 @@ def confirm_rules_api(project_id):
         return jsonify({"error": str(exc)}), 400
 
 
+@evaluation_workbench_bp.route("/api/evaluation-workbench/projects/<project_id>/rules/acquisition-validation", methods=["GET"])
+def rule_acquisition_validation_api(project_id):
+    """确认前的只读图片取证配置预检；不改变既有确认接口的返回语义。"""
+    _init()
+    _, error = _project_or_404(project_id)
+    if error:
+        return error
+    return jsonify(storage.rule_set_acquisition_validation(current_app, project_id))
+
+
 @evaluation_workbench_bp.route("/api/evaluation-workbench/projects/<project_id>/review-results")
 def review_results_api(project_id):
     _init()

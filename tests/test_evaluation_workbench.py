@@ -1607,6 +1607,30 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(updated["vision_level"], "standard")
         self.assertEqual(worker._rule_image_mode(updated), "ocr_only")
 
+    def test_acquisition_preset_maps_to_legacy_execution_fields_without_breaking_them(self):
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "扫描材料", "check_rule": "核验扫描材料文字",
+        })
+        updated = storage.update_rule(self.app, self.project["project_id"], rule["rule_id"], {
+            "acquisition_preset": "text", "vision_level": "standard",
+        })
+        self.assertEqual(updated["acquisition_preset"], "text")
+        self.assertEqual(updated["image_mode"], "ocr_only")
+        self.assertEqual(updated["vision_trigger"], "text_fallback")
+        self.assertEqual(updated["vision_level"], "standard")
+        self.assertEqual(updated["acquisition_recommendation"]["acquisition_preset"], "text")
+
+    def test_acquisition_validation_reports_conflicting_budget_without_blocking_confirmation(self):
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "待取证材料", "check_rule": "核验扫描材料", "ocr_required": True,
+        })
+        validation = storage.rule_set_acquisition_validation(self.app, self.project["project_id"])
+        self.assertTrue(any(item["rule_id"] == rule["rule_id"] and item["code"] == "image_budget_off" for item in validation["issues"]))
+        self.assertEqual(self.app.test_client().get(
+            f"/api/evaluation-workbench/projects/{self.project['project_id']}/rules/acquisition-validation"
+        ).status_code, 200)
+        self.assertEqual(storage.confirm_rule_set(self.app, self.project["project_id"])["status"], "confirmed")
+
     def test_evaluation_can_queue_ocr_only_rule_without_multimodal_profile(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "扫描声明函")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
@@ -2334,6 +2358,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertTrue(all(rule["source_type"] == "global" for rule in rules))
         self.assertEqual(imported["营业执照有效性"]["check_rule"], "核验是否提供有效营业执照")
         self.assertEqual(imported["营业执照有效性"]["check_mode"], "ocr")
+        self.assertEqual(imported["营业执照有效性"]["acquisition_preset"], "smart")
         self.assertTrue(imported["营业执照有效性"]["enabled"])
         self.assertFalse(imported["默认不选项"]["enabled"])
 
@@ -2490,6 +2515,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         payload = saved[0]["payload"]
         self.assertTrue(payload["decision_participation"] is False)
         self.assertEqual(payload["mode"], "candidate_pages_only")
+        self.assertFalse(payload["acquisition_plan"]["decision_participation"])
+        self.assertEqual(payload["acquisition_plan"]["actual_execution"]["ocr_evidence_pages"], [12])
         self.assertIn({"source": "ocr_evidence", "page": 12}, payload["page_provenance"])
         self.assertEqual(payload["ocr_findings"][0]["evidence_pages"], [12])
         self.assertEqual(
@@ -2500,6 +2527,57 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         reused = worker._with_evidence_pack_candidates(self.app, document, rule, {"status": "manual"})
         self.assertEqual(reused["evidence_pack_candidate_pages"], [12])
         self.assertEqual(reused["status"], "manual")
+
+    def test_shadow_acquisition_plan_is_generic_and_does_not_change_result(self):
+        rule = {
+            "rule_id": "certificate", "title": "材料证明", "check_rule": "核验材料名称、型号、编号和有效期",
+            "check_mode": "ocr", "ocr_required": True, "vision_level": "standard",
+        }
+        result = {"status": "manual", "ocr_candidate_pages": [8], "ocr_evidence_pages": [8]}
+        before = dict(result)
+        plan = worker._build_shadow_acquisition_plan({"extension": ".pdf", "page_count": 20}, rule, result)
+        self.assertEqual(plan["channels"], ["ocr"])
+        self.assertEqual(plan["coverage_level"], "standard")
+        self.assertIn("关键字段", plan["stop_condition"])
+        self.assertEqual(result, before)
+
+    def test_explicit_material_field_policy_prefers_ocr_but_keeps_visual_fallback(self):
+        """第三轮只改变显式新策略，旧 OCR/视觉规则的顺序不能被升级改变。"""
+        explicit = {
+            "rule_id": "generic-material", "title": "证明材料字段核验",
+            "check_rule": "核验所需材料本体、编号、日期和型号",
+            "execution_meta_json": json.dumps({
+                "acquisition_preset": "smart", "image_mode": "auto",
+                "vision_trigger": "text_fallback", "vision_level": "standard",
+                "evidence_requirements": ["document", "field", "text", "visual"],
+            }),
+        }
+        legacy = {
+            "rule_id": "legacy-material", "title": "认证证书字段核验",
+            "check_rule": "核验所需材料本体、编号、日期和型号",
+            "check_mode": "ocr", "ocr_required": True, "vision_level": "standard",
+        }
+        result = {"status": "manual", "vision_status": "not_requested"}
+        self.assertFalse(worker._prefer_vision_first(explicit, "review", result, "hybrid", "text_fallback"))
+        self.assertTrue(worker._prefer_vision_first(legacy, "review", result, "hybrid", "required"))
+
+        visual = {**explicit, "title": "认证证书签字盖章核验"}
+        self.assertTrue(worker._prefer_vision_first(visual, "review", result, "hybrid", "required"))
+
+    def test_explicit_material_field_policy_only_early_stops_after_multiple_field_signals(self):
+        explicit = {
+            "rule_id": "generic-certificate", "title": "认证证书核验",
+            "check_rule": "核验认证证书名称、编号、日期、型号",
+            "execution_meta_json": json.dumps({
+                "acquisition_preset": "text", "image_mode": "ocr_only",
+                "vision_trigger": "text_fallback", "vision_level": "standard",
+                "evidence_requirements": ["document", "field", "text"],
+            }),
+        }
+        material_only = [{"text": "认证证书"}]
+        complete = [{"text": "认证证书 编号：ABC-2026-001 有效期至：2028年12月 型号：X100"}]
+        self.assertFalse(worker._ocr_discovery_is_sufficient(explicit, material_only))
+        self.assertTrue(worker._ocr_discovery_is_sufficient(explicit, complete))
 
     def test_deleting_project_removes_files_and_related_records(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案：稳定运行。")

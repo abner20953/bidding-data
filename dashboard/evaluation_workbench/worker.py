@@ -4194,6 +4194,7 @@ def _scan_strategy(rules: list[dict]) -> str:
 
 
 _EVIDENCE_PACK_VERSION = "candidate-v2"
+_ACQUISITION_PLAN_VERSION = "shadow-v1"
 
 
 def _shadow_rule_fingerprint(rule: dict) -> str:
@@ -4266,6 +4267,111 @@ def _shadow_material_checklist(rule: dict) -> list[dict]:
             "criterion": "", "status": "unassessed",
         })
     return values[:24]
+
+
+def _acquisition_required_fields(rule: dict) -> list[str]:
+    """从规则及材料角色提炼取证字段，只用于影子计划与后续稳定性对比。
+
+    不让模型在这里自由新增行业规则；字段仅描述常见材料核验所需的可见事实，
+    具体满足与否仍由既有文字/OCR/图片链路和人工复核决定。"""
+    roles = _rule_material_roles(rule)
+    text = "\n".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text"))
+    values: list[str] = []
+    defaults = {
+        "certificate": ("材料名称", "主体或产品", "编号", "日期或有效期"),
+        "business_license": ("材料名称", "主体名称", "统一社会信用代码", "登记状态"),
+        "identity": ("材料名称", "姓名", "证件号码"),
+        "personnel": ("材料名称", "人员姓名", "资格或岗位"),
+        "contract": ("合同主体", "项目名称", "日期", "金额或规模"),
+        "response_form": ("表单名称", "对应项目", "填写内容"),
+        "platform_screenshot": ("截图主体", "查询对象", "可见状态"),
+    }
+    for role in sorted(roles):
+        for field in defaults.get(role, ()):
+            if field not in values:
+                values.append(field)
+    field_terms = (
+        ("型号", "型号"), ("品牌", "品牌"), ("编号", "编号"), ("有效期", "有效期"),
+        ("日期", "日期"), ("金额", "金额"), ("数量", "数量"), ("签字", "签字"),
+        ("签章", "签章"), ("盖章", "盖章"), ("勾选", "勾选"), ("印章", "印章"),
+    )
+    for term, field in field_terms:
+        if term in text and field not in values:
+            values.append(field)
+    return values[:10] or ["规则相关材料"]
+
+
+def _acquisition_plan_channel_order(rule: dict) -> list[str]:
+    """生成通用通道路由建议；影子阶段绝不影响实际调用顺序。"""
+    try:
+        meta = storage.rule_execution_meta(rule)
+    except (TypeError, ValueError):
+        meta = {}
+    preset = str(meta.get("acquisition_preset") or "smart")
+    if preset == "text":
+        return ["ocr"]
+    if preset == "visual":
+        return ["vision"]
+    if preset == "dual":
+        return ["ocr", "vision"]
+    if preset == "off":
+        return []
+    requirements = set(meta.get("evidence_requirements") or [])
+    if requirements & {"document", "field"}:
+        return ["ocr", "vision"] if "visual" in requirements else ["ocr"]
+    if "visual" in requirements:
+        return ["vision"]
+    if str(rule.get("check_mode") or "") == "ocr":
+        return ["ocr"]
+    return []
+
+
+def _build_shadow_acquisition_plan(document: dict, rule: dict, result: dict) -> dict:
+    """构造只读取证计划，观察“材料—字段—候选页—停止条件”的完整链路。
+
+    该计划不会修改 result，不会改变 OCR/多模态选页，更不会参与评分或状态合并。
+    它是第三轮受控启用前的可审计基线。"""
+    try:
+        meta = storage.rule_execution_meta(rule)
+    except (TypeError, ValueError):
+        meta = {}
+    channels = _acquisition_plan_channel_order(rule)
+    candidates = _normalise_result_pages(_vision_page_candidates(document, rule, result)) if channels else []
+    checklist = _shadow_material_checklist(rule)
+    branches = []
+    for item in checklist[:12]:
+        branches.append({
+            "material_id": str(item.get("material_id") or "rule_requirement")[:80],
+            "name": _clean_model_text(item.get("name"))[:240],
+            "required_fields": _acquisition_required_fields(rule),
+            # 影子计划只建议轮转首选页，不重排当前主链路；候选不足时明确空缺。
+            "candidate_pages": candidates[:2] if len(checklist) == 1 else candidates[len(branches) - 1:len(branches) + 1],
+        })
+    level = str(rule.get("vision_level") or meta.get("vision_level") or "off")
+    page_budget = {
+        "ocr": _OCR_PAGE_LIMITS.get(level, 0),
+        "vision": int(_VISION_LEVEL_SETTINGS.get(level, {}).get("max_pages", 0)),
+        "vision_followup": int(_VISION_LEVEL_SETTINGS.get(level, {}).get("followup_pages", 0)),
+    }
+    actual = {
+        "ocr_checked_pages": _shadow_pages(result.get("ocr_candidate_pages")),
+        "ocr_evidence_pages": _shadow_pages(result.get("ocr_evidence_pages")),
+        "vision_checked_pages": _shadow_pages(result.get("vision_pages")),
+        "vision_evidence_pages": _shadow_pages(result.get("vision_evidence_pages")),
+        "vision_status": str(result.get("vision_status") or "not_requested"),
+    }
+    return {
+        "version": _ACQUISITION_PLAN_VERSION,
+        "decision_participation": False,
+        "preset": str(meta.get("acquisition_preset") or "smart"),
+        "channels": channels,
+        "coverage_level": level,
+        "page_budget": page_budget,
+        "candidate_pages": candidates[:16],
+        "material_branches": branches,
+        "stop_condition": "每个材料分支均已获得所需关键字段，或已穷尽可信候选页",
+        "actual_execution": actual,
+    }
 
 
 def _shadow_pages(values: object) -> list[int]:
@@ -4379,6 +4485,7 @@ def _build_shadow_evidence_pack(task: dict, document: dict, component: str, rule
         "material_key": material_key,
         "text_findings": findings, "ocr_findings": ocr_findings[:4], "vision_findings": vision_findings[:4],
         "material_checklist": _shadow_material_checklist(rule), "page_provenance": provenance[:80],
+        "acquisition_plan": _build_shadow_acquisition_plan(document, rule, result),
         "result_snapshot": snapshot, "ocr_visual_field_check": cross_modal,
     }
     return {"rule_id": rule_id, "component": component, "rule_fingerprint": _shadow_rule_fingerprint(rule),
@@ -4807,6 +4914,22 @@ def _rule_image_mode(rule: dict) -> str:
     return mode if mode in {"auto", "ocr_only", "vision_only", "combined", "off"} else "auto"
 
 
+def _uses_explicit_field_acquisition_plan(rule: dict) -> bool:
+    """仅识别用户新配置过的“材料＋字段”取证规则。
+
+    旧规则的 acquisition_preset 由读取时推导，不能据此改变其历史运行顺序；必须
+    在 execution_meta_json 中实际保存过 preset，才允许第三轮计划器参与路由。"""
+    raw = rule.get("execution_meta_json")
+    try:
+        value = json.loads(raw or "{}") if isinstance(raw, str) else (raw or {})
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(value, dict) or str(value.get("acquisition_preset") or "") not in {"smart", "text", "dual"}:
+        return False
+    requirements = {str(item) for item in value.get("evidence_requirements") or []}
+    return bool(requirements & {"document", "field"})
+
+
 def _ocr_service_candidates(rule: dict, level: str) -> list[str]:
     """按场景排列质量优先级；额度不足或接口不可用时自动顺延。"""
     text = f"{rule.get('title') or ''}\n{rule.get('check_rule') or ''}\n{rule.get('source_text') or ''}"
@@ -4929,7 +5052,21 @@ def _ocr_discovery_is_sufficient(rule: dict, values: list[dict]) -> bool:
     terms = [term for term in _rule_material_terms(rule) if len(term) >= 4][:48]
     for role in _rule_material_roles(rule):
         terms.extend(term for term in _MATERIAL_ROLE_TERMS.get(role, ()) if len(term) >= 2)
-    return any(re.sub(r"[\s\W_]+", "", term) in compact for term in dict.fromkeys(terms))
+    material_hit = any(re.sub(r"[\s\W_]+", "", term) in compact for term in dict.fromkeys(terms))
+    if not material_hit:
+        return False
+    if not _uses_explicit_field_acquisition_plan(rule):
+        return True
+    # 新计划器不把“出现材料名称”当作“字段已经够用”。只在材料名之外至少识别到
+    # 两类可验证字段时提前停止；否则继续既有候选页，优先保证完整性而非省页数。
+    signals = 0
+    if re.search(r"(?:编号|证书号|No\.?|序列号|统一社会信用代码)\s*[:：#]?[A-Za-z0-9\-]{3,}", text, re.I):
+        signals += 1
+    if re.search(r"(?:有效期|发证日期|日期|至)\s*[:：]?\s*(?:19|20)\d{2}", text) or re.search(r"(?:19|20)\d{2}[年./-]\d{1,2}", text):
+        signals += 1
+    if re.search(r"(?:型号|规格|Model|品牌|生产厂家)\s*[:：]?[A-Za-z0-9\-一-龥]{2,}", text, re.I):
+        signals += 1
+    return signals >= 2
 
 
 def _ocr_runtime_enabled(configuration: dict) -> bool:
@@ -5548,6 +5685,10 @@ def _prefer_vision_first(rule: dict, component: str, result: dict, strategy: str
     if strategy != "hybrid" or trigger == "off":
         return False
     if trigger == "text_fallback" and not _needs_visual_fallback(component, result):
+        return False
+    # 第三轮受控启用：用户明确选择的“材料＋关键字段”规则先走 OCR。若 OCR
+    # 未形成充分证据，既有后续多模态路径仍会完整回退；只有纯视觉事实继续视觉优先。
+    if _uses_explicit_field_acquisition_plan(rule) and not _rule_has_visual_only_terms(rule):
         return False
     roles = _rule_material_roles(rule)
     return bool(roles & _VISION_FIRST_MATERIAL_ROLES)

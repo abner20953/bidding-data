@@ -470,6 +470,7 @@ def init_database(app) -> None:
                 check_rule TEXT NOT NULL,
                 source_text TEXT NOT NULL DEFAULT '',
                 check_mode TEXT NOT NULL DEFAULT 'auto',
+                execution_meta_json TEXT,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 sort_order INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
@@ -606,6 +607,7 @@ def init_database(app) -> None:
         _ensure_column(conn, "ew_rules", "source_task_id", "TEXT")
         _ensure_column(conn, "ew_rules", "check_rule", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "ew_rules", "execution_meta_json", "TEXT")
+        _ensure_column(conn, "ew_global_rules", "execution_meta_json", "TEXT")
         _ensure_column(conn, "ew_evidence_packs", "material_key", "TEXT NOT NULL DEFAULT ''")
         # 旧数据库先补列，再建索引；把索引放在 CREATE TABLE 脚本里会导致升级时
         # 因旧表尚无 material_key 而中断整个初始化。
@@ -1021,10 +1023,11 @@ def _import_global_rules(conn: sqlite3.Connection, project_id: str, timestamp: s
     for position, template in enumerate(templates):
         conn.execute(
             """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode,
-               source_type, source_task_id, scoring_json, enabled, sort_order, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'global', NULL, NULL, ?, ?, ?, ?)""",
+               source_type, source_task_id, scoring_json, execution_meta_json, enabled, sort_order, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'global', NULL, NULL, ?, ?, ?, ?, ?)""",
             (str(uuid.uuid4()), rule_set_id, template["category"], template["title"], template["check_rule"],
-             template["source_text"], template["check_mode"], int(bool(template["enabled"])), position, timestamp, timestamp),
+             template["source_text"], template["check_mode"], template["execution_meta_json"],
+             int(bool(template["enabled"])), position, timestamp, timestamp),
         )
 
 
@@ -1074,10 +1077,10 @@ def _sync_new_global_rule_to_drafts(conn: sqlite3.Connection, template: dict, ti
         ).fetchone()[0]
         conn.execute(
             """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode,
-               source_type, source_task_id, scoring_json, enabled, sort_order, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'global', NULL, NULL, ?, ?, ?, ?)""",
+               source_type, source_task_id, scoring_json, execution_meta_json, enabled, sort_order, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'global', NULL, NULL, ?, ?, ?, ?, ?)""",
             (str(uuid.uuid4()), rule_set_id, template["category"], template["title"], template["check_rule"],
-             template["source_text"], template["check_mode"], int(bool(template["enabled"])), sort_order,
+             template["source_text"], template["check_mode"], template["execution_meta_json"], int(bool(template["enabled"])), sort_order,
              timestamp, timestamp),
         )
         conn.execute("UPDATE ew_rule_sets SET updated_at=? WHERE rule_set_id=?", (timestamp, rule_set_id))
@@ -1097,12 +1100,15 @@ def _global_rule_payload(payload: dict, existing: dict | None = None) -> dict:
     if not check_rule:
         raise ValueError("检查规则不能为空")
     ocr_required = payload.get("ocr_required", base.get("check_mode") == "ocr")
+    check_mode = "ocr" if ocr_required or payload.get("check_mode") == "ocr" else "auto"
+    execution_payload = {**payload, "check_mode": check_mode}
     return {
         "category": category,
         "title": title,
         "check_rule": check_rule,
         "source_text": str(payload.get("source_text", base.get("source_text", ""))).strip(),
-        "check_mode": "ocr" if ocr_required or payload.get("check_mode") == "ocr" else "auto",
+        "check_mode": check_mode,
+        "execution_meta_json": _execution_meta_json(execution_payload, fallback=base),
         "enabled": 1 if bool(payload.get("enabled", base.get("enabled", True))) else 0,
         "sort_order": int(payload.get("sort_order", base.get("sort_order", 0)) or 0),
     }
@@ -1113,7 +1119,7 @@ def list_global_rules(app) -> list[dict]:
         rows = conn.execute(
             "SELECT * FROM ew_global_rules ORDER BY category, sort_order, created_at"
         ).fetchall()
-    return [dict(row) for row in rows]
+    return [_rule_public_value(dict(row)) for row in rows]
 
 
 def create_global_rule(app, payload: dict) -> dict:
@@ -1121,8 +1127,8 @@ def create_global_rule(app, payload: dict) -> dict:
     rule.update({"global_rule_id": str(uuid.uuid4()), "created_at": now_iso(), "updated_at": now_iso()})
     with connection(app) as conn:
         conn.execute(
-            """INSERT INTO ew_global_rules(global_rule_id, category, title, check_rule, source_text, check_mode, enabled, sort_order, created_at, updated_at)
-               VALUES (:global_rule_id, :category, :title, :check_rule, :source_text, :check_mode, :enabled, :sort_order, :created_at, :updated_at)""",
+            """INSERT INTO ew_global_rules(global_rule_id, category, title, check_rule, source_text, check_mode, execution_meta_json, enabled, sort_order, created_at, updated_at)
+               VALUES (:global_rule_id, :category, :title, :check_rule, :source_text, :check_mode, :execution_meta_json, :enabled, :sort_order, :created_at, :updated_at)""",
             rule,
         )
         # 新增立即同步到所有待确认项目；修改/删除只影响规则库自身，避免破坏
@@ -1140,7 +1146,7 @@ def update_global_rule(app, global_rule_id: str, payload: dict) -> dict:
         rule.update({"global_rule_id": global_rule_id, "updated_at": now_iso()})
         conn.execute(
             """UPDATE ew_global_rules SET category=:category, title=:title, check_rule=:check_rule, source_text=:source_text,
-               check_mode=:check_mode, enabled=:enabled, sort_order=:sort_order, updated_at=:updated_at WHERE global_rule_id=:global_rule_id""",
+               check_mode=:check_mode, execution_meta_json=:execution_meta_json, enabled=:enabled, sort_order=:sort_order, updated_at=:updated_at WHERE global_rule_id=:global_rule_id""",
             rule,
         )
     return rule
@@ -2470,6 +2476,45 @@ _VISION_LEVELS = {"off", "low", "standard", "high"}
 # image_mode 仅控制图片取证通道；保持 vision_trigger / vision_level 的旧字段，
 # 使已有 API、历史规则与外部调用方无需迁移即可继续工作。
 _IMAGE_MODES = {"auto", "ocr_only", "vision_only", "combined", "off"}
+# acquisition_preset 是面向前台的业务级快捷设置。底层仍以 image_mode /
+# vision_trigger / vision_level 执行，确保既有规则、历史任务和外部 API 完全兼容。
+_ACQUISITION_PRESETS = {"smart", "text", "visual", "dual", "off", "custom"}
+
+
+def _preset_from_legacy_image_mode(image_mode: object) -> str:
+    return {
+        "ocr_only": "text",
+        "vision_only": "visual",
+        "combined": "dual",
+        "off": "off",
+    }.get(str(image_mode or "auto"), "smart")
+
+
+def rule_acquisition_recommendation(rule: dict) -> dict:
+    """为前台提供可恢复的通用建议，不擅自改写当前规则的执行口径。
+
+    recommendation 只根据证据类型和材料角色判断，避免为某一行业、某一种证书或
+    具体项目写补丁。"""
+    meta = rule_execution_meta(rule)
+    requirements = set(meta.get("evidence_requirements") or [])
+    text = "\n".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text"))
+    visual_terms = ("签字", "签章", "盖章", "勾选", "外观", "版式", "图纸", "截图", "印章")
+    has_visual_fact = "visual" in requirements or any(term in text for term in visual_terms)
+    has_document_field = bool(requirements & {"document", "field"}) or str(rule.get("check_mode") or "") == "ocr"
+    if has_document_field and has_visual_fact:
+        preset = "smart"
+    elif has_document_field:
+        preset = "text"
+    elif has_visual_fact:
+        preset = "visual"
+    else:
+        preset = "off"
+    return {
+        "acquisition_preset": preset,
+        "image_mode": {"smart": "auto", "text": "ocr_only", "visual": "vision_only", "dual": "combined", "off": "off"}[preset],
+        "vision_trigger": "required" if preset == "visual" else "text_fallback" if preset in {"smart", "text"} else "off",
+        "vision_level": "standard" if preset != "off" else "off",
+    }
 
 
 def rule_execution_meta(rule: dict) -> dict:
@@ -2501,6 +2546,9 @@ def rule_execution_meta(rule: dict) -> dict:
     image_mode = str(value.get("image_mode") or "auto")
     if image_mode not in _IMAGE_MODES:
         image_mode = "auto"
+    acquisition_preset = str(value.get("acquisition_preset") or "")
+    if acquisition_preset not in _ACQUISITION_PRESETS:
+        acquisition_preset = _preset_from_legacy_image_mode(image_mode)
     return {
         "execution_strategy": strategy if strategy in _RULE_EXECUTION_STRATEGIES else "",
         "evidence_requirements": list(dict.fromkeys(requirements)),
@@ -2508,6 +2556,7 @@ def rule_execution_meta(rule: dict) -> dict:
         "vision_trigger": trigger,
         "vision_level": level,
         "image_mode": image_mode,
+        "acquisition_preset": acquisition_preset,
     }
 
 
@@ -2532,6 +2581,24 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
     applicability = payload.get("applicability", base["applicability"])
     if not isinstance(applicability, dict):
         applicability = {}
+    preset_value = payload.get("acquisition_preset")
+    preset = str(preset_value if preset_value is not None else base["acquisition_preset"] or "smart")
+    if preset not in _ACQUISITION_PRESETS:
+        raise ValueError("图片取证策略不正确")
+    # 用户明确选择“智能/扫描文字”策略时，将扫描件取证表述为通用的
+    # “材料本体＋关键字段”需求。旧规则没有 acquisition_preset 时绝不迁移，
+    # 从而避免升级后改变其既有视觉优先语义。
+    explicit_text_policy = preset_value is not None and preset in {"smart", "text", "dual"}
+    explicit_ocr_path = payload.get("ocr_required") or payload.get("check_mode") == "ocr" or (
+        preset in {"smart", "text", "dual"} and str(payload.get("image_mode") or base["image_mode"] or "") in {"auto", "ocr_only", "combined"}
+    )
+    if explicit_text_policy and explicit_ocr_path:
+        # 旧 OCR 勾选会先放入 visual/text；新策略还需要明确表达“材料本体＋关键字段”，
+        # 让计划器能在不识别具体行业名的前提下保守地选择 OCR 优先。保留 visual
+        # 是有意的：它仍允许在文字不足时回退到多模态外观核验。
+        for requirement in ("document", "field", "text"):
+            if requirement not in normalized:
+                normalized.append(requirement)
     trigger_value = payload.get("vision_trigger")
     trigger = str(trigger_value if trigger_value is not None else base["vision_trigger"] or "off")
     # 新建或重新标记为 OCR 的规则，默认只表达“图片可能是决定性证据”；强度仍为 off，
@@ -2546,6 +2613,13 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
         )
     level = str(payload.get("vision_level", base["vision_level"]) or "off")
     image_mode = str(payload.get("image_mode", base["image_mode"]) or "auto")
+    # 前台选择业务预设时明确生成旧字段；仅保存旧字段的历史/API调用保持原样。
+    if preset_value is not None and preset != "custom":
+        image_mode = {"smart": "auto", "text": "ocr_only", "visual": "vision_only", "dual": "combined", "off": "off"}[preset]
+        if "vision_trigger" not in payload:
+            trigger = "required" if preset in {"visual", "dual"} else "text_fallback" if preset in {"smart", "text"} else "off"
+        if "vision_level" not in payload:
+            level = "standard" if preset != "off" else "off"
     if trigger not in _VISION_TRIGGERS:
         raise ValueError("图片识别条件不正确")
     if level not in _VISION_LEVELS:
@@ -2564,6 +2638,7 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
         "vision_trigger": trigger,
         "vision_level": level,
         "image_mode": image_mode,
+        "acquisition_preset": preset,
     }
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
@@ -2572,6 +2647,7 @@ def _rule_public_value(row: dict) -> dict:
     value = dict(row)
     meta = rule_execution_meta(value)
     value.update(meta)
+    value["acquisition_recommendation"] = rule_acquisition_recommendation(value)
     return value
 
 
@@ -2748,7 +2824,10 @@ def update_rule(app, project_id: str, rule_id: str, payload: dict) -> dict:
                 "UPDATE ew_rules SET enabled = ?, updated_at = ? WHERE rule_id = ?",
                 (enabled, now_iso(), rule_id),
             )
-        if any(key in payload for key in ("execution_strategy", "evidence_requirements", "applicability", "ocr_required", "check_mode", "vision_trigger", "vision_level")):
+        if any(key in payload for key in (
+            "execution_strategy", "evidence_requirements", "applicability", "ocr_required", "check_mode",
+            "image_mode", "vision_trigger", "vision_level", "acquisition_preset",
+        )):
             conn.execute(
                 "UPDATE ew_rules SET execution_meta_json = ?, updated_at = ? WHERE rule_id = ?",
                 (_execution_meta_json(payload, fallback=rule), now_iso(), rule_id),
@@ -2831,10 +2910,11 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
             signatures.add(signature)
             conn.execute(
                 """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode,
-                   source_type, source_task_id, scoring_json, enabled, sort_order, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'global', NULL, NULL, ?, ?, ?, ?)""",
+                   source_type, source_task_id, scoring_json, execution_meta_json, enabled, sort_order, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'global', NULL, NULL, ?, ?, ?, ?, ?)""",
                 (str(uuid.uuid4()), rule_set["rule_set_id"], template["category"], template["title"], template["check_rule"],
-                 template["source_text"], template["check_mode"], int(bool(template["enabled"])), position, timestamp, timestamp),
+                 template["source_text"], template["check_mode"], template["execution_meta_json"],
+                 int(bool(template["enabled"])), position, timestamp, timestamp),
             )
             global_rule_count += 1
         rule_set["global_rule_count"] = global_rule_count
@@ -2866,6 +2946,54 @@ def confirm_rule_set(app, project_id: str) -> dict:
         conn.execute("UPDATE ew_rule_sets SET status = 'superseded', updated_at = ? WHERE project_id = ? AND rule_set_id != ? AND status = 'confirmed'", (now_iso(), project_id, rule_set["rule_set_id"]))
         conn.execute("UPDATE ew_rule_sets SET status = 'confirmed', updated_at = ? WHERE rule_set_id = ?", (now_iso(), rule_set["rule_set_id"]))
     return current_rule_set(app, project_id)
+
+
+def rule_set_acquisition_validation(app, project_id: str) -> dict:
+    """检查图片取证配置是否自洽，仅返回提示而不改写规则或阻断业务。
+
+    该检查专门服务于前台确认前预检。历史规则允许保留“待人工选择强度”的状态，
+    因此除无可用能力的显式单通道外均为 warning，避免升级后突然无法确认旧项目。
+    """
+    rule_set, rules = list_rules(app, project_id)
+    if not rule_set:
+        return {"rule_set_id": None, "issues": [], "summary": {"enabled": 0, "active": 0}}
+    ocr_enabled = bool(ocr_feature_configuration(app).get("enabled"))
+    ocr_settings = ocr_configuration(app)
+    local = ocr_settings.get("local") if isinstance(ocr_settings, dict) else {}
+    ocr_runtime = bool(ocr_settings.get("tencent_enabled") or (isinstance(local, dict) and local.get("runtime_available")))
+    vision_enabled = bool(vision_configuration(app).get("enabled"))
+    issues: list[dict] = []
+    active = 0
+    for rule in rules:
+        if not rule.get("enabled"):
+            continue
+        meta = rule_execution_meta(rule)
+        mode = meta["image_mode"]
+        trigger = meta["vision_trigger"]
+        level = meta["vision_level"]
+        wants_image = mode != "off" and trigger != "off"
+        key = str(rule.get("rule_id") or "")
+        label = str(rule.get("title") or "检查规则")
+        if wants_image and level == "off":
+            issues.append({"severity": "warning", "code": "image_budget_off", "rule_id": key, "title": label,
+                           "message": "已设置图片取证，但覆盖上限为关闭；本次不会调用 OCR 或多模态。"})
+            continue
+        if not wants_image or level == "off":
+            continue
+        active += 1
+        if mode in {"ocr_only", "combined"} and (not ocr_enabled or not ocr_runtime):
+            issues.append({"severity": "warning", "code": "ocr_unavailable", "rule_id": key, "title": label,
+                           "message": "该规则需要 OCR，但当前没有可用 OCR 路径；将保留文字结论。"})
+        if mode in {"vision_only", "combined"} and not vision_enabled:
+            issues.append({"severity": "warning", "code": "vision_unavailable", "rule_id": key, "title": label,
+                           "message": "该规则要求图片外观核验，但未启用可用的多模态模型；将保留其他已获得的证据。"})
+        if mode == "auto" and not ocr_enabled and not vision_enabled:
+            issues.append({"severity": "warning", "code": "all_image_capabilities_off", "rule_id": key, "title": label,
+                           "message": "该规则设为智能取证，但 OCR 与多模态均未启用；本次只执行文字审查。"})
+    return {
+        "rule_set_id": rule_set["rule_set_id"], "issues": issues,
+        "summary": {"enabled": sum(1 for rule in rules if rule.get("enabled")), "active": active},
+    }
 
 
 def create_review_run(app, project_id: str, task_id: str, profile_id: str | None) -> dict:
