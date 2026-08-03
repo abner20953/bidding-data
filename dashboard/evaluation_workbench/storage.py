@@ -1028,6 +1028,63 @@ def _import_global_rules(conn: sqlite3.Connection, project_id: str, timestamp: s
         )
 
 
+def _rule_signature(category: object, title: object, check_rule: object) -> tuple[str, str, str]:
+    """用于规则集内的精确去重；不以近似标题覆盖人工已有规则。"""
+    return (
+        str(category or ""),
+        re.sub(r"\s+", "", str(title or "")).casefold(),
+        re.sub(r"\s+", "", str(check_rule or title or "")).casefold(),
+    )
+
+
+def _sync_new_global_rule_to_drafts(conn: sqlite3.Connection, template: dict, timestamp: str) -> int:
+    """把新增模板补入所有当前待确认规则集，不改已确认或历史版本。
+
+    没有规则集的早期项目也会创建一个仅包含此通用规则的待确认版本；这样用户不必
+    先重新提取规则才能看见新基线。若项目内已有完全相同的 AI 或人工规则，则保留
+    既有规则并跳过插入，避免同一检查点重复执行。
+    """
+    signature = _rule_signature(template.get("category"), template.get("title"), template.get("check_rule"))
+    synced_count = 0
+    projects = conn.execute("SELECT project_id FROM ew_projects").fetchall()
+    for project in projects:
+        project_id = project["project_id"]
+        current = conn.execute(
+            "SELECT * FROM ew_rule_sets WHERE project_id=? ORDER BY version DESC LIMIT 1", (project_id,),
+        ).fetchone()
+        # 已确认项目只能经“重新提取规则”获得新的模板，避免新增全局规则悄悄改变
+        # 已完成或正在复核的评审口径。
+        if current and current["status"] != "draft":
+            continue
+        if current is None:
+            rule_set_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO ew_rule_sets(rule_set_id, project_id, version, status, created_at, updated_at) VALUES (?, ?, 1, 'draft', ?, ?)",
+                (rule_set_id, project_id, timestamp, timestamp),
+            )
+        else:
+            rule_set_id = current["rule_set_id"]
+        rows = conn.execute(
+            "SELECT category, title, check_rule FROM ew_rules WHERE rule_set_id=?", (rule_set_id,),
+        ).fetchall()
+        if any(_rule_signature(row["category"], row["title"], row["check_rule"]) == signature for row in rows):
+            continue
+        sort_order = conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM ew_rules WHERE rule_set_id=?", (rule_set_id,),
+        ).fetchone()[0]
+        conn.execute(
+            """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode,
+               source_type, source_task_id, scoring_json, enabled, sort_order, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'global', NULL, NULL, ?, ?, ?, ?)""",
+            (str(uuid.uuid4()), rule_set_id, template["category"], template["title"], template["check_rule"],
+             template["source_text"], template["check_mode"], int(bool(template["enabled"])), sort_order,
+             timestamp, timestamp),
+        )
+        conn.execute("UPDATE ew_rule_sets SET updated_at=? WHERE rule_set_id=?", (timestamp, rule_set_id))
+        synced_count += 1
+    return synced_count
+
+
 def _global_rule_payload(payload: dict, existing: dict | None = None) -> dict:
     base = existing or {}
     category = str(payload.get("category", base.get("category", "substantive"))).strip()
@@ -1068,6 +1125,9 @@ def create_global_rule(app, payload: dict) -> dict:
                VALUES (:global_rule_id, :category, :title, :check_rule, :source_text, :check_mode, :enabled, :sort_order, :created_at, :updated_at)""",
             rule,
         )
+        # 新增立即同步到所有待确认项目；修改/删除只影响规则库自身，避免破坏
+        # 用户正在人工核对的项目规则内容。
+        rule["synced_draft_rule_sets"] = _sync_new_global_rule_to_drafts(conn, rule, rule["created_at"])
     return rule
 
 

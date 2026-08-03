@@ -2343,6 +2343,43 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("营业执照有效性", unchanged)
         self.assertNotIn("更新名称", unchanged)
 
+    def test_new_global_rule_immediately_syncs_only_current_draft_rule_sets(self):
+        # self.project 有人工规则，代表用户正在编辑的待确认项目。
+        existing = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "substantive", "title": "人工已有规则", "check_rule": "核验人工已有材料",
+        })
+        confirmed_project = storage.create_project(self.app, "已确认项目")
+        storage.add_rule(self.app, confirmed_project["project_id"], {
+            "category": "substantive", "title": "已确认规则", "check_rule": "核验已确认材料",
+        })
+        storage.confirm_rule_set(self.app, confirmed_project["project_id"])
+        # 该项目没有任何规则集，也应得到可立即查看的新待确认规则集。
+        empty_project = storage.create_project(self.app, "尚未提取项目")
+
+        created = storage.create_global_rule(self.app, {
+            "category": "compliance", "title": "即时同步规则", "check_rule": "核验新增通用要求", "enabled": False,
+        })
+
+        self.assertEqual(created["synced_draft_rule_sets"], 2)
+        _, draft_rules = storage.list_rules(self.app, self.project["project_id"])
+        synced = next(item for item in draft_rules if item["title"] == "即时同步规则")
+        self.assertEqual(synced["source_type"], "global")
+        self.assertFalse(synced["enabled"])
+        self.assertEqual(next(item for item in draft_rules if item["rule_id"] == existing["rule_id"])["source_type"], "manual")
+        empty_set, empty_rules = storage.list_rules(self.app, empty_project["project_id"])
+        self.assertEqual(empty_set["status"], "draft")
+        self.assertEqual([item["title"] for item in empty_rules], ["即时同步规则"])
+        _, confirmed_rules = storage.list_rules(self.app, confirmed_project["project_id"])
+        self.assertNotIn("即时同步规则", {item["title"] for item in confirmed_rules})
+
+        duplicate = storage.create_global_rule(self.app, {
+            "category": "substantive", "title": "人工已有规则", "check_rule": "核验人工已有材料",
+        })
+        _, after_duplicate = storage.list_rules(self.app, self.project["project_id"])
+        self.assertEqual(sum(item["title"] == "人工已有规则" for item in after_duplicate), 1)
+        self.assertEqual(next(item for item in after_duplicate if item["title"] == "人工已有规则")["source_type"], "manual")
+        self.assertEqual(duplicate["synced_draft_rule_sets"], 1)
+
     def test_rule_extraction_merges_all_global_rules_with_default_selection_without_exact_duplicates(self):
         storage.create_global_rule(self.app, {
             "category": "qualification", "title": "通用营业执照", "check_rule": "核验是否提供有效营业执照", "source_text": "通用基线",
