@@ -2478,7 +2478,9 @@ _VISION_LEVELS = {"off", "low", "standard", "high"}
 _IMAGE_MODES = {"auto", "ocr_only", "vision_only", "combined", "off"}
 # acquisition_preset 是面向前台的业务级快捷设置。底层仍以 image_mode /
 # vision_trigger / vision_level 执行，确保既有规则、历史任务和外部 API 完全兼容。
-_ACQUISITION_PRESETS = {"smart", "text", "visual", "dual", "off", "custom"}
+# always 是前台“每次执行”的简化语义：仍由 auto 通道根据规则证据类型决定
+# OCR/多模态，而不是让用户自行组合两个技术通道。
+_ACQUISITION_PRESETS = {"smart", "always", "text", "visual", "dual", "off", "custom"}
 
 
 def _preset_from_legacy_image_mode(image_mode: object) -> str:
@@ -2588,9 +2590,9 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
     # 用户明确选择“智能/扫描文字”策略时，将扫描件取证表述为通用的
     # “材料本体＋关键字段”需求。旧规则没有 acquisition_preset 时绝不迁移，
     # 从而避免升级后改变其既有视觉优先语义。
-    explicit_text_policy = preset_value is not None and preset in {"smart", "text", "dual"}
+    explicit_text_policy = preset_value is not None and preset in {"smart", "always", "text", "dual"}
     explicit_ocr_path = payload.get("ocr_required") or payload.get("check_mode") == "ocr" or (
-        preset in {"smart", "text", "dual"} and str(payload.get("image_mode") or base["image_mode"] or "") in {"auto", "ocr_only", "combined"}
+        preset in {"smart", "always", "text", "dual"} and str(payload.get("image_mode") or base["image_mode"] or "") in {"auto", "ocr_only", "combined"}
     )
     if explicit_text_policy and explicit_ocr_path:
         # 旧 OCR 勾选会先放入 visual/text；新策略还需要明确表达“材料本体＋关键字段”，
@@ -2615,9 +2617,9 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
     image_mode = str(payload.get("image_mode", base["image_mode"]) or "auto")
     # 前台选择业务预设时明确生成旧字段；仅保存旧字段的历史/API调用保持原样。
     if preset_value is not None and preset != "custom":
-        image_mode = {"smart": "auto", "text": "ocr_only", "visual": "vision_only", "dual": "combined", "off": "off"}[preset]
+        image_mode = {"smart": "auto", "always": "auto", "text": "ocr_only", "visual": "vision_only", "dual": "combined", "off": "off"}[preset]
         if "vision_trigger" not in payload:
-            trigger = "required" if preset in {"visual", "dual"} else "text_fallback" if preset in {"smart", "text"} else "off"
+            trigger = "required" if preset in {"always", "visual", "dual"} else "text_fallback" if preset in {"smart", "text"} else "off"
         if "vision_level" not in payload:
             level = "standard" if preset != "off" else "off"
     if trigger not in _VISION_TRIGGERS:

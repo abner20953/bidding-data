@@ -1620,6 +1620,19 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(updated["vision_level"], "standard")
         self.assertEqual(updated["acquisition_recommendation"]["acquisition_preset"], "text")
 
+    def test_always_acquisition_preset_keeps_auto_channel_but_requires_execution(self):
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "图片材料核验", "check_rule": "核验证明材料本体和关键字段",
+        })
+        updated = storage.update_rule(self.app, self.project["project_id"], rule["rule_id"], {
+            "acquisition_preset": "always", "vision_level": "standard",
+        })
+        self.assertEqual(updated["acquisition_preset"], "always")
+        self.assertEqual(updated["image_mode"], "auto")
+        self.assertEqual(updated["vision_trigger"], "required")
+        self.assertEqual(updated["vision_level"], "standard")
+        self.assertTrue({"document", "field", "text"}.issubset(set(updated["evidence_requirements"])))
+
     def test_acquisition_validation_reports_conflicting_budget_without_blocking_confirmation(self):
         rule = storage.add_rule(self.app, self.project["project_id"], {
             "category": "qualification", "title": "待取证材料", "check_rule": "核验扫描材料", "ocr_required": True,
