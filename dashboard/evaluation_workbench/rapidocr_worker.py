@@ -74,6 +74,45 @@ def _result_for_page(engine, item: dict) -> dict:
         return {"page": page, "error": str(exc)[:240]}
 
 
+def _metrics_payload(started: float) -> dict:
+    peak_rss_kb = None
+    if resource is not None:
+        try:
+            peak_rss_kb = max(0, int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss))
+        except (AttributeError, OSError, ValueError):
+            peak_rss_kb = None
+    return {
+        "elapsed_ms": max(0, int((time.perf_counter() - started) * 1000)),
+        "peak_rss_kb": peak_rss_kb,
+        "model": "PP-OCRv5-mobile-onnx",
+        "limit_side_len": _detector_limit_side_len(),
+    }
+
+
+def _serve() -> int:
+    """常驻模式：引擎只加载一次，之后按行接收 {"pages": [...]} 并逐行回 JSON。
+
+    协议与单次模式完全一致（最后一行合法 JSON 为结果），调用方在任何异常时
+    都可安全杀掉本进程并回退到单次模式。stdin 关闭即退出，内存随之释放。
+    """
+    engine = None
+    for line in sys.stdin:
+        started = time.perf_counter()
+        try:
+            payload = json.loads(line)
+            pages = payload.get("pages") if isinstance(payload, dict) else []
+            if not isinstance(pages, list) or not pages:
+                raise ValueError("未提供本地 OCR 页面")
+            if engine is None:
+                engine = _engine()
+            values = [_result_for_page(engine, item) for item in pages if isinstance(item, dict)]
+            print(json.dumps({"ok": True, "pages": values, "metrics": _metrics_payload(started)},
+                             ensure_ascii=False), flush=True)
+        except Exception as exc:  # noqa: BLE001 - 单批失败不退出，保持常驻可用
+            print(json.dumps({"ok": False, "error": str(exc)[:400]}, ensure_ascii=False), flush=True)
+    return 0
+
+
 def main() -> int:
     started = time.perf_counter()
     try:
@@ -81,26 +120,17 @@ def main() -> int:
             _engine()
             print(json.dumps({"ok": True, "warmup": True}, ensure_ascii=False), flush=True)
             return 0
+        if "--serve" in sys.argv[1:]:
+            return _serve()
         payload = json.load(sys.stdin)
         pages = payload.get("pages") if isinstance(payload, dict) else []
         if not isinstance(pages, list) or not pages:
             raise ValueError("未提供本地 OCR 页面")
         engine = _engine()
         values = [_result_for_page(engine, item) for item in pages if isinstance(item, dict)]
-        peak_rss_kb = None
-        if resource is not None:
-            try:
-                peak_rss_kb = max(0, int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss))
-            except (AttributeError, OSError, ValueError):
-                peak_rss_kb = None
         print(json.dumps({
             "ok": True, "pages": values,
-            "metrics": {
-                "elapsed_ms": max(0, int((time.perf_counter() - started) * 1000)),
-                "peak_rss_kb": peak_rss_kb,
-                "model": "PP-OCRv5-mobile-onnx",
-                "limit_side_len": _detector_limit_side_len(),
-            },
+            "metrics": _metrics_payload(started),
         }, ensure_ascii=False), flush=True)
         return 0
     except Exception as exc:  # noqa: BLE001 - 调用方会转为回退状态

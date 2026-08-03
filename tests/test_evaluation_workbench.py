@@ -2036,7 +2036,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
                 "stderr": "",
             })()
             metrics = {}
-            with patch("dashboard.evaluation_workbench.local_ocr_gateway.subprocess.run", return_value=completed) as run:
+            with patch.dict(os.environ, {"RAPIDOCR_WORKER_MODE": "oneshot"}), \
+                 patch("dashboard.evaluation_workbench.local_ocr_gateway.subprocess.run", return_value=completed) as run:
                 values, error = local_ocr_gateway.request_local_ocr(
                     [{"page": 3, "path": str(image_path)}], metrics=metrics,
                 )
@@ -2063,13 +2064,119 @@ class EvaluationWorkbenchTests(unittest.TestCase):
                 ]}, ensure_ascii=False),
                 "stderr": "",
             })()
-            with patch("dashboard.evaluation_workbench.local_ocr_gateway.subprocess.run", return_value=completed):
+            with patch.dict(os.environ, {"RAPIDOCR_WORKER_MODE": "oneshot"}), \
+                 patch("dashboard.evaluation_workbench.local_ocr_gateway.subprocess.run", return_value=completed):
                 values, error = local_ocr_gateway.request_local_ocr([
                     {"page": 1, "path": str(first)}, {"page": 2, "path": str(second)},
                 ])
 
         self.assertIsNone(error)
         self.assertEqual([item["state"] for item in values], ["empty", "failed"])
+
+    def test_local_ocr_serve_pool_reuses_persistent_worker_across_batches(self):
+        import sys
+        script = (
+            "import json, sys\n"
+            "for line in sys.stdin:\n"
+            "    req = json.loads(line)\n"
+            "    pages = [{'page': int(item['page']), 'text': '常驻文字', 'line_count': 1, 'confidence': 99.0} for item in req.get('pages') or []]\n"
+            "    print(json.dumps({'ok': True, 'pages': pages, 'metrics': {'elapsed_ms': 5, 'peak_rss_kb': 1000, 'model': 'fake', 'limit_side_len': 960}}), flush=True)\n"
+        )
+        pool = local_ocr_gateway._ServePool(command_factory=lambda: [sys.executable, "-c", script])
+        try:
+            first_worker = pool.acquire()
+            first = first_worker.request([{"page": 1, "path": __file__}], 30)
+            pool.release(first_worker)
+            second_worker = pool.acquire()
+            second = second_worker.request([{"page": 2, "path": __file__}], 30)
+            pool.release(second_worker)
+        finally:
+            pool.shutdown()
+
+        self.assertIs(first_worker, second_worker)
+        self.assertEqual(second_worker.served_batches, 2)
+        self.assertTrue(first["ok"] and second["ok"])
+        self.assertEqual(second["pages"][0]["text"], "常驻文字")
+
+    def test_local_ocr_serve_pool_reaps_idle_workers(self):
+        import sys
+        script = "import sys\nfor line in sys.stdin:\n    print('{\"ok\": true, \"pages\": []}', flush=True)\n"
+        pool = local_ocr_gateway._ServePool(command_factory=lambda: [sys.executable, "-c", script])
+        try:
+            serve_worker = pool.acquire()
+            serve_worker.request([{"page": 1, "path": __file__}], 30)
+            pool.release(serve_worker)
+            self.assertTrue(serve_worker.is_alive())
+            serve_worker.last_used -= local_ocr_gateway._SERVE_IDLE_SECONDS + 1
+            pool.reap_idle()
+            self.assertFalse(serve_worker.is_alive())
+            self.assertEqual(len(pool._workers), 0)
+        finally:
+            pool.shutdown()
+
+    def test_local_ocr_falls_back_to_oneshot_when_serve_worker_broken(self):
+        import sys
+        with tempfile.TemporaryDirectory(prefix="local_ocr_test_") as folder:
+            image_path = Path(folder) / "page.jpg"
+            image_path.write_bytes(b"jpeg")
+            completed = type("Completed", (), {
+                "returncode": 0,
+                "stdout": json.dumps({"ok": True, "pages": [{"page": 1, "text": "回退文字", "line_count": 1}]}, ensure_ascii=False),
+                "stderr": "",
+            })()
+            broken_pool = local_ocr_gateway._ServePool(command_factory=lambda: [sys.executable, "-c", "import sys; sys.exit(0)"])
+            try:
+                with patch("dashboard.evaluation_workbench.local_ocr_gateway._pool", return_value=broken_pool), \
+                     patch("dashboard.evaluation_workbench.local_ocr_gateway.subprocess.run", return_value=completed) as run:
+                    values, error = local_ocr_gateway.request_local_ocr([{"page": 1, "path": str(image_path)}])
+            finally:
+                broken_pool.shutdown()
+
+        self.assertIsNone(error)
+        self.assertEqual(values[0]["text"], "回退文字")
+        run.assert_called_once()
+
+    def test_local_ocr_max_workers_clamped_by_env(self):
+        with patch.dict(os.environ, {"LOCAL_OCR_MAX_WORKERS": "2"}):
+            self.assertEqual(local_ocr_gateway.local_ocr_max_workers(), 2)
+        with patch.dict(os.environ, {"LOCAL_OCR_MAX_WORKERS": "99"}):
+            self.assertEqual(local_ocr_gateway.local_ocr_max_workers(), 4)
+        with patch.dict(os.environ, {"LOCAL_OCR_MAX_WORKERS": "abc"}):
+            self.assertEqual(local_ocr_gateway.local_ocr_max_workers(), 1)
+
+    def test_ocr_numeric_thread_count_env_override(self):
+        with patch.dict(os.environ, {"RAPIDOCR_OMP_THREADS": "2"}):
+            self.assertEqual(local_ocr_gateway._ocr_numeric_thread_count(), "2")
+            self.assertEqual(local_ocr_gateway._runtime_env()["OMP_NUM_THREADS"], "2")
+        with patch.dict(os.environ, {"RAPIDOCR_OMP_THREADS": "9"}):
+            self.assertEqual(local_ocr_gateway._ocr_numeric_thread_count(), "4")
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("RAPIDOCR_OMP_THREADS", None)
+            self.assertEqual(local_ocr_gateway._ocr_numeric_thread_count(), "1")
+
+    def test_render_ocr_page_reuses_task_level_render_cache(self):
+        from unittest.mock import MagicMock
+        pixmap = MagicMock()
+        pixmap.tobytes.return_value = b"jpeg-ocr-bytes"
+        page = MagicMock()
+        page.rect.width = 100
+        page.rect.height = 100
+        page.get_pixmap.return_value = pixmap
+        pdf = MagicMock()
+        pdf.page_count = 5
+        pdf.__getitem__.return_value = page
+        pdf.__enter__.return_value = pdf
+        pdf.__exit__.return_value = False
+        document = {"extension": ".pdf", "document_id": "doc-render-cache"}
+        task = {}
+        with patch("dashboard.evaluation_workbench.worker.storage.document_path", return_value="x.pdf"), \
+             patch("dashboard.evaluation_workbench.worker.fitz.open", return_value=pdf) as open_pdf:
+            first = worker._render_ocr_page(self.app, document, 2, "fast", task=task)
+            second = worker._render_ocr_page(self.app, document, 2, "fast", task=task)
+
+        self.assertEqual(first[0], b"jpeg-ocr-bytes")
+        self.assertEqual(first, second)
+        open_pdf.assert_called_once()
 
     def test_local_ocr_caches_empty_page_and_reports_failed_page(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "扫描件候选页")

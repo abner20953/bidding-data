@@ -27,7 +27,7 @@ from dashboard.evaluation_workbench.ai_gateway import (
 from dashboard.evaluation_workbench.collusion_signals import build_cross_bid_analysis
 from dashboard.evaluation_workbench.ocr_gateway import OCR_PARSER_VERSION, request_tencent_ocr
 from dashboard.evaluation_workbench.local_ocr_gateway import (
-    LOCAL_OCR_PARSER_VERSION, LOCAL_OCR_SERVICE, request_local_ocr,
+    LOCAL_OCR_PARSER_VERSION, LOCAL_OCR_SERVICE, local_ocr_max_workers, request_local_ocr,
 )
 from dashboard.evaluation_workbench.prompt_context import (
     build_rule_context, select_rule_chunk_evidence_map, select_rule_chunk_map, select_rule_chunks,
@@ -4981,10 +4981,10 @@ _VISION_LEVEL_SETTINGS = {
     "high": {"detail": "high", "max_pages": 6, "followup_pages": 6, "scale": 2.0, "quality": 88},
 }
 _VISION_REQUEST_GATE = threading.BoundedSemaphore(1)
-# RapidOCR/ONNX 的单个子进程会占用数百 MB；2 核 2 GB 服务器上宁可让本地 OCR
+# RapidOCR/ONNX 的单个子进程峰值约 500-650 MB；2 核 2 GB 服务器上宁可让本地 OCR
 # 排队，也不能让多份投标文件并行拉起多个模型进程。它只约束本地推理，不影响远端
-# 文字或图片模型的动态并行。
-_LOCAL_OCR_REQUEST_GATE = threading.BoundedSemaphore(1)
+# 文字或图片模型的动态并行。内存升级到 4 GB 以上后可设 LOCAL_OCR_MAX_WORKERS=2 放开一路。
+_LOCAL_OCR_REQUEST_GATE = threading.BoundedSemaphore(local_ocr_max_workers())
 _VISION_LOCATOR_THUMBNAILS_PER_SHEET = 12
 _VISION_LOCATOR_SHEETS_PER_REQUEST = 6
 _VISION_MAX_PIXELS_PER_PAGE = 10_000_000
@@ -5152,10 +5152,20 @@ def _ocr_service_candidates_for_page(rule: dict, level: str, page_text: object) 
     return base
 
 
-def _render_ocr_page(app, document: dict, page_number: int, service: str) -> tuple[bytes, str] | None:
+def _render_ocr_page(app, document: dict, page_number: int, service: str, task: dict | None = None) -> tuple[bytes, str] | None:
     """仅在内存中渲染候选页，并在 Pixmap 前限制超大页面内存。"""
     if document.get("extension") != ".pdf":
         return None
+    # 同一页同一档位在同一任务内可能被多条规则重复选中；任务级缓存避免重复 fitz
+    # 渲染占用 2 核 CPU。与图片模型链路共用同一容量上限，只缓存 JPEG 字节。
+    task_cache = _task_vision_render_cache(task)
+    cache_key = ("ocr", str(document.get("document_id") or ""), int(page_number), str(service))
+    if task_cache:
+        cache, lock = task_cache
+        with lock:
+            cached_content = cache["items"].get(cache_key)
+        if cached_content is not None:
+            return cached_content, hashlib.sha256(cached_content).hexdigest()
     source = storage.document_path(app, document)
     scale = 2.0 if service in {"accurate", "table", "biz_license"} else 1.5
     quality = 88 if scale >= 2 else 80
@@ -5181,6 +5191,16 @@ def _render_ocr_page(app, document: dict, page_number: int, service: str) -> tup
                 )
     except (OSError, RuntimeError, ValueError):
         return None
+    if task_cache and len(content) <= 4 * 1024 * 1024:
+        cache, lock = task_cache
+        with lock:
+            # FIFO 淘汰，与图片模型渲染缓存共用容量上限。
+            while cache["items"] and cache["bytes"] + len(content) > _VISION_TASK_RENDER_CACHE_BYTES:
+                oldest_key = next(iter(cache["items"]))
+                removed = cache["items"].pop(oldest_key)
+                cache["bytes"] -= len(removed)
+            cache["items"][cache_key] = content
+            cache["bytes"] += len(content)
     return content, hashlib.sha256(content).hexdigest()
 
 
@@ -5394,7 +5414,7 @@ def _local_ocr_page_texts(app, document: dict, pages: list[int], *, rule: dict |
             # 本地没有腾讯的专项接口，但仍按规则强度与页面角色选择渲染质量：
             # 普通正文保持快速档，证照/表格/精细核验才使用高精度渲染。
             render_service = _ocr_service_candidates_for_page(rule or {}, level, page_texts.get(page, ""))[0]
-            rendered = _render_ocr_page(app, document, page, render_service)
+            rendered = _render_ocr_page(app, document, page, render_service, task=task)
             if not rendered:
                 failed_pages.append(page)
                 continue
@@ -5514,7 +5534,7 @@ def _tencent_ocr_page_texts(app, task: dict, document: dict, rule: dict, result:
         page_empty = False
         fallback_allowed = not ordered
         for service in ordered:
-            rendered = _render_ocr_page(app, document, page, service)
+            rendered = _render_ocr_page(app, document, page, service, task=task)
             if not rendered:
                 continue
             image, image_hash = rendered
