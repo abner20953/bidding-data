@@ -1636,12 +1636,20 @@ def _rule_requires_visual_verification(item: dict) -> bool:
     # 提取模型已经明确给出布尔判断时，不能再因规则文字中提及“证照”“签章”等
     # 触发词把整条规则强行升级为 OCR。混合型规则可能以文字为决定性证据，视觉
     # 兜底只服务于旧规则或没有给出明确分类的输入。
+    try:
+        execution_meta = storage.rule_execution_meta(item)
+    except (TypeError, ValueError):
+        execution_meta = {}
+    baseline_ocr_mode = str(item.get("baseline_ocr_mode") or execution_meta.get("baseline_ocr_mode") or "auto")
+    # 人工明确选择纯文字/本地 OCR 时，优先级高于历史 check_mode 与关键词兜底。
+    # 这样旧规则无需迁移数据库，也能按新选择稳定执行。
+    if baseline_ocr_mode == "text_only":
+        return False
+    if baseline_ocr_mode == "local_ocr":
+        return True
     configured_trigger = str(item.get("vision_trigger") or "")
     if not configured_trigger:
-        try:
-            configured_trigger = str(storage.rule_execution_meta(item).get("vision_trigger") or "")
-        except (TypeError, ValueError):
-            configured_trigger = ""
+        configured_trigger = str(execution_meta.get("vision_trigger") or "")
     if configured_trigger == "text_fallback":
         return False
     if configured_trigger == "required":
@@ -1686,12 +1694,45 @@ def _normalise_visual_rule_policies(rules: list[dict]) -> list[dict]:
         requirements = rule.get("evidence_requirements")
         if not isinstance(requirements, list):
             requirements = []
-        requirements = {str(value) for value in requirements}
-        visual = "visual" in requirements or _rule_requires_visual_verification(rule)
+        requirements = {str(value) for value in requirements if str(value) in {"text", "document", "field", "visual", "cross_bid", "external"}}
+        instruction = str(rule.get("check_rule") or "")
+        # 仅要求提供证书、报告、复印件或扫描件时，已解析文字可能已经足够；
+        # 只有签章、勾选、手写及版式外观才默认视为必须看图。
+        decisive_visual = bool(DECISIVE_VISUAL_FACT_PATTERN.search(instruction))
+        # 编译/补充模型若漏回证据维度，以最保守的通用语义补齐：默认可先走文字；
+        # 只有检查指令明确要求辨认签章、扫描件等外观时，才把 visual 作为决定性证据。
+        if not requirements:
+            requirements.add("visual" if decisive_visual else "text")
+        if requirements & {"document", "field"}:
+            requirements.add("text")
+        visual = "visual" in requirements
         text = "text" in requirements
-        rule["vision_trigger"] = "text_fallback" if visual and text else "required" if visual else "off"
-        # 默认关闭，保持既有“默认仅选择无需 OCR 项”的行为；人工在规则集开启后才调用图片模型。
-        rule["vision_level"] = "off"
+        # “提到证书/复印件”不等于每次必须 OCR。只在 visual 是唯一证据，或检查指令
+        # 明确要求核验图片外观时标为强制；混合材料先全文，证据不足再按需 OCR。
+        force_ocr = bool((visual and not text) or decisive_visual)
+        rule["ocr_required"] = force_ocr
+        rule["check_mode"] = "ocr" if force_ocr else "auto"
+        rule["evidence_requirements"] = [
+            value for value in ("text", "document", "field", "visual", "cross_bid", "external")
+            if value in requirements
+        ]
+        if force_ocr:
+            rule.update({
+                "baseline_ocr_mode": "auto", "acquisition_preset": "visual",
+                "image_mode": "vision_only", "vision_trigger": "required", "vision_level": "standard",
+            })
+        elif visual:
+            rule.update({
+                "baseline_ocr_mode": "auto", "acquisition_preset": "smart",
+                "image_mode": "auto", "vision_trigger": "text_fallback", "vision_level": "standard",
+            })
+        else:
+            # 所有 AI 建议均以文字优先；材料/字段或整页扫描导致文字不足时，才启动
+            # 有限本地 OCR。只有人工明确选择 text_only 才完全禁止 OCR。
+            rule.update({
+                "baseline_ocr_mode": "auto",
+                "acquisition_preset": "off", "image_mode": "off", "vision_trigger": "off", "vision_level": "off",
+            })
         result.append(rule)
     return result
 
@@ -2379,9 +2420,6 @@ def _extract_rules(app, task: dict) -> dict:
         storage.update_task(app, task["task_id"], progress=76, message=f"规则编译未完成，已保留原始提取结果：{exc}")
     # 是否可由投标文件核验交给完整提示词与人工确认判断；不以词表硬过滤，避免误删业绩有效期等规则。
     rules = _filter_inapplicable_template_rules(_filter_rules_for_package(candidates, package_number), text)
-    for item in rules:
-        if _rule_requires_visual_verification(item):
-            item["ocr_required"] = True
     excluded_rule_count = 0
     for item in rules:
         if item.get("category") not in {"objective", "subjective"}:
@@ -2426,9 +2464,6 @@ def _extract_rules(app, task: dict) -> dict:
     rules = [item for item in rules if not _is_non_file_scoring_process(item)]
     excluded_rule_count += before_procedural_filter - len(rules)
     rules = _normalise_visual_rule_policies(rules)
-    for item in rules:
-        if _rule_requires_visual_verification(item):
-            item["ocr_required"] = True
     if not rules:
         raise ValueError("模型未提取到可确认的有效规则，请检查招标文件文本或更换模型")
     storage.update_task(app, task["task_id"], progress=80, message="正在保存待确认规则")
@@ -2581,6 +2616,10 @@ _BOUNDARY_COMPARISON_PATTERN = re.compile(
     r"([≥≤])\s*(\d+(?:\.\d+)?)\s*(mm|cm|m|kg|g|w|kw|v|a|hz|%|年|月|日|天|小时|分钟|次|个|项|台|套|件|页)"
     r"[^。；;\n]{0,90}?(?:投标(?:文件|响应)?|响应(?:值|内容)?|填写|提供)[^。；;\n]{0,36}?"
     r"(?:Φ|φ)?\s*(\d+(?:\.\d+)?)\s*\3",
+    flags=re.IGNORECASE,
+)
+DECISIVE_VISUAL_FACT_PATTERN = re.compile(
+    r"签字|签章|盖章|公章|印章|骑缝章|手写|指印|勾选|涂改|图片外观|照片外观|版式外观",
     flags=re.IGNORECASE,
 )
 
@@ -4929,6 +4968,14 @@ def _local_ocr_baseline_required(rule: dict, result: dict, component: str = "rev
     （包括扫描型文件经守卫回落）时才处理有限候选页。这样不会把“材料/字段”这类
     普通文字规则仅因名称相符就重复 OCR，仍不扩张成全文逐页 OCR。
     """
+    try:
+        baseline_mode = str(storage.rule_execution_meta(rule).get("baseline_ocr_mode") or "auto")
+    except (TypeError, ValueError):
+        baseline_mode = str(rule.get("baseline_ocr_mode") or "auto")
+    if baseline_mode == "text_only":
+        return False
+    if baseline_mode == "local_ocr":
+        return True
     if bool(rule.get("ocr_required")) or str(rule.get("check_mode") or "") == "ocr":
         return True
     # 文字证据已足以支撑当前结论时，材料名称、字段名称或视觉元数据只用于将来
@@ -7812,6 +7859,10 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
         "evidence_ledger_empty_rule_count": sum(
             1 for value in ledger.values() if not value.get("candidates")
         ) if isinstance(ledger, dict) else 0,
+        "local_ocr_rule_count": 0,
+        "local_ocr_skipped_rule_count": 0,
+        "local_ocr_seconds": 0.0,
+        "enhancement_rule_count": 0,
         "failed_units": [],
     }
     # 全文扫描临时不可用时，后续逐规则审查已经用本地章节检索继续完成；这是恢复告警
@@ -7918,18 +7969,25 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
             tencent_upgrade_requested = enhancement_requested and (
                 trigger == "required" or _needs_visual_fallback(component, merged)
             )
+            if not baseline_required:
+                values["local_ocr_skipped_rule_count"] += 1
+            if enhancement_requested:
+                values["enhancement_rule_count"] += 1
             if not baseline_required and not enhancement_requested:
                 continue
             # 固定顺序：本地 OCR 先给出可复用的基础文字，再根据人工策略和规则事实
             # 升级腾讯精确字段核验或多模态外观核验。这样非多模态模型也能稳定运行。
             if baseline_required:
                 progress.message(f"正在本地 OCR 识别：{bidder_name} · {label}")
+                ocr_started_at = time.monotonic()
                 merged = _run_ocr_supplement(
                     app, task, document, component, rule, merged, profile,
                     # 高强度纯扫描件在文字锚点失效时，可借助已配置的多模态模型
                     # 做一次低清找页；即使专家模式仅选择腾讯 OCR，也不丢失旧能力。
                     locator_profile=vision_profile, baseline=True, allow_tencent=tencent_upgrade_requested,
                 )
+                values["local_ocr_seconds"] += max(0.0, time.monotonic() - ocr_started_at)
+                values["local_ocr_rule_count"] += 1
                 values["batch_count"] += 1
             allow_vision = enhancement_requested and (image_mode in {"vision_only", "combined"} or image_mode == "auto")
             skip_note = _multimodal_skip_note(image_strategy, merged, rule, trigger) if enhancement_requested else ""
@@ -8243,6 +8301,8 @@ def _evaluate_all(app, task: dict) -> dict:
     batch_count = 0
     full_scan_document_count = full_scan_batch_count = full_scan_failed_chunk_count = 0
     full_scan_recovery_warning_count = 0
+    local_ocr_rule_count = local_ocr_skipped_rule_count = enhancement_rule_count = 0
+    local_ocr_seconds = 0.0
     groups_per_document = sum(
         len(_evaluation_rule_batches(component, component_rules))
         for component, component_rules in (("review", review_rules), ("objective", local_objective_rules), ("subjective", subjective_rules))
@@ -8303,6 +8363,10 @@ def _evaluate_all(app, task: dict) -> dict:
         full_scan_batch_count += value.get("full_scan_batch_count", 0)
         full_scan_failed_chunk_count += value.get("full_scan_failed_chunk_count", 0)
         full_scan_recovery_warning_count += int(bool(value.get("full_scan_recovery_warning")))
+        local_ocr_rule_count += value.get("local_ocr_rule_count", 0)
+        local_ocr_skipped_rule_count += value.get("local_ocr_skipped_rule_count", 0)
+        local_ocr_seconds += float(value.get("local_ocr_seconds", 0) or 0)
+        enhancement_rule_count += value.get("enhancement_rule_count", 0)
     cross_bid_price = {"rule_count": 0, "result_count": 0, "retry_count": 0, "missing_count": 0}
     price_review_reconciled_count = 0
     if cross_bid_units and objective_run:
@@ -8347,6 +8411,10 @@ def _evaluate_all(app, task: dict) -> dict:
             "price_review_reconciled_count": price_review_reconciled_count,
             "evidence_ledger_rule_count": evidence_ledger_rule_count,
             "evidence_ledger_empty_rule_count": evidence_ledger_empty_rule_count,
+            "local_ocr_rule_count": local_ocr_rule_count,
+            "local_ocr_skipped_rule_count": local_ocr_skipped_rule_count,
+            "local_ocr_seconds": round(local_ocr_seconds, 2),
+            "enhancement_rule_count": enhancement_rule_count,
             "completion_state": "partial_success" if failed_units else "complete",
             "failed_units": failed_units,
             "highlights": highlights, "highlight_failure_count": highlight_failure_count,

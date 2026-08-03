@@ -834,7 +834,9 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(len(rules), 2)
         self.assertTrue(all(item["source_type"] == "ai" for item in rules))
         self.assertEqual(next(item for item in rules if item["title"] == "具备有效资质")["check_rule"], "核验是否提供有效资质材料")
-        self.assertEqual(next(item for item in rules if item["title"] == "技术方案评分")["check_mode"], "ocr")
+        # 模型误把纯文字方案评分标为 OCR 时，提取归一化应校正为纯文字核验。
+        self.assertEqual(next(item for item in rules if item["title"] == "技术方案评分")["check_mode"], "auto")
+        self.assertEqual(next(item for item in rules if item["title"] == "技术方案评分")["baseline_ocr_mode"], "auto")
 
     def test_rule_extraction_treats_objective_rules_with_score_items_as_manual(self):
         self._add_pdf("tender.pdf", "tender", "", "管理体系认证每提供一类得1分，最高3分。")
@@ -1610,6 +1612,24 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(updated["vision_level"], "standard")
         self.assertEqual(worker._rule_image_mode(updated), "ocr_only")
 
+    def test_baseline_ocr_mode_round_trip_supports_manual_text_and_local_choices(self):
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "证明材料", "check_rule": "核验证明材料",
+            "evidence_requirements": ["text", "document", "field"],
+        })
+        text_only = storage.update_rule(self.app, self.project["project_id"], rule["rule_id"], {
+            "baseline_ocr_mode": "text_only", "acquisition_preset": "off",
+        })
+        self.assertEqual(text_only["baseline_ocr_mode"], "text_only")
+        self.assertFalse(worker._local_ocr_baseline_required(text_only, {"status": "manual"}))
+        local_ocr = storage.update_rule(self.app, self.project["project_id"], rule["rule_id"], {
+            "baseline_ocr_mode": "local_ocr", "acquisition_preset": "off",
+        })
+        self.assertEqual(local_ocr["baseline_ocr_mode"], "local_ocr")
+        self.assertTrue(worker._local_ocr_baseline_required(local_ocr, {
+            "status": "satisfied", "evidence_quality": "sufficient", "confidence": "high",
+        }))
+
     def test_acquisition_preset_maps_to_legacy_execution_fields_without_breaking_them(self):
         rule = storage.add_rule(self.app, self.project["project_id"], {
             "category": "qualification", "title": "扫描材料", "check_rule": "核验扫描材料文字",
@@ -1621,7 +1641,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(updated["image_mode"], "ocr_only")
         self.assertEqual(updated["vision_trigger"], "text_fallback")
         self.assertEqual(updated["vision_level"], "standard")
-        self.assertEqual(updated["acquisition_recommendation"]["acquisition_preset"], "text")
+        self.assertEqual(updated["acquisition_recommendation"]["acquisition_preset"], "off")
+        self.assertEqual(updated["acquisition_recommendation"]["baseline_ocr_mode"], "auto")
 
     def test_always_acquisition_preset_keeps_auto_channel_but_requires_execution(self):
         rule = storage.add_rule(self.app, self.project["project_id"], {
@@ -2323,6 +2344,10 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("source_clause_ids", compile_template)
         self.assertIn("scoring.items", compile_template)
         self.assertIn("逐项响应覆盖候选", compile_template)
+        for value in (extraction_user, extraction_continue, compile_template, coverage_template):
+            self.assertIn('"evidence_requirements"', value)
+            self.assertIn("每条输出都必须保留该字段", value)
+        self.assertIn("不得因材料名称或可能存在扫描页而把整条规则强制 OCR", compile_template)
         self.assertIn("category=other 的逐项响应覆盖规则", coverage_template)
         self.assertIn('"drops"', quality_gate_template)
         self.assertIn("受保护规则", quality_gate_template)
@@ -3442,7 +3467,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         multi_package = tender + "\n采购包1：网络设备。\n采购包2：机房设备。"
         self.assertIsNone(worker._technical_star_requirement_seed(multi_package, package_number=1))
 
-    def test_visual_rule_policy_is_generic_and_default_disabled(self):
+    def test_visual_rule_policy_is_generic_and_uses_ai_recommendation(self):
         rules = worker._normalise_visual_rule_policies([{
             "rule_id": "any-visual-rule", "category": "qualification", "title": "任意扫描材料",
             "check_rule": "核验扫描件上的盖章状态", "source_text": "应加盖单位章",
@@ -3450,8 +3475,33 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         }])
         self.assertEqual(len(rules), 1)
         self.assertEqual(rules[0]["vision_trigger"], "required")
-        # 提取阶段只给出建议条件，真正的图片调用必须由人工选择强度后启用。
-        self.assertEqual(rules[0]["vision_level"], "off")
+        self.assertEqual(rules[0]["vision_level"], "standard")
+        self.assertEqual(rules[0]["acquisition_preset"], "visual")
+        self.assertTrue(rules[0]["ocr_required"])
+
+    def test_rule_policy_keeps_text_verifiable_material_out_of_forced_ocr(self):
+        material, plain = worker._normalise_visual_rule_policies([{
+            "rule_id": "certificate", "category": "objective", "title": "认证证书评分",
+            "check_rule": "核验证书名称、编号、有效期并按有效证书数量计分",
+            "ocr_required": True, "evidence_requirements": ["text", "document", "field", "visual"],
+        }, {
+            "rule_id": "duration", "category": "compliance", "title": "服务期限",
+            "check_rule": "核验服务期限是否为30日", "ocr_required": False,
+            "evidence_requirements": ["text"],
+        }])
+        self.assertFalse(material["ocr_required"])
+        self.assertEqual(material["check_mode"], "auto")
+        self.assertEqual(material["vision_trigger"], "text_fallback")
+        self.assertEqual(material["baseline_ocr_mode"], "auto")
+        self.assertFalse(plain["ocr_required"])
+        self.assertEqual(plain["baseline_ocr_mode"], "auto")
+        self.assertEqual(plain["vision_trigger"], "off")
+        self.assertFalse(worker._local_ocr_baseline_required(plain, {
+            "status": "satisfied", "evidence_quality": "sufficient", "confidence": "high",
+        }))
+        self.assertTrue(worker._local_ocr_baseline_required(plain, {
+            "status": "manual", "evidence_quality": "missing", "confidence": "low",
+        }))
 
     def test_enabled_visual_rule_reports_unavailable_model_instead_of_looking_like_visual_result(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "已提供证书明细，扫描件见附件。")

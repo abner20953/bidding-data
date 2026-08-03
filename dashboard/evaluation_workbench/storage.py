@@ -2473,6 +2473,7 @@ _VISION_LEVELS = {"off", "low", "standard", "high"}
 # image_mode 仅控制图片取证通道；保持 vision_trigger / vision_level 的旧字段，
 # 使已有 API、历史规则与外部调用方无需迁移即可继续工作。
 _IMAGE_MODES = {"auto", "ocr_only", "vision_only", "combined", "off"}
+_BASELINE_OCR_MODES = {"auto", "text_only", "local_ocr"}
 # acquisition_preset 是面向前台的业务级快捷设置。底层仍以 image_mode /
 # vision_trigger / vision_level 执行，确保既有规则、历史任务和外部 API 完全兼容。
 # always 是前台“每次执行”的简化语义：仍由 auto 通道根据规则证据类型决定
@@ -2549,19 +2550,21 @@ def rule_acquisition_recommendation(rule: dict) -> dict:
     visual_terms = ("签字", "签章", "盖章", "勾选", "外观", "版式", "图纸", "截图", "印章")
     has_visual_fact = "visual" in requirements or any(term in text for term in visual_terms)
     has_document_field = bool(requirements & {"document", "field"}) or str(rule.get("check_mode") or "") == "ocr"
-    if has_document_field and has_visual_fact:
+    if has_visual_fact and (has_document_field or "text" in requirements):
         preset = "smart"
-    elif has_document_field:
-        preset = "text"
     elif has_visual_fact:
         preset = "visual"
     else:
         preset = "off"
+    # 本地 OCR 是基础层，不再等同于腾讯 OCR 增强。纯文字规则明确跳过 OCR；
+    # 材料/字段规则采用 auto，仅在全文证据不足时才执行有限候选页 OCR。
+    baseline_ocr_mode = "auto"
     return {
         "acquisition_preset": preset,
         "image_mode": {"smart": "auto", "text": "ocr_only", "visual": "vision_only", "dual": "combined", "off": "off"}[preset],
         "vision_trigger": "required" if preset == "visual" else "text_fallback" if preset in {"smart", "text"} else "off",
         "vision_level": "standard" if preset != "off" else "off",
+        "baseline_ocr_mode": baseline_ocr_mode,
     }
 
 
@@ -2597,6 +2600,9 @@ def rule_execution_meta(rule: dict) -> dict:
     acquisition_preset = str(value.get("acquisition_preset") or "")
     if acquisition_preset not in _ACQUISITION_PRESETS:
         acquisition_preset = _preset_from_legacy_image_mode(image_mode)
+    baseline_ocr_mode = str(value.get("baseline_ocr_mode") or "auto")
+    if baseline_ocr_mode not in _BASELINE_OCR_MODES:
+        baseline_ocr_mode = "auto"
     return {
         "execution_strategy": strategy if strategy in _RULE_EXECUTION_STRATEGIES else "",
         "evidence_requirements": list(dict.fromkeys(requirements)),
@@ -2605,6 +2611,7 @@ def rule_execution_meta(rule: dict) -> dict:
         "vision_level": level,
         "image_mode": image_mode,
         "acquisition_preset": acquisition_preset,
+        "baseline_ocr_mode": baseline_ocr_mode,
         "evidence_items": _normalise_evidence_items(value.get("evidence_items")),
     }
 
@@ -2662,6 +2669,7 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
         )
     level = str(payload.get("vision_level", base["vision_level"]) or "off")
     image_mode = str(payload.get("image_mode", base["image_mode"]) or "auto")
+    baseline_ocr_mode = str(payload.get("baseline_ocr_mode", base["baseline_ocr_mode"]) or "auto")
     # 前台选择业务预设时明确生成旧字段；仅保存旧字段的历史/API调用保持原样。
     if preset_value is not None and preset != "custom":
         image_mode = {"smart": "auto", "always": "auto", "text": "ocr_only", "visual": "vision_only", "dual": "combined", "off": "off"}[preset]
@@ -2675,6 +2683,8 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
         raise ValueError("图片识别强度不正确")
     if image_mode not in _IMAGE_MODES:
         raise ValueError("图片取证方式不正确")
+    if baseline_ocr_mode not in _BASELINE_OCR_MODES:
+        raise ValueError("基础核验方式不正确")
     if trigger == "off":
         level = "off"
     if image_mode == "off":
@@ -2688,6 +2698,7 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
         "vision_level": level,
         "image_mode": image_mode,
         "acquisition_preset": preset,
+        "baseline_ocr_mode": baseline_ocr_mode,
         "evidence_items": _normalise_evidence_items(payload.get("evidence_items", base.get("evidence_items"))),
     }
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -2877,6 +2888,7 @@ def update_rule(app, project_id: str, rule_id: str, payload: dict) -> dict:
         if any(key in payload for key in (
             "execution_strategy", "evidence_requirements", "applicability", "ocr_required", "check_mode",
             "image_mode", "vision_trigger", "vision_level", "acquisition_preset", "evidence_items",
+            "baseline_ocr_mode",
         )):
             conn.execute(
                 "UPDATE ew_rules SET execution_meta_json = ?, updated_at = ? WHERE rule_id = ?",
