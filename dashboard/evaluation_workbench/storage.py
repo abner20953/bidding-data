@@ -3059,6 +3059,38 @@ def _score_rule_max_value(rule: dict) -> float | None:
     return value if math.isfinite(value) and value > 0 else None
 
 
+_TENDER_TOTAL_SCORE_PATTERNS = (
+    # “部分总分/条款满分”属于局部表述，用负向断言排除，只保留整体声明口径。
+    re.compile(r"(?<![部项节则条])(?<!部分)总分\s*[为计（(]?\s*(\d+(?:\.\d+)?)\s*分"),
+    re.compile(r"(?<![项条款节])满分\s*[为（(]?\s*(\d+(?:\.\d+)?)\s*分"),
+)
+
+
+def _tender_declared_total_score(app, project_id: str) -> float | None:
+    """从招标文件解析文本读取明示总分（如“（总分100分）”），取出现次数最多的分值。
+
+    只采纳“总分/满分 X 分”的显式表述且要求不小于 50 分，避免把单个评分项的
+    分值误当声明总分。找不到招标文件、解析文本或声明总分时返回 None，预检保持静默。
+    """
+    tender = next((item for item in list_documents(app, project_id) if item.get("role") == "tender"), None)
+    parsed_path = str((tender or {}).get("parsed_path") or "")
+    if not parsed_path:
+        return None
+    try:
+        text = Path(parsed_path).read_text(encoding="utf-8", errors="ignore")[:500_000]
+    except OSError:
+        return None
+    votes: dict[float, int] = {}
+    for pattern in _TENDER_TOTAL_SCORE_PATTERNS:
+        for match in pattern.finditer(text):
+            value = float(match.group(1))
+            if 50 <= value <= 1000:
+                votes[value] = votes.get(value, 0) + 1
+    if not votes:
+        return None
+    return max(sorted(votes), key=lambda value: votes[value])
+
+
 def rule_set_acquisition_validation(app, project_id: str) -> dict:
     """检查图片取证配置是否自洽，仅返回提示而不改写规则或阻断业务。
 
@@ -3119,6 +3151,27 @@ def rule_set_acquisition_validation(app, project_id: str) -> dict:
         issues.append({"severity": "warning", "code": "duplicate_score_rule",
                        "rule_id": str(group[0].get("rule_id") or ""), "title": str(group[0].get("title") or "评分规则"),
                        "message": f"疑似同一评分事实的重复规则（均 {max_value:g} 分）：{titles}。重复计分会导致总分虚高，请核对后仅保留一条。"})
+    # 招标声明总分与启用评分规则满分合计交叉校验：提取可能把评分表标题分值
+    # （如“商务评分标准（15分）”）误作规则满分，使合计偏离招标文件明示的
+    # “（总分100分）”。只提示不阻断，由人工核对各规则满分是否与分值构成一致。
+    declared_total = _tender_declared_total_score(app, project_id)
+    score_total = 0.0
+    score_rules: list[dict] = []
+    for rule in rules:
+        if not rule.get("enabled") or str(rule.get("category") or "") not in {"objective", "subjective"}:
+            continue
+        max_value = _score_rule_max_value(rule)
+        if max_value is None:
+            continue
+        score_total += max_value
+        score_rules.append(rule)
+    if declared_total is not None and score_rules and abs(score_total - declared_total) > 0.01:
+        titles = "；".join(str(rule.get("title") or "未命名规则") for rule in score_rules[:6])
+        if len(score_rules) > 6:
+            titles += f" 等{len(score_rules)}条"
+        issues.append({"severity": "warning", "code": "score_total_mismatch",
+                       "rule_id": str(score_rules[0].get("rule_id") or ""), "title": "评分满分合计",
+                       "message": f"招标文件明示总分为 {declared_total:g} 分，但当前启用的评分规则满分合计为 {score_total:g} 分（{titles}）。请核对各评分规则满分是否与招标文件分值构成一致。"})
     return {
         "rule_set_id": rule_set["rule_set_id"], "issues": issues,
         "summary": {"enabled": sum(1 for rule in rules if rule.get("enabled")), "active": active},

@@ -1686,6 +1686,54 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(len(duplicate), 1)
         self.assertIn("企业业绩", duplicate[0]["message"])
 
+    def test_acquisition_validation_warns_when_score_total_differs_from_tender_declared(self):
+        self._add_pdf("tender.pdf", "tender", "", "用于建立解析文件")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        tender = next(item for item in storage.list_documents(self.app, self.project["project_id"]) if item["role"] == "tender")
+        Path(tender["parsed_path"]).write_text(
+            "评审办法\n3.2.1 分值构成（总分100分）：商务部分：10 分；技术部分：55 分；报价：35 分。\n" * 2,
+            encoding="utf-8",
+        )
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "商务业绩评分15分",
+            "check_rule": "按有效业绩数量计分", "scoring": {"max_score": 15, "kind": "manual"},
+        })
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "subjective", "title": "技术实施方案评分30分",
+            "check_rule": "按方案分档计分", "scoring": {"max_score": 30, "kind": "manual"},
+        })
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "报价得分计算35分",
+            "check_rule": "按基准价公式计分", "scoring": {"max_score": 35, "kind": "manual"},
+        })
+
+        validation = storage.rule_set_acquisition_validation(self.app, self.project["project_id"])
+        mismatch = [item for item in validation["issues"] if item["code"] == "score_total_mismatch"]
+        self.assertEqual(len(mismatch), 1)
+        self.assertIn("100", mismatch[0]["message"])
+        self.assertIn("80", mismatch[0]["message"])
+        # 确认不被该预检阻断
+        self.assertEqual(storage.confirm_rule_set(self.app, self.project["project_id"])["status"], "confirmed")
+
+    def test_acquisition_validation_silent_when_score_total_matches_tender_declared(self):
+        self._add_pdf("tender.pdf", "tender", "", "用于建立解析文件")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        tender = next(item for item in storage.list_documents(self.app, self.project["project_id"]) if item["role"] == "tender")
+        Path(tender["parsed_path"]).write_text("分值构成（总分100分）详见评分标准。", encoding="utf-8")
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "报价得分计算35分",
+            "check_rule": "按基准价公式计分", "scoring": {"max_score": 35, "kind": "manual"},
+        })
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "subjective", "title": "技术实施方案评分65分",
+            "check_rule": "按方案分档计分", "scoring": {"max_score": 65, "kind": "manual"},
+        })
+
+        validation = storage.rule_set_acquisition_validation(self.app, self.project["project_id"])
+        self.assertFalse(any(item["code"] == "score_total_mismatch" for item in validation["issues"]))
+
     def test_score_rule_dedupe_merges_truncated_duplicate_clause(self):
         full = {"category": "objective", "title": "商务部分-企业业绩评分（满分9分）",
                 "check_rule": "按有效业绩数量计分",
@@ -2976,6 +3024,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(values[0]["status"], "partial")
         self.assertEqual(values[0]["risk_level"], "low")
         self.assertIn("正常对照", values[0]["reason"])
+        self.assertIn("参数存在照抄", values[0]["reason"])
 
     def test_technical_source_baseline_downgrades_inherited_parameter_noise(self):
         rules = [{

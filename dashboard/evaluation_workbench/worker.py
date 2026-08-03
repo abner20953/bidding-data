@@ -2810,13 +2810,17 @@ def _normalise_review_results(output: object, rules: list[dict], tender_baseline
                 if status == "not_satisfied":
                     status = "partial"
         # 对照表逐项复述招标参数是正常编制方式。真正的边界删改、无关内容或方案
-        # 缺失仍会由对应的参数一致性/方案完整性规则检出，不在此重复放大。
+        # 缺失仍会由对应的参数一致性/方案完整性规则检出，不在此重复放大。固定说明
+        # 作为前置提示保留，但不再覆盖模型针对该投标人的具体分析，避免不同投标人
+        # 的结论一字不差、看不出各自依据。
         if _is_copying_only_rule(rule):
+            note = "技术响应或偏离表对招标参数的逐项复述属于正常对照，不单独构成照抄风险；如有实质删改或无关内容，应由对应技术规则单独核验。"
+            original_reason = _clean_model_text(item.get("reason"))
             item = {
                 **item,
                 "risk_level": "low",
                 "confidence": "medium" if item.get("confidence") == "high" else item.get("confidence"),
-                "reason": "技术响应或偏离表对招标参数的逐项复述属于正常对照，不单独构成照抄风险；如有实质删改或无关内容，应由对应技术规则单独核验。",
+                "reason": "；".join([note] + ([original_reason] if original_reason and original_reason != note else []))[:2000],
             }
             if status == "not_satisfied":
                 status = "partial"
