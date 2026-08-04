@@ -4500,6 +4500,20 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         ambiguous = {"title": "价格评分", "check_rule": "按评标基准价计算价格得分", "source_text": "满分45分"}
         self.assertIsNone(worker._deterministic_price_score(ambiguous, 100, [100, 120], 45)[0])
 
+    def test_suggested_score_recovered_from_reason_text(self):
+        rule = {"rule_id": "r1", "scoring": {"max_score": 14, "kind": "quantity"}}
+        raw = {"reason": "逐项复制招标条款并标符合要求，未发现负偏离；按规则每项不扣分，结果=14分，封顶14分。建议14分。需人工核验证明材料。"}
+        self.assertEqual(worker._suggested_score(rule, raw, "objective", 14.0), 14.0)
+
+    def test_suggested_score_recovery_rejects_conflict_and_overflow(self):
+        rule = {"rule_id": "r1", "scoring": {"max_score": 14, "kind": "quantity"}}
+        conflict = {"reason": "建议14分。最终建议分：12分。"}
+        self.assertIsNone(worker._suggested_score(rule, conflict, "objective", 14.0))
+        overflow = {"reason": "建议20分。"}
+        self.assertIsNone(worker._suggested_score(rule, overflow, "objective", 14.0))
+        subjective = {"reason": "方案完整、针对性强，建议得7.5分。"}
+        self.assertEqual(worker._suggested_score(rule, subjective, "subjective", 14.0), 7.5)
+
     def test_lowest_price_formula_matches_common_chinese_phrasing(self):
         rule = {
             "title": "投标报价评分（10分）", "check_rule": "",

@@ -3318,8 +3318,8 @@ def _suggested_score(rule_payload: dict, raw: dict, score_type: str, max_score: 
             return calculated
         if met is False:
             return 0.0
-        return None
-    return None
+        return _score_declared_in_text(f"{raw.get('calculation') or ''} {raw.get('reason') or ''}", max_score)
+    return _score_declared_in_text(f"{raw.get('calculation') or ''} {raw.get('reason') or ''}", max_score)
 
 
 def _score_evidence_text(raw: dict) -> str:
@@ -3360,6 +3360,22 @@ _SCORE_CONCLUSION_PATTERN = re.compile(r"(?:最终|建议|得分|合计|总计|�
 
 def _format_score(value: float) -> str:
     return str(int(value)) if float(value).is_integer() else f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def _score_declared_in_text(text: object, max_score: float) -> float | None:
+    """模型把建议分写进理由/计分过程却漏填结构化字段时回溯采用。
+
+    只取“最终/建议/得分/合计/总计/封顶”结论性措辞后的分值；多个分值必须一致
+    且不越界，否则保持空分由人工核对，不把猜测当结论。
+    """
+    cleaned = _clean_model_text(text)
+    if not cleaned or max_score <= 0:
+        return None
+    values = {round(float(value), 2) for value in _SCORE_CONCLUSION_PATTERN.findall(cleaned)
+              if 0 <= float(value) <= max_score}
+    if len(values) != 1:
+        return None
+    return values.pop()
 
 
 def _reason_declares_conflicting_score(reason: object, suggested: float | None) -> bool:
@@ -8384,12 +8400,20 @@ def _summarise_evaluation_highlights(app, task: dict, profile: dict) -> list[dic
         app, "evaluate_all_highlights_user",
         candidates=json.dumps(candidates, ensure_ascii=False, separators=(",", ":")),
     )
-    parsed = _request_task_json(
-        app, task, profile, "evaluate_all_highlights", _system_prompt(app, "evaluate_all_highlights"),
-        prompt, context_mode="result_highlights_only",
-        max_tokens=_output_token_budget(profile, min(4_000, 1_400 + len(candidates) * 500)),
-        thinking_mode="disabled",
-    )
+    try:
+        parsed = _request_task_json(
+            app, task, profile, "evaluate_all_highlights", _system_prompt(app, "evaluate_all_highlights"),
+            prompt, context_mode="result_highlights_only",
+            max_tokens=_output_token_budget(profile, min(8_000, 1_400 + len(candidates) * 600)),
+            thinking_mode="disabled",
+        )
+    except InvalidJsonResponse as exc:
+        # 投标人多时结论 JSON 较长易被截断；与其他阶段一致先修复重试，
+        # 修复仍失败才由调用方保留原始结果并标记 highlight_failure_count。
+        storage.update_task(app, task["task_id"], message="重要结论正在规范化")
+        parsed = _repair_invalid_json(
+            app, task, profile, "evaluate_all_highlights_json_repair", exc, "summaries",
+        )
     return _normalise_evaluation_highlights(parsed, candidates, allowed)
 
 
