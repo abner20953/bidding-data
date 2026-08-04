@@ -10,9 +10,11 @@ import os
 import re
 import shutil
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -34,6 +36,11 @@ VISION_ENABLED_SETTING = "evaluation_workbench_vision_enabled"
 OCR_ENABLED_SETTING = "evaluation_workbench_ocr_enabled"
 DEFAULT_VISION_MODEL_SETTING = "default_vision_model_profile_id"
 TENCENT_OCR_CONFIGURATION_SETTING = "evaluation_workbench_tencent_ocr_configuration"
+# 本地 OCR 验收样本统计只用于配置页提示；加短 TTL 缓存，避免每次 OCR 额度预留
+# 都执行一次全表聚合（见 _local_ocr_readiness）。
+_LOCAL_OCR_READINESS_CACHE: dict[str, object] = {}
+_LOCAL_OCR_READINESS_TTL_SECONDS = 300
+_LOCAL_OCR_READINESS_LOCK = threading.Lock()
 TENCENT_OCR_SERVICES = {
     "accurate": {"label": "通用文字识别（高精度版）", "action": "GeneralAccurateOCR", "default_limit": 900,
                  "usage": "证书编号、小字、复杂背景及关键字段"},
@@ -763,8 +770,8 @@ def _decrypt_model_api_key(app, encrypted: str) -> str:
 
 
 def _ocr_month_key() -> str:
-    """OCR 免费包按中国自然月发放；容器时区已固定为 Asia/Shanghai。"""
-    return time.strftime("%Y-%m", time.localtime())
+    """OCR 免费包按中国自然月发放；固定按 UTC+8 计算，不依赖容器或系统时区。"""
+    return (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m")
 
 
 def _ocr_configuration_raw(app) -> dict:
@@ -808,7 +815,16 @@ def _local_ocr_settings(value: object) -> dict:
 
 
 def _local_ocr_readiness(app) -> dict:
-    """仅提示是否应人工发起第二阶段验收，绝不自动切换 OCR 优先级。"""
+    """仅提示是否应人工发起第二阶段验收，绝不自动切换 OCR 优先级。
+
+    该指标只用于配置页提示，允许 5 分钟 TTL 缓存。否则每次 OCR 额度预留都会
+    触发一次全表聚合，评审页数多时成为无谓的 SQLite 负载。
+    """
+    now = time.time()
+    with _LOCAL_OCR_READINESS_LOCK:
+        cached = _LOCAL_OCR_READINESS_CACHE.get("value")
+        if cached is not None and cached[0] > now:
+            return cached[1]
     with connection(app) as conn:
         row = conn.execute(
             """SELECT COUNT(DISTINCT c.document_id || ':' || c.page_number) AS page_count,
@@ -818,11 +834,14 @@ def _local_ocr_readiness(app) -> dict:
         ).fetchone()
     pages = int(row["page_count"] or 0) if row else 0
     projects = int(row["project_count"] or 0) if row else 0
-    return {
+    value = {
         "sample_pages": pages, "sample_projects": projects,
         # 这只是“提醒人工验收”的最低客观门槛；准确率和内存指标仍须人工确认。
         "ready_for_manual_validation": pages >= 30 and projects >= 3,
     }
+    with _LOCAL_OCR_READINESS_LOCK:
+        _LOCAL_OCR_READINESS_CACHE["value"] = (time.time() + _LOCAL_OCR_READINESS_TTL_SECONDS, value)
+    return value
 
 
 def ocr_configuration(app) -> dict:
@@ -1412,7 +1431,7 @@ def list_task_summaries(app, project_id: str) -> list[dict]:
     with connection(app) as conn:
         rows = conn.execute(
             """SELECT task_id, project_id, task_type, status, progress, message, error, created_at, started_at, finished_at, updated_at,
-                      CASE WHEN task_type = 'evaluate_all' THEN result_json ELSE NULL END AS result_json
+                      CASE WHEN task_type = 'evaluate_all' OR status = 'running' THEN result_json ELSE NULL END AS result_json
                FROM ew_tasks WHERE project_id = ? ORDER BY created_at DESC LIMIT 50""",
             (project_id,),
         ).fetchall()
@@ -2911,10 +2930,17 @@ def update_rule(app, project_id: str, rule_id: str, payload: dict) -> dict:
             if rule["category"] == "objective":
                 current["kind"] = "boolean" if scoring.get("kind") == "boolean" else "manual"
             scoring_json = json.dumps(current, ensure_ascii=False)
-        # 规则内容/评分口径的人工修改属于长期维护内容；启用勾选仅属于当前规则集，
-        # 重新提取时必须重新选择，不能因为一次勾选操作把 AI 规则固化到下一版本。
+        # 规则内容、评分口径和图片取证策略的人工修改都属于长期维护内容；启用勾选
+        # 仅属于当前规则集，重新提取时必须重新选择，不能因为一次勾选操作把 AI
+        # 规则固化到下一版本。
+        execution_meta_keys = (
+            "execution_strategy", "evidence_requirements", "applicability", "ocr_required", "check_mode",
+            "image_mode", "vision_trigger", "vision_level", "acquisition_preset", "evidence_items",
+            "baseline_ocr_mode",
+        )
+        execution_meta_changed = any(key in payload for key in execution_meta_keys)
         content_locked = rule.get("source_type") in {"ai", "ai_locked"} and (
-            check_rule is not None or scoring_json is not None
+            check_rule is not None or scoring_json is not None or execution_meta_changed
         )
         if check_rule is not None:
             conn.execute(
@@ -2931,14 +2957,10 @@ def update_rule(app, project_id: str, rule_id: str, payload: dict) -> dict:
                 "UPDATE ew_rules SET enabled = ?, updated_at = ? WHERE rule_id = ?",
                 (enabled, now_iso(), rule_id),
             )
-        if any(key in payload for key in (
-            "execution_strategy", "evidence_requirements", "applicability", "ocr_required", "check_mode",
-            "image_mode", "vision_trigger", "vision_level", "acquisition_preset", "evidence_items",
-            "baseline_ocr_mode",
-        )):
+        if execution_meta_changed:
             conn.execute(
-                "UPDATE ew_rules SET execution_meta_json = ?, updated_at = ? WHERE rule_id = ?",
-                (_execution_meta_json(payload, fallback=rule), now_iso(), rule_id),
+                "UPDATE ew_rules SET execution_meta_json = ?, source_type = CASE WHEN ? THEN 'ai_edited' ELSE source_type END, updated_at = ? WHERE rule_id = ?",
+                (_execution_meta_json(payload, fallback=rule), 1 if content_locked else 0, now_iso(), rule_id),
             )
         conn.execute("UPDATE ew_rule_sets SET updated_at = ? WHERE rule_set_id = ?", (now_iso(), rule_set["rule_set_id"]))
         updated = conn.execute("SELECT * FROM ew_rules WHERE rule_id = ?", (rule_id,)).fetchone()
@@ -3354,8 +3376,7 @@ def latest_review_results(app, project_id: str) -> tuple[dict | None, list[dict]
                FROM ew_review_runs r JOIN ew_tasks t ON t.task_id = r.task_id
                WHERE r.project_id = ? AND t.status IN ('running', 'success', 'error')
                AND EXISTS (SELECT 1 FROM ew_review_results item WHERE item.review_run_id = r.review_run_id)
-               AND r.rule_set_id = (SELECT rule_set_id FROM ew_rule_sets WHERE project_id = ? ORDER BY version DESC LIMIT 1)
-               ORDER BY r.rowid DESC LIMIT 1""", (project_id, project_id)
+               ORDER BY r.rowid DESC LIMIT 1""", (project_id,)
         ).fetchone()
         if not run:
             return None, []
@@ -3648,9 +3669,8 @@ def latest_score_results(app, project_id: str, score_type: str) -> tuple[dict | 
                FROM ew_score_runs r JOIN ew_tasks t ON t.task_id = r.task_id
                WHERE r.project_id = ? AND r.score_type = ? AND t.status IN ('running', 'success', 'error')
                AND EXISTS (SELECT 1 FROM ew_score_results item WHERE item.score_run_id = r.score_run_id)
-               AND r.rule_set_id = (SELECT rule_set_id FROM ew_rule_sets WHERE project_id = ? ORDER BY version DESC LIMIT 1)
                ORDER BY r.rowid DESC LIMIT 1""",
-            (project_id, score_type, project_id),
+            (project_id, score_type),
         ).fetchone()
         if not run:
             return None, []

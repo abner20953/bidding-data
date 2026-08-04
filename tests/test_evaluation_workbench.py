@@ -5317,6 +5317,64 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(result["status"], "satisfied")
         self.assertEqual(result["coverage_status"], "covered")
 
+    def test_rule_set_changes_do_not_hide_most_recent_review_and_score_results(self):
+        """新增/编辑规则或重新提取生成新版本后，最近一次有结果的运行仍应可见。"""
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案：稳定运行。")
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "资质", "check_rule": "核验资质",
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        storage.update_task(self.app, task["task_id"], status="success")
+        review_run = storage.create_review_run(self.app, self.project["project_id"], task["task_id"], "profile-1")
+        storage.save_review_results(self.app, review_run["review_run_id"], document["document_id"], [{
+            "rule_id": rule["rule_id"], "status": "satisfied", "evidence": "已提供资质",
+            "risk_level": "low", "confidence": "high", "evidence_quality": "sufficient",
+        }])
+        score_run = storage.create_score_run(self.app, self.project["project_id"], task["task_id"], "objective", "profile-1")
+        storage.save_score_results(self.app, score_run["score_run_id"], document["document_id"], [{
+            "rule_id": rule["rule_id"], "suggested_score": 5.0, "max_score": 5.0,
+        }])
+        # 用户随后新增规则会生成更高版本的待确认草稿；结果仍应可见。
+        storage.add_rule(self.app, self.project["project_id"], {"category": "compliance", "title": "响应"})
+
+        run, results = storage.latest_review_results(self.app, self.project["project_id"])
+        self.assertIsNotNone(run)
+        self.assertEqual([item["rule_id"] for item in results], [rule["rule_id"]])
+        score_run, score_rows = storage.latest_score_results(self.app, self.project["project_id"], "objective")
+        self.assertIsNotNone(score_run)
+        self.assertEqual([item["rule_id"] for item in score_rows], [rule["rule_id"]])
+
+        # 重新提取规则会把旧确认版本标记为 superseded 并生成新草稿；历史结果仍保留展示。
+        storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-2", [{
+            "category": "qualification", "title": "投标人资质", "check_rule": "核验投标人资质",
+        }])
+        run, results = storage.latest_review_results(self.app, self.project["project_id"])
+        self.assertIsNotNone(run)
+        self.assertEqual([item["rule_id"] for item in results], [rule["rule_id"]])
+
+    def test_acquisition_setting_change_locks_ai_rule_across_reextract(self):
+        """用户调整 AI 规则的图片取证设置后，重新提取时该规则应整体保留。"""
+        storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-1", [{
+            "category": "qualification", "title": "营业执照", "check_rule": "核验营业执照", "source_text": "应提供营业执照。",
+        }])
+        _, rules = storage.list_rules(self.app, self.project["project_id"])
+        ai_rule = next(item for item in rules if item["source_type"] == "ai")
+        tuned = storage.update_rule(self.app, self.project["project_id"], ai_rule["rule_id"], {
+            "acquisition_preset": "smart", "image_mode": "auto",
+            "vision_trigger": "text_fallback", "vision_level": "standard",
+        })
+        self.assertEqual(tuned["source_type"], "ai_edited")
+
+        storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-2", [{
+            "category": "qualification", "title": "营业执照", "check_rule": "核验营业执照", "source_text": "应提供营业执照。",
+        }])
+        _, refreshed = storage.list_rules(self.app, self.project["project_id"])
+        preserved = next(item for item in refreshed if item["title"] == "营业执照")
+        self.assertEqual(preserved["source_type"], "ai_edited")
+        self.assertEqual(preserved["vision_trigger"], "text_fallback")
+        self.assertEqual(len([item for item in refreshed if item["title"] == "营业执照"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

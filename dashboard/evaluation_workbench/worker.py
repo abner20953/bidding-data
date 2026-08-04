@@ -5548,8 +5548,6 @@ def _tencent_ocr_page_texts(app, task: dict, document: dict, rule: dict, result:
     """腾讯 OCR 的精确复核层；调用方必须先完成本地 OCR 基线。"""
     configuration = storage.ocr_configuration(app)
     service_configs = {item["service"]: item for item in configuration["services"]}
-    # 本函数只负责腾讯云，不在这里回退本地，避免未来的路由又被反转。
-    local_enabled = False
     # 图片优先链路会在视觉模型已确认材料页后，仅复核这些目标页；普通链路仍使用
     # 原有候选页逻辑。显式页码必须经过规范化，防止模型页码或旧结果污染 OCR 调用。
     if pages is None:
@@ -5565,7 +5563,6 @@ def _tencent_ocr_page_texts(app, task: dict, document: dict, rule: dict, result:
     failure = ""
     unavailable_services: set[str] = set()
     preferred_service = ""
-    local_fallback_pages: list[int] = []
     page_texts = _document_page_texts(document)
     for page in pages:
         page_candidates = [
@@ -5574,14 +5571,11 @@ def _tencent_ocr_page_texts(app, task: dict, document: dict, rule: dict, result:
         ]
         if not page_candidates:
             failure = "腾讯 OCR 可用额度不足"
-            if local_enabled:
-                local_fallback_pages.append(page)
             continue
         ordered = ([preferred_service] if preferred_service in page_candidates else []) + page_candidates
         ordered = list(dict.fromkeys(service for service in ordered if service not in unavailable_services))
         page_completed = False
         page_empty = False
-        fallback_allowed = not ordered
         for service in ordered:
             rendered = _render_ocr_page(app, document, page, service, task=task)
             if not rendered:
@@ -5631,19 +5625,6 @@ def _tencent_ocr_page_texts(app, task: dict, document: dict, rule: dict, result:
             # 仅影响当前页，下一页仍允许尝试原优先接口。
             if error_kind in {"auth", "quota", "unsupported"}:
                 unavailable_services.add(service)
-                fallback_allowed = True
-        if local_enabled and not page_completed and not page_empty and fallback_allowed:
-            local_fallback_pages.append(page)
-    if local_enabled and local_fallback_pages:
-        local_values, local_failure = _local_ocr_page_texts(
-            app, document, local_fallback_pages, rule=rule, level=level, task=task,
-        )
-        if local_values:
-            values.extend(local_values)
-            # 本地部分成功时仍须保留单页失败提示，避免后续归纳误判为全部覆盖。
-            failure = local_failure or ""
-        elif local_failure:
-            failure = local_failure
     return values, failure
 
 
@@ -6234,8 +6215,13 @@ def _complete_repeated_page_sequence(pages: list[int], page_count: int) -> list[
 
 
 # 按 PDF 页序缓存解析文本拆分结果；worker 为单进程按需运行，缓存只覆盖当前
-# 评审批次涉及的少量文件，任务结束随进程释放，不常驻内存。
-_PAGE_TEXTS_CACHE: dict[tuple[str, str], dict[int, str]] = {}
+# 评审批次涉及的少量文件，任务结束随进程释放，不常驻内存。键含 mtime/size，
+# 重新解析同一文档后不会命中旧内容；按字符预算逐出最旧条目，避免多文档项目
+# 整体清空后反复重读整份解析文本。综合评审并行处理多份投标文件，访问需加锁。
+_PAGE_TEXTS_CACHE: dict[tuple[str, str, int, int], dict[int, str]] = {}
+_PAGE_TEXTS_CACHE_TOTAL_CHARS = 0
+_PAGE_TEXTS_CACHE_MAX_CHARS = 64 * 1024 * 1024
+_PAGE_TEXTS_CACHE_LOCK = threading.Lock()
 _SCAN_PAGE_TEXT_LIMIT = 80
 # 页眉/页脚中独立成行的数字或“第N页”视为印刷页码；行内还有其他内容的数字不算。
 _PRINTED_FOOTER_PATTERN = re.compile(r"^[-—–_\s]*(\d{1,4})[-—–_\s]*$")
@@ -6247,18 +6233,28 @@ def _document_page_texts(document: dict) -> dict[int, str]:
     path = str(document.get("parsed_path") or "")
     if not path or not Path(path).is_file():
         return {}
-    key = (str(document.get("document_id") or ""), path)
-    cached = _PAGE_TEXTS_CACHE.get(key)
-    if cached is not None:
-        return cached
+    try:
+        stat = Path(path).stat()
+    except OSError:
+        return {}
+    key = (str(document.get("document_id") or ""), path, stat.st_mtime_ns, stat.st_size)
+    global _PAGE_TEXTS_CACHE_TOTAL_CHARS
+    with _PAGE_TEXTS_CACHE_LOCK:
+        cached = _PAGE_TEXTS_CACHE.get(key)
+        if cached is not None:
+            return cached
     text = Path(path).read_text(encoding="utf-8", errors="ignore")
     parts = re.split(r"\[第(\d+)页\]\n", text)
     pages: dict[int, str] = {}
     for index in range(1, len(parts) - 1, 2):
         pages[int(parts[index])] = parts[index + 1]
-    if len(_PAGE_TEXTS_CACHE) >= 12:
-        _PAGE_TEXTS_CACHE.clear()
-    _PAGE_TEXTS_CACHE[key] = pages
+    with _PAGE_TEXTS_CACHE_LOCK:
+        while _PAGE_TEXTS_CACHE and _PAGE_TEXTS_CACHE_TOTAL_CHARS + len(text) > _PAGE_TEXTS_CACHE_MAX_CHARS:
+            oldest_key = next(iter(_PAGE_TEXTS_CACHE))
+            removed = _PAGE_TEXTS_CACHE.pop(oldest_key)
+            _PAGE_TEXTS_CACHE_TOTAL_CHARS -= sum(len(value) for value in removed.values())
+        _PAGE_TEXTS_CACHE[key] = pages
+        _PAGE_TEXTS_CACHE_TOTAL_CHARS += len(text)
     return pages
 
 

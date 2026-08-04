@@ -2,8 +2,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 from dashboard.evaluation_workbench.ai_gateway import (
-    InvalidJsonResponse, ModelResponseEnvelopeError, _decode_json_content, _recover_complete_json_array, build_vision_user_content,
-    model_capabilities, request_json, test_connection,
+    InvalidJsonResponse, ModelResponseEnvelopeError, _balanced_object_candidates, _decode_json_content,
+    _recover_complete_json_array, build_vision_user_content, model_capabilities, request_json, test_connection,
 )
 
 
@@ -260,3 +260,14 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
             test_connection(profile, CONNECTION_TEST_PROMPT)
 
         self.assertNotIn("thinking", post.call_args.kwargs["json"])
+
+    def test_balanced_object_candidates_handle_escaped_quotes_inside_strings(self):
+        """兜底扫描必须把转义引号当作字符串内容，而不是提前闭合字符串。"""
+        text = '前置说明 {"rule_id":"R1","evidence":"他说\\"通过\\""} 结尾'
+
+        candidates = _balanced_object_candidates(text)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertTrue(candidates[0].startswith("{"))
+        self.assertTrue(candidates[0].endswith("}"))
+        self.assertIn('\\"', candidates[0])
