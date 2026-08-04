@@ -4999,7 +4999,23 @@ _VISION_LEVEL_SETTINGS = {
     "standard": {"detail": "standard", "max_pages": 4, "followup_pages": 4, "scale": 1.55, "quality": 82},
     "high": {"detail": "high", "max_pages": 6, "followup_pages": 6, "scale": 2.0, "quality": 88},
 }
-_VISION_REQUEST_GATE = threading.BoundedSemaphore(1)
+
+
+def _vision_parallel_limit() -> int:
+    """视觉请求并发上限，默认 2 路。
+
+    多份投标文件同时进入图片识别阶段时，2 路并发可明显缩短尾部等待；单份文件
+    内部仍按规则顺序执行，因此单投标人项目不受影响。可用环境变量
+    VISION_PARALLEL_LIMIT 在 1-4 之间调整。
+    """
+    try:
+        requested = int(os.environ.get("VISION_PARALLEL_LIMIT", "2"))
+    except (TypeError, ValueError):
+        return 2
+    return max(1, min(4, requested))
+
+
+_VISION_REQUEST_GATE = threading.BoundedSemaphore(_vision_parallel_limit())
 # RapidOCR/ONNX 的单个子进程峰值约 500-650 MB；2 核 2 GB 服务器上宁可让本地 OCR
 # 排队，也不能让多份投标文件并行拉起多个模型进程。它只约束本地推理，不影响远端
 # 文字或图片模型的动态并行。内存升级到 4 GB 以上后可设 LOCAL_OCR_MAX_WORKERS=2 放开一路。

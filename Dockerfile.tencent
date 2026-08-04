@@ -11,6 +11,13 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 # 确保日志即时输出
 ENV PYTHONUNBUFFERED=1
 
+# 工作台并发与 OCR 调优：MiniMax 文本请求默认 3 路、视觉 2 路、本地 OCR 双线程。
+# 全部可随时通过部署环境变量覆盖（MINIMAX_PARALLEL_LIMIT / VISION_PARALLEL_LIMIT /
+# RAPIDOCR_OMP_THREADS），无需改代码。
+ENV RAPIDOCR_OMP_THREADS=2
+ENV MINIMAX_PARALLEL_LIMIT=3
+ENV VISION_PARALLEL_LIMIT=2
+
 # 安装系统依赖 (先将 APT 源替换为国内阿里云源加速下载，包括基础编译工具以支持 gevent 等包编译)
 RUN (sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
     sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list) && \

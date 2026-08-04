@@ -1,3 +1,4 @@
+import os
 import unittest
 from unittest.mock import Mock, patch
 
@@ -271,3 +272,16 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
         self.assertTrue(candidates[0].startswith("{"))
         self.assertTrue(candidates[0].endswith("}"))
         self.assertIn('\\"', candidates[0])
+
+    def test_minimax_parallel_limit_default_three_and_env_override(self):
+        """MiniMax 并行档位默认 3 路，并支持环境变量 1-4 收敛。"""
+        profile = self._profile(base_url="https://api.minimaxi.com/v1", model_name="MiniMax-M3")
+
+        with patch.dict(os.environ, {"MINIMAX_PARALLEL_LIMIT": "1"}, clear=False):
+            self.assertEqual(model_capabilities(profile)["parallel_limit"], 1)
+        with patch.dict(os.environ, {"MINIMAX_PARALLEL_LIMIT": "9"}, clear=False):
+            self.assertEqual(model_capabilities(profile)["parallel_limit"], 4)
+        with patch.dict(os.environ, {"MINIMAX_PARALLEL_LIMIT": "abc"}, clear=False):
+            self.assertEqual(model_capabilities(profile)["parallel_limit"], 3)
+        with patch.dict(os.environ, {"MINIMAX_PARALLEL_LIMIT": "3"}, clear=False):
+            self.assertEqual(model_capabilities(profile)["parallel_limit"], 3)

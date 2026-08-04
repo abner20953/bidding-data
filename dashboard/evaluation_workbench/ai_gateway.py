@@ -281,6 +281,20 @@ def _is_minimax_profile(profile: dict) -> bool:
     return "api.minimaxi.com" in str(profile.get("base_url") or "").lower()
 
 
+def _minimax_parallel_limit() -> int:
+    """MiniMax 文本请求并发上限，默认 3 路。
+
+    MiniMax 的令牌计划按并发突发计量；多家投标人并行评审时 3 路可明显缩短全文
+    扫描与规则组的等待时间，请求闸门在限流时仍会自动逐级降回 2→1 路，不会因
+    档位升高卡死任务。可用环境变量 MINIMAX_PARALLEL_LIMIT 在 1-4 之间调整。
+    """
+    try:
+        requested = int(os.environ.get("MINIMAX_PARALLEL_LIMIT", "3"))
+    except (TypeError, ValueError):
+        return 3
+    return max(1, min(4, requested))
+
+
 def _is_minimax_m3(profile: dict) -> bool:
     return (
         _is_minimax_profile(profile)
@@ -364,7 +378,9 @@ def model_capabilities(profile: dict) -> dict:
             "vision": declared_vision,
             "vision_protocol": vision_protocol if declared_vision else "",
             "thinking_modes": ["adaptive", "disabled"] if m3 else ["default"],
-            "parallel_limit": 2,
+            # MiniMax 的令牌计划按并发突发计量；默认 3 路供多家投标人并行评审，
+            # 可通过 MINIMAX_PARALLEL_LIMIT 在 1-4 之间调整。
+            "parallel_limit": _minimax_parallel_limit(),
             "prompt_cache": "prefix",
         }
     return {

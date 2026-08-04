@@ -5375,6 +5375,31 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(preserved["vision_trigger"], "text_fallback")
         self.assertEqual(len([item for item in refreshed if item["title"] == "营业执照"]), 1)
 
+    def test_profile_parallel_limit_scales_with_document_count(self):
+        """并行档位按投标人数量自适应：1~2 家不受影响，3 家及以上才用满上限。"""
+        profile = {"base_url": "https://api.minimaxi.com/v1", "model_name": "MiniMax-M3"}
+
+        self.assertEqual(worker._profile_parallel_limit(profile, 1), 1)
+        self.assertEqual(worker._profile_parallel_limit(profile, 2), 2)
+        self.assertEqual(worker._profile_parallel_limit(profile, 3), 3)
+        self.assertEqual(worker._profile_parallel_limit(profile, 8), 3)
+
+        with patch.dict(os.environ, {"MINIMAX_PARALLEL_LIMIT": "1"}, clear=False):
+            self.assertEqual(worker._profile_parallel_limit(profile, 8), 1)
+        with patch.dict(os.environ, {"MINIMAX_PARALLEL_LIMIT": "4"}, clear=False):
+            self.assertEqual(worker._profile_parallel_limit(profile, 8), 4)
+
+    def test_vision_parallel_limit_defaults_to_two_and_respects_env(self):
+        """视觉并发默认 2 路，并支持环境变量 1-4 收敛。"""
+        with patch.dict(os.environ, {"VISION_PARALLEL_LIMIT": "1"}, clear=False):
+            self.assertEqual(worker._vision_parallel_limit(), 1)
+        with patch.dict(os.environ, {"VISION_PARALLEL_LIMIT": "9"}, clear=False):
+            self.assertEqual(worker._vision_parallel_limit(), 4)
+        with patch.dict(os.environ, {"VISION_PARALLEL_LIMIT": "abc"}, clear=False):
+            self.assertEqual(worker._vision_parallel_limit(), 2)
+        with patch.dict(os.environ, {"VISION_PARALLEL_LIMIT": "2"}, clear=False):
+            self.assertEqual(worker._vision_parallel_limit(), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
