@@ -792,6 +792,76 @@ class ComparatorTests(unittest.TestCase):
 
         self.assertFalse(detector._is_segment_artifact_deletion(edit, tender_text))
 
+    def test_fifteen_digit_price_run_is_not_an_identity(self):
+        """报价等 15 位纯数字长串不得误判为人员身份信息。"""
+        detector = CollusionDetector()
+        text = "投标总价为182546003795000元，详见开标一览表。"
+        self.assertFalse(detector.extract_entities(text))
+        self.assertFalse(detector.extract_typed_entities(text))
+
+    def test_valid_eighteen_digit_identity_still_detected(self):
+        """18 位且校验位正确的身份证仍然必须识别。"""
+        detector = CollusionDetector()
+        self.assertIn(
+            "11010519491231002X",
+            detector.extract_entities("身份证号:11010519491231002X"),
+        )
+
+    def test_wrapped_tender_continuation_insertion_is_not_a_shared_edit(self):
+        """招标单元在换行处截断时，投标文件补全的后半句不是共同新增。"""
+        detector = CollusionDetector()
+        tender_text = detector.normalize(
+            "13、全通道速记板:整机支持在任意界面下通过手势"
+        )
+        bid_text = detector.normalize(
+            "13、全通道速记板:整机支持在任意界面下通过手势滑动调出速记板进行即时书写"
+        )
+        # 招标全文中该句完整连续存在，只是比较单元在“通过手势”处被截断。
+        detector.tender_full_text = detector.normalize(
+            "13、全通道速记板:整机支持在任意界面下通过手势滑动调出速记板进行即时书写,书写内容可保存"
+        )
+
+        evidence = detector._shared_tender_edit_evidence(tender_text, bid_text, bid_text)
+
+        self.assertIsNone(evidence)
+
+    def test_genuine_shared_insertion_is_preserved(self):
+        """两份投标文件新增招标全文不存在的内容时，共同新增信号必须保留。"""
+        detector = CollusionDetector()
+        tender_text = detector.normalize(
+            "13、全通道速记板:整机支持在任意界面下通过手势"
+        )
+        bid_text = detector.normalize(
+            "13、全通道速记板:整机支持在任意界面下通过手势滑动调出速记板进行即时书写"
+        )
+        # 招标全文同样不含“新增”片段（与比较单元一致），不能误判为截断假象。
+        detector.tender_full_text = tender_text
+
+        evidence = detector._shared_tender_edit_evidence(tender_text, bid_text, bid_text)
+
+        self.assertIsNotNone(evidence)
+        self.assertIn(
+            {"original": "（此处新增）", "modified": "滑动调出速记板进行即时书写"},
+            evidence["changes"],
+        )
+
+    def test_table_quantity_item_glue_is_not_a_shared_edit(self):
+        """招标提取把“13套”与“8系统软件”拼进句子时，干净引用不算共同删除。"""
+        detector = CollusionDetector()
+        tender_text = detector.normalize(
+            "师生协作1、支持教师将ppt、word、pdf、图片、视频等课件13套8系统软件"
+            "文档通过控制面板一键广播至各小组"
+        )
+        bid_text = detector.normalize(
+            "1、支持教师将ppt、word、pdf、图片、视频等课件"
+            "文档通过控制面板一键广播至各小组"
+        )
+        detector.tender_full_text = tender_text
+
+        evidence = detector._shared_tender_edit_evidence(tender_text, bid_text, bid_text)
+
+        self.assertIsNone(evidence)
+
     def test_voice_adaptation_edit_is_tagged_not_removed(self):
         """拆分出的“实施→我、须→会”必须作为同一常规响应编辑簇处理。"""
         detector = CollusionDetector()

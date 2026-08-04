@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from flask import Blueprint, current_app, jsonify, render_template, request, session
+from flask import Blueprint, current_app, jsonify, render_template, request, send_file, session
 from werkzeug.security import check_password_hash
 
 from dashboard.evaluation_workbench import storage
@@ -457,6 +457,30 @@ def delete_document_api(project_id, document_id):
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify({"status": "success"})
+
+
+@evaluation_workbench_bp.route("/api/evaluation-workbench/projects/<project_id>/documents/<document_id>/download", methods=["GET"])
+def download_document_api(project_id, document_id):
+    _init()
+    _, error = _project_or_404(project_id)
+    if error:
+        return error
+    document = next(
+        (
+            item
+            for item in storage.list_documents(current_app, project_id)
+            if item["document_id"] == document_id
+        ),
+        None,
+    )
+    if document is None:
+        return jsonify({"error": "文件不存在"}), 404
+    path = storage.document_path(current_app, document)
+    if not path.exists():
+        return jsonify({"error": "源文件已丢失，无法下载"}), 404
+    return send_file(
+        path, as_attachment=True, download_name=document["original_name"]
+    )
 
 
 @evaluation_workbench_bp.route("/api/evaluation-workbench/projects/<project_id>/tasks", methods=["POST"])

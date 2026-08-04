@@ -799,6 +799,15 @@ class CollusionDetector:
         ):
             return True
 
+        # PDF 提取会把表格里“数量 13套”和下一行序号“8系统软件”拼成
+        # “13套8系统软件”插进句子中间。数量单位后紧跟另一个数字序号是表格
+        # 拼接特征，该片段并非投标人对招标原文的真实删改。
+        if re.search(
+            r"\d+(?:\.\d+)?(?:台|套|件|项|个|张|把|批|块|组|辆|架|部)\d",
+            original,
+        ):
+            return True
+
         # A short removed cell heading or suffix is normally caused by a
         # heading being rendered separately in the bidder's document.  It has
         # no independent review value.  Keep replacements (including numeric
@@ -1008,6 +1017,54 @@ class CollusionDetector:
                 start = position + 1
         return False
 
+    def _is_segment_artifact_insertion(self, edit, tender_text):
+        """排除招标比较单元在换行/分页处截断造成的“新增”假象。
+
+        招标原文的一句话被 PDF 提取拆成两个单元时，比较单元只保留前半句，
+        投标文件中的完整句子对齐后会把招标原文自己的后半句误判为投标人
+        “新增”。仅当该片段在招标全文中、且紧邻其在比较单元的截断锚点时，
+        才认为它是被截断的原文续接而非真实新增。方向与
+        ``_is_segment_artifact_deletion`` 相反，逻辑对称：删除侧查投标全文，
+        插入侧查招标全文（``tender_full_text`` 已由 ``load_tender`` 归一化）。
+        """
+        if edit["original"]:
+            return False
+        haystack = getattr(self, "tender_full_text", "") or ""
+        if not haystack:
+            return False
+        needle = re.sub(r"\s+", "", edit["modified"]).strip(
+            " ,，。；;：:、（）()【】《》\"'“”‘’"
+        )
+        if len(needle) < 4:
+            return False
+        try:
+            source_start = int(edit["source_start"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        # 插入点的前文作为左锚点；右锚点取插入点之后的原文开头（纯插入时
+        # source_end == source_start）。锚点贴近片段出现位置才算同一上下文。
+        left_anchor = tender_text[max(0, source_start - 14):source_start][-6:]
+        right_anchor = tender_text[source_start:source_start + 14][:6]
+        if len(left_anchor) < 4:
+            left_anchor = ""
+        if len(right_anchor) < 4:
+            right_anchor = ""
+        if not left_anchor and not right_anchor:
+            return False
+        start = 0
+        while True:
+            position = haystack.find(needle, start)
+            if position < 0:
+                break
+            before = haystack[max(0, position - 16):position]
+            after = haystack[position + len(needle):position + len(needle) + 16]
+            if (left_anchor and left_anchor in before) or (
+                right_anchor and right_anchor in after
+            ):
+                return True
+            start = position + 1
+        return False
+
     def _shared_tender_edit_evidence(self, tender_text, text_a, text_b):
         """Prove that A and B made substantially the same edits to tender text."""
         if not tender_text or tender_text == text_a or tender_text == text_b:
@@ -1029,6 +1086,7 @@ class CollusionDetector:
             and not self._is_form_field_completion(edit, tender_text)
             and not self._is_leading_table_title_insertion(edit, tender_text)
             and not self._is_segment_artifact_deletion(edit, tender_text)
+            and not self._is_segment_artifact_insertion(edit, tender_text)
         }
         edits_b = {
             signature: edit
@@ -1037,6 +1095,7 @@ class CollusionDetector:
             and not self._is_form_field_completion(edit, tender_text)
             and not self._is_leading_table_title_insertion(edit, tender_text)
             and not self._is_segment_artifact_deletion(edit, tender_text)
+            and not self._is_segment_artifact_insertion(edit, tender_text)
         }
         self._mark_voice_adaptation_clusters(tender_text, text_a, edits_a)
         self._mark_voice_adaptation_clusters(tender_text, text_b, edits_b)
@@ -1759,8 +1818,8 @@ class CollusionDetector:
 
     @staticmethod
     def _is_valid_cn_id(identity):
-        if len(identity) == 15:
-            return identity.isdigit()
+        # 仅支持 18 位二代身份证（含校验位验证）。15 位一代证件在投标文件中
+        # 基本不再出现，而报价等长数字串极易误命中，代价远大于漏检。
         if not re.fullmatch(r"\d{17}[0-9X]", identity):
             return False
         weights = (7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2)
@@ -1775,8 +1834,7 @@ class CollusionDetector:
         normalized_text = unicodedata.normalize("NFKC", text)
         separator_pattern = r"[\s\-—_]*"
         identities = re.findall(
-            rf"(?<!\d)(?:(?:\d{separator_pattern}){{17}}[0-9Xx]|"
-            rf"(?:\d{separator_pattern}){{14}}\d)(?!\d)",
+            rf"(?<!\d)(?:\d{separator_pattern}){{17}}[0-9Xx](?!\d)",
             normalized_text,
         )
         for identity in identities:
@@ -1812,7 +1870,7 @@ class CollusionDetector:
         typed = set()
         separator_pattern = r"[\s\-—_]*"
         identities = re.findall(
-            rf"(?<!\d)(?:(?:\d{separator_pattern}){{17}}[0-9Xx]|(?:\d{separator_pattern}){{14}}\d)(?!\d)",
+            rf"(?<!\d)(?:\d{separator_pattern}){{17}}[0-9Xx](?!\d)",
             normalized_text,
         )
         for identity in identities:

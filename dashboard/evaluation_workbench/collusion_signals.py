@@ -45,7 +45,8 @@ def _clip(value, limit: int = 160) -> str:
 
 def _entity_dimension(value: str) -> str | None:
     normalized = re.sub(r"[\s\-—_]", "", str(value or "")).upper()
-    if re.fullmatch(r"(?:\d{15}|\d{17}[0-9X])", normalized):
+    # 仅 18 位二代身份证；15 位纯数字串多为报价等长数字拼接，易误判。
+    if re.fullmatch(r"\d{17}[0-9X]", normalized):
         return "person_identity"
     if "@" in normalized:
         return "email"
