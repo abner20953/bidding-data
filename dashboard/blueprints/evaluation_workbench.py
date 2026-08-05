@@ -192,8 +192,12 @@ def _report_presentation(documents: list[dict], rule_set: dict | None, rules: li
             summary for layer, summary in zip(layers, layer_summaries)
             if not (isinstance(layer, dict) and layer.get("source") == "score_calculation")
         ]
-        evidence_parts = other_summaries[-2:] + calculation_summaries + [_report_result_explanation(evidence, value)]
-        value["evidence_brief"] = _report_brief(evidence_parts, 260)
+        stored_summary = _report_compact_text(value.get("conclusion_summary"), 90)
+        if stored_summary:
+            value["evidence_brief"] = stored_summary
+        else:
+            evidence_parts = other_summaries[-2:] + calculation_summaries + [_report_result_explanation(evidence, value)]
+            value["evidence_brief"] = _report_brief(evidence_parts, 260)
         value["reason_brief"] = _report_compact_text(_report_result_explanation(reason, value), 200)
         value["confidence_label"] = _report_label(_REPORT_CONFIDENCE_LABELS, value.get("confidence"))
         vision_status = str(value.get("vision_status") or "not_requested")

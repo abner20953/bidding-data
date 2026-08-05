@@ -2860,8 +2860,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.confirm_rule_set(self.app, self.project["project_id"])
         task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
         storage.update_task(self.app, task["task_id"], status="success")
-        review_run = storage.create_review_run(self.app, self.project["project_id"], task["task_id"], None)
-        score_run = storage.create_score_run(self.app, self.project["project_id"], task["task_id"], "objective", None)
+        review_run = storage.create_review_run(self.app, self.project["project_id"], task["task_id"], "profile-1")
+        score_run = storage.create_score_run(self.app, self.project["project_id"], task["task_id"], "objective", "profile-1")
         storage.save_review_results(self.app, review_run["review_run_id"], document["document_id"], [
             {"rule_id": review_rule["rule_id"], "status": "satisfied", "confidence": "high", "evidence_quality": "sufficient", "risk_level": "low", "requires_review": False, "automation_status": "ready_for_batch_confirmation",
              "vision_status": "applied", "vision_pages": [3, 5], "vision_evidence_pages": [5],
@@ -2888,6 +2888,73 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(score_rows[0]["final_score"], 5.0)
         self.assertEqual(score_rows[0]["vision_pages"], [8])
         self.assertEqual(score_rows[0]["vision_status"], "applied_partial")
+
+    def test_normalise_conclusion_summary_cleans_and_truncates(self):
+        self.assertEqual(worker._normalise_conclusion_summary("结论：投标有效期承诺缺失，需复核。"), "投标有效期承诺缺失，需复核。")
+        self.assertEqual(worker._normalise_conclusion_summary("综上：逐项响应无偏离，建议满分。"), "逐项响应无偏离，建议满分。")
+        self.assertEqual(worker._normalise_conclusion_summary(""), "")
+        self.assertEqual(worker._normalise_conclusion_summary(None), "")
+        long_text = "，".join(f"事项{i}" for i in range(1, 40))
+        out = worker._normalise_conclusion_summary(long_text)
+        self.assertLessEqual(len(out), 61)
+        self.assertTrue(out.endswith("…"))
+
+    def test_result_models_carry_conclusion_summary(self):
+        review = worker._review_result_from_model(
+            {"status": "not_found", "summary": "结论：投标有效期三项承诺未发现，需复核。", "evidence": "x", "reason": "y"},
+            "r1", "not_found",
+        )
+        self.assertEqual(review["conclusion_summary"], "投标有效期三项承诺未发现，需复核。")
+        score = worker._score_result_from_model(
+            "r2", 3.0, 6.0, {"suggested_score": 3, "confidence": "high", "summary": "综上：逐项响应无偏离，建议满分。"},
+        )
+        self.assertEqual(score["conclusion_summary"], "逐项响应无偏离，建议满分。")
+        self.assertEqual(worker._score_result_from_model("r3", None, 6.0, {"confidence": "low"})["conclusion_summary"], "")
+
+    def test_apply_ocr_summary_overrides_or_clears_conclusion_summary(self):
+        rule = {"rule_id": "r1", "title": "证书核验", "scoring_json": json.dumps({"max_score": 6})}
+        working = {"rule_id": "r1", "status": "not_found", "evidence": "文字层", "reason": "文字层理由",
+                   "risk_level": "medium", "confidence": "medium", "evidence_quality": "limited",
+                   "conclusion_summary": "文字层旧结论"}
+        payload = {"pages": [1, 2], "service_labels": "本地 RapidOCR", "local_only": True, "failure": "", "incomplete_pages": False}
+        parsed = {"status": "satisfied", "summary": "结论：已核验证书并采纳", "evidence": "OCR事实", "reason": "OCR理由",
+                  "content_coverage": "covered", "coverage": "covered", "conclusion_scope": "full",
+                  "evidence_pages": [1], "risk_level": "low", "confidence": "high"}
+        merged = worker._apply_ocr_summary("review", rule, working, parsed, payload)
+        self.assertEqual(merged["conclusion_summary"], "已核验证书并采纳")
+        merged2 = worker._apply_ocr_summary("review", rule, working, {**parsed, "summary": None}, payload)
+        self.assertEqual(merged2["conclusion_summary"], "")
+
+    def test_storage_round_trip_conclusion_summary(self):
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案。")
+        review_rule = storage.add_rule(self.app, self.project["project_id"], {"category": "qualification", "title": "资质"})
+        score_rule = storage.add_rule(self.app, self.project["project_id"], {"category": "objective", "title": "资质评分", "scoring": {"kind": "boolean", "max_score": 5}})
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        rule_set = storage.current_rule_set(self.app, self.project["project_id"])
+        task = storage.create_task(self.app, self.project["project_id"], "evaluate_all", {"prompt_version": "vision-evidence-contract-v31"})
+        storage.update_task(self.app, task["task_id"], status="success")
+        review_run = storage.create_review_run(self.app, self.project["project_id"], task["task_id"], "profile-1")
+        score_run = storage.create_score_run(self.app, self.project["project_id"], task["task_id"], "objective", "profile-1")
+        storage.save_review_results(self.app, review_run["review_run_id"], document["document_id"], [{
+            "rule_id": review_rule["rule_id"], "status": "not_found", "reason": "未发现",
+            "conclusion_summary": "投标有效期承诺缺失，需复核。",
+        }])
+        storage.save_score_results(self.app, score_run["score_run_id"], document["document_id"], [{
+            "rule_id": score_rule["rule_id"], "suggested_score": 5, "max_score": 5, "confidence": "high",
+            "conclusion_summary": "资质满足，建议满分。",
+        }])
+        _, review_rows = storage.latest_review_results(self.app, self.project["project_id"])
+        _, score_rows = storage.latest_score_results(self.app, self.project["project_id"], "objective")
+        self.assertEqual(review_rows[0]["conclusion_summary"], "投标有效期承诺缺失，需复核。")
+        self.assertEqual(score_rows[0]["conclusion_summary"], "资质满足，建议满分。")
+        reused = storage.reusable_evaluation_document_results(
+            self.app, self.project["project_id"], rule_set["rule_set_id"], "profile-1", document["document_id"],
+            {"review": {review_rule["rule_id"]}, "objective": {score_rule["rule_id"]}},
+            prompt_version="vision-evidence-contract-v31",
+        )
+        self.assertIsNotNone(reused)
+        self.assertEqual(reused["review"][0]["conclusion_summary"], "投标有效期承诺缺失，需复核。")
+        self.assertEqual(reused["objective"][0]["conclusion_summary"], "资质满足，建议满分。")
 
     def test_evidence_pack_reuses_only_confirmed_candidate_pages_and_records_provenance(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "认证证书见第12页。")

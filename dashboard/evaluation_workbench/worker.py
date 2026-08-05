@@ -2872,6 +2872,7 @@ def _review_result_from_model(item: dict, rule_id: str, status: str) -> dict:
             "evidence": _truncate_field(_clean_model_text(item.get("evidence")), 2000),
             "page_hint": _clean_model_text(item.get("page_hint"))[:80] or None,
             "reason": _truncate_field(_clean_model_text(item.get("reason")), 2000),
+            "conclusion_summary": _normalise_conclusion_summary(item.get("summary")),
             "risk_level": risk, "confidence": confidence, "evidence_quality": evidence_quality,
             "automation_status": "ready_for_batch_confirmation" if auto_ready else "needs_review",
             "requires_review": not auto_ready,
@@ -2928,6 +2929,20 @@ def _truncate_field(text: object, limit: int) -> str:
         return value
     keep = max(0, limit - len(_TRUNCATE_MARKER))
     return f"{value[:keep].rstrip()}{_TRUNCATE_MARKER}"
+
+
+def _normalise_conclusion_summary(value: object, limit: int = 60) -> str:
+    """归一化模型返回的一句话结论：剥掉“结论/综上”前缀、子句边界截断。
+
+    空结果返回空串，由前端回退到既有展示逻辑；绝不把过程描述或页码带进摘要。
+    """
+    text = _clean_model_text(value)
+    text = re.sub(r"^(?:结论|综上|总结|一句话结论)\s*[：:]?\s*", "", text)
+    if len(text) > limit:
+        cut = text[:limit]
+        boundary = max(cut.rfind("，"), cut.rfind(","), cut.rfind("、"), cut.rfind("；"), cut.rfind(";"))
+        text = f"{cut[:boundary].rstrip()}…" if boundary > 10 else f"{cut.rstrip()}…"
+    return text.strip()
 
 
 def _enum_text(value: object, allowed: set[str], default: str) -> str:
@@ -3491,6 +3506,7 @@ def _score_result_from_model(rule_id: str, suggested: float | None, max_score: f
         "effective_score": suggested if auto_ready else None, "max_score": max_score or None,
         "evidence": evidence,
         "reason": reason,
+        "conclusion_summary": _normalise_conclusion_summary(raw.get("summary")),
         # 仅在当前任务内供图片识别定位使用；存储层会忽略该临时字段，避免改变历史结果 API。
         "visual_page_candidates": _score_visual_page_candidates(raw),
         "confidence": confidence, "automation_status": "ready_for_batch_confirmation" if auto_ready else "needs_review",
@@ -5051,13 +5067,15 @@ def _combined_manual_results(component: str, rules: list[dict], payload: list[di
     if component == "review":
         return [
             _review_result_from_model(
-                {"reason": reason, "risk_level": "low", "confidence": "low", "evidence_quality": "missing"},
+                {"reason": reason, "summary": "模型未返回结论，需人工复核。",
+                 "risk_level": "low", "confidence": "low", "evidence_quality": "missing"},
                 rule["rule_id"], "ocr_required" if _rule_requires_visual_verification(rule) else "manual",
             )
             for rule in rules
         ]
     return _normalise_score_results(
-        [{"rule_id": item["rule_id"], "reason": reason, "confidence": "low"} for item in payload],
+        [{"rule_id": item["rule_id"], "reason": reason, "summary": "模型未返回结论，需人工复核。", "confidence": "low"}
+         for item in payload],
         payload, component,
     )
 
@@ -6158,6 +6176,9 @@ def _apply_ocr_summary(component: str, rule: dict, working_result: dict, parsed:
                   "confidence": _enum_text(parsed.get("confidence"), {"high", "medium", "low"}, working_result.get("confidence")) if can_apply else working_result.get("confidence"),
                   "ocr_candidate_pages": pages, "ocr_evidence_pages": evidence_pages,
                   "requires_review": True, "automation_status": "needs_review", "review_reason": f"{service_labels} 结果已补充，需人工复核。"}
+    # 采纳层有 summary 就覆盖为最新结论，没有则清空（前端回退到最新层摘要，
+    # 绝不显示可能已被本轮核验推翻的文字层旧结论）。
+    merged["conclusion_summary"] = _normalise_conclusion_summary(parsed.get("summary"))
     merged = _append_evidence_layer(
         merged, source="local_ocr" if local_only else "tencent_ocr", summary=evidence or reason, checked_pages=pages,
         evidence_pages=evidence_pages, service=service_labels,
@@ -7517,6 +7538,7 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
                 reconciled_reason, f"{prefix}{visual_reason}" if visual_reason else "",
                 supplement_first=has_conflict,
             ),
+            "summary": parsed.get("summary"),
             "risk_level": parsed.get("risk_level") if conclusion_scope == "full" else result.get("risk_level"),
             "confidence": "low" if has_conflict else (parsed.get("confidence") if conclusion_scope == "full" else result.get("confidence")),
             "evidence_quality": "sufficient" if conclusion_scope == "full" and visual_evidence else result.get("evidence_quality"),
@@ -7568,6 +7590,8 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
         adjusted=previous_suggested is not None and suggested is not None and abs(previous_suggested - suggested) > 1e-6,
         source="图片/OCR",
     )
+    # 视觉层是当前最新采纳层：有 summary 覆盖为最新结论，无则清空回退前端摘要逻辑。
+    merged["conclusion_summary"] = _normalise_conclusion_summary(parsed.get("summary"))
     merged = _append_evidence_layer(
         merged, source="vision", summary=visual_evidence or visual_reason, checked_pages=checked_pages,
         evidence_pages=visual_evidence_pages, model=str(vision_profile.get("display_name") or vision_profile.get("model_name") or ""),
@@ -8740,6 +8764,7 @@ def _highlight_display_candidate(item: dict) -> dict:
             str(item.get("evidence_quality")), str(item.get("evidence_quality") or ""))
     value["evidence"] = _clean_model_text(item.get("evidence"))[:300]
     value["reason"] = _clean_model_text(item.get("reason"))[:220]
+    value["conclusion_summary"] = str(item.get("conclusion_summary") or "")[:80]
     return {key: val for key, val in value.items() if val not in (None, "")}
 
 
