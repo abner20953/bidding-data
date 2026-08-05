@@ -43,6 +43,9 @@ COPY --chown=1000:1000 model_data /app/model_data
 ENV RAPIDOCR_OMP_THREADS=2
 ENV MINIMAX_PARALLEL_LIMIT=3
 ENV VISION_PARALLEL_LIMIT=2
+# OCR 归纳批量合并：2-6 条规则一次模型调用，整批失败自动回退逐条原路径。
+# 默认开启用于真实项目 A/B；对比完成后再决定保留或恢复关闭。
+ENV EVALUATION_WORKBENCH_OCR_BATCH=1
 
 # 【最后】才复制频繁变动的业务代码
 # 这样每次改代码发布时，上面所有步骤都会被跳过，只有这一步会重做
