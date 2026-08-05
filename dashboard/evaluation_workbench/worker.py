@@ -8711,6 +8711,7 @@ def _highlight_display_candidate(item: dict) -> dict:
     status=/risk_level=/evidence_quality= 等 JSON 字段名泄漏到用户可见结论。"""
     value: dict[str, object] = {
         "type": item.get("type"),
+        "rule_id": item.get("rule_id"),
         "category": item.get("category"),
         "title": item.get("title"),
         "check_rule": item.get("check_rule"),

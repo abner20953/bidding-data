@@ -1839,10 +1839,11 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
     def test_highlight_display_candidate_translates_status_labels(self):
         display = worker._highlight_display_candidate({
-            "type": "review", "category": "compliance", "title": "承诺函",
+            "type": "review", "rule_id": "rule-9", "category": "compliance", "title": "承诺函",
             "status": "not_found", "risk_level": "high", "confidence": "high",
             "evidence_quality": "missing", "evidence": "全文未发现", "reason": "需人工核验",
         })
+        self.assertEqual(display["rule_id"], "rule-9")
         self.assertEqual(display["status_label"], "未找到证据")
         self.assertEqual(display["risk_label"], "高")
         self.assertEqual(display["evidence_quality_label"], "缺失")
