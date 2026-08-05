@@ -70,9 +70,31 @@ def _report_label(labels: dict, value: object, default: str = "-") -> str:
     return labels.get(value, value or default)
 
 
+_REPORT_INTERNAL_ID_PATTERN = re.compile(r"(?<![0-9A-Za-z])SI-\d+(?![0-9A-Za-z])")
+_REPORT_FIELD_NOTATION_PATTERN = re.compile(
+    r"\b(?:status|risk_level|evidence_quality|confidence|suggested_score|max_score|"
+    r"matched_count|needs_ocr|coverage_status|final_score|effective_score)\s*=\s*[^，。；;：:\s]+"
+)
+
+
+def _clean_report_text(value: object) -> str:
+    """与网页端一致的展示清洗：去掉内部编号（SI-1/SI-2）与 JSON 字段名记法
+    （status=、suggested_score= 等）、统一页码格式（第P55页 → 第55页）。"""
+    text = str(value or "")
+    text = _REPORT_INTERNAL_ID_PATTERN.sub("", text)
+    text = _REPORT_FIELD_NOTATION_PATTERN.sub("", text)
+    text = re.sub(r"[（(]\s*[）)]", "", text)
+    text = text.replace("计分过程：", "")
+    text = re.sub(r"第P(\d+)-P?(\d+)页", r"第\1-\2页", text)
+    text = re.sub(r"第P(\d+)页", r"第\1页", text)
+    text = re.sub(r"(^|[^0-9A-Za-z])P(\d+)-P?(\d+)(?![0-9A-Za-z])", r"\1第\2-\3页", text)
+    text = re.sub(r"(^|[^0-9A-Za-z])P(\d+)(?![0-9A-Za-z])", r"\1第\2页", text)
+    return text
+
+
 def _report_compact_text(value: object, limit: int = 240) -> str:
     """压缩打印报告中的长文本，不改变网页端原始结果。"""
-    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = re.sub(r"\s+", " ", _clean_report_text(value)).strip()
     return text if len(text) <= limit else f"{text[:limit - 1].rstrip()}…"
 
 

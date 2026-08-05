@@ -3306,7 +3306,7 @@ def _evidence_layers_json(item: dict) -> str:
         if not isinstance(value, dict):
             continue
         source = str(value.get("source") or "").strip()
-        if source not in {"text", "tencent_ocr", "local_ocr", "vision"}:
+        if source not in {"text", "tencent_ocr", "local_ocr", "vision", "score_calculation"}:
             continue
         checked = json.loads(_pages_json(value, "checked_pages", "checked_pages_json"))
         evidence = json.loads(_pages_json(value, "evidence_pages", "evidence_pages_json"))

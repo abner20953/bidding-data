@@ -12,8 +12,41 @@
   let hasCurrentRules = false;
   const defaultDocumentTitle = document.title;
   let completionTicker = null;
+  let cachedHighlights = [];
   const $ = (id) => document.getElementById(id);
   const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+  // 展示层统一清洗：去掉内部编号（SI-1/SI-2）、JSON 字段名记法（status=、suggested_score=）、
+  // 统一页码格式（第P55页 → 第55页）。只影响展示，不修改已保存结果。
+  const fieldNotationPattern = /\b(?:status|risk_level|evidence_quality|confidence|suggested_score|max_score|matched_count|needs_ocr|coverage_status|final_score|effective_score)\s*=\s*[^，。；;：:\s]+/g;
+  function normalizePageRefs(value) {
+    let text = String(value || '');
+    text = text.replace(/第P(\d+)-P?(\d+)页/g, '第$1-$2页');
+    text = text.replace(/第P(\d+)页/g, '第$1页');
+    text = text.replace(/(^|[^0-9A-Za-z])P(\d+)-P?(\d+)(?![0-9A-Za-z])/g, '$1第$2-$3页');
+    text = text.replace(/(^|[^0-9A-Za-z])P(\d+)(?![0-9A-Za-z])/g, '$1第$2页');
+    return text;
+  }
+  function cleanDisplayText(value) {
+    let text = String(value || '').replace(/\bSI-\d+\b/g, '').replace(/[（(]\s*[）)]/g, '').replace(fieldNotationPattern, '').replace(/计分过程：/g, '');
+    return normalizePageRefs(text).replace(/\s+/g, ' ').trim();
+  }
+  function sortedPageList(pages) {
+    return Array.isArray(pages) ? pages.filter((page) => Number.isInteger(page) && page > 0).sort((a, b) => a - b) : [];
+  }
+  function ruleTitle(result) {
+    const title = String(result?.title || '').trim();
+    return title || conciseText(String(result?.check_rule || ''), 48);
+  }
+  function ruleCellHtml(result) {
+    const title = escapeHtml(ruleTitle(result));
+    const full = String(result?.check_rule || '').trim();
+    const short = String(result?.title || '').trim();
+    if (full && full !== short) {
+      return `${title}<details class="rule-full"><summary>完整规则</summary><span>${escapeHtml(full)}</span></details>`;
+    }
+    return title;
+  }
+  const highlightLevelRank = {critical:3, high:2, attention:1, none:0};
   async function request(path, options = {}) { let response; try { response = await fetch(`${api}${path}`, options); } catch (_) { throw new Error('无法连接本地服务，请确认程序仍在运行后刷新页面重试'); } let data; try { data = await response.json(); } catch (_) { data = {error:`请求失败（HTTP ${response.status}）`}; } if (!response.ok) throw new Error(data.error || '请求失败'); return data; }
   // 检查规则已单列展示；结果区只保留投标文件事实与 AI 判断，避免模型偶尔再复述规则。
   function resultExplanation(value, rule) {
@@ -46,26 +79,29 @@
     // 最新的图片/ OCR 已是对文字阶段的补充，优先展示；原始完整内容仍可展开追溯。
     const preferred = [...layers].reverse().find((item) => ['vision', 'tencent_ocr', 'local_ocr'].includes(item.source));
     if (!preferred) return '';
-    const pages = Array.isArray(preferred.evidence_pages) && preferred.evidence_pages.length
-      ? preferred.evidence_pages : (Array.isArray(preferred.checked_pages) ? preferred.checked_pages : []);
+    const pages = sortedPageList(
+      Array.isArray(preferred.evidence_pages) && preferred.evidence_pages.length
+        ? preferred.evidence_pages : (Array.isArray(preferred.checked_pages) ? preferred.checked_pages : [])
+    );
     const source = {vision:'图片识别', tencent_ocr:'腾讯 OCR', local_ocr:'本地 RapidOCR'}[preferred.source] || '补充识别';
     const pageText = pages.length ? `（${pages.map((page) => `P${page}`).join('、')}）` : '';
     const rawSummary = result?.max_score != null ? compactObjectiveOcrText(preferred.summary) : preferred.summary;
-    const summary = conciseText(rawSummary, result?.max_score != null ? 110 : 150);
+    const summary = conciseText(cleanDisplayText(rawSummary), result?.max_score != null ? 110 : 150);
     return `${source}${pageText}${summary ? `：${summary}` : '：已完成关键页核验。'}`;
   }
   function conciseResultEvidence(result) {
-    return evidenceLayerSummary(result) || conciseText(result?.evidence, 180) || '-';
+    return evidenceLayerSummary(result) || conciseText(cleanDisplayText(result?.evidence), 180) || '-';
   }
   function conciseResultReason(result) {
+    const raw = result?.max_score != null ? compactObjectiveOcrText(result?.reason) : result?.reason;
+    const cleaned = cleanDisplayText(raw);
+    if (cleaned) return conciseText(cleaned, result?.max_score != null ? 120 : 150);
     const status = String(result?.vision_status || '');
-    const verification = /(?:applied|partial|uncovered|conflict)/.test(status) ? conciseText(result?.vision_message, 120) : '';
-    const reason = result?.max_score != null ? compactObjectiveOcrText(result?.reason) : result?.reason;
-    return verification || conciseText(reason, result?.max_score != null ? 120 : 150);
+    return /(?:applied|partial|uncovered|conflict)/.test(status) ? conciseText(cleanDisplayText(result?.vision_message), 120) : '';
   }
   function rawResultDetailHtml(result) {
-    const evidence = String(result?.evidence || '').trim();
-    const reason = String(result?.reason || '').trim();
+    const evidence = cleanDisplayText(result?.evidence);
+    const reason = cleanDisplayText(result?.reason);
     if (!evidence && !reason) return '';
     return `<details class="evidence-chain"><summary>查看完整文字结论</summary>${evidence ? `<div class="evidence-layer"><strong>文字证据</strong><span>${escapeHtml(evidence)}</span></div>` : ''}${reason ? `<div class="evidence-layer"><strong>文字理由</strong><span>${escapeHtml(reason)}</span></div>` : ''}</details>`;
   }
@@ -379,8 +415,8 @@
       ocr_vision_conflict:'⚠ OCR后图片检查发现疑似字段冲突',
     };
     const label = [ocrStatus, multimodalStatus].filter((item) => item !== 'not_requested').map((item) => labels[item] || '图片识别状态').join('；');
-    const pages = Array.isArray(result?.vision_pages) ? result.vision_pages.filter((page) => Number.isInteger(page) && page > 0).map((page) => `P${page}`).join('、') : '';
-    const evidencePages = Array.isArray(result?.vision_evidence_pages) ? result.vision_evidence_pages.filter((page) => Number.isInteger(page) && page > 0).map((page) => `P${page}`).join('、') : '';
+    const pages = sortedPageList(result?.vision_pages).map((page) => `P${page}`).join('、');
+    const evidencePages = sortedPageList(result?.vision_evidence_pages).map((page) => `P${page}`).join('、');
     const meta = [result?.vision_model, pages ? `检查页：${pages}` : '', evidencePages ? `证据页：${evidencePages}` : ''].filter(Boolean).join(' · ');
     const message = String(result?.vision_message || '').trim();
     return `<div class="vision-result vision-result-${escapeHtml(status)}"><strong>${escapeHtml(label)}</strong>${meta ? `<span>${escapeHtml(meta)}</span>` : ''}${message ? `<small>${escapeHtml(message)}</small>` : ''}</div>`;
@@ -404,12 +440,12 @@
   function evidenceChainHtml(result) {
     const layers = Array.isArray(result?.evidence_layers) ? result.evidence_layers.filter((item) => item && typeof item === 'object' && item.summary) : [];
     if (!layers.length) return '';
-    const labels = {text:'文字解析', tencent_ocr:'腾讯 OCR', local_ocr:'本地 RapidOCR', vision:'图片识别'};
+    const labels = {text:'文字解析', tencent_ocr:'腾讯 OCR', local_ocr:'本地 RapidOCR', vision:'图片识别', score_calculation:'计分过程'};
     return `<details class="evidence-chain"><summary>证据链详情</summary>${layers.map((layer) => {
-      const checked = Array.isArray(layer.checked_pages) ? layer.checked_pages.map((page) => `P${page}`).join('、') : '';
-      const evidence = Array.isArray(layer.evidence_pages) ? layer.evidence_pages.map((page) => `P${page}`).join('、') : '';
+      const checked = sortedPageList(layer.checked_pages).map((page) => `P${page}`).join('、');
+      const evidence = sortedPageList(layer.evidence_pages).map((page) => `P${page}`).join('、');
       const meta = [layer.service || layer.model || '', checked ? `检查页：${checked}` : '', evidence ? `证据页：${evidence}` : ''].filter(Boolean).join(' · ');
-      return `<div class="evidence-layer"><strong>${escapeHtml(labels[layer.source] || '补充证据')}</strong>${meta ? `<small>${escapeHtml(meta)}</small>` : ''}<span>${escapeHtml(layer.summary)}</span></div>`;
+      return `<div class="evidence-layer"><strong>${escapeHtml(labels[layer.source] || '补充证据')}</strong>${meta ? `<small>${escapeHtml(meta)}</small>` : ''}<span>${escapeHtml(cleanDisplayText(layer.summary))}</span></div>`;
     }).join('')}</details>`;
   }
   function scoreOcrHint(result) {
@@ -444,10 +480,36 @@
   function renderEvaluationHighlights(summaries) {
     const values = (summaries || []).filter((summary) => Array.isArray(summary.highlights) && summary.highlights.length);
     $('evaluation-highlights-panel').classList.toggle('hidden', !values.length);
-    $('evaluation-highlights').innerHTML = values.map((summary) => `<section class="evaluation-highlight-group"><h4>${escapeHtml(summary.bidder_name || '未命名投标人')}</h4>${summary.headline ? `<p>${escapeHtml(summary.headline)}</p>` : ''}<ul>${summary.highlights.map((item) => `<li class="evaluation-highlight-${escapeHtml(item.level || 'attention')}"><strong>${escapeHtml(item.keyword)}</strong><span>${escapeHtml(item.conclusion)}</span>${item.basis ? `<small>${escapeHtml(item.basis)}</small>` : ''}</li>`).join('')}</ul></section>`).join('');
+    cachedHighlights = values;
+    if (!values.length) return;
+    const counts = {critical:0, high:0, attention:0};
+    values.forEach((summary) => (summary.highlights || []).forEach((item) => { if (counts[item.level] != null) counts[item.level] += 1; }));
+    const total = values.reduce((sum, summary) => sum + (summary.highlights || []).length, 0);
+    const stats = [];
+    if (counts.critical) stats.push(`${counts.critical} 条高风险`);
+    if (counts.high) stats.push(`${counts.high} 条重点关注`);
+    if (counts.attention) stats.push(`${counts.attention} 条关注项`);
+    const statsNode = $('evaluation-highlights-stats');
+    if (statsNode) statsNode.textContent = `共 ${total} 条重要结论：${stats.join('、') || '无'}。按风险从高到低排列，可切换只看高风险。`;
+    const highOnly = $('highlights-high-only')?.classList.contains('active');
+    const ordered = [...values].sort((a, b) => (highlightLevelRank[b.overall_level] || 0) - (highlightLevelRank[a.overall_level] || 0));
+    $('evaluation-highlights').innerHTML = ordered.map((summary) => {
+      const items = summary.highlights || [];
+      const criticalHigh = items.filter((item) => item.level === 'critical' || item.level === 'high');
+      const attention = items.filter((item) => item.level === 'attention');
+      const visible = highOnly ? criticalHigh : items;
+      const listHtml = (list) => list.map((item) => {
+        const basis = cleanDisplayText(item.basis);
+        return `<li class="evaluation-highlight-${escapeHtml(item.level || 'attention')}"><strong>${escapeHtml(item.keyword)}</strong><span>${escapeHtml(cleanDisplayText(item.conclusion))}</span>${basis ? `<small>${escapeHtml(basis)}</small>` : ''}</li>`;
+      }).join('');
+      const headline = cleanDisplayText(summary.headline);
+      const attentionBlock = (!highOnly && attention.length)
+        ? `<details class="evaluation-highlight-more"><summary>另有 ${attention.length} 条关注项</summary><ul>${listHtml(attention)}</ul></details>` : '';
+      return `<section class="evaluation-highlight-group"><h4>${escapeHtml(summary.bidder_name || '未命名投标人')}</h4>${headline ? `<p>${escapeHtml(headline.length > 60 ? `${headline.slice(0, 60)}…` : headline)}</p>` : ''}<ul>${listHtml(visible)}</ul>${attentionBlock}</section>`;
+    }).join('');
   }
-  async function refreshReview() { if (!activeProject) return; const data = await request(`/projects/${activeProject}/review-results`); renderEvaluationHighlights(data.review_run?.highlights || []); const groups = groupByBidder(visibleCompletedResults(data.review_run, data.results)); $('review-results').innerHTML = groups.length ? `${partialResultNotice(data.review_run)}<p class="hint">以下为 AI 基于电子文件生成的审查建议；主表展示结论摘要，完整文字和取证过程可展开查看。</p>${groups.map(([bidder, results]) => { const ordered = [...results].sort((left, right) => { const leftOcr = left.status === 'ocr_required' ? 1 : 0; const rightOcr = right.status === 'ocr_required' ? 1 : 0; return leftOcr - rightOcr || riskRank(right.risk_level) - riskRank(left.risk_level); }); return `<details class="result-group"><summary>投标人：${escapeHtml(bidder)}（${ordered.length} 项）</summary><div class="review-result-table-wrap"><table class="review-result-table"><colgroup><col class="review-col-category"><col class="review-col-rule"><col class="review-col-advice"><col class="review-col-risk"><col class="review-col-evidence"></colgroup><thead><tr><th>分类</th><th>检查规则</th><th>AI建议</th><th>风险</th><th>关键证据与理由</th></tr></thead><tbody>${ordered.map((r) => `<tr><td><span class="tag">${categoryLabel(r.category)}</span></td><td>${escapeHtml(r.check_rule || r.title)}</td><td>${escapeHtml(statusLabel(r.status))}<br><small>置信度：${escapeHtml(confidenceLabel(r.confidence))}；证据：${escapeHtml(evidenceQualityLabel(r.evidence_quality))}</small>${visionBadgeHtml(r)}</td><td>${escapeHtml(riskLabel(r.status === 'ocr_required' ? 'low' : r.risk_level))}</td><td><div class="result-evidence">${escapeHtml(resultExplanation(conciseResultEvidence(r), r) || '-')}</div><small class="result-evidence">${escapeHtml(resultExplanation(conciseResultReason(r), r))}</small>${visionStatusHtml(r)}${evidenceChainHtml(r)}${rawResultDetailHtml(r)}</td></tr>`).join('')}</tbody></table></div></details>`; }).join('')}` : `<p class="muted">${data.review_run ? '正在生成审查结果。' : '本项目没有审查规则。'}</p>`; }
-  async function refreshScores() { for (const type of ['objective','subjective']) { const data = await request(`/projects/${activeProject}/score-results/${type}`); const target = $(`${type}-results`); const groups = groupByBidder(visibleCompletedResults(data.score_run, data.results)); target.innerHTML = groups.length ? `${partialResultNotice(data.score_run)}<p class="hint">以下为 AI 基于电子文件生成的评分建议；扫描件证据未覆盖时不会将“未找到”误作 0 分，主表会提示待 OCR 后评分。</p>${groups.map(([bidder, results]) => `<details class="result-group"><summary>投标人：${escapeHtml(bidder)}（${results.length} 项）</summary><table><thead><tr><th>检查规则</th><th>AI 建议得分</th><th>满分</th><th>置信度</th><th>关键证据与理由</th></tr></thead><tbody>${results.map((r) => `<tr><td>${escapeHtml(r.check_rule || r.title)}${scoreOcrHint(r)}</td><td>${escapeHtml(scoreSuggestionLabel(r))}</td><td>${r.max_score ?? '-'}</td><td>${escapeHtml(confidenceLabel(r.confidence))}${visionBadgeHtml(r)}</td><td><div class="result-evidence">${escapeHtml(resultExplanation(conciseResultEvidence(r), r) || '-')}</div><small class="result-evidence">${escapeHtml(resultExplanation(conciseResultReason(r), r))}</small>${scoreVerificationSummary(r)}${evidenceChainHtml(r)}${rawResultDetailHtml(r)}</td></tr>`).join('')}</tbody></table></details>`).join('')}` : `<p class="muted">${data.score_run ? '正在生成评分结果。' : `本项目没有${type === 'objective' ? '客观分' : '主观分'}规则。`}</p>`; } }
+  async function refreshReview() { if (!activeProject) return; const data = await request(`/projects/${activeProject}/review-results`); renderEvaluationHighlights(data.review_run?.highlights || []); const groups = groupByBidder(visibleCompletedResults(data.review_run, data.results)); $('review-results').innerHTML = groups.length ? `${partialResultNotice(data.review_run)}<p class="hint">以下为 AI 基于电子文件生成的审查建议；主表展示结论摘要，完整文字和取证过程可展开查看。</p>${groups.map(([bidder, results]) => { const ordered = [...results].sort((left, right) => { const leftOcr = left.status === 'ocr_required' ? 1 : 0; const rightOcr = right.status === 'ocr_required' ? 1 : 0; return leftOcr - rightOcr || riskRank(right.risk_level) - riskRank(left.risk_level); }); return `<details class="result-group"><summary>投标人：${escapeHtml(bidder)}（${ordered.length} 项）</summary><div class="review-result-table-wrap"><table class="review-result-table"><colgroup><col class="review-col-category"><col class="review-col-rule"><col class="review-col-advice"><col class="review-col-risk"><col class="review-col-evidence"></colgroup><thead><tr><th>分类</th><th>检查规则</th><th>AI建议</th><th>风险</th><th>关键证据与理由</th></tr></thead><tbody>${ordered.map((r) => `<tr><td><span class="tag">${categoryLabel(r.category)}</span></td><td>${ruleCellHtml(r)}</td><td>${escapeHtml(statusLabel(r.status))}<br><small>置信度：${escapeHtml(confidenceLabel(r.confidence))}；证据：${escapeHtml(evidenceQualityLabel(r.evidence_quality))}</small>${visionBadgeHtml(r)}</td><td>${escapeHtml(riskLabel(r.status === 'ocr_required' ? 'low' : r.risk_level))}</td><td><div class="result-evidence">${escapeHtml(resultExplanation(conciseResultEvidence(r), r) || '-')}</div><small class="result-evidence">${escapeHtml(resultExplanation(conciseResultReason(r), r))}</small>${visionStatusHtml(r)}${evidenceChainHtml(r)}${rawResultDetailHtml(r)}</td></tr>`).join('')}</tbody></table></div></details>`; }).join('')}` : `<p class="muted">${data.review_run ? '正在生成审查结果。' : '本项目没有审查规则。'}</p>`; }
+  async function refreshScores() { for (const type of ['objective','subjective']) { const data = await request(`/projects/${activeProject}/score-results/${type}`); const target = $(`${type}-results`); const groups = groupByBidder(visibleCompletedResults(data.score_run, data.results)); target.innerHTML = groups.length ? `${partialResultNotice(data.score_run)}<p class="hint">以下为 AI 基于电子文件生成的评分建议；扫描件证据未覆盖时不会将“未找到”误作 0 分，主表会提示待 OCR 后评分。</p>${groups.map(([bidder, results]) => `<details class="result-group"><summary>投标人：${escapeHtml(bidder)}（${results.length} 项）</summary><table><thead><tr><th>检查规则</th><th>AI 建议得分</th><th>满分</th><th>置信度</th><th>关键证据与理由</th></tr></thead><tbody>${results.map((r) => `<tr><td>${ruleCellHtml(r)}${scoreOcrHint(r)}</td><td>${escapeHtml(scoreSuggestionLabel(r))}</td><td>${r.max_score ?? '-'}</td><td>${escapeHtml(confidenceLabel(r.confidence))}${visionBadgeHtml(r)}</td><td><div class="result-evidence">${escapeHtml(resultExplanation(conciseResultEvidence(r), r) || '-')}</div><small class="result-evidence">${escapeHtml(resultExplanation(conciseResultReason(r), r))}</small>${scoreVerificationSummary(r)}${evidenceChainHtml(r)}${rawResultDetailHtml(r)}</td></tr>`).join('')}</tbody></table></details>`).join('')}` : `<p class="muted">${data.score_run ? '正在生成评分结果。' : `本项目没有${type === 'objective' ? '客观分' : '主观分'}规则。`}</p>`; } }
   $('create-project').onclick = () => $('project-form').classList.remove('hidden'); $('cancel-project').onclick = () => $('project-form').classList.add('hidden');
   $('save-project').onclick = async () => { try { const data = await request('/projects', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name:$('project-name').value, project_number:$('project-number').value, section_name:$('section-name').value, password:$('project-password').value})}); $('project-password').value = ''; await loadProjects(); openProject(data.project.project_id); } catch (error) { alert(error.message); } };
   $('back-projects').onclick = () => { activeProject = null; stopPolling(); $('workspace').classList.add('hidden'); $('projects-panel').classList.remove('hidden'); loadProjects(); };
@@ -471,6 +533,8 @@
   $('file-drop-zone').addEventListener('drop', (event) => { const files = event.dataTransfer?.files; if (!files?.length) return; if (files.length > 1) alert('请一次拖入一个文件，并分别选择对应的文件角色和投标人。'); setSelectedUploadFile(files[0]); });
   $('upload-file').onclick = async () => { const file = selectedUploadFile || $('file-input').files[0]; const role = $('file-role').value; const bidderName = $('bidder-name').value.trim(); if (!file) return alert('请选择或拖入文件'); if (role === 'bid' && !bidderName) { $('bidder-name').focus(); return alert('上传投标文件时必须填写投标人名称'); } const form = new FormData(); form.append('file', file); form.append('role', role); form.append('bidder_name', bidderName); const button = $('upload-file'); button.disabled = true; try { await uploadFileWithProgress(form, file); updateUploadProgress(100, '上传完成，正在刷新文件清单…', 'success'); clearSelectedUploadFile(); $('bidder-name').value = ''; await refreshProject(); } catch (error) { updateUploadProgress(0, `上传失败：${error.message}`, 'error'); alert(error.message); } finally { button.disabled = false; } };
   $('parse-documents').onclick = () => queue('parse_documents'); $('start-compare').onclick = () => queue('compare_documents', {force_rerun:true});
+  const highlightToggle = $('highlights-high-only');
+  if (highlightToggle) highlightToggle.onclick = () => { highlightToggle.classList.toggle('active'); renderEvaluationHighlights(cachedHighlights); };
   $('extract-rules').onclick = async () => { if (hasCurrentRules && !confirm('重新提取会以新的 AI 结果和全部通用规则替换当前待确认规则集；通用规则按规则库的默认选择状态进入项目。已确认的历史规则和结果不会删除，是否继续？')) return; try { const profile_id = $('rule-profile').value; await request(`/projects/${activeProject}/tasks`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({task_type:'extract_rules', profile_id, force_rerun:true})}); await refreshProject(); } catch (error) { alert(error.message); } };
   function updateManualRuleScoringFields() { const category = $('manual-rule-category').value; const isScoring = ['objective', 'subjective'].includes(category); $('manual-rule-max-score-field').classList.toggle('hidden', !isScoring); $('manual-rule-max-score').required = isScoring; $('manual-rule-score-kind-field').classList.toggle('hidden', category !== 'objective'); }
   $('manual-rule-category').onchange = updateManualRuleScoringFields;
@@ -537,7 +601,7 @@
   $('save-ocr-configuration').onclick = async () => { try { const services = {}; $('ocr-services').querySelectorAll('.ocr-service-enabled').forEach((input) => { const limit = $('ocr-services').querySelector(`.ocr-service-limit[data-service="${input.dataset.service}"]`); services[input.dataset.service] = {enabled:input.checked, monthly_limit:Number(limit?.value || 900)}; }); await request('/tencent-ocr-configuration', {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({tencent_enabled:$('tencent-ocr-enabled').checked, region:$('ocr-region').value, secret_id:$('ocr-secret-id').value, secret_key:$('ocr-secret-key').value, services})}); $('ocr-secret-id').value = ''; $('ocr-secret-key').value = ''; await loadProfiles(); } catch (error) { alert(error.message); } };
   $('test-ocr-configuration').onclick = async () => { try { const data = await request('/tencent-ocr-configuration/test', {method:'POST'}); alert(data.message); } catch (error) { alert(error.message); } };
   $('open-report').onclick = () => window.open(`/pingbiao/projects/${activeProject}/report`, '_blank', 'noopener');
-  $('export-score-csv').onclick = async () => { try { const [objective, subjective] = await Promise.all(['objective', 'subjective'].map((type) => request(`/projects/${activeProject}/score-results/${type}`))); const rows = [['评分类型','投标人','检查规则','AI建议得分','满分','置信度','证据','理由']]; for (const [type, data] of [['客观分', objective], ['主观分', subjective]]) for (const item of data.results) { const compactOcr = type === '客观分'; rows.push([type, item.bidder_name || item.original_name, item.check_rule || item.title, item.suggested_score ?? '', item.max_score ?? '', confidenceLabel(item.confidence), compactOcr ? compactObjectiveOcrText(item.evidence) : (item.evidence || ''), compactOcr ? compactObjectiveOcrText(item.reason) : (item.reason || '')]); } const csv = '\ufeff' + rows.map((row) => row.map((cell) => `"${String(cell).replaceAll('"', '""')}"`).join(',')).join('\r\n'); const link = document.createElement('a'); link.href = URL.createObjectURL(new Blob([csv], {type:'text/csv;charset=utf-8'})); link.download = '评标评分汇总.csv'; link.click(); URL.revokeObjectURL(link.href); } catch (error) { alert(error.message); } };
+  $('export-score-csv').onclick = async () => { try { const [objective, subjective] = await Promise.all(['objective', 'subjective'].map((type) => request(`/projects/${activeProject}/score-results/${type}`))); const rows = [['评分类型','投标人','检查规则','AI建议得分','满分','置信度','证据','理由']]; for (const [type, data] of [['客观分', objective], ['主观分', subjective]]) for (const item of data.results) { const compactOcr = type === '客观分'; rows.push([type, item.bidder_name || item.original_name, ruleTitle(item), item.suggested_score ?? '', item.max_score ?? '', confidenceLabel(item.confidence), compactOcr ? cleanDisplayText(compactObjectiveOcrText(item.evidence)) : cleanDisplayText(item.evidence), compactOcr ? cleanDisplayText(compactObjectiveOcrText(item.reason)) : cleanDisplayText(item.reason)]); } const csv = '\ufeff' + rows.map((row) => row.map((cell) => `"${String(cell).replaceAll('"', '""')}"`).join(',')).join('\r\n'); const link = document.createElement('a'); link.href = URL.createObjectURL(new Blob([csv], {type:'text/csv;charset=utf-8'})); link.download = '评标评分汇总.csv'; link.click(); URL.revokeObjectURL(link.href); } catch (error) { alert(error.message); } };
   document.querySelectorAll('[data-tab]').forEach((button) => button.onclick = () => { if (button.disabled) return; document.querySelectorAll('[data-tab]').forEach((item) => item.classList.toggle('active', item === button)); document.querySelectorAll('[data-pane]').forEach((item) => item.classList.toggle('active', item.dataset.pane === button.dataset.tab)); });
   Promise.all([loadProjects(), loadProfiles()]).catch((error) => { $('projects').textContent = error.message; });
 })();

@@ -2868,8 +2868,10 @@ def _review_result_from_model(item: dict, rule_id: str, status: str) -> dict:
         if not str(item.get("reason", "")).strip():
             item = {**item, "reason": "该规则的关键证据需要 OCR 识别后才能判定。"}
     auto_ready = status == "satisfied" and risk == "low" and confidence == "high" and evidence_quality == "sufficient"
-    return {"rule_id": rule_id, "status": status, "evidence": _clean_model_text(item.get("evidence"))[:2000],
-            "page_hint": _clean_model_text(item.get("page_hint"))[:80] or None, "reason": _clean_model_text(item.get("reason"))[:2000],
+    return {"rule_id": rule_id, "status": status,
+            "evidence": _truncate_field(_clean_model_text(item.get("evidence")), 2000),
+            "page_hint": _clean_model_text(item.get("page_hint"))[:80] or None,
+            "reason": _truncate_field(_clean_model_text(item.get("reason")), 2000),
             "risk_level": risk, "confidence": confidence, "evidence_quality": evidence_quality,
             "automation_status": "ready_for_batch_confirmation" if auto_ready else "needs_review",
             "requires_review": not auto_ready,
@@ -2894,15 +2896,37 @@ def _score_payload(rules: list[dict]) -> list[dict]:
     return payload
 
 
+_INTERNAL_ID_PATTERN = re.compile(r"(?<![0-9A-Za-z])SI-\d+(?![0-9A-Za-z])")
+_FIELD_NOTATION_PATTERN = re.compile(
+    r"\b(?:status|risk_level|evidence_quality|confidence|suggested_score|max_score|"
+    r"matched_count|needs_ocr|coverage_status|final_score|effective_score)\s*=\s*[^，。；;：:\s]+"
+)
+_TRUNCATE_MARKER = "…（内容过长已省略）"
+
+
 def _clean_model_text(value: object) -> str:
     """移除只供内部编排使用的标记，保留模型的业务判断。"""
     text = str(value or "")
     text = re.sub(r"\bcontext_unmatched\s*=\s*true\b[，,。；;：:\s]*", "", text, flags=re.IGNORECASE)
+    # 评分项兜底编号（SI-1/SI-2）与 JSON 字段名记法（status=、suggested_score= 等）
+    # 只用于内部编排，用户界面无法理解；一律从结论文本中移除，结构化字段仍保留原始值。
+    text = _INTERNAL_ID_PATTERN.sub("", text)
+    text = _FIELD_NOTATION_PATTERN.sub("", text)
+    text = re.sub(r"[（(]\s*[）)]", "", text)
     # OCR 对不可辨认字符会输出替换符（U+FFFD）。连续乱码没有阅读价值，折叠为省略号；
     # 单个替换符直接移除，避免证据里出现无法理解的碎片。
     text = re.sub(r"\ufffd{2,}", "…", text)
     text = text.replace("\ufffd", "")
     return text.strip()
+
+
+def _truncate_field(text: object, limit: int) -> str:
+    """长字段截断时保留明确的省略标记，避免用户误以为展示的就是完整结论。"""
+    value = str(text or "").strip()
+    if len(value) <= limit:
+        return value
+    keep = max(0, limit - len(_TRUNCATE_MARKER))
+    return f"{value[:keep].rstrip()}{_TRUNCATE_MARKER}"
 
 
 def _enum_text(value: object, allowed: set[str], default: str) -> str:
@@ -3336,6 +3360,10 @@ def _score_evidence_text(raw: dict) -> str:
                 continue
             name = _clean_model_text(item.get("name") or item.get("project_name") or f"证据{index}")
             page = _clean_model_text(item.get("page_hint") or item.get("page"))
+            # 页码统一为“第N页/第N-M页”，去掉模型偶发的 P55、第P55 前缀写法。
+            page_numbers = re.findall(r"\d+", page)
+            if page_numbers:
+                page = "-".join(page_numbers)
             validity = labels.get(str(item.get("validity") or ""), str(item.get("validity") or ""))
             reason = _clean_model_text(item.get("reason"))
             detail = "；".join(value for value in (validity, reason) if value)
@@ -3348,10 +3376,10 @@ def _score_evidence_text(raw: dict) -> str:
 
 
 def _score_reason_text(raw: dict, suggested: float | None) -> str:
-    calculation = _clean_model_text(raw.get("calculation"))
     reason = _clean_model_text(raw.get("reason"))
-    text = _merge_reason_text(f"计分过程：{calculation}" if calculation else "", reason)
-    return text or ("AI未返回完整理由。" if suggested is not None else "模型未返回可用建议分。")
+    # 计分过程不再并入 reason：由 _score_result_from_model 单独写入证据层，
+    # reason 只保留判断理由，避免“计分过程：SI-1…”顶到主表首句。
+    return reason or ("AI未返回完整理由。" if suggested is not None else "模型未返回可用建议分。")
 
 
 _SCORE_CALCULATION_RESULT_PATTERN = re.compile(r"(?:=|＝)\s*(\d+(?:\.\d+)?)\s*分?")
@@ -3406,7 +3434,7 @@ def _reconcile_score_reason(reason: object, suggested: float | None, *, adjusted
         retained.append(piece.strip())
     origin = f"；依据{source}已确认的材料" if source else ""
     retained.append(f"最终建议分：{_format_score(float(suggested))}分{origin}。")
-    return " ".join(dict.fromkeys(retained))[:2000]
+    return _truncate_field(" ".join(dict.fromkeys(retained)), 2000)
 
 
 def _normalise_score_results(output: object, rule_payload: list[dict], score_type: str) -> list[dict]:
@@ -3434,19 +3462,29 @@ def _score_result_from_model(rule_id: str, suggested: float | None, max_score: f
         raw = {**raw, "needs_ocr": True}
     confidence = _enum_text(raw.get("confidence"), {"high", "medium", "low"}, "medium")
     needs_ocr = raw.get("needs_ocr") is True
-    evidence = _score_evidence_text(raw)
+    evidence = _truncate_field(_score_evidence_text(raw), 2000)
     has_evidence = bool(evidence)
     auto_ready = suggested is not None and confidence == "high" and has_evidence and not needs_ocr
     reason = _reconcile_score_reason(_score_reason_text(raw, suggested), suggested)
-    return {"rule_id": rule_id, "suggested_score": suggested, "final_score": None,
-            "effective_score": suggested if auto_ready else None, "max_score": max_score or None,
-            "evidence": evidence[:2000],
-            "reason": reason,
-            # 仅在当前任务内供图片识别定位使用；存储层会忽略该临时字段，避免改变历史结果 API。
-            "visual_page_candidates": _score_visual_page_candidates(raw),
-            "confidence": confidence, "automation_status": "ready_for_batch_confirmation" if auto_ready else "needs_review",
-            "requires_review": not auto_ready,
-            "review_reason": "" if auto_ready else "未得到高置信、可引用的建议分，需人工复核。"}
+    result = {
+        "rule_id": rule_id, "suggested_score": suggested, "final_score": None,
+        "effective_score": suggested if auto_ready else None, "max_score": max_score or None,
+        "evidence": evidence,
+        "reason": reason,
+        # 仅在当前任务内供图片识别定位使用；存储层会忽略该临时字段，避免改变历史结果 API。
+        "visual_page_candidates": _score_visual_page_candidates(raw),
+        "confidence": confidence, "automation_status": "ready_for_batch_confirmation" if auto_ready else "needs_review",
+        "requires_review": not auto_ready,
+        "review_reason": "" if auto_ready else "未得到高置信、可引用的建议分，需人工复核。",
+    }
+    # 计分过程以结构化证据层保留（前端证据链可展开），不再与判断理由混在同一字段。
+    calculation = _clean_model_text(raw.get("calculation"))
+    if calculation:
+        result = _append_evidence_layer(
+            result, source="score_calculation", summary=calculation,
+            checked_pages=[], evidence_pages=[], service="", model="",
+        )
+    return result
 
 
 def _is_invalid_json_model_response(exc: ValueError) -> bool:
@@ -5839,9 +5877,9 @@ def _merge_supplement_text(base: object, supplement: object, limit: int = 2000, 
     base_text = _clean_model_text(base)
     supplement_text = _clean_model_text(supplement)
     if not base_text:
-        return supplement_text[:limit]
+        return _truncate_field(supplement_text, limit)
     if not supplement_text:
-        return base_text[:limit]
+        return _truncate_field(base_text, limit)
     separator = "\n"
     if len(base_text) + len(separator) + len(supplement_text) <= limit:
         return separator.join((supplement_text, base_text) if supplement_first else (base_text, supplement_text))
@@ -5854,7 +5892,7 @@ def _merge_supplement_text(base: object, supplement: object, limit: int = 2000, 
         clipped_base = clipped_base[:-1].rstrip() + "…"
     clipped_supplement = supplement_text[:supplement_budget].rstrip()
     values = (clipped_supplement, clipped_base) if supplement_first else (clipped_base, clipped_supplement)
-    return separator.join(value for value in values if value)[:limit]
+    return _truncate_field(separator.join(value for value in values if value), limit)
 
 
 _REASON_LAYER_PREFIX_PATTERN = re.compile(r"【(?:腾讯OCR|本地OCR|OCR|图片识别)[^】]*】")
@@ -5880,7 +5918,7 @@ def _merge_reason_text(base: object, supplement: object, limit: int = 2000, *,
                 continue
             seen.add(signature)
             retained.append(sentence)
-    return "\n".join(retained)[:limit]
+    return _truncate_field("\n".join(retained), limit)
 
 
 _OCR_TABLE_HEADER_FRAGMENT_PATTERN = re.compile(
@@ -8642,11 +8680,46 @@ def _evaluation_highlight_candidates(app, project_id: str) -> tuple[list[dict], 
         values.append({
             "document_id": group["document_id"], "bidder_name": group["bidder_name"],
             "candidates": [
-                {key: value for key, value in item.items() if not key.startswith("_")}
+                _highlight_display_candidate(item)
                 for item in ordered
             ],
         })
     return values, allowed
+
+
+_HIGHLIGHT_STATUS_LABELS = {
+    "satisfied": "满足", "not_satisfied": "不满足", "partial": "部分满足",
+    "not_found": "未找到证据", "manual": "需人工判断", "ocr_required": "需 OCR 后判定",
+}
+_HIGHLIGHT_RISK_LABELS = {"high": "高", "medium": "中", "low": "低"}
+_HIGHLIGHT_EVIDENCE_LABELS = {"sufficient": "充分", "limited": "有限", "missing": "缺失"}
+_HIGHLIGHT_CONFIDENCE_LABELS = {"high": "高", "medium": "中", "low": "低"}
+
+
+def _highlight_display_candidate(item: dict) -> dict:
+    """把内部英文状态字段翻译成中文描述后再交给提炼模型，避免模型照抄
+    status=/risk_level=/evidence_quality= 等 JSON 字段名泄漏到用户可见结论。"""
+    value: dict[str, object] = {
+        "type": item.get("type"),
+        "category": item.get("category"),
+        "title": item.get("title"),
+        "check_rule": item.get("check_rule"),
+    }
+    if item.get("type") == "score":
+        value["suggested_score"] = item.get("suggested_score")
+        value["max_score"] = item.get("max_score")
+    else:
+        value["status_label"] = _HIGHLIGHT_STATUS_LABELS.get(
+            str(item.get("status")), str(item.get("status") or ""))
+        value["risk_label"] = _HIGHLIGHT_RISK_LABELS.get(
+            str(item.get("risk_level")), str(item.get("risk_level") or ""))
+        value["confidence_label"] = _HIGHLIGHT_CONFIDENCE_LABELS.get(
+            str(item.get("confidence")), str(item.get("confidence") or ""))
+        value["evidence_quality_label"] = _HIGHLIGHT_EVIDENCE_LABELS.get(
+            str(item.get("evidence_quality")), str(item.get("evidence_quality") or ""))
+    value["evidence"] = _clean_model_text(item.get("evidence"))[:300]
+    value["reason"] = _clean_model_text(item.get("reason"))[:220]
+    return {key: val for key, val in value.items() if val not in (None, "")}
 
 
 def _normalise_evaluation_highlights(parsed: dict, candidates: list[dict],
@@ -8667,7 +8740,8 @@ def _normalise_evaluation_highlights(parsed: dict, candidates: list[dict],
         seen_rule_ids: set[str] = set()
         raw_highlights = summary.get("highlights")
         for item in raw_highlights if isinstance(raw_highlights, list) else []:
-            if not isinstance(item, dict) or len(highlights) >= 5:
+            # 每家最多 3 条，避免汇总结论面板信息过载。
+            if not isinstance(item, dict) or len(highlights) >= 3:
                 continue
             rule_id = str(item.get("rule_id") or "")
             candidate = allowed.get((document_id, rule_id))
@@ -8684,9 +8758,9 @@ def _normalise_evaluation_highlights(parsed: dict, candidates: list[dict],
             # 高风险；除非上游规则已经给出其他实质性不响应证据。
             if "照抄" in str(candidate.get("title") or "") and level in {"critical", "high"}:
                 level = "attention"
-            keyword = re.sub(r"[*_`#]+", "", str(item.get("keyword") or "")).strip()[:16]
-            conclusion = re.sub(r"\s+", " ", str(item.get("conclusion") or "")).strip()[:80]
-            basis = re.sub(r"\s+", " ", str(item.get("basis") or "")).strip()[:140]
+            keyword = re.sub(r"[*_`#]+", "", _clean_model_text(item.get("keyword")))[:16]
+            conclusion = re.sub(r"\s+", " ", _clean_model_text(item.get("conclusion")))[:80]
+            basis = re.sub(r"\s+", " ", _clean_model_text(item.get("basis")))[:120]
             if not keyword or not conclusion:
                 continue
             highlights.append({
@@ -8695,7 +8769,9 @@ def _normalise_evaluation_highlights(parsed: dict, candidates: list[dict],
             })
         highlights.sort(key=lambda item: severity_rank[item["level"]], reverse=True)
         overall_level = highlights[0]["level"] if highlights else "none"
-        headline = re.sub(r"\s+", " ", str(summary.get("headline") or "")).strip()[:100]
+        headline = re.sub(r"\s+", " ", _clean_model_text(summary.get("headline"))).strip()
+        if len(headline) > 40:
+            headline = f"{headline[:40].rstrip()}…"
         values.append({
             "document_id": document_id, "bidder_name": bidder_names[document_id],
             "overall_level": overall_level, "headline": headline,

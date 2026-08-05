@@ -1778,6 +1778,70 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("…", cleaned)
         self.assertEqual(worker._clean_model_text("正常文字"), "正常文字")
 
+    def test_clean_model_text_strips_internal_ids_and_field_notation(self):
+        text = "计分过程：SI-1供货方案（第P55页）：建议有效；status=not_found、risk=high、evidence_quality=missing；suggested_score=0。"
+        cleaned = worker._clean_model_text(text)
+        self.assertNotIn("SI-1", cleaned)
+        self.assertNotIn("status=", cleaned)
+        self.assertNotIn("risk=", cleaned)
+        self.assertNotIn("suggested_score=", cleaned)
+        self.assertIn("供货方案", cleaned)
+        self.assertIn("第P55页", cleaned)
+
+    def test_truncate_field_adds_omission_marker(self):
+        self.assertEqual(worker._truncate_field("短文本", 2000), "短文本")
+        long_text = "长" * 2005
+        truncated = worker._truncate_field(long_text, 2000)
+        self.assertLessEqual(len(truncated), 2000)
+        self.assertIn("内容过长已省略", truncated)
+
+    def test_score_reason_text_keeps_calculation_out_of_reason(self):
+        result = worker._score_result_from_model(
+            "rule-1", 3.0, 9.0,
+            {"suggested_score": 3, "confidence": "high",
+             "calculation": "1项×3分=3分", "reason": "建议得3分"},
+        )
+        self.assertEqual(result["reason"], "建议得3分")
+        layers = [layer for layer in result.get("evidence_layers", []) if layer.get("source") == "score_calculation"]
+        self.assertEqual(len(layers), 1)
+        self.assertIn("1项×3分=3分", layers[0]["summary"])
+        self.assertNotIn("计分过程", result["reason"])
+
+    def test_score_evidence_text_normalizes_page_format(self):
+        raw = {
+            "matched_count": 1,
+            "evidence_items": [{"name": "项目一", "page_hint": "P55", "validity": "valid", "reason": "同类型"}],
+        }
+        evidence = worker._score_evidence_text(raw)
+        self.assertIn("第55页", evidence)
+        self.assertNotIn("第P55页", evidence)
+
+    def test_evaluation_highlights_caps_three_per_bidder_and_shortens_headline(self):
+        candidates = [{"document_id": "bid-a", "bidder_name": "甲公司", "candidates": []}]
+        allowed = {("bid-a", f"r{i}"): {"_critical_eligible": False} for i in range(1, 6)}
+        values = worker._normalise_evaluation_highlights({"summaries": [{
+            "document_id": "bid-a",
+            "headline": "这是一个非常长的总览句子，需要验证是否会被压缩到四十个字以内并且加上省略号表示内容未完整展示。",
+            "highlights": [
+                {"rule_id": f"r{i}", "level": "high", "keyword": f"事项{i}", "conclusion": f"结论{i}", "basis": "依据"} for i in range(1, 6)
+            ],
+        }]}, candidates, allowed)
+        self.assertEqual(len(values), 1)
+        self.assertLessEqual(len(values[0]["highlights"]), 3)
+        self.assertLessEqual(len(values[0]["headline"]), 41)
+
+    def test_highlight_display_candidate_translates_status_labels(self):
+        display = worker._highlight_display_candidate({
+            "type": "review", "category": "compliance", "title": "承诺函",
+            "status": "not_found", "risk_level": "high", "confidence": "high",
+            "evidence_quality": "missing", "evidence": "全文未发现", "reason": "需人工核验",
+        })
+        self.assertEqual(display["status_label"], "未找到证据")
+        self.assertEqual(display["risk_label"], "高")
+        self.assertEqual(display["evidence_quality_label"], "缺失")
+        self.assertNotIn("status", display)
+        self.assertNotIn("risk_level", display)
+
     def test_evaluation_can_queue_ocr_only_rule_without_multimodal_profile(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "扫描声明函")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
@@ -3315,7 +3379,12 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(results[0]["suggested_score"], 3.0)
         self.assertIn("AI共识别1项", results[0]["evidence"])
         self.assertIn("项目一", results[0]["evidence"])
-        self.assertIn("1项×3分=3分", results[0]["reason"])
+        calculation_layers = [
+            layer.get("summary") for layer in (results[0].get("evidence_layers") or [])
+            if layer.get("source") == "score_calculation"
+        ]
+        self.assertIn("1项×3分=3分", calculation_layers)
+        self.assertNotIn("计分过程", results[0]["reason"])
 
     def test_cross_bid_price_rule_is_recalculated_with_all_bidders(self):
         bid_a = self._add_pdf("a.pdf", "bid", "甲公司", "投标报价：100万元。")
