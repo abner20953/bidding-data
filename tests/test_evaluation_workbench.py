@@ -2911,6 +2911,26 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(score["conclusion_summary"], "逐项响应无偏离，建议满分。")
         self.assertEqual(worker._score_result_from_model("r3", None, 6.0, {"confidence": "low"})["conclusion_summary"], "")
 
+    def test_reconcile_summary_score_strips_conflicting_definite_score(self):
+        self.assertEqual(
+            worker._reconcile_summary_score("建议价格分29.75分，报价632836元为次低有效报价。", 29.72),
+            "建议价格分，报价632836元为次低有效报价。",
+        )
+        self.assertEqual(worker._reconcile_summary_score("建议分9分，待核验签字盖章。", 9.0), "建议分9分，待核验签字盖章。")
+        self.assertEqual(worker._reconcile_summary_score("建议暂计0.5-1分，需复核。", 0.75), "建议暂计0.5-1分，需复核。")
+        self.assertEqual(worker._reconcile_summary_score("满分9分，建议得3分。", 3.0), "满分9分，建议得3分。")
+        self.assertEqual(worker._reconcile_summary_score("", 3.0), "")
+        self.assertEqual(worker._reconcile_summary_score("建议满分6分，逐项无偏离。", 3.0), "建议满分，逐项无偏离。")
+
+    def test_score_result_model_reconciles_summary_score(self):
+        score = worker._score_result_from_model(
+            "r4", 29.72, 30.0,
+            {"suggested_score": 29.72, "confidence": "high",
+             "summary": "建议价格分29.75分，报价632836元为次低有效报价。"},
+        )
+        self.assertNotIn("29.75", score["conclusion_summary"])
+        self.assertIn("报价632836元", score["conclusion_summary"])
+
     def test_apply_ocr_summary_overrides_or_clears_conclusion_summary(self):
         rule = {"rule_id": "r1", "title": "证书核验", "scoring_json": json.dumps({"max_score": 6})}
         working = {"rule_id": "r1", "status": "not_found", "evidence": "文字层", "reason": "文字层理由",

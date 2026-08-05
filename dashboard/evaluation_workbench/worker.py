@@ -2945,6 +2945,28 @@ def _normalise_conclusion_summary(value: object, limit: int = 60) -> str:
     return text.strip()
 
 
+_SCORE_SUMMARY_VALUE_PATTERN = re.compile(
+    r"((?:建议|暂计|应计|应为|合计|总计|得|共)[^。；;]{0,16}?)"
+    r"(?<![0-9.\-—–～~至])(\d+(?:\.\d+)?)\s*分"
+)
+
+
+def _reconcile_summary_score(summary: str, suggested: float | None) -> str:
+    """摘要中出现与最终建议分冲突的确定分值（如"建议29.75分"而实际为29.72分）时，
+    剥离该分值短语、保留其余文字，避免主表摘要与得分列互相矛盾。
+
+    区间（0.5-1分）、满分/封顶说明不视为建议分值，不做处理；无冲突时原样返回。
+    """
+    if not summary or suggested is None:
+        return summary
+    values = [float(value) for _, value in _SCORE_SUMMARY_VALUE_PATTERN.findall(summary)]
+    if not values:
+        return summary
+    if all(abs(value - suggested) <= 1e-6 for value in values):
+        return summary
+    return _SCORE_SUMMARY_VALUE_PATTERN.sub(lambda match: match.group(1), summary).strip("，,；;：:\s")
+
+
 def _enum_text(value: object, allowed: set[str], default: str) -> str:
     """模型偶尔会把枚举字段返回成数组或对象；非字符串一律回落默认值，
     避免 ``value in {...}`` 成员判断对 list/dict 抛出 ``unhashable type`` 而中断整份评审。"""
@@ -3501,12 +3523,15 @@ def _score_result_from_model(rule_id: str, suggested: float | None, max_score: f
     has_evidence = bool(evidence)
     auto_ready = suggested is not None and confidence == "high" and has_evidence and not needs_ocr
     reason = _reconcile_score_reason(_score_reason_text(raw, suggested), suggested)
+    conclusion_summary = _normalise_conclusion_summary(raw.get("summary"))
+    if suggested is not None:
+        conclusion_summary = _reconcile_summary_score(conclusion_summary, suggested)
     result = {
         "rule_id": rule_id, "suggested_score": suggested, "final_score": None,
         "effective_score": suggested if auto_ready else None, "max_score": max_score or None,
         "evidence": evidence,
         "reason": reason,
-        "conclusion_summary": _normalise_conclusion_summary(raw.get("summary")),
+        "conclusion_summary": conclusion_summary,
         # 仅在当前任务内供图片识别定位使用；存储层会忽略该临时字段，避免改变历史结果 API。
         "visual_page_candidates": _score_visual_page_candidates(raw),
         "confidence": confidence, "automation_status": "ready_for_batch_confirmation" if auto_ready else "needs_review",
@@ -6179,6 +6204,8 @@ def _apply_ocr_summary(component: str, rule: dict, working_result: dict, parsed:
     # 采纳层有 summary 就覆盖为最新结论，没有则清空（前端回退到最新层摘要，
     # 绝不显示可能已被本轮核验推翻的文字层旧结论）。
     merged["conclusion_summary"] = _normalise_conclusion_summary(parsed.get("summary"))
+    if component != "review" and suggested is not None:
+        merged["conclusion_summary"] = _reconcile_summary_score(merged["conclusion_summary"], suggested)
     merged = _append_evidence_layer(
         merged, source="local_ocr" if local_only else "tencent_ocr", summary=evidence or reason, checked_pages=pages,
         evidence_pages=evidence_pages, service=service_labels,
@@ -7592,6 +7619,8 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
     )
     # 视觉层是当前最新采纳层：有 summary 覆盖为最新结论，无则清空回退前端摘要逻辑。
     merged["conclusion_summary"] = _normalise_conclusion_summary(parsed.get("summary"))
+    if suggested is not None:
+        merged["conclusion_summary"] = _reconcile_summary_score(merged["conclusion_summary"], suggested)
     merged = _append_evidence_layer(
         merged, source="vision", summary=visual_evidence or visual_reason, checked_pages=checked_pages,
         evidence_pages=visual_evidence_pages, model=str(vision_profile.get("display_name") or vision_profile.get("model_name") or ""),

@@ -122,8 +122,16 @@
     const boundary = Math.max(cut.lastIndexOf('，'), cut.lastIndexOf(','), cut.lastIndexOf('、'));
     return boundary > 20 ? `${cut.slice(0, boundary)}…` : `${cut}…`;
   }
+  const summaryScorePattern = /((?:建议|暂计|应计|应为|合计|总计|得|共)[^。；;]{0,16}?)(?<![0-9.\-—–～~至])(\d+(?:\.\d+)?)\s*分/g;
+  function reconcileSummaryScore(summary, suggested) {
+    if (!summary || suggested == null || !Number.isFinite(Number(suggested))) return summary;
+    const values = Array.from(summary.matchAll(summaryScorePattern)).map((match) => Number(match[2]));
+    if (!values.length) return summary;
+    if (values.every((value) => Math.abs(value - Number(suggested)) <= 1e-6)) return summary;
+    return summary.replace(summaryScorePattern, '$1').replace(/\s+/g, ' ').trim();
+  }
   function conciseResultSummary(result) {
-    const stored = cleanDisplayText(result?.conclusion_summary);
+    const stored = reconcileSummaryScore(cleanDisplayText(result?.conclusion_summary), result?.suggested_score);
     if (stored) return stored.length > 90 ? `${stored.slice(0, 90)}…` : stored;
     const segment = latestLayerSegment(result?.reason);
     const compacted = result?.max_score != null ? compactObjectiveOcrText(segment) : segment;
