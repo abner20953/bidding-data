@@ -107,6 +107,54 @@
     const status = String(result?.vision_status || '');
     return /(?:applied|partial|uncovered|conflict)/.test(status) ? conciseText(cleanDisplayText(result?.vision_message), 120) : '';
   }
+  // 主表摘要只取“结论句”：层文本首句常是过程描述（“本次图片覆盖…”），真正结论
+  // 在中间或末尾；按结论语义词定位并取最后一个结论子句，找不到再回退首句。
+  const conclusionMarkers = /建议|判|得分|得\d+分|满足|不满足|需复核|不一致|未提供|需人工|未发现|缺失|不予|不符|无效|不通过|通过|采纳|应计|暂计|应为|封顶/;
+  function extractConclusionClause(value) {
+    const text = cleanDisplayText(value);
+    if (!text) return '';
+    const clauses = text.split(/(?<=[。；;])/).map((item) => item.trim()).filter(Boolean);
+    if (!clauses.length) return '';
+    const matches = clauses.filter((item) => conclusionMarkers.test(item));
+    const selected = matches.length ? matches[matches.length - 1] : clauses[0];
+    if (selected.length <= 90) return selected;
+    const cut = selected.slice(0, 90);
+    const boundary = Math.max(cut.lastIndexOf('，'), cut.lastIndexOf(','), cut.lastIndexOf('、'));
+    return boundary > 20 ? `${cut.slice(0, boundary)}…` : `${cut}…`;
+  }
+  function conciseResultSummary(result) {
+    const segment = latestLayerSegment(result?.reason);
+    const compacted = result?.max_score != null ? compactObjectiveOcrText(segment) : segment;
+    const fromReason = extractConclusionClause(compacted);
+    if (fromReason) return fromReason;
+    const layer = evidenceLayerSummary(result);
+    if (layer) return extractConclusionClause(layer);
+    return extractConclusionClause(result?.evidence);
+  }
+  function verificationLineHtml(result) {
+    const status = String(result?.vision_status || '');
+    const ocrStatus = String(result?.ocr_status || (status.startsWith('ocr_') ? status : 'not_requested'));
+    const multimodal = String(result?.multimodal_status || (status.startsWith('ocr_') ? 'not_requested' : status));
+    const means = ['文字解析'];
+    const layerList = Array.isArray(result?.evidence_layers) ? result.evidence_layers : [];
+    const sources = new Set(layerList.map((layer) => layer && layer.source).filter(Boolean));
+    if (sources.has('local_ocr') || ocrStatus !== 'not_requested') means.push('本地OCR');
+    if (sources.has('tencent_ocr')) means.push('腾讯OCR');
+    if (sources.has('vision') || (multimodal !== 'not_requested' && !/^ocr_/.test(status))) means.push('图片识别');
+    const pages = [];
+    const addPages = (list) => { (Array.isArray(list) ? list : []).forEach((page) => { if (Number.isInteger(page) && page > 0 && !pages.includes(page)) pages.push(page); }); };
+    layerList.forEach((layer) => { if (layer) { addPages(layer.checked_pages); addPages(layer.evidence_pages); } });
+    addPages(result?.vision_pages);
+    addPages(result?.vision_evidence_pages);
+    pages.sort((a, b) => a - b);
+    const pageText = pages.length
+      ? (pages.length <= 6
+        ? ` · 证据页 ${pages.map((page) => `P${page}`).join('、')}`
+        : ` · 证据页 ${pages.slice(0, 6).map((page) => `P${page}`).join('、')} 等 ${pages.length} 页`)
+      : '';
+    const abnormal = /failed|unavailable|quota_exhausted|not_located|uncovered/.test(`${status} ${ocrStatus} ${multimodal}`);
+    return `${abnormal ? '核验状态' : '已核验'}：${means.join('＋')}${pageText}`;
+  }
   const layerSourceLabels = {图片识别:'图片补充', '腾讯OCR':'腾讯 OCR 补充', 本地OCR:'本地 OCR 补充', OCR:'OCR 补充'};
   function layerBlockHtml(label, text, updated) {
     const full = cleanDisplayText(text);
@@ -482,9 +530,11 @@
   }
   function evidenceChainHtml(result) {
     const layers = Array.isArray(result?.evidence_layers) ? result.evidence_layers.filter((item) => item && typeof item === 'object' && item.summary) : [];
-    if (!layers.length) return '';
+    const statusMessage = String(result?.vision_message || '').trim();
+    if (!layers.length && !statusMessage) return '';
     const labels = {text:'文字解析', tencent_ocr:'腾讯 OCR', local_ocr:'本地 RapidOCR', vision:'图片识别', score_calculation:'计分过程'};
-    return `<details class="evidence-chain"><summary>证据链详情</summary>${layers.map((layer, index) => {
+    const statusNote = statusMessage ? `<div class="evidence-layer"><strong>识别状态</strong><span>${escapeHtml(cleanDisplayText(statusMessage))}</span></div>` : '';
+    return `<details class="evidence-chain"><summary>证据链详情</summary>${statusNote}${layers.map((layer, index) => {
       const checked = sortedPageList(layer.checked_pages).map((page) => `P${page}`).join('、');
       const evidence = sortedPageList(layer.evidence_pages).map((page) => `P${page}`).join('、');
       const meta = [layer.service || layer.model || '', checked ? `检查页：${checked}` : '', evidence ? `证据页：${evidence}` : ''].filter(Boolean).join(' · ');
@@ -565,8 +615,8 @@
       return `<section class="evaluation-highlight-group"><h4>${escapeHtml(summary.bidder_name || '未命名投标人')}</h4>${headline ? `<p>${escapeHtml(headline.length > 60 ? `${headline.slice(0, 60)}…` : headline)}</p>` : ''}<ul>${listHtml(visible)}</ul>${attentionBlock}</section>`;
     }).join('') || '<p class="muted">当前筛选下没有高风险或重点关注事项。</p>';
   }
-  async function refreshReview() { if (!activeProject) return; const data = await request(`/projects/${activeProject}/review-results`); renderEvaluationHighlights(data.review_run?.highlights || []); const groups = groupByBidder(visibleCompletedResults(data.review_run, data.results)); $('review-results').innerHTML = groups.length ? `${partialResultNotice(data.review_run)}<p class="hint">以下为 AI 基于电子文件生成的审查建议；主表展示结论摘要，完整文字和取证过程可展开查看。</p>${groups.map(([bidder, results]) => { const ordered = [...results].sort((left, right) => { const leftOcr = left.status === 'ocr_required' ? 1 : 0; const rightOcr = right.status === 'ocr_required' ? 1 : 0; return leftOcr - rightOcr || riskRank(right.risk_level) - riskRank(left.risk_level); }); return `<details class="result-group"><summary>投标人：${escapeHtml(bidder)}（${ordered.length} 项）</summary><div class="review-result-table-wrap"><table class="review-result-table"><colgroup><col class="review-col-category"><col class="review-col-rule"><col class="review-col-advice"><col class="review-col-risk"><col class="review-col-evidence"></colgroup><thead><tr><th>分类</th><th>检查规则</th><th>AI建议</th><th>风险</th><th>关键证据与理由</th></tr></thead><tbody>${ordered.map((r) => `<tr><td><span class="tag">${categoryLabel(r.category)}</span></td><td>${ruleCellHtml(r)}</td><td>${escapeHtml(statusLabel(r.status))}<br><small>置信度：${escapeHtml(confidenceLabel(r.confidence))}；证据：${escapeHtml(evidenceQualityLabel(r.evidence_quality))}</small>${visionBadgeHtml(r)}</td><td>${escapeHtml(riskLabel(r.status === 'ocr_required' ? 'low' : r.risk_level))}</td><td>${conflictBadgeHtml(r)}<div class="result-evidence">${escapeHtml(resultExplanation(conciseResultEvidence(r), r) || '-')}</div><small class="result-evidence">${escapeHtml(resultExplanation(conciseResultReason(r), r))}</small>${visionStatusHtml(r)}${evidenceChainHtml(r)}${rawResultDetailHtml(r)}</td></tr>`).join('')}</tbody></table></div></details>`; }).join('')}` : `<p class="muted">${data.review_run ? '正在生成审查结果。' : '本项目没有审查规则。'}</p>`; }
-  async function refreshScores() { for (const type of ['objective','subjective']) { const data = await request(`/projects/${activeProject}/score-results/${type}`); const target = $(`${type}-results`); const groups = groupByBidder(visibleCompletedResults(data.score_run, data.results)); target.innerHTML = groups.length ? `${partialResultNotice(data.score_run)}<p class="hint">以下为 AI 基于电子文件生成的评分建议；扫描件证据未覆盖时不会将“未找到”误作 0 分，主表会提示待 OCR 后评分。</p>${groups.map(([bidder, results]) => `<details class="result-group"><summary>投标人：${escapeHtml(bidder)}（${results.length} 项）</summary><table><thead><tr><th>检查规则</th><th>AI 建议得分</th><th>满分</th><th>置信度</th><th>关键证据与理由</th></tr></thead><tbody>${results.map((r) => `<tr><td>${ruleCellHtml(r)}${scoreOcrHint(r)}</td><td>${escapeHtml(scoreSuggestionLabel(r))}</td><td>${r.max_score ?? '-'}</td><td>${escapeHtml(confidenceLabel(r.confidence))}${visionBadgeHtml(r)}</td><td>${conflictBadgeHtml(r)}<div class="result-evidence">${escapeHtml(resultExplanation(conciseResultEvidence(r), r) || '-')}</div><small class="result-evidence">${escapeHtml(resultExplanation(conciseResultReason(r), r))}</small>${scoreVerificationSummary(r)}${evidenceChainHtml(r)}${rawResultDetailHtml(r)}</td></tr>`).join('')}</tbody></table></details>`).join('')}` : `<p class="muted">${data.score_run ? '正在生成评分结果。' : `本项目没有${type === 'objective' ? '客观分' : '主观分'}规则。`}</p>`; } }
+  async function refreshReview() { if (!activeProject) return; const data = await request(`/projects/${activeProject}/review-results`); renderEvaluationHighlights(data.review_run?.highlights || []); const groups = groupByBidder(visibleCompletedResults(data.review_run, data.results)); $('review-results').innerHTML = groups.length ? `${partialResultNotice(data.review_run)}<p class="hint">以下为 AI 基于电子文件生成的审查建议；主表展示结论摘要，完整文字和取证过程可展开查看。</p>${groups.map(([bidder, results]) => { const ordered = [...results].sort((left, right) => { const leftOcr = left.status === 'ocr_required' ? 1 : 0; const rightOcr = right.status === 'ocr_required' ? 1 : 0; return leftOcr - rightOcr || riskRank(right.risk_level) - riskRank(left.risk_level); }); return `<details class="result-group"><summary>投标人：${escapeHtml(bidder)}（${ordered.length} 项）</summary><div class="review-result-table-wrap"><table class="review-result-table"><colgroup><col class="review-col-category"><col class="review-col-rule"><col class="review-col-advice"><col class="review-col-risk"><col class="review-col-evidence"></colgroup><thead><tr><th>分类</th><th>检查规则</th><th>AI建议</th><th>风险</th><th>关键证据与理由</th></tr></thead><tbody>${ordered.map((r) => `<tr><td><span class="tag">${categoryLabel(r.category)}</span></td><td>${ruleCellHtml(r)}</td><td>${escapeHtml(statusLabel(r.status))}<br><small>置信度：${escapeHtml(confidenceLabel(r.confidence))}；证据：${escapeHtml(evidenceQualityLabel(r.evidence_quality))}</small>${visionBadgeHtml(r)}</td><td>${escapeHtml(riskLabel(r.status === 'ocr_required' ? 'low' : r.risk_level))}</td><td><div class="result-evidence result-summary">${escapeHtml(resultExplanation(conciseResultSummary(r), r) || '-')}</div><small class="result-evidence result-verification">${escapeHtml(verificationLineHtml(r))}</small>${conflictBadgeHtml(r)}${evidenceChainHtml(r)}${rawResultDetailHtml(r)}</td></tr>`).join('')}</tbody></table></div></details>`; }).join('')}` : `<p class="muted">${data.review_run ? '正在生成审查结果。' : '本项目没有审查规则。'}</p>`; }
+  async function refreshScores() { for (const type of ['objective','subjective']) { const data = await request(`/projects/${activeProject}/score-results/${type}`); const target = $(`${type}-results`); const groups = groupByBidder(visibleCompletedResults(data.score_run, data.results)); target.innerHTML = groups.length ? `${partialResultNotice(data.score_run)}<p class="hint">以下为 AI 基于电子文件生成的评分建议；扫描件证据未覆盖时不会将“未找到”误作 0 分，主表会提示待 OCR 后评分。</p>${groups.map(([bidder, results]) => `<details class="result-group"><summary>投标人：${escapeHtml(bidder)}（${results.length} 项）</summary><table><thead><tr><th>检查规则</th><th>AI 建议得分</th><th>满分</th><th>置信度</th><th>关键证据与理由</th></tr></thead><tbody>${results.map((r) => `<tr><td>${ruleCellHtml(r)}${scoreOcrHint(r)}</td><td>${escapeHtml(scoreSuggestionLabel(r))}</td><td>${r.max_score ?? '-'}</td><td>${escapeHtml(confidenceLabel(r.confidence))}${visionBadgeHtml(r)}</td><td><div class="result-evidence result-summary">${escapeHtml(resultExplanation(conciseResultSummary(r), r) || '-')}</div><small class="result-evidence result-verification">${escapeHtml(verificationLineHtml(r))}</small>${conflictBadgeHtml(r)}${evidenceChainHtml(r)}${rawResultDetailHtml(r)}</td></tr>`).join('')}</tbody></table></details>`).join('')}` : `<p class="muted">${data.score_run ? '正在生成评分结果。' : `本项目没有${type === 'objective' ? '客观分' : '主观分'}规则。`}</p>`; } }
   $('create-project').onclick = () => $('project-form').classList.remove('hidden'); $('cancel-project').onclick = () => $('project-form').classList.add('hidden');
   $('save-project').onclick = async () => { try { const data = await request('/projects', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name:$('project-name').value, project_number:$('project-number').value, section_name:$('section-name').value, password:$('project-password').value})}); $('project-password').value = ''; await loadProjects(); openProject(data.project.project_id); } catch (error) { alert(error.message); } };
   $('back-projects').onclick = () => { activeProject = null; stopPolling(); $('workspace').classList.add('hidden'); $('projects-panel').classList.remove('hidden'); loadProjects(); };
