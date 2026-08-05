@@ -5400,6 +5400,153 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         with patch.dict(os.environ, {"VISION_PARALLEL_LIMIT": "2"}, clear=False):
             self.assertEqual(worker._vision_parallel_limit(), 2)
 
+    def test_full_scan_chunk_size_reduces_call_count(self):
+        """全文扫描块从 11K 提升到 14K，同文本的调用块数应减少。"""
+        self.assertEqual(worker.FULL_SCAN_CHUNK_CHARS, 14_000)
+        path = self.temp_dir / "chunk-scale.txt"
+        path.write_text(
+            "\n\n".join(f"[第{i}页]\n" + "内容" * 300 for i in range(1, 41)),
+            encoding="utf-8",
+        )
+        chunks_large = split_full_text_chunks(path, worker.FULL_SCAN_CHUNK_CHARS, overlap_pages=1)
+        chunks_small = split_full_text_chunks(path, 11_000, overlap_pages=1)
+        self.assertLess(len(chunks_large), len(chunks_small))
+        self.assertLessEqual(len(chunks_large), 3)
+
+    def test_scan_document_fulltext_parallel_chunks_preserve_order(self):
+        """单文件页块并行扫描后，findings 仍按页块顺序归并。"""
+        document = self._add_pdf("scan.pdf", "bid", "甲公司", "投标方案正文")
+        document.update({"text_length": 50_000})
+        chunks = [
+            {"chunk_id": "c1", "start_page": 1, "end_page": 2, "text": "第一段" * 20},
+            {"chunk_id": "c2", "start_page": 3, "end_page": 4, "text": "第二段" * 20},
+            {"chunk_id": "c3", "start_page": 5, "end_page": 6, "text": "第三段" * 20},
+        ]
+
+        def fake_piece(app, task, profile, document, catalog, chunk, project_scope, system_prompt):
+            time.sleep(0.01)
+            return ({"findings": [{"rule_id": "r1", "page_hint": chunk["chunk_id"]}], "scope_anomalies": []}, 0, 0, [])
+
+        task = {"task_id": "t", "project_id": self.project["project_id"], "payload": {"force_rerun": False}}
+        with patch.object(worker, "_document_evidence_chunks", return_value=chunks), \
+             patch.object(worker, "_run_full_scan_piece", side_effect=fake_piece) as piece:
+            result = worker._scan_document_fulltext(
+                self.app, task, {"profile_id": "p"}, document,
+                [{"rule_id": "r1", "category": "qualification", "title": "资质", "check_rule": "核验资质"}],
+                {"scope_summary": "x"}, "sys",
+            )
+
+        self.assertEqual([item["page_hint"] for item in result["findings"]], ["c1", "c2", "c3"])
+        self.assertEqual(piece.call_count, 3)
+
+    def test_acquisition_recommendation_defaults_low_for_non_visual_rules(self):
+        """非签章/外观类规则默认“快速”档，视觉事实规则保持“标准”。"""
+        certificate = storage.rule_acquisition_recommendation({
+            "title": "认证证书编号核验", "check_rule": "核验证书编号与有效期", "source_text": "提供认证证书复印件",
+            "check_mode": "ocr", "ocr_required": True,
+            "execution_meta_json": {"evidence_requirements": ["document", "field"]},
+        })
+        self.assertEqual(certificate["acquisition_preset"], "smart")
+        self.assertEqual(certificate["vision_level"], "low")
+
+        signature = storage.rule_acquisition_recommendation({
+            "title": "签章核验", "check_rule": "核验响应函是否签字并加盖公章", "source_text": "",
+        })
+        self.assertNotEqual(signature["acquisition_preset"], "off")
+        self.assertEqual(signature["vision_level"], "standard")
+
+    def test_vision_render_setting_downscales_standard_for_non_visual_rules(self):
+        """材料/字段类规则标准档降采样；纯视觉（签章）规则保持高清晰。"""
+        certificate = {"title": "认证证书", "check_rule": "核验证书编号及扫描件完整性"}
+        self.assertEqual(worker._rule_image_strategy(certificate), "hybrid")
+        setting = worker._vision_render_setting(certificate, "standard")
+        self.assertEqual(setting["scale"], 1.2)
+        self.assertEqual(setting["quality"], 76)
+
+        signature = {"title": "签字盖章", "check_rule": "核验响应函是否签字并加盖公章"}
+        self.assertEqual(worker._rule_image_strategy(signature), "vision")
+        seal_setting = worker._vision_render_setting(signature, "standard")
+        self.assertEqual(seal_setting["scale"], 1.8)
+        self.assertEqual(seal_setting["quality"], 82)
+
+    def test_ocr_batch_enabled_flag_defaults_off(self):
+        """OCR 归纳批量合并默认关闭，需 A/B 验证后再开启。"""
+        with patch.dict(os.environ, {"EVALUATION_WORKBENCH_OCR_BATCH": ""}, clear=True):
+            self.assertFalse(worker._ocr_batch_enabled())
+        with patch.dict(os.environ, {"EVALUATION_WORKBENCH_OCR_BATCH": "1"}, clear=True):
+            self.assertTrue(worker._ocr_batch_enabled())
+        with patch.dict(os.environ, {"EVALUATION_WORKBENCH_OCR_BATCH": "off"}, clear=True):
+            self.assertFalse(worker._ocr_batch_enabled())
+
+    def test_ocr_batch_supplement_uses_one_model_call_and_merges_per_rule(self):
+        """同组件多条规则合并为一次 OCR 归纳调用，并按 rule_id 逐条合并。"""
+        document = {"document_id": "doc", "extension": ".pdf", "page_count": 50,
+                    "original_name": "投标.pdf", "bidder_name": "甲"}
+        rules = [
+            {"rule_id": "r1", "title": "证书评分", "check_rule": "证书有效得2分", "scoring": {"max_score": 2}},
+            {"rule_id": "r2", "title": "业绩评分", "check_rule": "每个业绩得1分", "scoring": {"max_score": 3}},
+        ]
+        bases = [
+            {"rule_id": "r1", "suggested_score": 0, "max_score": 2, "confidence": "low", "evidence": "文字层未见"},
+            {"rule_id": "r2", "suggested_score": 0, "max_score": 3, "confidence": "low", "evidence": "文字层未见"},
+        ]
+        parsed = {"results": [
+            {"rule_id": "r1", "coverage": "covered", "conclusion_scope": "full", "evidence_pages": [12],
+             "suggested_score": 2, "confidence": "high", "evidence": "P12证书可见", "reason": "满足"},
+            {"rule_id": "r2", "coverage": "covered", "conclusion_scope": "full", "evidence_pages": [20],
+             "suggested_score": 1, "confidence": "high", "evidence": "P20业绩可见", "reason": "满足"},
+        ]}
+        with patch.object(worker, "_ocr_candidate_pages", return_value=[12, 20]), \
+             patch.object(worker, "_ocr_discovery_page_count", return_value=10), \
+             patch.object(worker, "_ocr_page_texts", return_value=([
+                 {"page": 12, "service": "accurate", "text": "证书编号A123"},
+                 {"page": 20, "service": "accurate", "text": "业绩合同"},
+             ], "")), \
+             patch.object(worker, "_request_task_json", return_value=parsed) as request_json:
+            results = worker._run_ocr_batch_supplement(
+                self.app, {"task_id": "t"}, document, "objective",
+                [(rules[0], bases[0], True), (rules[1], bases[1], True)], {"profile_id": "m"},
+            )
+
+        self.assertEqual(request_json.call_count, 1)
+        self.assertEqual(results["r1"]["suggested_score"], 2)
+        self.assertEqual(results["r2"]["suggested_score"], 1)
+        self.assertEqual(results["r1"]["vision_status"], "ocr_applied")
+
+    def test_ocr_batch_falls_back_to_per_rule_path_when_model_misses_rule(self):
+        """批量模型漏掉某个 rule_id 时，该规则整批回退到逐条原路径。"""
+        document = {"document_id": "doc", "extension": ".pdf", "page_count": 50,
+                    "original_name": "投标.pdf", "bidder_name": "甲"}
+        rules = [
+            {"rule_id": "r1", "title": "证书评分", "check_rule": "证书有效得2分", "scoring": {"max_score": 2}},
+            {"rule_id": "r2", "title": "业绩评分", "check_rule": "每个业绩得1分", "scoring": {"max_score": 3}},
+        ]
+        bases = [
+            {"rule_id": "r1", "suggested_score": 0, "max_score": 2, "confidence": "low", "evidence": "文字层未见"},
+            {"rule_id": "r2", "suggested_score": 0, "max_score": 3, "confidence": "low", "evidence": "文字层未见"},
+        ]
+        parsed_r1 = {"rule_id": "r1", "coverage": "covered", "conclusion_scope": "full", "evidence_pages": [12],
+                     "suggested_score": 2, "confidence": "high", "evidence": "P12证书可见", "reason": "满足"}
+        parsed_r2 = {"rule_id": "r2", "coverage": "covered", "conclusion_scope": "full", "evidence_pages": [20],
+                     "suggested_score": 1, "confidence": "high", "evidence": "P20业绩可见", "reason": "满足"}
+        parsed_missing = {"results": [parsed_r1]}
+        with patch.object(worker, "_ocr_candidate_pages", return_value=[12, 20]), \
+             patch.object(worker, "_ocr_discovery_page_count", return_value=10), \
+             patch.object(worker, "_ocr_page_texts", return_value=([
+                 {"page": 12, "service": "accurate", "text": "证书编号A123"},
+                 {"page": 20, "service": "accurate", "text": "业绩合同"},
+             ], "")), \
+             patch.object(worker, "_request_task_json", side_effect=[parsed_missing, parsed_r1, parsed_r2]) as request_json:
+            results = worker._run_ocr_batch_supplement(
+                self.app, {"task_id": "t"}, document, "objective",
+                [(rules[0], bases[0], True), (rules[1], bases[1], True)], {"profile_id": "m"},
+            )
+
+        # 整批回退：r1 与 r2 都重走逐条原路径（1 次批量 + 2 次逐条）。
+        self.assertEqual(request_json.call_count, 3)
+        self.assertEqual(results["r1"]["suggested_score"], 2)
+        self.assertEqual(results["r2"]["suggested_score"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

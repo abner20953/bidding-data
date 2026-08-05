@@ -2628,7 +2628,10 @@ def rule_acquisition_recommendation(rule: dict) -> dict:
         "acquisition_preset": preset,
         "image_mode": {"smart": "auto", "text": "ocr_only", "visual": "vision_only", "dual": "combined", "off": "off"}[preset],
         "vision_trigger": "required" if preset == "visual" else "text_fallback" if preset in {"smart", "text"} else "off",
-        "vision_level": "standard" if preset != "off" else "off",
+        # 非签章/外观类规则默认“快速”档（首轮 2 页、无补页），避免不必要的高清
+        # 大图与多页调用；确需签字、盖章、勾选、照片、外观等视觉事实的规则保持
+        # “标准”。只影响新规则与“恢复 AI 建议”，存量规则不受影响，可逐条调高。
+        "vision_level": ("standard" if has_visual_fact else "low") if preset != "off" else "off",
         "baseline_ocr_mode": baseline_ocr_mode,
     }
 

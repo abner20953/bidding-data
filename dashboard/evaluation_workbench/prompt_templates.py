@@ -266,6 +266,25 @@ PROMPT_TEMPLATES["evaluate_all_ocr_user"] = _template(
     "已有文字结论：{{text_result}}\nOCR接口：{{ocr_service}}；已识别页：{{ocr_pages}}\nOCR文字：\n{{ocr_text}}",
     "rule", "document_name", "bidder_name", "text_result", "ocr_service", "ocr_pages", "ocr_text",
 )
+PROMPT_TEMPLATES["evaluate_all_ocr_batch_user"] = _template(
+    "综合评审 · OCR 归纳（批量）",
+    "同组件多条规则的 OCR 文字合并归纳；每条规则必须独立判断并按 rule_id 恰好返回一次。",
+    "你正在根据专用 OCR 已识别的页面文字，对同一投标文件的 N 条招投标规则分别补充文字审查。"
+    "只能引用各规则自己的 OCR 文字和已有文字结论，禁止混用其他规则的证据；"
+    "不得把 OCR 未识别到的内容当作材料缺失；签字、盖章、勾选、证件外观、图片真实性或版式完整性仍需要图片核验。"
+    "只返回合法 JSON：{\"results\":[{\"rule_id\":\"规则ID\",\"status\":\"satisfied|not_satisfied|partial|not_found|manual\","
+    "\"suggested_score\":数字或null,\"evidence\":\"OCR中可直接引用的关键事实\",\"reason\":\"简洁判断理由\","
+    "\"risk_level\":\"low|medium|high\",\"confidence\":\"high|medium|low\","
+    "\"conclusion_scope\":\"full|partial|none\",\"coverage\":\"covered|not_covered|uncertain\","
+    "\"evidence_pages\":[实际形成证据的PDF页码]}]}。"
+    "必须按输入顺序覆盖每个 rule_id 且每个 ID 恰好返回一次，不得新增 ID。"
+    "coverage=covered 仅表示该规则 OCR 文字覆盖到规则相关材料；只有 OCR 文字足以完成整条文字性规则判断时 conclusion_scope 才可为 full。"
+    "若 OCR 已覆盖文字条件但签章、勾选或图片外观仍待核验，可给出明确的文字性 status 或 suggested_score，"
+    "同时 conclusion_scope=partial 并额外返回 content_coverage:\"covered\"、visual_review_required:true、"
+    "visual_review_reason:\"待核验的外观事实\"。若连文字条件也未覆盖，content_coverage 必须为 not_covered 且不得改写已有结论或建议分。"
+    "证据与理由不得复述规则。\n待归纳规则：\n{{items}}\n投标文件：{{document_name}}；投标人：{{bidder_name}}",
+    "items", "document_name", "bidder_name",
+)
 PROMPT_TEMPLATES["evaluate_all_visual_user"]["content"] += (
     "\n\n找页补充：图片标签 Pn 是系统实际发送的 PDF 页，不得以目录或印刷页码替代。"
     "若 text_result 含 prior_image_batches，必须以文字证据与图片证据的合并覆盖给出最终建议，并重新给出整条规则的 suggested_score；多材料规则应明确已覆盖与未覆盖项。"

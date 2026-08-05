@@ -3466,7 +3466,10 @@ EVALUATION_BATCH_SIZES = {"review": 8, "objective": 8, "subjective": 6}
 # 超过阈值的文件先按连续页块做全文覆盖扫描；阈值以下的短文件直接随最终规则
 # 组发送全文，同样满足全文覆盖。所有索引都只存在于当前工作进程内。
 FULL_SCAN_THRESHOLD_CHARS = 24_000
-FULL_SCAN_CHUNK_CHARS = 11_000
+# 全文扫描块字符预算：11K 已实测调用次数过多（8 家项目 208 次扫描），14K 在
+# 调用数（约减少 1/3）与单次上下文/截断风险之间取平衡；输出超长时系统只拆
+# 规则目录重试，不会重发全文或丢页。
+FULL_SCAN_CHUNK_CHARS = 14_000
 # 首轮只建立候选证据索引：每个页块携带一次完整的精简规则目录。正常情况下
 # 不再形成“页块 × 规则批次”的矩阵；若模型确实输出超长，才仅拆规则目录一次。
 FULL_SCAN_CATALOG_RULE_CHARS = 220
@@ -4273,53 +4276,68 @@ def _scan_document_fulltext(app, task: dict, profile: dict, document: dict, rule
     failed_chunks: list[dict] = []
     compact_retry_count = split_retry_count = 0
     total = max(1, len(chunks))
+    # 单份文件内页块最多 2 路并行：少家投标人项目只有 1-2 份文件并行时，这能让
+    # 单文件内部的模型请求也重叠；总并发仍受任务请求闸门限制，不会超过服务商
+    # 并发上限。结果按页块序号归并，保持原有顺序语义与断点缓存不变。
+    per_chunk: dict[int, tuple[dict, list[dict]]] = {}
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="scan-chunk") as executor:
+        futures: dict = {}
+        for index, chunk in enumerate(chunks):
+            chunk_hash = hashlib.sha256(str(chunk.get("text") or "").encode("utf-8")).hexdigest()
+            checkpoint = storage.get_evaluation_scan_checkpoint(app, document["document_id"], scan_key, chunk["chunk_id"], chunk_hash)
+            stable_scope = storage.get_evaluation_scan_checkpoint(
+                app, document["document_id"], scope_scan_key, chunk["chunk_id"], chunk_hash,
+            )
+            stable_candidates = stable_scope.get("scope_anomalies", []) if isinstance(stable_scope, dict) else []
+            historical_candidates = storage.previous_scope_anomalies(
+                app, document["document_id"], chunk["chunk_id"], chunk_hash,
+            )
+            if checkpoint is not None:
+                # 兼容 v3 已落库的纯 findings 检查点，避免升级时浪费一次扫描。
+                if isinstance(checkpoint, list):
+                    value = {"findings": checkpoint, "scope_anomalies": _merge_scope_anomalies([], stable_candidates + historical_candidates)}
+                elif isinstance(checkpoint, dict):
+                    value = {"findings": checkpoint.get("findings") or [], "scope_anomalies": _merge_scope_anomalies(
+                        checkpoint.get("scope_anomalies") or [], stable_candidates + historical_candidates,
+                    )}
+                else:
+                    value = {"findings": [], "scope_anomalies": []}
+                per_chunk[index] = (value, [])
+                continue
+            futures[executor.submit(
+                _run_full_scan_piece, app, task, profile, document, catalog, chunk, project_scope, system_prompt,
+            )] = (index, chunk, chunk_hash, stable_candidates, historical_candidates)
+        for future in as_completed(futures):
+            index, chunk, chunk_hash, stable_candidates, historical_candidates = futures[future]
+            result = future.result()
+            merged_scope = _merge_scope_anomalies(
+                result[0]["scope_anomalies"], stable_candidates + historical_candidates,
+            )
+            result[0]["scope_anomalies"] = merged_scope
+            compact_retry_count += result[1]
+            split_retry_count += result[2]
+            if not result[3]:
+                storage.save_evaluation_scan_checkpoint(
+                    app, task["project_id"], document["document_id"], scope_scan_key,
+                    chunk["chunk_id"], chunk_hash, {"scope_anomalies": merged_scope},
+                )
+                storage.save_evaluation_scan_checkpoint(
+                    app, task["project_id"], document["document_id"], scan_key, chunk["chunk_id"], chunk_hash, result[0],
+                )
+            per_chunk[index] = (result[0], result[3])
     completed = 0
-    for chunk in chunks:
+    for index in sorted(per_chunk):
+        value, failed = per_chunk[index]
         completed += 1
-        chunk_hash = hashlib.sha256(str(chunk.get("text") or "").encode("utf-8")).hexdigest()
-        message = f"正在全文证据扫描 {document['bidder_name'] or document['original_name']}：{_full_scan_chunk_label(chunk)}（{completed}/{total}）"
+        message = f"正在全文证据扫描 {document['bidder_name'] or document['original_name']}：{_full_scan_chunk_label(chunks[index])}（{completed}/{total}）"
         if progress_callback:
             progress_callback(message)
         else:
             progress = int((progress_offset + completed - 1) * 100 / max(1, progress_total))
             storage.update_task(app, task["task_id"], progress=progress, message=message)
-        checkpoint = storage.get_evaluation_scan_checkpoint(app, document["document_id"], scan_key, chunk["chunk_id"], chunk_hash)
-        stable_scope = storage.get_evaluation_scan_checkpoint(
-            app, document["document_id"], scope_scan_key, chunk["chunk_id"], chunk_hash,
-        )
-        stable_candidates = stable_scope.get("scope_anomalies", []) if isinstance(stable_scope, dict) else []
-        historical_candidates = storage.previous_scope_anomalies(
-            app, document["document_id"], chunk["chunk_id"], chunk_hash,
-        )
-        if checkpoint is not None:
-            # 兼容 v3 已落库的纯 findings 检查点，避免升级时浪费一次扫描。
-            if isinstance(checkpoint, list):
-                findings.extend(checkpoint)
-                scope_anomalies.extend(_merge_scope_anomalies([], stable_candidates + historical_candidates))
-            elif isinstance(checkpoint, dict):
-                findings.extend(checkpoint.get("findings") or [])
-                scope_anomalies.extend(_merge_scope_anomalies(
-                    checkpoint.get("scope_anomalies") or [], stable_candidates + historical_candidates,
-                ))
-            continue
-        result = _run_full_scan_piece(app, task, profile, document, catalog, chunk, project_scope, system_prompt)
-        findings.extend(result[0]["findings"])
-        merged_scope = _merge_scope_anomalies(
-            result[0]["scope_anomalies"], stable_candidates + historical_candidates,
-        )
-        result[0]["scope_anomalies"] = merged_scope
-        scope_anomalies.extend(merged_scope)
-        compact_retry_count += result[1]
-        split_retry_count += result[2]
-        failed_chunks.extend(result[3])
-        if not result[3]:
-            storage.save_evaluation_scan_checkpoint(
-                app, task["project_id"], document["document_id"], scope_scan_key,
-                chunk["chunk_id"], chunk_hash, {"scope_anomalies": merged_scope},
-            )
-            storage.save_evaluation_scan_checkpoint(
-                app, task["project_id"], document["document_id"], scan_key, chunk["chunk_id"], chunk_hash, result[0],
-            )
+        findings.extend(value["findings"])
+        scope_anomalies.extend(value["scope_anomalies"])
+        failed_chunks.extend(failed)
     return {
         "chunks": chunks,
         "findings": findings,
@@ -5947,6 +5965,252 @@ def _with_ocr_fallback_evidence(result: dict, component: str, service_labels: st
     )
 
 
+_OCR_BATCH_MAX_RULES = 6
+_OCR_BATCH_MAX_CHARS = 40_000
+
+
+def _ocr_batch_enabled() -> bool:
+    """OCR 归纳批量合并开关；默认关闭，需在真实项目上做开/关 A/B 验证后再启用。"""
+    return str(os.environ.get("EVALUATION_WORKBENCH_OCR_BATCH") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _ocr_supplement_extract(app, task, document, rule, result, level, *,
+                            locator_profile=None, allow_tencent=True):
+    """批量路径的 OCR 候选页定位与文字提取；返回归纳载荷或提前结束的最终结果。"""
+    working_result = result
+    if level == "high" and locator_profile and not _vision_page_candidates(document, rule, result):
+        located = _locate_visual_pages(app, task, document, rule, locator_profile)
+        if located:
+            working_result = {**result, "visual_page_candidates": located}
+    candidate_pages = _ocr_candidate_pages(document, rule, working_result, level)
+    discovery_count = _ocr_discovery_page_count(rule, level, candidate_pages)
+    discovery_pages = candidate_pages[:discovery_count]
+    values, failure = _ocr_page_texts(
+        app, task, document, rule, working_result, level, pages=discovery_pages, allow_tencent=allow_tencent,
+    )
+    remaining_pages = candidate_pages[discovery_count:]
+    if remaining_pages and not _ocr_discovery_is_sufficient(rule, values):
+        followup_values, followup_failure = _ocr_page_texts(
+            app, task, document, rule, working_result, level, pages=remaining_pages, allow_tencent=allow_tencent,
+        )
+        values.extend(followup_values)
+        if followup_failure:
+            failure = "；".join(value for value in (failure, followup_failure) if value)
+    if not values:
+        status = "ocr_quota_exhausted" if "额度" in failure else "ocr_not_located" if "定位" in failure else "ocr_failed"
+        return None, _set_result_coverage(_with_vision_execution(working_result, status, [], {}, failure or "OCR 未获得可用文字，已保留原文字结论。"), "uncovered")
+    pages = [int(value["page"]) for value in values]
+    ocr_text = _pack_ocr_page_texts(values, rule=rule)
+    if not ocr_text.strip():
+        return None, _set_result_coverage(_with_vision_execution(working_result, "ocr_failed", pages, {}, "OCR 未识别到可用文字，已保留原文字结论。"), "uncovered")
+    service_labels = "、".join(dict.fromkeys(_ocr_service_label(str(value.get("service") or "")) for value in values))
+    local_only = bool(values) and all(str(value.get("service") or "") == LOCAL_OCR_SERVICE for value in values)
+    incomplete_pages = "本地 RapidOCR 未完成" in str(failure or "")
+    return {
+        "working_result": working_result, "pages": pages, "ocr_text": ocr_text,
+        "service_labels": service_labels, "local_only": local_only,
+        "failure": failure, "incomplete_pages": incomplete_pages,
+    }, None
+
+
+def _ocr_summarize_prompt(app, payload: dict, rule: dict, document: dict) -> str:
+    prompt = storage.render_prompt_template(
+        app, "evaluate_all_ocr_user",
+        rule=json.dumps(_visual_rule_packet(rule), ensure_ascii=False, separators=(",", ":")),
+        document_name=document.get("original_name") or "投标文件",
+        bidder_name=document.get("bidder_name") or document.get("original_name") or "投标人",
+        text_result=json.dumps(payload["working_result"], ensure_ascii=False, separators=(",", ":")),
+        ocr_service=payload["service_labels"],
+        ocr_pages="、".join(f"P{page}" for page in payload["pages"]),
+        ocr_text=payload["ocr_text"],
+    )
+    prompt += "\n\n【系统输出与证据协议】\n" + storage.render_prompt_template(app, "evaluate_all_ocr_contract")
+    if payload["incomplete_pages"]:
+        prompt += (
+            "\n\n【OCR执行边界】部分候选页未能完成本地 OCR：" + payload["failure"][:240]
+            + "。只能基于已识别页给出部分补充，不得声称本次 OCR 已完整覆盖整条规则。"
+        )
+    return prompt
+
+
+def _apply_ocr_summary(component: str, rule: dict, working_result: dict, parsed: dict, payload: dict) -> dict:
+    """把一次 OCR 归纳结果合并进单条规则；与 _run_ocr_supplement 的合并语义逐字段一致。"""
+    pages = payload["pages"]
+    service_labels = payload["service_labels"]
+    local_only = payload["local_only"]
+    failure = payload["failure"]
+    incomplete_pages = payload["incomplete_pages"]
+    scope = _ocr_response_scope(parsed)
+    content_covered = str(parsed.get("content_coverage") or "").lower() == "covered"
+    can_apply = not incomplete_pages and (scope == "full" or content_covered)
+    if incomplete_pages:
+        scope = "partial"
+    evidence_pages: list[int] = []
+    for value in parsed.get("evidence_pages") or []:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            page = int(value)
+            if page in pages and page not in evidence_pages:
+                evidence_pages.append(page)
+    if not evidence_pages:
+        for value in (parsed.get("evidence"), parsed.get("reason")):
+            for page in _explicit_page_references(value):
+                if page in pages and page not in evidence_pages:
+                    evidence_pages.append(page)
+    if not evidence_pages and len(pages) == 1:
+        evidence_pages = list(pages)
+    display_pages = evidence_pages or pages
+    prefix_name = "本地OCR" if local_only else "OCR"
+    prefix = f"【{prefix_name}·{service_labels}·" + "、".join(f"P{page}" for page in display_pages) + "】"
+    evidence_limit = 500 if component == "objective" else 1600
+    reason_limit = 400 if component == "objective" else 1200
+    merge_limit = 1_000 if component == "objective" else 2_000
+    evidence = _clean_model_text(parsed.get("evidence"))[:evidence_limit]
+    reason = _clean_model_text(parsed.get("reason"))[:reason_limit]
+    status = "ocr_applied" if scope == "full" else "ocr_applied_partial"
+    reconciled_evidence = _reconcile_stale_pending_text(
+        working_result.get("evidence"), f"{evidence}\n{reason}", rule, full=scope == "full",
+    )
+    reconciled_reason = _reconcile_stale_pending_text(
+        working_result.get("reason"), f"{evidence}\n{reason}", rule, full=scope == "full",
+    )
+    if component == "review":
+        selected_status = str(parsed.get("status") or working_result.get("status") or "manual") if can_apply else str(working_result.get("status") or "manual")
+        if selected_status not in {"satisfied", "not_satisfied", "partial", "not_found", "manual"}:
+            selected_status = "manual"
+        merged = _review_result_from_model({
+            "evidence": _merge_supplement_text(reconciled_evidence, f"{prefix}{evidence}" if evidence else "", limit=merge_limit),
+            "page_hint": "P" + "、P".join(str(page) for page in (evidence_pages or pages)),
+            "reason": _merge_reason_text(reconciled_reason, f"{prefix}{reason}" if reason else "", limit=merge_limit),
+            "risk_level": parsed.get("risk_level") if can_apply else working_result.get("risk_level"),
+            "confidence": parsed.get("confidence") if can_apply else working_result.get("confidence"),
+            "evidence_quality": "sufficient" if can_apply and evidence else working_result.get("evidence_quality"),
+        }, rule["rule_id"], selected_status)
+        merged = {
+            **merged,
+            "visual_page_candidates": list(working_result.get("visual_page_candidates") or []),
+            "ocr_candidate_pages": pages,
+            "ocr_evidence_pages": evidence_pages,
+        }
+    else:
+        max_score = float(_rule_scoring(rule).get("max_score") or working_result.get("max_score") or 0)
+        suggested = _bounded_model_score(parsed.get("suggested_score"), max_score) if can_apply and max_score > 0 else working_result.get("suggested_score")
+        merged = {**working_result, "suggested_score": suggested,
+                  "evidence": _merge_supplement_text(reconciled_evidence, f"{prefix}{evidence}" if evidence else "", limit=merge_limit),
+                  "reason": _merge_reason_text(reconciled_reason, f"{prefix}{reason}" if reason else "", limit=merge_limit),
+                  "confidence": _enum_text(parsed.get("confidence"), {"high", "medium", "low"}, working_result.get("confidence")) if can_apply else working_result.get("confidence"),
+                  "ocr_candidate_pages": pages, "ocr_evidence_pages": evidence_pages,
+                  "requires_review": True, "automation_status": "needs_review", "review_reason": f"{service_labels} 结果已补充，需人工复核。"}
+    merged = _append_evidence_layer(
+        merged, source="local_ocr" if local_only else "tencent_ocr", summary=evidence or reason, checked_pages=pages,
+        evidence_pages=evidence_pages, service=service_labels,
+    )
+    return _with_vision_execution(
+        _set_result_coverage(merged, "covered" if can_apply else "partial"), status, pages, {"display_name": service_labels},
+        f"{service_labels} 已识别候选页并{'采纳到规则结论' if can_apply else '补充部分文字事实'}"
+        + (f"；{failure}" if incomplete_pages else "。"),
+        evidence_pages=evidence_pages,
+    )
+
+
+def _run_ocr_summarize(app, task, document, component, rule, payload, profile) -> dict:
+    """对已提取的 OCR 载荷执行单条归纳模型调用；失败语义与 _run_ocr_supplement 一致。"""
+    prompt = _ocr_summarize_prompt(app, payload, rule, document)
+    try:
+        parsed = _request_task_json(
+            app, task, profile, f"evaluate_all_{component}_ocr", _system_prompt(app, "evaluate_all"), prompt,
+            document_id=document["document_id"], context_mode="local_ocr" if payload["local_only"] else "tencent_ocr",
+            max_tokens=_output_token_budget(profile, 1300), thinking_mode="disabled",
+        )
+    except ValueError:
+        fallback = _with_ocr_fallback_evidence(payload["working_result"], component, payload["service_labels"], payload["pages"], payload["ocr_text"])
+        message = (
+            f"{payload['service_labels']} 已完成文字识别；OCR结论规范化失败，客观分仅保留简短摘要和原建议。"
+            if component == "objective"
+            else f"{payload['service_labels']} 已识别文字并附入证据；OCR结论规范化失败，已保留原结论。"
+        )
+        return _set_result_coverage(_with_vision_execution(fallback, "ocr_applied_partial", payload["pages"], {}, message), "partial")
+    if not isinstance(parsed, dict) or _ocr_response_coverage(parsed) != "covered":
+        fallback = _with_ocr_fallback_evidence(
+            payload["working_result"], component, payload["service_labels"], payload["pages"], payload["ocr_text"], uncovered=True,
+        )
+        return _set_result_coverage(_with_vision_execution(fallback, "ocr_uncovered", payload["pages"], {}, f"{payload['service_labels']} 已识别候选页，但未覆盖可形成结论的关键文字，已保留原结论。"), "uncovered")
+    return _apply_ocr_summary(component, rule, payload["working_result"], parsed, payload)
+
+
+def _run_ocr_batch_supplement(app, task, document, component, entries, profile, *, locator_profile=None) -> dict[str, dict]:
+    """同组件多条规则合并 OCR 归纳调用，降低模型调用次数。
+
+    只对 2-6 条规则且合并 OCR 文本不超过阈值的组件启用；模型必须按输入顺序覆盖
+    每个 rule_id 且每条 coverage=covered 才采纳整批结果，否则整批回退为逐条原路径
+    （_run_ocr_supplement），保证证据链与覆盖率语义与旧实现完全一致。
+    """
+    results: dict[str, dict] = {}
+    batch_items: list[tuple[dict, dict]] = []
+    for rule, result, allow_tencent in entries:
+        trigger, configured_level = _rule_vision_policy(rule)
+        level = configured_level if configured_level in {"low", "standard", "high"} else "standard"
+        payload, early = _ocr_supplement_extract(
+            app, task, document, rule, result, level, locator_profile=locator_profile, allow_tencent=allow_tencent,
+        )
+        if payload is None:
+            results[rule["rule_id"]] = early
+        else:
+            batch_items.append((rule, payload))
+    if not batch_items:
+        return results
+    if len(batch_items) < 2 or len(batch_items) > _OCR_BATCH_MAX_RULES or sum(len(p["ocr_text"]) for _, p in batch_items) > _OCR_BATCH_MAX_CHARS:
+        for rule, payload in batch_items:
+            results[rule["rule_id"]] = _run_ocr_summarize(app, task, document, component, rule, payload, profile)
+        return results
+    items = [{
+        "rule_id": rule["rule_id"],
+        "rule": _visual_rule_packet(rule),
+        "text_result": payload["working_result"],
+        "ocr_service": payload["service_labels"],
+        "ocr_pages": payload["pages"],
+        "ocr_text": payload["ocr_text"],
+    } for rule, payload in batch_items]
+    prompt = storage.render_prompt_template(
+        app, "evaluate_all_ocr_batch_user",
+        items=json.dumps(items, ensure_ascii=False, separators=(",", ":")),
+        document_name=document.get("original_name") or "投标文件",
+        bidder_name=document.get("bidder_name") or document.get("original_name") or "投标人",
+    )
+    prompt += "\n\n【系统输出与证据协议】\n" + storage.render_prompt_template(app, "evaluate_all_ocr_contract")
+    incomplete = [(rule, payload) for rule, payload in batch_items if payload["incomplete_pages"]]
+    if incomplete:
+        note = "；".join(f"规则{rule['rule_id'][:8]}：{payload['failure'][:120]}" for rule, payload in incomplete)
+        prompt += "\n\n【OCR执行边界】以下规则存在未完成的本地 OCR 页：" + note[:400] + "。只能基于已识别页给出部分补充，不得声称整条规则 OCR 已完整覆盖。"
+    parsed = None
+    try:
+        value = _request_task_json(
+            app, task, profile, f"evaluate_all_{component}_ocr_batch", _system_prompt(app, "evaluate_all"), prompt,
+            document_id=document["document_id"], context_mode="ocr_batch",
+            max_tokens=_output_token_budget(profile, 800 + len(batch_items) * 900), thinking_mode="disabled",
+        )
+        if isinstance(value, dict) and isinstance(value.get("results"), list):
+            parsed = value
+    except ValueError:
+        parsed = None
+    if parsed is not None:
+        by_id = {str(item.get("rule_id")): item for item in parsed["results"] if isinstance(item, dict) and str(item.get("rule_id"))}
+        if all(rule["rule_id"] in by_id for rule, _ in batch_items) and all(
+            _ocr_response_coverage(by_id[rule["rule_id"]]) == "covered" for rule, _ in batch_items
+        ):
+            for rule, payload in batch_items:
+                results[rule["rule_id"]] = _apply_ocr_summary(component, rule, payload["working_result"], by_id[rule["rule_id"]], payload)
+            return results
+    # 整批回退：逐条走与旧实现完全一致的路径（含重新提取），保证行为一致。
+    for rule, result, allow_tencent in entries:
+        if rule["rule_id"] in results:
+            continue
+        results[rule["rule_id"]] = _run_ocr_supplement(
+            app, task, document, component, rule, result, profile,
+            locator_profile=locator_profile, baseline=True, allow_tencent=allow_tencent,
+        )
+    return results
+
+
 def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: dict, result: dict,
                         profile: dict, locator_profile: dict | None = None, *,
                         baseline: bool = False, allow_tencent: bool = True) -> dict:
@@ -6763,6 +7027,13 @@ def _vision_render_setting(rule: dict, level: str) -> dict:
         setting["quality"] = max(int(setting["quality"]), 80)
         if setting["detail"] == "low":
             setting["detail"] = "standard"
+    elif level == "standard":
+        # 材料/字段/文字类规则不涉及签章外观，标准档适度降采样，减小图片体积与
+        # 单次视觉调用延迟；OCR 文字层已先完成，识别所需关键字段仍可读。
+        setting["scale"] = min(float(setting["scale"]), 1.2)
+        setting["quality"] = min(int(setting["quality"]), 76)
+        if setting["detail"] == "standard":
+            setting["detail"] = "low"
     return setting
 
 
@@ -8116,6 +8387,33 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
     ocr_configuration = storage.ocr_configuration(app)
     ocr_enabled = _evaluation_ocr_enabled(ocr_features_enabled, ocr_configuration)
     for component, component_rules, run in visual_components:
+        # OCR 归纳批量合并（默认关闭，开启后同组件 2 条以上规则一次模型调用）：
+        # 先收集本组件需要 OCR 的规则并批量提取文字，主循环命中批结果时直接使用；
+        # 批内任何缺失/异常都会整批回退为逐条原路径，行为与旧实现一致。
+        ocr_batch_results: dict[str, dict] = {}
+        if _ocr_batch_enabled():
+            batch_entries: list[tuple[dict, dict, bool]] = []
+            for rule in component_rules:
+                if rule["rule_id"] in reused_rule_ids[component]:
+                    continue
+                base = completed_results[component].get(rule["rule_id"])
+                if not base:
+                    continue
+                base = _with_evidence_pack_candidates(app, document, rule, base)
+                if ocr_enabled and _local_ocr_baseline_required(rule, base, component):
+                    trigger, level = _rule_vision_policy(rule)
+                    enhancement = trigger != "off" and level != "off" and _rule_image_mode(rule) != "off"
+                    tencent_upgrade = enhancement and (trigger == "required" or _needs_visual_fallback(component, base))
+                    batch_entries.append((rule, base, tencent_upgrade))
+            if len(batch_entries) >= 2:
+                progress.message(f"正在批量 OCR 识别：{bidder_name} · {component}")
+                ocr_started_at = time.monotonic()
+                ocr_batch_results = _run_ocr_batch_supplement(
+                    app, task, document, component, batch_entries, profile, locator_profile=vision_profile,
+                )
+                values["local_ocr_seconds"] += max(0.0, time.monotonic() - ocr_started_at)
+                values["local_ocr_rule_count"] += len(batch_entries)
+                values["batch_count"] += 1
         for rule in component_rules:
             if rule["rule_id"] in reused_rule_ids[component]:
                 continue
@@ -8148,16 +8446,19 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
             # 升级腾讯精确字段核验或多模态外观核验。这样非多模态模型也能稳定运行。
             if baseline_required:
                 progress.message(f"正在本地 OCR 识别：{bidder_name} · {label}")
-                ocr_started_at = time.monotonic()
-                merged = _run_ocr_supplement(
-                    app, task, document, component, rule, merged, profile,
-                    # 高强度纯扫描件在文字锚点失效时，可借助已配置的多模态模型
-                    # 做一次低清找页；即使专家模式仅选择腾讯 OCR，也不丢失旧能力。
-                    locator_profile=vision_profile, baseline=True, allow_tencent=tencent_upgrade_requested,
-                )
-                values["local_ocr_seconds"] += max(0.0, time.monotonic() - ocr_started_at)
-                values["local_ocr_rule_count"] += 1
-                values["batch_count"] += 1
+                if rule["rule_id"] in ocr_batch_results:
+                    merged = ocr_batch_results[rule["rule_id"]]
+                else:
+                    ocr_started_at = time.monotonic()
+                    merged = _run_ocr_supplement(
+                        app, task, document, component, rule, merged, profile,
+                        # 高强度纯扫描件在文字锚点失效时，可借助已配置的多模态模型
+                        # 做一次低清找页；即使专家模式仅选择腾讯 OCR，也不丢失旧能力。
+                        locator_profile=vision_profile, baseline=True, allow_tencent=tencent_upgrade_requested,
+                    )
+                    values["local_ocr_seconds"] += max(0.0, time.monotonic() - ocr_started_at)
+                    values["local_ocr_rule_count"] += 1
+                    values["batch_count"] += 1
             allow_vision = enhancement_requested and (image_mode in {"vision_only", "combined"} or image_mode == "auto")
             skip_note = _multimodal_skip_note(image_strategy, merged, rule, trigger) if enhancement_requested else ""
             should_run_vision = image_mode == "combined" or _should_run_multimodal_after_ocr(image_strategy, merged)
