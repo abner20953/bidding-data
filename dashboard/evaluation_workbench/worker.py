@@ -3360,10 +3360,20 @@ def _score_evidence_text(raw: dict) -> str:
                 continue
             name = _clean_model_text(item.get("name") or item.get("project_name") or f"证据{index}")
             page = _clean_model_text(item.get("page_hint") or item.get("page"))
-            # 页码统一为“第N页/第N-M页”，去掉模型偶发的 P55、第P55 前缀写法。
+            # 页码统一为“第N页/第N-M页”，去掉模型偶发的 P55、第P55 前缀写法；
+            # 只有原文带范围分隔符（-、—、～、至）才视为连续区间，散页用“、”连接，
+            # 避免把“P55、P57”两个独立页误写成“第55-57页”。
             page_numbers = re.findall(r"\d+", page)
             if page_numbers:
-                page = "-".join(page_numbers)
+                if re.search(r"[-—–～~至]", page):
+                    if len(page_numbers) >= 2:
+                        page = f"{page_numbers[0]}-{page_numbers[1]}"
+                        if len(page_numbers) > 2:
+                            page += "、" + "、".join(page_numbers[2:])
+                    else:
+                        page = page_numbers[0]
+                else:
+                    page = "、".join(page_numbers)
             validity = labels.get(str(item.get("validity") or ""), str(item.get("validity") or ""))
             reason = _clean_model_text(item.get("reason"))
             detail = "；".join(value for value in (validity, reason) if value)

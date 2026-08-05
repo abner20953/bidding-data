@@ -98,6 +98,12 @@ def _report_compact_text(value: object, limit: int = 240) -> str:
     return text if len(text) <= limit else f"{text[:limit - 1].rstrip()}…"
 
 
+def _report_brief(parts: list[str], limit: int) -> str:
+    """拼接报告摘要且不再做整体清洗，保留各部分已经带上的语义标签（如"计分过程："）。"""
+    text = re.sub(r"\s+", " ", "；".join(part for part in parts if part)).strip()
+    return text if len(text) <= limit else f"{text[:limit - 1].rstrip()}…"
+
+
 def _report_result_explanation(value: object, rule: dict) -> str:
     """与网页端保持一致：结果区不重复显示已经单列的检查规则。"""
     text = str(value or "").strip()
@@ -173,9 +179,20 @@ def _report_presentation(documents: list[dict], rule_set: dict | None, rules: li
             _report_compact_text(layer.get("summary"), 140) for layer in layers
             if isinstance(layer, dict) and str(layer.get("summary") or "").strip()
         ]
-        # 新增的 OCR/图片补充通常位于原字符串尾部；报告优先呈现结构化补充，避免截断后丢失。
-        evidence_parts = layer_summaries[-2:] + [_report_result_explanation(evidence, value)]
-        value["evidence_brief"] = _report_compact_text("；".join(part for part in evidence_parts if part), 260)
+        # 计分过程是评分留痕的关键一层，必须保留在报告正文；其余补充取最近两层，
+        # 避免“计分过程+腾讯OCR+图片识别”三层时把计分过程挤出报告。
+        calculation_summaries = [
+            f"计分过程：{_report_compact_text(layer.get('summary'), 130)}"
+            for layer in layers
+            if isinstance(layer, dict) and layer.get("source") == "score_calculation"
+            and str(layer.get("summary") or "").strip()
+        ]
+        other_summaries = [
+            summary for layer, summary in zip(layers, layer_summaries)
+            if not (isinstance(layer, dict) and layer.get("source") == "score_calculation")
+        ]
+        evidence_parts = other_summaries[-2:] + calculation_summaries + [_report_result_explanation(evidence, value)]
+        value["evidence_brief"] = _report_brief(evidence_parts, 260)
         value["reason_brief"] = _report_compact_text(_report_result_explanation(reason, value), 200)
         value["confidence_label"] = _report_label(_REPORT_CONFIDENCE_LABELS, value.get("confidence"))
         vision_status = str(value.get("vision_status") or "not_requested")

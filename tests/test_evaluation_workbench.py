@@ -1808,13 +1808,20 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn("计分过程", result["reason"])
 
     def test_score_evidence_text_normalizes_page_format(self):
-        raw = {
-            "matched_count": 1,
-            "evidence_items": [{"name": "项目一", "page_hint": "P55", "validity": "valid", "reason": "同类型"}],
-        }
-        evidence = worker._score_evidence_text(raw)
-        self.assertIn("第55页", evidence)
-        self.assertNotIn("第P55页", evidence)
+        def build(page_hint):
+            return worker._score_evidence_text({
+                "matched_count": 1,
+                "evidence_items": [{"name": "项目一", "page_hint": page_hint, "validity": "valid", "reason": "同类型"}],
+            })
+        self.assertIn("第55页", build("P55"))
+        self.assertNotIn("第P55页", build("P55"))
+        # 散页必须用“、”连接，不能被误写成连续区间
+        scatter = build("P55、P57")
+        self.assertIn("第55、57页", scatter)
+        self.assertNotIn("第55-57页", scatter)
+        # 原文带范围分隔符时才保留区间语义
+        span = build("第P55-P58页")
+        self.assertIn("第55-58页", span)
 
     def test_evaluation_highlights_caps_three_per_bidder_and_shortens_headline(self):
         candidates = [{"document_id": "bid-a", "bidder_name": "甲公司", "candidates": []}]
@@ -2371,6 +2378,25 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("腾讯OCR摘要", compact)
         self.assertNotIn("身份证号码", compact)
         self.assertIn("文字层建议1分", compact)
+
+    def test_report_keeps_score_calculation_layer_in_evidence_brief(self):
+        objective_scores = [{
+            "rule_id": "r1", "title": "业绩评分", "check_rule": "每个同类型项目得3分，最高9分。",
+            "evidence": "文字层证据。", "reason": "文字层理由。",
+            "max_score": 9, "suggested_score": 6,
+            "evidence_layers": [
+                {"source": "score_calculation", "summary": "计分过程：3项×3分=9分，封顶9分。"},
+                {"source": "tencent_ocr", "summary": "腾讯 OCR 摘要。"},
+                {"source": "vision", "summary": "图片识别摘要。"},
+            ],
+        }]
+        presentation = evaluation_workbench_module._report_presentation(
+            [], None, [], None, [], [], objective_scores, [],
+        )
+        brief = presentation["objective_scores"][0]["evidence_brief"]
+        self.assertIn("计分过程：3项×3分=9分", brief)
+        self.assertIn("腾讯 OCR 摘要", brief)
+        self.assertIn("图片识别摘要", brief)
 
     def test_supplement_text_keeps_latest_ocr_or_visual_fact_at_length_limit(self):
         merged = worker._merge_supplement_text("旧结论" * 900, "【图片识别】证书编号A123，有效期至2029年。")
