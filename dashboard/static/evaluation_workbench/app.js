@@ -112,18 +112,21 @@
     const full = cleanDisplayText(text);
     if (!full) return '';
     const badge = updated ? '<small class="layer-updated">已被后续核验更新</small>' : '';
+    const labelHtml = label ? `<strong>${escapeHtml(label)}</strong>` : '';
     if (full.length <= 160) {
-      return `<div class="layer-block"><strong>${escapeHtml(label)}</strong>${badge}<span>${escapeHtml(full)}</span></div>`;
+      return `<div class="layer-block">${labelHtml}${badge}<span>${escapeHtml(full)}</span></div>`;
     }
     const preview = `${full.slice(0, 160)}…`;
-    return `<details class="layer-block"><summary><strong>${escapeHtml(label)}</strong>${badge}<span>${escapeHtml(preview)}</span></summary><div>${escapeHtml(full)}</div></details>`;
+    return `<details class="layer-block"><summary>${labelHtml}${badge}<span>${escapeHtml(preview)}</span></summary><div>${escapeHtml(full)}</div></details>`;
   }
-  function layeredBlocksHtml(text, baseLabel) {
+  function layeredBlocksHtml(text) {
     const parts = String(text || '').split(/(?=【(?:图片识别|腾讯OCR|本地OCR|OCR)[^】]*】)/).filter(Boolean);
     if (!parts.length) return '';
     return parts.map((part, index) => {
       const marker = part.match(/^【(图片识别|腾讯OCR|本地OCR|OCR)[^】]*】/);
-      let label = baseLabel;
+      // 第一个文字层块由外层“文字证据/文字理由”标题覆盖，不再重复显示标题；
+      // 只有 OCR/图片补充块才带各自的小标题。
+      let label = '';
       let body = part;
       if (marker) {
         label = layerSourceLabels[marker[1]] || '补充';
@@ -136,7 +139,7 @@
     const evidence = String(result?.evidence || '').trim();
     const reason = String(result?.reason || '').trim();
     if (!evidence && !reason) return '';
-    return `<details class="evidence-chain"><summary>查看完整文字结论</summary>${evidence ? `<div class="evidence-layer"><strong>文字证据</strong>${layeredBlocksHtml(evidence, '文字证据')}</div>` : ''}${reason ? `<div class="evidence-layer"><strong>文字理由</strong>${layeredBlocksHtml(reason, '文字理由')}</div>` : ''}</details>`;
+    return `<details class="evidence-chain"><summary>查看完整文字结论</summary>${evidence ? `<div class="evidence-layer"><strong>文字证据</strong>${layeredBlocksHtml(evidence)}</div>` : ''}${reason ? `<div class="evidence-layer"><strong>文字理由</strong>${layeredBlocksHtml(reason)}</div>` : ''}</details>`;
   }
   function roleLabel(role) { return {tender:'主招标文件', tender_attachment:'招标附件', bid:'投标文件'}[role] || role; }
   function parseStatusLabel(status) { return {pending:'待解析',queued:'排队中',running:'解析中',success:'解析完成',error:'解析失败'}[status] || status || '-'; }
