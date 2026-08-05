@@ -1779,14 +1779,31 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(worker._clean_model_text("正常文字"), "正常文字")
 
     def test_clean_model_text_strips_internal_ids_and_field_notation(self):
-        text = "计分过程：SI-1供货方案（第P55页）：建议有效；status=not_found、risk=high、evidence_quality=missing；suggested_score=0。"
+        text = ("计分过程：SI-1供货方案（第P55页）：建议有效；status=not_found、risk=high、"
+                "evidence_quality=missing；suggested_score=0。结论scope=partial；validity=partial；met=false。")
         cleaned = worker._clean_model_text(text)
         self.assertNotIn("SI-1", cleaned)
         self.assertNotIn("status=", cleaned)
         self.assertNotIn("risk=", cleaned)
         self.assertNotIn("suggested_score=", cleaned)
+        self.assertNotIn("scope=", cleaned)
+        self.assertNotIn("validity=", cleaned)
+        self.assertNotIn("met=", cleaned)
         self.assertIn("供货方案", cleaned)
         self.assertIn("第P55页", cleaned)
+
+    def test_score_evidence_validity_labels_use_chinese_and_unknown_fallback(self):
+        def build(validity):
+            return worker._score_evidence_text({
+                "evidence_items": [{"name": "项目一", "page_hint": "1", "validity": validity, "reason": "同类型"}],
+            })
+        self.assertIn("有效；同类型", build("valid"))
+        self.assertIn("需人工核验；同类型", build("uncertain"))
+        self.assertIn("无效；同类型", build("invalid"))
+        self.assertIn("部分有效；同类型", build("partial"))
+        self.assertIn("需人工核验；同类型", build("whatever"))
+        self.assertNotIn("；同类型", build(""))
+        self.assertNotIn("partial", build("partial"))
 
     def test_truncate_field_adds_omission_marker(self):
         self.assertEqual(worker._truncate_field("短文本", 2000), "短文本")

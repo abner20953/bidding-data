@@ -72,8 +72,9 @@ def _report_label(labels: dict, value: object, default: str = "-") -> str:
 
 _REPORT_INTERNAL_ID_PATTERN = re.compile(r"(?<![0-9A-Za-z])SI-\d+(?![0-9A-Za-z])")
 _REPORT_FIELD_NOTATION_PATTERN = re.compile(
-    r"\b(?:status|risk_level|evidence_quality|confidence|suggested_score|max_score|"
-    r"matched_count|needs_ocr|coverage_status|final_score|effective_score)\s*=\s*[^，。；;：:\s]+"
+    r"(?<![0-9A-Za-z])(?:status|risk_level|evidence_quality|confidence|suggested_score|max_score|"
+    r"matched_count|needs_ocr|coverage_status|final_score|effective_score|scope|validity|met)"
+    r"\s*=\s*[^，。；;：:\s]+"
 )
 
 

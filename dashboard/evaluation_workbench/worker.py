@@ -2898,8 +2898,9 @@ def _score_payload(rules: list[dict]) -> list[dict]:
 
 _INTERNAL_ID_PATTERN = re.compile(r"(?<![0-9A-Za-z])SI-\d+(?![0-9A-Za-z])")
 _FIELD_NOTATION_PATTERN = re.compile(
-    r"\b(?:status|risk_level|evidence_quality|confidence|suggested_score|max_score|"
-    r"matched_count|needs_ocr|coverage_status|final_score|effective_score)\s*=\s*[^，。；;：:\s]+"
+    r"(?<![0-9A-Za-z])(?:status|risk_level|evidence_quality|confidence|suggested_score|max_score|"
+    r"matched_count|needs_ocr|coverage_status|final_score|effective_score|scope|validity|met)"
+    r"\s*=\s*[^，。；;：:\s]+"
 )
 _TRUNCATE_MARKER = "…（内容过长已省略）"
 
@@ -3354,7 +3355,12 @@ def _score_evidence_text(raw: dict) -> str:
         parts.append(f"AI共识别{count_text}项")
     items = raw.get("evidence_items")
     if isinstance(items, list):
-        labels = {"valid": "建议有效", "uncertain": "待核验", "invalid": "建议无效"}
+        # 有效性标签用用户可理解的中文；模型偶发的别名与未知枚举一律收敛，
+        # 绝不把 partial/status 等英文原文透传到结论里。
+        labels = {
+            "valid": "有效", "uncertain": "需人工核验", "invalid": "无效",
+            "partial": "部分有效", "confirmed": "有效", "unresolved": "需人工核验",
+        }
         for index, item in enumerate(items[:20], start=1):
             if not isinstance(item, dict):
                 continue
@@ -3374,7 +3380,11 @@ def _score_evidence_text(raw: dict) -> str:
                         page = page_numbers[0]
                 else:
                     page = "、".join(page_numbers)
-            validity = labels.get(str(item.get("validity") or ""), str(item.get("validity") or ""))
+            raw_validity = str(item.get("validity") or "").strip().lower()
+            if raw_validity:
+                validity = labels.get(raw_validity, "需人工核验")
+            else:
+                validity = ""
             reason = _clean_model_text(item.get("reason"))
             detail = "；".join(value for value in (validity, reason) if value)
             page_label = page if "页" in page else f"第{page}页"
