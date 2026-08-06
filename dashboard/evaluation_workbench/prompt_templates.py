@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 PROMPT_TEMPLATE_SETTING = "evaluation_workbench_prompt_templates"
-EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v35"
+EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v36"
 
 
 def _template(name: str, description: str, content: str, *placeholders: str) -> dict:
@@ -464,6 +464,41 @@ _SCOPE_PROFILE_REVIEW_GUIDANCE = (
     '范围偏离判断以系统生成的“项目范围画像”为唯一基准（画像覆盖采购对象、核心任务、服务对象、技术主题、设备/材料、交付物、实施地域、适用标准等，字段按实际项目生成、可为空）：画像中未包含的任何具体对象、主体、技术、材料、服务、地域、标准或交付物，若上下文表明被作为本项目的响应、承诺、方案或报价写入，即为范围偏离候选；不限定行业或采购类型，也不依赖任何固定词表。章节上位主题相关（安全、施工、运维、培训、售后等）不等于其中具体内容属于本项目，必须逐项对照画像，不得整章放行。法规、标准、通用管理规定的引用、示例、历史业绩、资质证照中的合理出现不作为候选。可解释性检验：该具体内容能否由本项目范围画像合理解释？删去后是否影响响应或方案的完整性？不能解释且可删的，更可能是模板混用或无关内容，应作为候选提示页码。'
 )
 PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"] += "\n\n" + _SCOPE_PROFILE_REVIEW_GUIDANCE
+
+
+
+# 承诺性章节整章模板混用与正文文字错误（2026-08-06 扫描召回复核后补充，类型无关）
+_SCOPE_CHAPTER_TEMPLATE_GUIDANCE = (
+    "施工、安全、实施、运维等承诺性章节必须逐项对照范围画像中的工艺对象与作业场景："
+    "其中描述的具体结构、工法、材料、运输或防护作业等对象属于画像外内容时，即为范围偏离候选，"
+    "只有原文明确标注为法规条文、标准编号、通用示例或可选方案时才可放行；"
+    "不得因整章标题属于“安全/施工”而整体放行。"
+    "同一章节连续出现多个画像外对象时，应合并为一条“整章模板混用”候选，"
+    "逐项列出对象和代表页码（如结构洞口与防护、灌浇工艺、土方与基坑作业等），不要逐条忽略。"
+)
+_TEXT_ERROR_LINE_GUIDANCE = (
+    "正文中出现明显断字、错字或上下文不通的字符组合（完整句子中夹入无意义词、同音/形近字误写、"
+    "重复错位片段等）时，应作为文字错误线索写入 reason，给出页码并注明“疑为复制粘贴或 OCR 断字，"
+    "需人工确认”；不得忽略为纯 OCR 噪声，也不得单独据此判废标或否定性结论。"
+)
+PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"] += "\n\n" + _SCOPE_CHAPTER_TEMPLATE_GUIDANCE
+PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"] += "\n\n" + _SCOPE_CHAPTER_TEMPLATE_GUIDANCE
+PROMPT_TEMPLATES["evaluate_all_review_user"]["content"] += "\n\n" + _SCOPE_CHAPTER_TEMPLATE_GUIDANCE + "\n" + _TEXT_ERROR_LINE_GUIDANCE
+PROMPT_TEMPLATES["evaluate_all_subjective_user"]["content"] += "\n\n" + _SCOPE_CHAPTER_TEMPLATE_GUIDANCE
+
+
+
+# 范围结论摘要信息量与定级校准（2026-08-06 呈现链审查后补充，类型无关）
+_SCOPE_SUMMARY_RISK_GUIDANCE = (
+    "范围类规则的结论摘要必须点名最具辨识度的偏离对象与页码区间"
+    "（如“第N-M页××章节出现××、××等非本项目场景模板，需复核是否照搬”），"
+    "不得只写“部分内容为通用模板”之类的空泛表述。"
+    "定级校准：候选原文描述的作业对象明显无法由本项目实施场景合理解释、"
+    "且上下文表明被作为本项目方案、承诺或施工依据写入时，"
+    "全文扫描中该候选的优先级应为 high，最终审查中 risk_level 应为 high"
+    "（是否最终排除仍由人工裁决），不要因措辞像通用规范而整体降为 medium。"
+)
+PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"] += "\n\n" + _SCOPE_SUMMARY_RISK_GUIDANCE
 
 PROMPT_TEMPLATE_PRESENTATION = {
     # 日常优先修改：不承载运行时 JSON 协议。

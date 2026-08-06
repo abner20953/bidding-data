@@ -2938,7 +2938,20 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_subjective_user"]["content"])
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"])
         self.assertIn("统一为 partial 或需图片核验", PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v35")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v36")
+
+    def test_scope_chapter_and_text_error_guidance_present(self):
+        from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
+        scope_marker = "整章模板混用"
+        text_marker = "疑为复制粘贴或 OCR 断字"
+        for template_id in ("evaluate_all_scope_anomaly_guidance", "evaluate_all_full_scan_user",
+                            "evaluate_all_review_user", "evaluate_all_subjective_user"):
+            self.assertIn(scope_marker, PROMPT_TEMPLATES[template_id]["content"])
+        self.assertIn(text_marker, PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
+        self.assertNotIn(text_marker, PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"])
+        self.assertIn("必须点名最具辨识度的偏离对象", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
+        self.assertIn("risk_level 应为 high", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v36")
 
     def test_review_satisfied_downgraded_when_still_needs_review(self):
         # “满足”与“需人工复核”不能并存：非低风险/高置信/证据充分时降为 partial。
@@ -4916,7 +4929,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不限定行业或采购类型", guidance)
         scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v35")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v36")
 
     def test_full_scan_reruns_rule_evidence_but_rechecks_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")
