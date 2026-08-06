@@ -172,10 +172,11 @@
     const badge = updated ? '<small class="layer-updated">已被后续核验更新</small>' : '';
     const labelHtml = label ? `<strong>${escapeHtml(label)}</strong>` : '';
     if (full.length <= 160) {
-      return `<div class="layer-block">${labelHtml}${badge}<span>${escapeHtml(full)}</span></div>`;
+      return `<div class="layer-block layer-block-plain">${labelHtml}${badge}<span>${escapeHtml(full)}</span></div>`;
     }
     const preview = `${full.slice(0, 160)}…`;
-    return `<details class="layer-block"><summary>${labelHtml}${badge}<span>${escapeHtml(preview)}</span></summary><div>${escapeHtml(full)}</div></details>`;
+    // 摘要行已展示前 160 字，展开区只接续剩余内容，避免从头重复一遍。
+    return `<details class="layer-block"><summary>${labelHtml}${badge}<span>${escapeHtml(preview)}</span></summary><div>${escapeHtml(full.slice(160))}</div></details>`;
   }
   function layeredBlocksHtml(text) {
     const parts = String(text || '').split(/(?=【(?:图片识别|腾讯OCR|本地OCR|OCR)[^】]*】)/).filter(Boolean);
@@ -551,8 +552,9 @@
       const updated = layers.length > 1 && index < layers.length - 1 ? '<small class="layer-updated">已被后续核验更新</small>' : '';
       const summary = cleanDisplayText(layer.summary);
       const body = summary.length > 160
-        ? `<details class="layer-block"><summary><span>${escapeHtml(summary.slice(0, 160))}…</span></summary><div>${escapeHtml(summary)}</div></details>`
-        : `<span>${escapeHtml(summary)}</span>`;
+        // 摘要行已展示前 160 字，展开区只接续剩余内容，避免从头重复一遍。
+        ? `<details class="layer-block"><summary><span>${escapeHtml(summary.slice(0, 160))}…</span></summary><div>${escapeHtml(summary.slice(160))}</div></details>`
+        : `<div class="layer-block layer-block-plain"><span>${escapeHtml(summary)}</span></div>`;
       return `<div class="evidence-layer"><strong>${escapeHtml(labels[layer.source] || '补充证据')}</strong>${meta ? `<small>${escapeHtml(meta)}</small>` : ''}${updated}${body}</div>`;
     }).join('')}</details>`;
   }
