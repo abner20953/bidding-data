@@ -2925,6 +2925,14 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(worker._reconcile_summary_score("", 3.0), "")
         self.assertEqual(worker._reconcile_summary_score("建议满分6分，逐项无偏离。", 3.0), "建议满分，逐项无偏离。")
 
+    def test_evidence_traceability_guidance_present_in_result_prompts(self):
+        from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
+        marker = "文本层无法定位具体金额时"
+        for template_id in ("evaluate_all_review_user", "evaluate_all_objective_user",
+                            "evaluate_all_cross_bid_price_user", "evaluate_all_guidance"):
+            self.assertIn(marker, PROMPT_TEMPLATES[template_id]["content"])
+        self.assertIn("统一为 partial 或需图片核验", PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
+
     def test_score_result_model_reconciles_summary_score(self):
         score = worker._score_result_from_model(
             "r4", 29.72, 30.0,

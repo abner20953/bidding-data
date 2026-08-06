@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 PROMPT_TEMPLATE_SETTING = "evaluation_workbench_prompt_templates"
-EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v32"
+EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v33"
 
 
 def _template(name: str, description: str, content: str, *placeholders: str) -> dict:
@@ -446,6 +446,17 @@ _SUMMARY_CONTRACT_TEMPLATE_IDS = (
 )
 for _summary_template_id in _SUMMARY_CONTRACT_TEMPLATE_IDS:
     PROMPT_TEMPLATES[_summary_template_id]["content"] += "\n\n" + _SUMMARY_CONTRACT
+
+
+
+# 报价金额溯源 / 声明函异常 / 状态一致性（2026-08-06 人工对照审查后补充）
+_EVIDENCE_TRACEABILITY_GUIDANCE = (
+    '涉及报价、金额、价格的结论，必须直接引用原文中实际存在的数字及其页码；文本层无法定位具体金额时，不得写出具体数字（如“2026元”），应写“文本层未提取到报价，需人工核对原件”。核验声明函、承诺函等固定表单时，须检查填写值是否明显不合理（单位、数量级异常）以及模板占位符（如“（企业名称）”“（标的名称）”）是否未删除，发现时必须在理由中显式提示。同一规则下，证据形态相同的投标人必须给相同状态：仅有“已提供”声明、无证书/凭证可核验字段的，统一为 partial 或需图片核验，不得判 satisfied；satisfied 结论不得同时标注“需人工复核/待核验”。'
+)
+PROMPT_TEMPLATES["evaluate_all_review_user"]["content"] += "\n\n" + _EVIDENCE_TRACEABILITY_GUIDANCE
+PROMPT_TEMPLATES["evaluate_all_objective_user"]["content"] += "\n\n" + _EVIDENCE_TRACEABILITY_GUIDANCE
+PROMPT_TEMPLATES["evaluate_all_cross_bid_price_user"]["content"] += "\n\n" + _EVIDENCE_TRACEABILITY_GUIDANCE
+PROMPT_TEMPLATES["evaluate_all_guidance"]["content"] += "\n\n" + _EVIDENCE_TRACEABILITY_GUIDANCE
 
 PROMPT_TEMPLATE_PRESENTATION = {
     # 日常优先修改：不承载运行时 JSON 协议。
