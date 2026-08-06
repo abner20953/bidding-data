@@ -2926,12 +2926,56 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(worker._reconcile_summary_score("建议满分6分，逐项无偏离。", 3.0), "建议满分，逐项无偏离。")
 
     def test_evidence_traceability_guidance_present_in_result_prompts(self):
-        from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
+        from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
         marker = "文本层无法定位具体金额时"
         for template_id in ("evaluate_all_review_user", "evaluate_all_objective_user",
-                            "evaluate_all_cross_bid_price_user", "evaluate_all_guidance"):
+                            "evaluate_all_cross_bid_price_user"):
             self.assertIn(marker, PROMPT_TEMPLATES[template_id]["content"])
+        # v33 曾把该约束同时追加到系统叠加层 evaluate_all_guidance，导致 review/
+        # objective/cross_bid 收到两遍、full_scan/subjective/OCR/vision 白扛一遍；
+        # 修复后只保留在真正产生报价/声明函结论的三个用户模板中。
+        self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_guidance"]["content"])
+        self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_subjective_user"]["content"])
+        self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"])
         self.assertIn("统一为 partial 或需图片核验", PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v35")
+
+    def test_review_satisfied_downgraded_when_still_needs_review(self):
+        # “满足”与“需人工复核”不能并存：非低风险/高置信/证据充分时降为 partial。
+        review = worker._review_result_from_model(
+            {"status": "satisfied", "evidence": "具备资质", "reason": "已提供",
+             "risk_level": "medium", "confidence": "high", "evidence_quality": "sufficient"},
+            "r1", "satisfied",
+        )
+        self.assertEqual(review["status"], "partial")
+        self.assertIn("需人工复核", review["review_reason"])
+        auto = worker._review_result_from_model(
+            {"status": "satisfied", "evidence": "具备资质", "reason": "已提供",
+             "risk_level": "low", "confidence": "high", "evidence_quality": "sufficient"},
+            "r2", "satisfied",
+        )
+        self.assertEqual(auto["status"], "satisfied")
+        self.assertEqual(auto["review_reason"], "")
+
+    def test_review_result_marks_truncated_model_text(self):
+        review = worker._review_result_from_model(
+            {"status": "satisfied", "evidence": "第57页：", "reason": "结论依据→已填写，但",
+             "summary": "", "risk_level": "medium", "confidence": "medium", "evidence_quality": "limited"},
+            "r1", "satisfied",
+        )
+        self.assertEqual(review["status"], "partial")
+        self.assertIn("结论输出不完整，需人工复核", review["reason"])
+        self.assertIn("结论输出不完整，需人工复核", review["evidence"])
+        self.assertEqual(review["conclusion_summary"], "")
+
+    def test_truncated_text_detector(self):
+        self.assertTrue(worker._looks_truncated_text("已填写，但"))
+        self.assertTrue(worker._looks_truncated_text("第57页："))
+        self.assertTrue(worker._looks_truncated_text("计分过程："))
+        self.assertFalse(worker._looks_truncated_text("已填写，但需人工核验原件。"))
+        self.assertTrue(worker._raw_result_text_incomplete("review", {"evidence": "第57页：", "reason": "完整结论。"}))
+        self.assertTrue(worker._raw_result_text_incomplete("objective", {"reason": "完整结论。", "calculation": "合计："}))
+        self.assertFalse(worker._raw_result_text_incomplete("review", {"evidence": "第57页内容", "reason": "完整结论。"}))
 
     def test_score_result_model_reconciles_summary_score(self):
         score = worker._score_result_from_model(
@@ -3273,7 +3317,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[
             {"project_identity": "测试项目", "scope_summary": "资质与技术方案", "service_targets": [], "core_tasks": [],
              "technical_topics": ["技术方案"], "equipment_or_materials": [], "deliverables": [], "standards_or_rules": [], "regions": [], "keywords": ["资质"]},
-            {"results": [{"rule_id": review_rule["rule_id"], "status": "satisfied", "evidence": "具备资质", "reason": "已提供", "risk_level": "low"}]},
+            {"results": [{"rule_id": review_rule["rule_id"], "status": "satisfied", "evidence": "具备资质", "reason": "已提供",
+                          "risk_level": "low", "confidence": "high", "evidence_quality": "sufficient"}]},
             {"results": [{"rule_id": objective_rule["rule_id"], "met": True, "evidence": "具备资质", "reason": "已提供"}]},
             {"results": [{"rule_id": subjective_rule["rule_id"], "suggested_score": 8, "evidence": "技术方案完整", "reason": "较完整"}]},
         ]) as request_json:
@@ -4686,6 +4731,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
     def test_review_normalisation_reconciles_positive_reason_and_negative_status(self):
         result = worker._normalise_review_results([{
             "rule_id": "joint", "status": "not_satisfied", "risk_level": "medium",
+            "confidence": "high", "evidence": "未见联合体协议",
             "reason": "全文未发现联合体协议，投标人为单一主体，符合不接受联合体要求。",
         }], [{"rule_id": "joint", "check_mode": "auto"}])[0]
         self.assertEqual(result["status"], "satisfied")
@@ -4870,7 +4916,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不限定行业或采购类型", guidance)
         scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v34")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v35")
 
     def test_full_scan_reruns_rule_evidence_but_rechecks_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")
@@ -5027,6 +5073,35 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(request_json.call_args_list[1].args[0]["thinking_mode"], "adaptive")
         self.assertEqual(request_json.call_args_list[2].args[0]["thinking_mode"], "disabled")
 
+    def test_combined_evaluation_retries_only_truncated_rule_with_compact_prompt(self):
+        self._add_pdf("bid.pdf", "bid", "甲公司", "本公司已提供中小企业声明函及全部字段。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        document = next(item for item in storage.list_documents(self.app, self.project["project_id"]) if item["role"] == "bid")
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "中小企业声明函完整性", "source_text": "声明函字段完整",
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        profile = storage.get_model_profile(self.app, None)
+        responses = [
+            {"results": [{"rule_id": rule["rule_id"], "status": "partial", "evidence": "第57页：",
+                          "reason": "结论依据→已填写，但", "summary": "", "risk_level": "medium",
+                          "confidence": "medium", "evidence_quality": "limited"}]},
+            {"results": [{"rule_id": rule["rule_id"], "status": "partial", "evidence": "第57页字段完整",
+                          "reason": "结论依据→已填写，需人工核验原件。", "summary": "字段完整，需人工核验",
+                          "risk_level": "medium", "confidence": "medium", "evidence_quality": "limited"}]},
+        ]
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=responses) as request_json:
+            results, retry_count, _, _, mode = worker._run_combined_batch(
+                self.app, task, profile, document, "review", [rule], "综合评审系统提示", 60_000, "声明函规则",
+            )
+        self.assertEqual(request_json.call_count, 2)
+        self.assertEqual(mode, "full_document+incomplete_retry")
+        self.assertNotIn("结论输出不完整", results[0]["reason"])
+        self.assertEqual(results[0]["reason"], "结论依据→已填写，需人工核验原件。")
+        self.assertIn("字符串内不得出现未转义的英文双引号", request_json.call_args_list[1].args[2])
+
     def test_combined_evaluation_repairs_only_raw_response_before_resending_document(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "本公司具备有效资质，正文不应在修复调用中重发。")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
@@ -5037,7 +5112,9 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.confirm_rule_set(self.app, self.project["project_id"])
         storage.create_task(self.app, self.project["project_id"], "evaluate_all")
         raw = '{"results":[{"rule_id":"%s","status":"satisfied",}]}' % rule["rule_id"]
-        repaired = {"results": [{"rule_id": rule["rule_id"], "status": "satisfied", "evidence": "有效资质"}]}
+        repaired = {"results": [{"rule_id": rule["rule_id"], "status": "satisfied", "evidence": "有效资质",
+                                 "reason": "已提供", "risk_level": "low", "confidence": "high",
+                                 "evidence_quality": "sufficient"}]}
 
         with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[
             worker.InvalidJsonResponse(raw, "stop"), repaired,
@@ -5234,7 +5311,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.create_task(self.app, self.project["project_id"], "evaluate_all")
         response = {"results": [{
             "rule_id": rule["rule_id"], "status": "satisfied", "evidence": "有效资质",
-            "reason": "全文确认已提供", "risk_level": "low",
+            "reason": "全文确认已提供", "risk_level": "low", "confidence": "high",
+            "evidence_quality": "sufficient",
         }]}
 
         with patch("dashboard.evaluation_workbench.worker.request_json", return_value=response) as request_json:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 PROMPT_TEMPLATE_SETTING = "evaluation_workbench_prompt_templates"
-EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v34"
+EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v35"
 
 
 def _template(name: str, description: str, content: str, *placeholders: str) -> dict:
@@ -456,7 +456,6 @@ _EVIDENCE_TRACEABILITY_GUIDANCE = (
 PROMPT_TEMPLATES["evaluate_all_review_user"]["content"] += "\n\n" + _EVIDENCE_TRACEABILITY_GUIDANCE
 PROMPT_TEMPLATES["evaluate_all_objective_user"]["content"] += "\n\n" + _EVIDENCE_TRACEABILITY_GUIDANCE
 PROMPT_TEMPLATES["evaluate_all_cross_bid_price_user"]["content"] += "\n\n" + _EVIDENCE_TRACEABILITY_GUIDANCE
-PROMPT_TEMPLATES["evaluate_all_guidance"]["content"] += "\n\n" + _EVIDENCE_TRACEABILITY_GUIDANCE
 
 
 

@@ -2868,11 +2868,26 @@ def _review_result_from_model(item: dict, rule_id: str, status: str) -> dict:
         if not str(item.get("reason", "")).strip():
             item = {**item, "reason": "该规则的关键证据需要 OCR 识别后才能判定。"}
     auto_ready = status == "satisfied" and risk == "low" and confidence == "high" and evidence_quality == "sufficient"
+    # “满足”与“需人工复核”不能并存：只有正向、低风险、高置信、证据充分的结论
+    # 才允许保持 satisfied；其余一律降为 partial，由 review_reason 承接复核提示。
+    if status == "satisfied" and not auto_ready:
+        status = "partial"
+    evidence = _truncate_field(_clean_model_text(item.get("evidence")), 2000)
+    reason = _truncate_field(_clean_model_text(item.get("reason")), 2000)
+    summary = _normalise_conclusion_summary(item.get("summary"))
+    # 模型输出被截断（半句话/只剩页码前缀）时保留已恢复内容并显式标注不完整，
+    # 同时清空摘要避免主表把残缺文字当最终结论；状态也回落为 partial。
+    if _result_text_incomplete("review", {"evidence": evidence, "reason": reason}):
+        evidence = _append_incomplete_marker(evidence)
+        reason = _append_incomplete_marker(reason)
+        summary = ""
+        if status == "satisfied":
+            status = "partial"
     return {"rule_id": rule_id, "status": status,
-            "evidence": _truncate_field(_clean_model_text(item.get("evidence")), 2000),
+            "evidence": evidence,
             "page_hint": _clean_model_text(item.get("page_hint"))[:80] or None,
-            "reason": _truncate_field(_clean_model_text(item.get("reason")), 2000),
-            "conclusion_summary": _normalise_conclusion_summary(item.get("summary")),
+            "reason": reason,
+            "conclusion_summary": summary,
             "risk_level": risk, "confidence": confidence, "evidence_quality": evidence_quality,
             "automation_status": "ready_for_batch_confirmation" if auto_ready else "needs_review",
             "requires_review": not auto_ready,
@@ -2943,6 +2958,53 @@ def _normalise_conclusion_summary(value: object, limit: int = 60) -> str:
         boundary = max(cut.rfind("，"), cut.rfind(","), cut.rfind("、"), cut.rfind("；"), cut.rfind(";"))
         text = f"{cut[:boundary].rstrip()}…" if boundary > 10 else f"{cut.rstrip()}…"
     return text.strip()
+
+
+_TRUNCATED_END_PATTERN = re.compile(r"(?:但|而|且|并且|以及|还有|另外|：|:|，|,|；|;|、)$")
+_TRUNCATED_PAGE_PREFIX_PATTERN = re.compile(r"第?\d+(?:-\d+)?页\s*[:：]$")
+_INCOMPLETE_OUTPUT_MARKER = "…（结论输出不完整，需人工复核）"
+
+
+def _looks_truncated_text(value: object) -> bool:
+    """识别模型输出在句子中间被截断的常见形态，避免把半句话当完整结论展示。
+
+    只匹配“明显断在语义中间”的结尾（悬空连词、冒号、顿号等）以及
+    “第N页：”这类只剩页码前缀的证据，不误伤以句号/感叹号收尾的完整句子。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if _INCOMPLETE_OUTPUT_MARKER in text:
+        return True
+    if _TRUNCATED_END_PATTERN.search(text) or _TRUNCATED_PAGE_PREFIX_PATTERN.search(text):
+        return True
+    return False
+
+
+def _raw_result_text_incomplete(component: str, item: dict) -> bool:
+    """对模型原始输出判断是否有字段被截断；评分规则同时检查计分过程。"""
+    if _looks_truncated_text(item.get("reason")):
+        return True
+    if _looks_truncated_text(item.get("evidence")):
+        return True
+    if component in {"objective", "subjective"} and _looks_truncated_text(item.get("calculation")):
+        return True
+    return False
+
+
+def _result_text_incomplete(component: str, result: dict) -> bool:
+    """对归一化后的结果判断是否仍带截断标记，供兜底标记复用。"""
+    return _raw_result_text_incomplete(component, result)
+
+
+def _append_incomplete_marker(value: object) -> str:
+    """保留已恢复的残缺内容并显式标注不完整，避免用户误以为是完整结论。"""
+    text = str(value or "").strip()
+    if not text:
+        return text
+    if _INCOMPLETE_OUTPUT_MARKER in text:
+        return text
+    return f"{text.rstrip()}{_INCOMPLETE_OUTPUT_MARKER}"
 
 
 _SCORE_SUMMARY_VALUE_PATTERN = re.compile(
@@ -3523,6 +3585,12 @@ def _score_result_from_model(rule_id: str, suggested: float | None, max_score: f
     has_evidence = bool(evidence)
     auto_ready = suggested is not None and confidence == "high" and has_evidence and not needs_ocr
     reason = _reconcile_score_reason(_score_reason_text(raw, suggested), suggested)
+    calculation = _clean_model_text(raw.get("calculation"))
+    # 计分过程或理由出现截断时保留已恢复内容并显式标注，避免把半句话当完整结论。
+    if _result_text_incomplete("score", {"evidence": evidence, "reason": reason, "calculation": calculation}):
+        evidence = _append_incomplete_marker(evidence)
+        reason = _append_incomplete_marker(reason)
+        calculation = _append_incomplete_marker(calculation)
     conclusion_summary = _normalise_conclusion_summary(raw.get("summary"))
     if suggested is not None:
         conclusion_summary = _reconcile_summary_score(conclusion_summary, suggested)
@@ -3539,7 +3607,6 @@ def _score_result_from_model(rule_id: str, suggested: float | None, max_score: f
         "review_reason": "" if auto_ready else "未得到高置信、可引用的建议分，需人工复核。",
     }
     # 计分过程以结构化证据层保留（前端证据链可展开），不再与判断理由混在同一字段。
-    calculation = _clean_model_text(raw.get("calculation"))
     if calculation:
         result = _append_evidence_layer(
             result, source="score_calculation", summary=calculation,
@@ -7730,7 +7797,8 @@ def _normalise_partial_combined_results(component: str, output: list[dict], rule
 def _run_combined_batch(app, task: dict, profile: dict, document: dict, component: str, rules: list[dict],
                         system_prompt: str, char_limit: int, label: str, depth: int = 0,
                         scan_index: dict | None = None, allow_missing_retry: bool = True,
-                        targeted_retry: bool = False, allow_item_split: bool = True) -> tuple[list[dict], int, int, int, str]:
+                        targeted_retry: bool = False, allow_item_split: bool = True,
+                        compact_retry: bool = False) -> tuple[list[dict], int, int, int, str]:
     """运行一个可独立保存的综合评审规则组；异常时仅拆分当前组。"""
     payload = _combined_batch_payload(component, rules)
     strategy = _scan_strategy(rules)
@@ -7770,6 +7838,26 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
         results, missing_rules = _normalise_partial_combined_results(
             component, parsed["results"], rules, tender_baseline,
         )
+        # 模型可能返回合法 JSON 但证据/理由半句截断（如“…已填写，但”）。这类行
+        # 按缺失规则同样只补评受影响条目，不重发整组；仅做一次，避免无限重试。
+        incomplete_rule_ids = {
+            str(item.get("rule_id")) for item in parsed["results"]
+            if isinstance(item, dict) and str(item.get("rule_id"))
+            and _raw_result_text_incomplete(component, item)
+        }
+        incomplete_rules = [item for item in rules if item["rule_id"] in incomplete_rule_ids]
+        if incomplete_rules and allow_missing_retry and not targeted_retry:
+            storage.update_task(app, task["task_id"], message=f"{label} 有 {len(incomplete_rules)} 条结论输出不完整，正在仅补评对应规则")
+            retried = _run_combined_batch(
+                app, task, profile, document, component, incomplete_rules, system_prompt, char_limit,
+                f"{label}/不完整补评", depth + 1, scan_index, allow_missing_retry=False,
+                targeted_retry=True, compact_retry=True,
+            )
+            retried_by_id = {item["rule_id"]: item for item in retried[0]}
+            results = [retried_by_id.get(item["rule_id"], item) for item in results]
+            results = _ordered_combined_results(rules, results)
+            retry_count += retried[1]
+            result_mode = f"{result_mode}+incomplete_retry"
         if missing_rules and results and allow_missing_retry:
             storage.update_task(app, task["task_id"], message=f"{label} 有 {len(missing_rules)} 条未返回，正在仅补评缺失规则")
             missing = _run_combined_batch(
@@ -7792,7 +7880,7 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
     try:
         parsed = _request_task_json(
             app, task, profile, f"evaluate_all_{component}_batch", system_prompt,
-            _combined_batch_prompt(app, component, document, payload, context["text"], compact=False),
+            _combined_batch_prompt(app, component, document, payload, context["text"], compact=compact_retry),
             document_id=document["document_id"], context_mode=f"{label}:{context['mode']}",
             max_tokens=_output_token_budget(profile, _combined_batch_output_budget(component, rules)), thinking_mode=thinking_mode,
         )
