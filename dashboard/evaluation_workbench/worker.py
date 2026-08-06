@@ -3925,6 +3925,19 @@ def _scope_candidate_is_actionable(candidate: dict) -> bool:
     return not any(pattern.search(conclusion) for pattern in _SCOPE_NON_ANOMALY_PATTERNS)
 
 
+def _scope_candidate_evidence_visible(candidate: dict, chunk_text_compact: str) -> bool:
+    """历史候选的证据必须能在当前页块文本中定位，防止页码错误/编造导致误挂到无关块。"""
+    evidence = re.sub(r"\s+", "", str(candidate.get("evidence") or ""))
+    if len(evidence) < 8 or len(chunk_text_compact) < 8:
+        return False
+    upper = min(16, len(evidence))
+    for width in range(upper, 7, -1):
+        for index in range(0, len(evidence) - width + 1):
+            if evidence[index:index + width] in chunk_text_compact:
+                return True
+    return False
+
+
 def _scope_candidate_matches_tender_material(candidate: dict, tender_baseline: object) -> bool:
     """排除招标清单/技术需求已明确允许的对象，避免范围画像抽样造成误报。
 
@@ -4389,8 +4402,14 @@ def _scan_document_fulltext(app, task: dict, profile: dict, document: dict, rule
             )
             stable_candidates = stable_scope.get("scope_anomalies", []) if isinstance(stable_scope, dict) else []
             historical_candidates = storage.previous_scope_anomalies(
-                app, document["document_id"], chunk["chunk_id"], chunk_hash,
+                app, document["document_id"],
+                int(chunk.get("start_page") or 0), int(chunk.get("end_page") or 0),
             )
+            chunk_text_compact = re.sub(r"\s+", "", str(chunk.get("text") or ""))
+            historical_candidates = [
+                item for item in historical_candidates
+                if _scope_candidate_evidence_visible(item, chunk_text_compact)
+            ]
             if checkpoint is not None:
                 # 兼容 v3 已落库的纯 findings 检查点，避免升级时浪费一次扫描。
                 if isinstance(checkpoint, list):

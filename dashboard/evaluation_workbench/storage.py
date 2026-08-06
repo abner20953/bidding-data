@@ -1742,21 +1742,44 @@ def record_local_ocr_run(app, *, task_id: str | None, project_id: str | None,
         )
 
 
-def previous_scope_anomalies(app, document_id: str, chunk_id: str, chunk_hash: str,
-                             *, limit: int = 32) -> list[dict]:
-    """读取相同原文页块在旧扫描中发现的范围候选，供新一轮重新判断。
+_SCOPE_PAGE_RANGE_PATTERN = re.compile(r"第?\s*(\d+)\s*(?:[-—–~至]\s*(\d+))?\s*页?")
 
-    这里只复用可定位的候选线索，不复用最终结论；因此规则目录或模型变化不会让
-    已发现的高价值原文静默消失，当前项目范围仍由最终评审重新判断。
+
+def _scope_candidate_page_overlap(candidate: dict, page_start: int, page_end: int) -> bool:
+    """候选页码（page_range 或 page_hint）与目标页区间是否重叠。
+
+    page_range 为系统生成的"第N-M页"标签；page_hint 为模型填写的单页，二者均可缺失，
+    无法定位页码时按不重叠处理（由证据包含度校验另行兜底）。
+    """
+    match = _SCOPE_PAGE_RANGE_PATTERN.search(str(candidate.get("page_range") or ""))
+    if match:
+        start = int(match.group(1))
+        end = int(match.group(2) or start)
+        return not (end < page_start or start > page_end)
+    hint = re.search(r"\d+", str(candidate.get("page_hint") or ""))
+    if hint:
+        page = int(hint.group(0))
+        return page_start <= page <= page_end
+    return False
+
+
+def previous_scope_anomalies(app, document_id: str, page_start: int, page_end: int,
+                             *, limit: int = 32) -> list[dict]:
+    """按页码区间读取历史扫描发现的范围候选，供新一轮重新判断。
+
+    候选以"页码 + 原文证据"为稳定锚点，不再绑定 chunk_id/chunk_hash：分块策略调整
+    （如 11K→14K）不会让已发现的高价值原文线索静默消失。这里只复用可定位的候选线索，
+    不复用最终结论；当前项目范围与指南仍由最终评审重新判断。
     """
     with connection(app) as conn:
         rows = conn.execute(
             """SELECT findings_json FROM ew_evaluation_scan_cache
-               WHERE document_id=? AND chunk_id=? AND chunk_hash=?
-               ORDER BY updated_at DESC LIMIT 24""",
-            (document_id, chunk_id, chunk_hash),
+               WHERE document_id=?
+               ORDER BY updated_at DESC LIMIT 400""",
+            (document_id,),
         ).fetchall()
     values: list[dict] = []
+    seen: set[str] = set()
     for row in rows:
         try:
             payload = json.loads(row["findings_json"] or "{}")
@@ -1766,10 +1789,19 @@ def previous_scope_anomalies(app, document_id: str, chunk_id: str, chunk_hash: s
         if not isinstance(candidates, list):
             continue
         for candidate in candidates:
-            if isinstance(candidate, dict) and candidate.get("evidence"):
-                values.append(dict(candidate))
-                if len(values) >= max(1, limit):
-                    return values
+            if not isinstance(candidate, dict):
+                continue
+            if candidate.get("candidate_priority") not in {"high", "medium"}:
+                continue
+            if not _scope_candidate_page_overlap(candidate, page_start, page_end):
+                continue
+            signature = re.sub(r"\s+", "", str(candidate.get("evidence") or ""))[:180]
+            if not signature or signature in seen:
+                continue
+            seen.add(signature)
+            values.append(dict(candidate))
+            if len(values) >= max(1, limit):
+                return values
     return values
 
 

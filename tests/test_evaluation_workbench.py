@@ -4831,7 +4831,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
     def test_previous_scope_anomalies_survive_scan_key_change_as_candidates(self):
         document = self._add_pdf("scope-history.pdf", "bid", "甲公司", "投标方案正文")
-        old_candidate = {"chunk_id": "chunk_1", "candidate_priority": "high",
+        old_candidate = {"chunk_id": "chunk_1", "page_range": "第1-10页", "page_hint": "8",
+                         "candidate_priority": "high",
                          "evidence": "与采购对象不同的实施工艺", "relation": "缺少项目范围依据"}
         storage.save_evaluation_scan_checkpoint(
             self.app, self.project["project_id"], document["document_id"], "old-rule-catalog",
@@ -4839,16 +4840,43 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         )
 
         recovered = storage.previous_scope_anomalies(
-            self.app, document["document_id"], "chunk_1", "same-content-hash",
+            self.app, document["document_id"], 1, 10,
         )
 
         self.assertEqual(recovered[0]["evidence"], old_candidate["evidence"])
+        # 页码不重叠的历史候选不应返回；低优先级候选也不返回
+        self.assertEqual(storage.previous_scope_anomalies(self.app, document["document_id"], 20, 30), [])
+        low = {"chunk_id": "chunk_1", "page_range": "第1-10页", "candidate_priority": "low",
+               "evidence": "低优先级线索"}
+        storage.save_evaluation_scan_checkpoint(
+            self.app, self.project["project_id"], document["document_id"], "old-rule-catalog",
+            "chunk_2", "hash-b", {"findings": [], "scope_anomalies": [low]},
+        )
+        self.assertNotIn("低优先级线索", [item["evidence"] for item in
+                                          storage.previous_scope_anomalies(self.app, document["document_id"], 1, 10)])
+
+    def test_scope_candidate_evidence_visible_requires_evidence_in_chunk(self):
+        candidate = {"evidence": "旧轮已定位的具体工艺", "candidate_priority": "high"}
+        self.assertTrue(worker._scope_candidate_evidence_visible(
+            candidate, re.sub(r"\s+", "", "安全章节包含 旧轮已定位的具体工艺 描述")))
+        self.assertFalse(worker._scope_candidate_evidence_visible(candidate, "其他内容"))
+        self.assertFalse(worker._scope_candidate_evidence_visible({"evidence": "短"}, "短"))
+
+    def test_scope_profile_review_guidance_present(self):
+        from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES, EVALUATION_PROMPT_VERSION
+        guidance = PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"]
+        self.assertIn("项目范围画像", guidance)
+        self.assertIn("可解释性检验", guidance)
+        self.assertIn("不限定行业或采购类型", guidance)
+        scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
+        self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v34")
 
     def test_full_scan_reruns_rule_evidence_but_rechecks_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")
         document.update({"text_length": 30_000, "parsed_path": str(self.temp_dir / "unused.txt")})
         chunk = {"chunk_id": "chunk_1", "start_page": 1, "end_page": 10,
-                 "text": "本轮模型未重新报告范围候选。"}
+                 "text": "本轮模型未重新报告范围候选。旧轮已定位的具体工艺"}
         chunk_hash = hashlib.sha256(chunk["text"].encode("utf-8")).hexdigest()
         old_candidate = {"chunk_id": "chunk_1", "page_range": "第1-10页", "page_hint": "8",
                          "dimension": "工作对象偏离", "candidate_priority": "high",
