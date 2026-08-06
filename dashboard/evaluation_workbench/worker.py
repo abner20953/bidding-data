@@ -3023,6 +3023,7 @@ _SCOPE_TEMPLATE_MIXING_PATTERN = re.compile(
 )
 _PAGE_RANGE_PATTERN = re.compile(r"第(\d+(?:-\d+)?)页")
 _SCOPE_OBJECT_LIST_PATTERN = re.compile(r"范围画像(?:中)?不含([^，。；;]{2,60}?)(?:等工艺|等)")
+_SCOPE_PAREN_OBJECT_PATTERN = re.compile(r"[（(]([^（）()]{4,80})[）)]")
 
 
 def _compact_page_ranges(evidence: object, reason: object) -> str:
@@ -3039,22 +3040,38 @@ def _compact_page_ranges(evidence: object, reason: object) -> str:
     return "第" + "、".join(values) + "页"
 
 
+def _scope_object_parts(reason: object, evidence: object, summary: object) -> list[str]:
+    """按优先级提取范围偏离对象清单：模型摘要自带“××等” > 理由“范围画像不含…等” > 括号对象清单。"""
+    summary_text = _clean_model_text(summary)
+    match = re.match(r"^([^，。；;]{2,40}?)等", summary_text)
+    if match:
+        parts = [part.strip() for part in match.group(1).split("、") if part.strip()]
+        if len(parts) >= 2:
+            return parts
+    text = f"{str(reason or '')} {str(evidence or '')}"
+    match = _SCOPE_OBJECT_LIST_PATTERN.search(text)
+    if match:
+        return [part.strip() for part in match.group(1).split("、") if part.strip()]
+    match = _SCOPE_PAREN_OBJECT_PATTERN.search(text)
+    if match:
+        return [part.strip().strip("'\"“”‘’") for part in re.split(r"[、/，,]", match.group(1)) if part.strip()]
+    return []
+
+
 def _enrich_scope_summary(evidence: object, reason: object, summary: object) -> str:
     """范围模板混用结论的摘要兜底：点名对象与页码，避免“部分内容为通用模板”式空泛摘要。"""
     current = _clean_model_text(summary)
     if _PAGE_RANGE_PATTERN.search(current):
         return current
-    match = _SCOPE_OBJECT_LIST_PATTERN.search(f"{str(reason or '')} {str(evidence or '')}")
-    if not match:
-        return current
-    parts = [part.strip() for part in match.group(1).split("、") if part.strip()]
-    if len(parts) < 2:
-        return current
     pages = _compact_page_ranges(evidence, reason)
     if not pages:
         return current
-    kept = "、".join(parts[:2]) + "等"
-    return _normalise_conclusion_summary(f"{pages}出现{kept}非本项目场景模板，需人工复核", limit=60)
+    parts = _scope_object_parts(reason, evidence, current)
+    if len(parts) >= 2:
+        kept = "、".join(parts[:2]) + "等"
+        return _normalise_conclusion_summary(f"{pages}出现{kept}非本项目场景模板，需人工复核", limit=60)
+    # 兜底：即使拿不到对象清单，也把页码前缀接到摘要前，保证结论可定位。
+    return _normalise_conclusion_summary(f"{pages}；{current}", limit=60)
 
 
 _SCORE_SUMMARY_VALUE_PATTERN = re.compile(
@@ -4984,6 +5001,19 @@ def _is_scope_consistency_rule(rule: dict) -> bool:
     ) or ("本项目" in text and "不一致" in text)
 
 
+_FLAW_SCORING_MARKERS = ("瑕疵", "套用", "针对性")
+
+
+def _flaw_scoring_rule(rule: dict) -> bool:
+    """主观瑕疵/针对性档评分规则：范围偏离候选页可直接支撑“套用模板/针对性不足”判断。"""
+    text = " ".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text"))
+    scoring = _rule_scoring(rule)
+    for item in scoring.get("items") or []:
+        if isinstance(item, dict):
+            text += " " + str(item.get("criterion") or "")
+    return any(marker in text for marker in _FLAW_SCORING_MARKERS)
+
+
 def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *, targeted: bool = False) -> dict:
     rule_ids = {item["rule_id"] for item in rules}
     findings = [item for item in scan.get("findings", []) if item.get("rule_id") in rule_ids]
@@ -5068,16 +5098,28 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
             if not _scope_candidate_matches_tender_material(item, tender_baseline)
         ]
     scope_anomalies.sort(key=lambda item: priority_rank.get(item.get("candidate_priority"), 1))
+    # 主观瑕疵/针对性档评分（安全施工、服务响应、方案瑕疵等）同样需要范围偏离
+    # 候选页作为“套用模板/针对性不足”的直接证据；只补最相关的少量页块和候选提示，
+    # 不携带画像，避免挤占方案原文预算。
+    flaw_group = (not is_review_group) and any(_flaw_scoring_rule(item) for item in rules)
     if is_review_group and has_scope_rule:
+        anomaly_limit = 4 if targeted else 12
+        anomaly_chunk_cap = anomaly_limit
+    elif flaw_group:
+        anomaly_limit = 4 if targeted else 6
+        anomaly_chunk_cap = 3
+    else:
+        anomaly_limit = anomaly_chunk_cap = 0
+    if anomaly_limit:
         # 该通道不依赖“地区、项目名”等固定关键词：任何范围偏离候选的原页都会
-        # 进入审查组，最终是否构成问题仍完全由 AI 结合规则和原文判断。
+        # 进入复核组，最终是否构成问题仍完全由 AI 结合规则和原文判断。
         anomaly_ids = []
-        # 每条候选同时需要保留原页；过多的摘要会挤掉原文，故保留优先级最高的 12 条。
-        for item in scope_anomalies[:(4 if targeted else 12)]:
+        # 每条候选同时需要保留原页；过多的摘要会挤掉原文，故按优先级限量保留。
+        for item in scope_anomalies[:anomaly_limit]:
             root_id = str(item.get("chunk_id") or "").split(".", 1)[0]
             if root_id and root_id not in anomaly_ids:
                 anomaly_ids.append(root_id)
-        for chunk_id in reversed(anomaly_ids):
+        for chunk_id in reversed(anomaly_ids[:anomaly_chunk_cap]):
             if chunk_id in selected_ids:
                 selected_ids.remove(chunk_id)
             selected_ids.insert(0, chunk_id)
@@ -5114,7 +5156,12 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
             "\n\n【项目范围画像（来自招标文件和已确认规则）】\n"
             + json.dumps(_scope_prompt_profile(scan.get("project_scope", {})), ensure_ascii=False, separators=(",", ":"))
             + "\n\n【项目范围偏离候选（仅供结合原页和规则核验，不是既成结论）】\n"
-            + json.dumps(scope_anomalies[:(4 if targeted else 12)], ensure_ascii=False, separators=(",", ":"))
+            + json.dumps(scope_anomalies[:anomaly_limit], ensure_ascii=False, separators=(",", ":"))
+        )
+    elif flaw_group:
+        scope_packet = (
+            "\n\n【项目范围偏离候选提示（仅供瑕疵/套用模板/针对性判断参考，不是既成结论，最终以原页为准）】\n"
+            + json.dumps(scope_anomalies[:anomaly_limit], ensure_ascii=False, separators=(",", ":"))
         )
     header = (
         f"【全文覆盖说明】已按连续页块扫描全文，共 {scan.get('chunk_count', 0)} 个页块；本规则组采用{strategy}汇总策略；"

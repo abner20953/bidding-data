@@ -2938,7 +2938,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_subjective_user"]["content"])
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"])
         self.assertIn("统一为 partial 或需图片核验", PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v37")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v38")
 
     def test_scope_chapter_and_text_error_guidance_present(self):
         from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
@@ -2956,7 +2956,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(text_marker, PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("必须点名最具辨识度的偏离对象", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("risk_level 应为 high", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v37")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v38")
 
     def test_scope_template_mixing_enforces_high_risk_and_object_summary(self):
         raw = {
@@ -2973,6 +2973,26 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         plain = worker._review_result_from_model(raw, "r2", "partial")
         self.assertEqual(plain["risk_level"], "medium")
         self.assertEqual(plain["conclusion_summary"], "部分施工工艺段为通用模板，需复核")
+
+    def test_scope_summary_enrichment_uses_model_summary_objects_and_pages(self):
+        evidence = "第740-768页配电柜安装；第775-780页高层建筑老虎口与青铅灌浇"
+        reason = "项目范围画像仅含机房改造→正文将建筑工程施工总承包模板作为本项目方案写入→属画像外工艺模板混用"
+        summary = "强电、桥架、家用新风等建筑机电通用模板写入本项目方案，建议人工核验"
+        enriched = worker._enrich_scope_summary(evidence, reason, summary)
+        self.assertIn("第740-768、775-780页", enriched)
+        self.assertIn("强电、桥架等非本项目场景模板", enriched)
+        self.assertLessEqual(len(enriched), 60)
+
+    def test_flaw_scoring_rule_detection(self):
+        self.assertTrue(worker._flaw_scoring_rule({
+            "title": "安全文明施工保障措施方案主观评分", "check_rule": "无瑕疵得6分；存在瑕疵按分档扣分",
+            "source_text": "", "scoring_json": json.dumps({"max_score": 6, "items": [
+                {"name": "施工保障措施方案瑕疵档得分", "max_score": 6, "criterion": "按瑕疵档打分"}]}),
+        }))
+        self.assertFalse(worker._flaw_scoring_rule({
+            "title": "技术参数响应情况主观评分", "check_rule": "按指标应答覆盖与证明材料完整性评分",
+            "source_text": "", "scoring_json": json.dumps({"max_score": 35}),
+        }))
 
     def test_review_satisfied_downgraded_when_still_needs_review(self):
         # “满足”与“需人工复核”不能并存：非低风险/高置信/证据充分时降为 partial。
@@ -3792,6 +3812,41 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         self.assertNotIn("项目范围偏离候选", context["text"])
         self.assertNotIn("锅炉燃烧控制设备安装", context["text"])
+
+    def test_scope_anomaly_pages_injected_into_flaw_scoring_subjective_group(self):
+        chunks = [{
+            "chunk_id": "chunk_37", "start_page": 775, "end_page": 785,
+            "text": "[第775页]\n针对高层建筑工程的特点，对于留洞口、电梯井、管道井等“老虎口”必须设置栏杆。\n"
+                    "[第776页]\n上层灌浇青铅，下层不得有人作业。",
+        }]
+        scan = {
+            "chunks": chunks, "findings": [], "failed_chunks": [], "chunk_count": 1,
+            "project_scope": {"scope_summary": "办公区机房与网络改造"},
+            "scope_anomalies": [{
+                "chunk_id": "chunk_37", "page_hint": "775", "dimension": "高层建筑洞口与青铅灌浇",
+                "candidate_priority": "high", "evidence": "针对高层建筑工程…“老虎口”…灌浇青铅",
+                "relation": "与本项目机房场景不符",
+            }],
+        }
+        flaw_rule = {
+            "rule_id": "safety", "category": "subjective", "title": "安全文明施工保障措施方案主观评分",
+            "check_rule": "无瑕疵得6分；存在瑕疵按分档扣分，瑕疵定义同服务要求条款", "source_text": "",
+            "scoring_json": json.dumps({"max_score": 6, "kind": "manual", "items": [
+                {"name": "施工保障措施方案瑕疵档得分", "max_score": 6, "criterion": "按瑕疵档打分"}]}),
+        }
+        context = worker._full_scan_review_context(scan, [flaw_rule], 30_000)
+        self.assertIn("青铅灌浇", context["text"])
+        self.assertIn("chunk_37", context["pages"])
+        self.assertIn("范围偏离候选提示", context["text"])
+
+        plain_rule = {
+            "rule_id": "params", "category": "subjective", "title": "技术参数响应情况主观评分",
+            "check_rule": "按指标应答覆盖与证明材料完整性评分", "source_text": "",
+            "scoring_json": json.dumps({"max_score": 35}),
+        }
+        context2 = worker._full_scan_review_context(scan, [plain_rule], 30_000)
+        self.assertNotIn("青铅灌浇", context2["text"])
+        self.assertNotIn("范围偏离候选提示", context2["text"])
 
     def test_full_scan_context_reserves_raw_evidence_for_each_rule(self):
         late_a = "资质证书编号A-2026，满足资格条件。"
@@ -4950,7 +5005,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不限定行业或采购类型", guidance)
         scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v37")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v38")
 
     def test_full_scan_reruns_rule_evidence_but_rechecks_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")

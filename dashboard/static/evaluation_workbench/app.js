@@ -617,7 +617,9 @@
       const items = summary.highlights || [];
       const criticalHigh = items.filter((item) => item.level === 'critical' || item.level === 'high');
       const attention = items.filter((item) => item.level === 'attention');
-      const visible = highOnly ? criticalHigh : items;
+      // attention 只收在“另有 N 条关注项”折叠块里；主列表只展开 critical/high，
+      // 避免同一结论在“显示全部”时同时出现在主列表与折叠块中重复。
+      const visible = criticalHigh;
       const listHtml = (list) => list.map((item) => {
         const basis = cleanDisplayText(item.basis);
         return `<li class="evaluation-highlight-${escapeHtml(item.level || 'attention')}"><strong>${escapeHtml(item.keyword)}</strong><span>${escapeHtml(cleanDisplayText(item.conclusion))}</span>${basis ? `<small>${escapeHtml(basis)}</small>` : ''}</li>`;
