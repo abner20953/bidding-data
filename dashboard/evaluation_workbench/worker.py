@@ -2842,7 +2842,9 @@ def _normalise_review_results(output: object, rules: list[dict], tender_baseline
                     "reason": "关键证据必须查看证照、签章、凭证或其他图像外观；当前未执行 OCR，需识别后再判定。"
                     + (f" 文本层模型线索：{prior_reason}" if prior_reason else ""),
                 }
-        normalized.append(_review_result_from_model(item, rule_id, status))
+        normalized.append(_review_result_from_model(
+            item, rule_id, status, scope_rule=_is_scope_consistency_rule(rule),
+        ))
     returned_ids = {item["rule_id"] for item in normalized}
     normalized.extend(
         _review_result_from_model(
@@ -2854,7 +2856,7 @@ def _normalise_review_results(output: object, rules: list[dict], tender_baseline
     return normalized
 
 
-def _review_result_from_model(item: dict, rule_id: str, status: str) -> dict:
+def _review_result_from_model(item: dict, rule_id: str, status: str, *, scope_rule: bool = False) -> dict:
     confidence = _enum_text(item.get("confidence"), {"high", "medium", "low"}, "medium")
     evidence_quality = _enum_text(
         item.get("evidence_quality"), {"sufficient", "limited", "missing"},
@@ -2883,6 +2885,15 @@ def _review_result_from_model(item: dict, rule_id: str, status: str) -> dict:
         summary = ""
         if status == "satisfied":
             status = "partial"
+    # 范围类规则整章模板混用属于需要重点复核的高风险发现：模型可能按保守习惯
+    # 给 medium，导致被重要结论面板挤出；这里按规则口径强制校准定级，并让摘要
+    # 点名对象与页码，避免“部分内容为通用模板”式空泛表述。
+    if scope_rule and status in {"partial", "not_satisfied"}:
+        combined = f"{reason} {evidence}"
+        if _SCOPE_TEMPLATE_MIXING_PATTERN.search(combined):
+            if risk != "high":
+                risk = "high"
+            summary = _enrich_scope_summary(evidence, reason, summary)
     return {"rule_id": rule_id, "status": status,
             "evidence": evidence,
             "page_hint": _clean_model_text(item.get("page_hint"))[:80] or None,
@@ -3005,6 +3016,45 @@ def _append_incomplete_marker(value: object) -> str:
     if _INCOMPLETE_OUTPUT_MARKER in text:
         return text
     return f"{text.rstrip()}{_INCOMPLETE_OUTPUT_MARKER}"
+
+
+_SCOPE_TEMPLATE_MIXING_PATTERN = re.compile(
+    r"模板混用|整章模板|非本项目(?:场景|工艺|对象|内容|范围)|场景(?:明显)?不符|不属于本项目"
+)
+_PAGE_RANGE_PATTERN = re.compile(r"第(\d+(?:-\d+)?)页")
+_SCOPE_OBJECT_LIST_PATTERN = re.compile(r"范围画像(?:中)?不含([^，。；;]{2,60}?)(?:等工艺|等)")
+
+
+def _compact_page_ranges(evidence: object, reason: object) -> str:
+    """把证据/理由中的“第N页/第N-M页”去重并按起始页排序，压缩为一段页码。"""
+    values: list[str] = []
+    for text in (evidence, reason):
+        for match in _PAGE_RANGE_PATTERN.finditer(str(text or "")):
+            value = match.group(1)
+            if value not in values:
+                values.append(value)
+    if not values:
+        return ""
+    values.sort(key=lambda item: int(item.split("-")[0]))
+    return "第" + "、".join(values) + "页"
+
+
+def _enrich_scope_summary(evidence: object, reason: object, summary: object) -> str:
+    """范围模板混用结论的摘要兜底：点名对象与页码，避免“部分内容为通用模板”式空泛摘要。"""
+    current = _clean_model_text(summary)
+    if _PAGE_RANGE_PATTERN.search(current):
+        return current
+    match = _SCOPE_OBJECT_LIST_PATTERN.search(f"{str(reason or '')} {str(evidence or '')}")
+    if not match:
+        return current
+    parts = [part.strip() for part in match.group(1).split("、") if part.strip()]
+    if len(parts) < 2:
+        return current
+    pages = _compact_page_ranges(evidence, reason)
+    if not pages:
+        return current
+    kept = "、".join(parts[:2]) + "等"
+    return _normalise_conclusion_summary(f"{pages}出现{kept}非本项目场景模板，需人工复核", limit=60)
 
 
 _SCORE_SUMMARY_VALUE_PATTERN = re.compile(
@@ -6271,7 +6321,7 @@ def _apply_ocr_summary(component: str, rule: dict, working_result: dict, parsed:
             "risk_level": parsed.get("risk_level") if can_apply else working_result.get("risk_level"),
             "confidence": parsed.get("confidence") if can_apply else working_result.get("confidence"),
             "evidence_quality": "sufficient" if can_apply and evidence else working_result.get("evidence_quality"),
-        }, rule["rule_id"], selected_status)
+        }, rule["rule_id"], selected_status, scope_rule=_is_scope_consistency_rule(rule))
         merged = {
             **merged,
             "visual_page_candidates": list(working_result.get("visual_page_candidates") or []),
@@ -6531,7 +6581,7 @@ def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: d
             "risk_level": parsed.get("risk_level") if can_apply_text_conclusion else working_result.get("risk_level"),
             "confidence": parsed.get("confidence") if can_apply_text_conclusion else working_result.get("confidence"),
             "evidence_quality": "sufficient" if can_apply_text_conclusion and evidence else working_result.get("evidence_quality"),
-        }, rule["rule_id"], selected_status)
+        }, rule["rule_id"], selected_status, scope_rule=_is_scope_consistency_rule(rule))
         # 标准化审查结果只保留业务字段，这些内部路由元数据需显式带到下一层图片识别。
         merged = {
             **merged,
@@ -7655,7 +7705,7 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
             "risk_level": parsed.get("risk_level") if conclusion_scope == "full" else result.get("risk_level"),
             "confidence": "low" if has_conflict else (parsed.get("confidence") if conclusion_scope == "full" else result.get("confidence")),
             "evidence_quality": "sufficient" if conclusion_scope == "full" and visual_evidence else result.get("evidence_quality"),
-        }, rule["rule_id"], status)
+        }, rule["rule_id"], status, scope_rule=_is_scope_consistency_rule(rule))
         # 仅在本次任务内供 OCR 影子核对与 EvidencePack 使用；存储层会忽略该临时字段，
         # 因此不会改变现有对外结果 API 或直接改写结论。
         merged["visual_field_checks"] = [

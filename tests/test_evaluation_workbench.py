@@ -2938,20 +2938,41 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_subjective_user"]["content"])
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"])
         self.assertIn("统一为 partial 或需图片核验", PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v36")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v37")
 
     def test_scope_chapter_and_text_error_guidance_present(self):
         from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
         scope_marker = "整章模板混用"
         text_marker = "疑为复制粘贴或 OCR 断字"
-        for template_id in ("evaluate_all_scope_anomaly_guidance", "evaluate_all_full_scan_user",
-                            "evaluate_all_review_user", "evaluate_all_subjective_user"):
-            self.assertIn(scope_marker, PROMPT_TEMPLATES[template_id]["content"])
+        # 范围章节指南只挂载在 scope_anomaly_guidance：全文扫描和范围规则复核分别
+        # 通过 worker 注入，避免同一指南在模板与注入层出现两次白烧 token。
+        self.assertIn(scope_marker, PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
+        for template_id in ("evaluate_all_full_scan_user", "evaluate_all_review_user",
+                            "evaluate_all_subjective_user"):
+            self.assertNotIn(scope_marker, PROMPT_TEMPLATES[template_id]["content"])
+        # 文字错误线索仅审查组需要，单点挂载不重复。
         self.assertIn(text_marker, PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
         self.assertNotIn(text_marker, PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"])
+        self.assertNotIn(text_marker, PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("必须点名最具辨识度的偏离对象", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("risk_level 应为 high", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v36")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v37")
+
+    def test_scope_template_mixing_enforces_high_risk_and_object_summary(self):
+        raw = {
+            "status": "partial",
+            "evidence": "第10-11页出现施工总平面图等土建模板；第775页出现高层建筑留洞口、灌浇青铅",
+            "reason": "范围画像不含土建总承包、强电配电柜/电力电缆施工、青铅灌浇等工艺，被作为本项目方案写入→属整章模板混用",
+            "summary": "部分施工工艺段为通用模板，需复核",
+            "risk_level": "medium", "confidence": "medium", "evidence_quality": "sufficient",
+        }
+        result = worker._review_result_from_model(raw, "r1", "partial", scope_rule=True)
+        self.assertEqual(result["risk_level"], "high")
+        self.assertIn("第10-11、775页", result["conclusion_summary"])
+        self.assertIn("非本项目场景模板", result["conclusion_summary"])
+        plain = worker._review_result_from_model(raw, "r2", "partial")
+        self.assertEqual(plain["risk_level"], "medium")
+        self.assertEqual(plain["conclusion_summary"], "部分施工工艺段为通用模板，需复核")
 
     def test_review_satisfied_downgraded_when_still_needs_review(self):
         # “满足”与“需人工复核”不能并存：非低风险/高置信/证据充分时降为 partial。
@@ -4929,7 +4950,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不限定行业或采购类型", guidance)
         scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v36")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v37")
 
     def test_full_scan_reruns_rule_evidence_but_rechecks_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")

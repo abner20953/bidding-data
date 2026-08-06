@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 PROMPT_TEMPLATE_SETTING = "evaluation_workbench_prompt_templates"
-EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v36"
+EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v37"
 
 
 def _template(name: str, description: str, content: str, *placeholders: str) -> dict:
@@ -474,7 +474,7 @@ _SCOPE_CHAPTER_TEMPLATE_GUIDANCE = (
     "只有原文明确标注为法规条文、标准编号、通用示例或可选方案时才可放行；"
     "不得因整章标题属于“安全/施工”而整体放行。"
     "同一章节连续出现多个画像外对象时，应合并为一条“整章模板混用”候选，"
-    "逐项列出对象和代表页码（如结构洞口与防护、灌浇工艺、土方与基坑作业等），不要逐条忽略。"
+    "逐项列出每个对象与代表页码，不要逐条忽略。"
 )
 _TEXT_ERROR_LINE_GUIDANCE = (
     "正文中出现明显断字、错字或上下文不通的字符组合（完整句子中夹入无意义词、同音/形近字误写、"
@@ -482,9 +482,7 @@ _TEXT_ERROR_LINE_GUIDANCE = (
     "需人工确认”；不得忽略为纯 OCR 噪声，也不得单独据此判废标或否定性结论。"
 )
 PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"] += "\n\n" + _SCOPE_CHAPTER_TEMPLATE_GUIDANCE
-PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"] += "\n\n" + _SCOPE_CHAPTER_TEMPLATE_GUIDANCE
-PROMPT_TEMPLATES["evaluate_all_review_user"]["content"] += "\n\n" + _SCOPE_CHAPTER_TEMPLATE_GUIDANCE + "\n" + _TEXT_ERROR_LINE_GUIDANCE
-PROMPT_TEMPLATES["evaluate_all_subjective_user"]["content"] += "\n\n" + _SCOPE_CHAPTER_TEMPLATE_GUIDANCE
+PROMPT_TEMPLATES["evaluate_all_review_user"]["content"] += "\n\n" + _TEXT_ERROR_LINE_GUIDANCE
 
 
 
