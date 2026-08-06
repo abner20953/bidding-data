@@ -2087,7 +2087,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         })
         rule = {"title": "证书编号", "check_rule": "核验证书编号", "vision_level": "standard"}
         response = {"service": "accurate", "text": "证书编号 A123", "parser_version": ocr_gateway.OCR_PARSER_VERSION}
-        local_response = [{"page": 1, "service": local_ocr_gateway.LOCAL_OCR_SERVICE, "text": "本地证书编号 A123", "confidence": 0.95}]
+        # 本地文本缺少规则所涉“编号”字段信号时按字段缺口升级腾讯复核。
+        local_response = [{"page": 1, "service": local_ocr_gateway.LOCAL_OCR_SERVICE, "text": "本地扫描件模糊", "confidence": 0.95}]
         with patch("dashboard.evaluation_workbench.worker.request_tencent_ocr", return_value=(response, "")), \
              patch("dashboard.evaluation_workbench.worker._local_ocr_page_texts", return_value=(local_response, "")) as local_pages:
             values, failure = worker._ocr_page_texts(self.app, {"task_id": "task", "project_id": self.project["project_id"]}, document, rule, {}, "standard", pages=[1])
@@ -2939,7 +2940,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_subjective_user"]["content"])
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"])
         self.assertIn("统一为 partial 或需图片核验", PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v39")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v41")
 
     def test_scope_chapter_and_text_error_guidance_present(self):
         from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
@@ -2957,7 +2958,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(text_marker, PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("必须点名最具辨识度的偏离对象", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("risk_level 应为 high", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v39")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v41")
 
     def test_scope_template_mixing_enforces_high_risk_and_object_summary(self):
         raw = {
@@ -2991,9 +2992,53 @@ class EvaluationWorkbenchTests(unittest.TestCase):
                 {"name": "施工保障措施方案瑕疵档得分", "max_score": 6, "criterion": "按瑕疵档打分"}]}),
         }))
         self.assertFalse(worker._flaw_scoring_rule({
-            "title": "技术参数响应情况主观评分", "check_rule": "按指标应答覆盖与证明材料完整性评分",
+            "title": "技术参数响应情况主观评分", "check_rule": "按指标应答覆盖与证明材料齐全情况评分",
             "source_text": "", "scoring_json": json.dumps({"max_score": 35}),
         }))
+
+    def test_flaw_scoring_rule_matches_quality_wording_across_industries(self):
+        # 环保/软件等行业的方案评分不一定写“瑕疵/套用”，完整性、科学性、可行性等
+        # 质量措辞同样需要范围候选页支撑判断。
+        self.assertTrue(worker._flaw_scoring_rule({
+            "title": "污水处理处置方案评分", "check_rule": "按处置工艺的科学性与可行性分档评分",
+            "source_text": "", "scoring_json": json.dumps({"max_score": 10}),
+        }))
+        self.assertTrue(worker._flaw_scoring_rule({
+            "title": "软件开发实施方案评分", "check_rule": "按需求理解完整性与实施计划合理性评分",
+            "source_text": "", "scoring_json": json.dumps({"max_score": 12}),
+        }))
+
+    def test_scope_rule_detection_without_range_keyword(self):
+        # 不同行业规则不一定带“范围/无关”字样，组合信号也要能识别为范围类规则。
+        self.assertTrue(worker._is_scope_consistency_rule({
+            "title": "服务内容与采购需求一致性核验", "check_rule": "核对服务内容是否与采购需求相符",
+        }))
+        self.assertTrue(worker._is_scope_consistency_rule({
+            "title": "技术交付内容相符性核验", "check_rule": "核对技术交付内容是否与本项目一致",
+        }))
+        self.assertFalse(worker._is_scope_consistency_rule({
+            "title": "投标报价得分", "check_rule": "按公式计算报价得分",
+        }))
+
+    def test_scope_mixing_detection_works_across_industries(self):
+        # 纯语义信号应跨行业命中：环保项目混入矿山/农田内容，软件项目混入土建/硬件内容。
+        for raw in (
+            {"status": "not_satisfied", "risk_level": "medium", "confidence": "high",
+             "evidence": "第60-80页出现矿山爆破、农田灌溉等章节",
+             "reason": "处置方案混入矿山爆破与农田灌溉内容，超出本项目污水处理厂改造范围，"
+                       "且被作为处置方案写入→属非本项目内容",
+             "summary": "处置方案混入非本项目工艺内容，需人工复核",
+             "evidence_quality": "sufficient"},
+            {"status": "not_satisfied", "risk_level": "medium", "confidence": "high",
+             "evidence": "第20-35页出现土建施工、硬件生产线组装等章节",
+             "reason": "软件开发方案混入土建施工与硬件生产内容，不属于本项目软件系统开发范围，"
+                       "且被作为实施方案写入→属整章模板混用",
+             "summary": "实施方案混入非本项目内容，需人工复核",
+             "evidence_quality": "sufficient"},
+        ):
+            result = worker._review_result_from_model(raw, "r1", "not_satisfied", scope_rule=True)
+            self.assertEqual(result["risk_level"], "high")
+            self.assertIn("第", result["conclusion_summary"])
 
     def test_review_satisfied_downgraded_when_still_needs_review(self):
         # “满足”与“需人工复核”不能并存：非低风险/高置信/证据充分时降为 partial。
@@ -3901,7 +3946,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         plain_rule = {
             "rule_id": "params", "category": "subjective", "title": "技术参数响应情况主观评分",
-            "check_rule": "按指标应答覆盖与证明材料完整性评分", "source_text": "",
+            "check_rule": "按指标逐项应答与证明材料齐全情况评分", "source_text": "",
             "scoring_json": json.dumps({"max_score": 35}),
         }
         context2 = worker._full_scan_review_context(scan, [plain_rule], 30_000)
@@ -4181,6 +4226,63 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(finished["status"], "success")
         self.assertEqual(rows[0]["vision_status"], "unavailable")
         self.assertEqual(rows[0]["vision_pages"], [])
+
+    def test_tencent_upgrade_pages_field_gap_driven(self):
+        rule = {"title": "体系认证证书核验", "check_rule": "核验证书编号、有效期与认证范围", "source_text": ""}
+        local_values = [
+            {"page": 1, "text": "证书编号 ABC123，有效期 2026-12-31，认证范围：软件开发。", "confidence": 0.95},
+            {"page": 2, "text": "证书编号 DEF456，有效期 2027-06-30，认证范围：环保服务。", "confidence": 0.91},
+            {"page": 3, "text": "扫描件内容模糊，仅见部分字样。", "confidence": 0.9},
+            {"page": 4, "text": "证书编号 GHI789，有效期 2028-03-15，认证范围：信息化服务。", "confidence": 0.5},
+        ]
+        # 页1/2/4 含编号+日期信号，只有低置信的页4升级；页3缺字段信号也会升级。
+        upgraded = worker._tencent_upgrade_pages(rule, local_values, "", "standard")
+        self.assertEqual(upgraded, [3, 4])
+        # 不再因“证书类”就把全部页送腾讯。
+        self.assertNotIn(1, upgraded)
+        self.assertNotIn(2, upgraded)
+        # 本地失败时仍全页容错升级。
+        self.assertEqual(worker._tencent_upgrade_pages(rule, local_values, "本地 RapidOCR 未完成", "standard"), [1, 2, 3, 4])
+
+    def test_should_run_vision_for_rule_gap_driven(self):
+        rule = {"title": "证书核验", "check_rule": "核验证书编号与有效期"}
+        # 本地 OCR 归纳明确无需外观核验 → 混合/文字策略都不再看图。
+        self.assertFalse(worker._should_run_vision_for_rule(
+            "auto", "hybrid", "text_fallback", rule, {"_ocr_visual_review_required": False},
+        ))
+        self.assertFalse(worker._should_run_vision_for_rule(
+            "auto", "ocr", "text_fallback", rule, {"_ocr_visual_review_required": False},
+        ))
+        # 本地 OCR 归纳确认有外观待核验 → 混合/文字策略升级看图。
+        self.assertTrue(worker._should_run_vision_for_rule(
+            "auto", "hybrid", "text_fallback", rule, {"_ocr_visual_review_required": True},
+        ))
+        self.assertTrue(worker._should_run_vision_for_rule(
+            "auto", "ocr", "text_fallback", rule, {"_ocr_visual_review_required": True},
+        ))
+        # 纯视觉策略或人工强制始终看图。
+        self.assertTrue(worker._should_run_vision_for_rule(
+            "auto", "vision", "off", rule, {"_ocr_visual_review_required": False},
+        ))
+        self.assertTrue(worker._should_run_vision_for_rule(
+            "auto", "hybrid", "required", rule, {"_ocr_visual_review_required": False},
+        ))
+        # combined 通道始终看图；模型未给出判定时回退旧启发式（OCR 未完整覆盖即看）。
+        self.assertTrue(worker._should_run_vision_for_rule(
+            "combined", "hybrid", "text_fallback", rule, {},
+        ))
+        self.assertTrue(worker._should_run_vision_for_rule(
+            "auto", "hybrid", "text_fallback", rule, {"vision_status": "ocr_applied_partial"},
+        ))
+        self.assertFalse(worker._should_run_vision_for_rule(
+            "auto", "hybrid", "text_fallback", rule, {"vision_status": "ocr_applied"},
+        ))
+
+    def test_ocr_visual_gap_flag(self):
+        self.assertTrue(worker._ocr_visual_gap_flag({"visual_review_required": True}, True))
+        self.assertFalse(worker._ocr_visual_gap_flag({"visual_review_required": False}, True))
+        self.assertIsNone(worker._ocr_visual_gap_flag({}, True))
+        self.assertTrue(worker._ocr_visual_gap_flag({}, False))
 
     def test_visual_page_candidates_only_accept_explicit_page_references(self):
         document = {"extension": ".pdf", "page_count": 300}
@@ -5065,7 +5167,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不限定行业或采购类型", guidance)
         scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v39")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v41")
 
     def test_full_scan_reruns_rule_evidence_but_rechecks_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")

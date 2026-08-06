@@ -3021,9 +3021,11 @@ def _append_incomplete_marker(value: object) -> str:
 _SCOPE_TEMPLATE_MIXING_PATTERN = re.compile(
     r"模板混用|整章模板|非本项目(?:场景|工艺|对象|内容|范围)|场景(?:明显)?不符|不属于本项目"
     r"|超出本项目.{0,14}范围|项目范围外|套用.{0,16}模板|与本项目.{0,12}(?:不符|无关|不一致)"
+    r"|不属于采购(?:范围)?|采购范围外|服务范围外|实施范围外|技术范围外|交付范围外"
+    r"|与采购需求.{0,12}(?:不符|不一致|无关)"
 )
 _PAGE_RANGE_PATTERN = re.compile(r"第(\d+(?:-\d+)?)页")
-_SCOPE_OBJECT_LIST_PATTERN = re.compile(r"范围画像(?:中)?不含([^，。；;]{2,60}?)(?:等工艺|等)")
+_SCOPE_OBJECT_LIST_PATTERN = re.compile(r"范围画像(?:中)?不含([^，。；;]{2,60}?)等")
 _SCOPE_PAREN_OBJECT_PATTERN = re.compile(r"[（(]([^（）()]{4,80})[）)]")
 
 
@@ -4992,17 +4994,30 @@ def _build_rule_evidence_ledger(scan: dict, rules: list[dict]) -> dict[str, dict
 _SCOPE_RULE_MARKERS = (
     "项目范围", "范围无关", "无关内容", "无关信息", "无关技术", "无关项目",
     "项目无关", "范围偏离", "范围一致", "混包", "其他项目",
+    "范围外", "采购范围", "服务范围", "实施范围", "技术范围", "交付范围",
 )
 
 
 def _is_scope_consistency_rule(rule: dict) -> bool:
     text = f"{rule.get('title') or ''} {rule.get('check_rule') or ''}"
-    return any(marker in text for marker in _SCOPE_RULE_MARKERS) or (
-        "全文" in text and "无关" in text
-    ) or ("本项目" in text and "不一致" in text)
+    if any(marker in text for marker in _SCOPE_RULE_MARKERS):
+        return True
+    if "全文" in text and "无关" in text:
+        return True
+    if "本项目" in text and any(marker in text for marker in ("不一致", "相符", "一致")):
+        return True
+    if "采购需求" in text and any(marker in text for marker in ("相符", "不符", "一致", "不一致")):
+        return True
+    if ("交付内容" in text or "服务内容" in text) and any(
+        marker in text for marker in ("范围", "一致", "相符")
+    ):
+        return True
+    return False
 
 
-_FLAW_SCORING_MARKERS = ("瑕疵", "套用", "针对性")
+_FLAW_SCORING_MARKERS = (
+    "瑕疵", "套用", "针对性", "完整性", "合理性", "可行性", "科学性", "规范性", "实用性", "专业性",
+)
 
 
 def _flaw_scoring_rule(rule: dict) -> bool:
@@ -5947,32 +5962,58 @@ def _tencent_ocr_page_texts(app, task: dict, document: dict, rule: dict, result:
     return values, failure
 
 
+_OCR_FIELD_SIGNALS = (
+    ("编号", re.compile(r"编号|证书号|No\.?|序列号|统一社会信用代码|许可证号|登记号")),
+    ("日期", re.compile(r"有效期|发证日期|签发日期|(?:19|20)\d{2}[年./-]\d{1,2}|至\s*(?:19|20)\d{2}")),
+    ("金额", re.compile(r"金额|价格|合计|小写|大写|单价|[￥¥]\s*\d|\d[\d,]*\.?\d*\s*元")),
+    ("型号", re.compile(r"型号|规格|品牌|Model|版本")),
+)
+
+
+def _local_ocr_field_gaps(rule: dict, local_values: list[dict]) -> list[int]:
+    """按规则原文推导所需字段类型，返回本地文本缺少这些字段信号的页。
+
+    字段类型信号是通用文字特征（编号/日期/金额/型号），不依赖任何行业词表；
+    规则没提字段类型时不做字段缺口升级，避免把普通 OCR 页无差别送腾讯。
+    """
+    rule_text = " ".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text"))
+    relevant = [pattern for _, pattern in _OCR_FIELD_SIGNALS if pattern.search(rule_text)]
+    if not relevant:
+        return []
+    gaps: list[int] = []
+    for value in local_values:
+        page = int(value.get("page") or 0)
+        text = str(value.get("text") or "")
+        if not text.strip() or not any(pattern.search(text) for pattern in relevant):
+            gaps.append(page)
+    return _normalise_result_pages(gaps)
+
+
 def _tencent_upgrade_pages(rule: dict, local_values: list[dict], local_failure: str,
                            level: str) -> list[int]:
     """仅把本地 OCR 不足或关键字段页送腾讯高精度复核。
 
-    该判断宁可保守升级，也不以节省额度换取漏检：高强度、证照/证件、明确字段
-    核验，以及本地失败/低置信页都会升级；普通可读正文则停在本地基线。
+    不再因为规则属于证照/证件类就把全部候选页升级；只升级本地置信度低、
+    规则所涉关键字段缺失或本地运行失败的页。level=high 仍允许在缺口页上放宽
+    置信度阈值，但不等于整组无差别升级。
     """
     pages = _normalise_result_pages([value.get("page") for value in local_values])
     if not pages:
         return []
-    roles = _rule_material_roles(rule)
-    requirements = set(_rule_evidence_requirements(rule))
-    critical = bool(roles & {"certificate", "business_license", "identity", "personnel"}) or bool(
-        requirements & {"field", "document"}
-    )
-    if level == "high" or critical or local_failure:
+    if local_failure:
         return pages
     selected: list[int] = []
+    confidence_threshold = 0.85 if level == "high" else 0.72
     for value in local_values:
+        page = value.get("page")
         try:
             confidence = float(value.get("confidence"))
         except (TypeError, ValueError):
             confidence = 1.0
-        if confidence < 0.72:
-            selected.append(value.get("page"))
-    return _normalise_result_pages(selected)
+        if confidence < confidence_threshold:
+            selected.append(page)
+    selected.extend(page for page in _local_ocr_field_gaps(rule, local_values) if page not in selected)
+    return sorted(_normalise_result_pages(selected))
 
 
 def _ocr_page_texts(app, task: dict, document: dict, rule: dict, result: dict, level: str,
@@ -6390,6 +6431,9 @@ def _apply_ocr_summary(component: str, rule: dict, working_result: dict, parsed:
     merged["conclusion_summary"] = _normalise_conclusion_summary(parsed.get("summary"))
     if component != "review" and suggested is not None:
         merged["conclusion_summary"] = _reconcile_summary_score(merged["conclusion_summary"], suggested)
+    # 本地 OCR 归纳模型会判定是否仍有外观事实待核验；该信号只在本轮任务内流转，
+    # 用于决定后续是否升级多模态，不改变落库结构。
+    merged["_ocr_visual_review_required"] = _ocr_visual_gap_flag(parsed, content_covered)
     merged = _append_evidence_layer(
         merged, source="local_ocr" if local_only else "tencent_ocr", summary=evidence or reason, checked_pages=pages,
         evidence_pages=evidence_pages, service=service_labels,
@@ -6646,6 +6690,7 @@ def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: d
                   "confidence": _enum_text(parsed.get("confidence"), {"high", "medium", "low"}, working_result.get("confidence")) if can_apply_text_conclusion else working_result.get("confidence"),
                   "ocr_candidate_pages": pages, "ocr_evidence_pages": evidence_pages,
                   "requires_review": True, "automation_status": "needs_review", "review_reason": f"{service_labels} 结果已补充，需人工复核。"}
+    merged["_ocr_visual_review_required"] = _ocr_visual_gap_flag(parsed, content_covered)
     merged = _append_evidence_layer(
         merged, source="local_ocr" if local_only else "tencent_ocr", summary=evidence or reason, checked_pages=pages,
         evidence_pages=evidence_pages, service=service_labels,
@@ -6736,6 +6781,43 @@ def _should_run_multimodal_after_ocr(strategy: str, result: dict) -> bool:
     if strategy in {"vision", "hybrid"}:
         return True
     return str(result.get("vision_status") or "") not in {"ocr_applied", "ocr_skipped_text_sufficient"}
+
+
+def _ocr_visual_gap_flag(parsed: dict, covered: bool) -> bool | None:
+    """本地 OCR 归纳模型是否仍要求外观核验。
+
+    True=必须看外观；False=文字已足够；None=模型未给出判定（走旧启发式兜底）。
+    """
+    review_required = parsed.get("visual_review_required")
+    if review_required is True or not covered:
+        return True
+    if review_required is False:
+        return False
+    return None
+
+
+def _appearance_gap_for_vision(image_strategy: str, trigger: str, rule: dict, merged: dict) -> bool:
+    """判断当前规则是否仍存在必须由多模态图片核验的外观缺口。
+
+    纯视觉策略、人工强制、规则明确要求签章/外观等视觉事实时始终视为有缺口；
+    其余情况优先采信本地 OCR 归纳模型给出的 visual_review_required 判定，
+    模型未判定时才回退到“OCR 未完整覆盖即视为有缺口”的旧启发式。
+    """
+    if image_strategy == "vision" or trigger == "required" or _rule_has_visual_only_terms(rule):
+        return True
+    flag = merged.get("_ocr_visual_review_required")
+    if flag is not None:
+        return flag is True
+    return str(merged.get("vision_status") or "") not in {"ocr_applied", "ocr_skipped_text_sufficient"}
+
+
+def _should_run_vision_for_rule(image_mode: str, image_strategy: str, trigger: str,
+                                rule: dict, merged: dict) -> bool:
+    """多模态识图按“外观缺口”分流，不再让证书类/混合策略整组无条件看图。"""
+    if image_mode == "combined":
+        return True
+    gap = _appearance_gap_for_vision(image_strategy, trigger, rule, merged)
+    return image_strategy == "vision" or (gap and image_strategy in {"hybrid", "ocr"})
 
 
 def _rule_has_visual_only_terms(rule: dict) -> bool:
@@ -8777,7 +8859,7 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
                     values["batch_count"] += 1
             allow_vision = enhancement_requested and (image_mode in {"vision_only", "combined"} or image_mode == "auto")
             skip_note = _multimodal_skip_note(image_strategy, merged, rule, trigger) if enhancement_requested else ""
-            should_run_vision = image_mode == "combined" or _should_run_multimodal_after_ocr(image_strategy, merged)
+            should_run_vision = _should_run_vision_for_rule(image_mode, image_strategy, trigger, rule, merged)
             if allow_vision and vision_profile and not skip_note and should_run_vision:
                 progress.message(f"正在图片识别：{bidder_name} · {label}")
                 merged = _run_visual_supplement(app, task, document, component, rule, merged, vision_profile)
