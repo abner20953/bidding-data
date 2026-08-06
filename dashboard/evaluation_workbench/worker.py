@@ -2964,7 +2964,7 @@ def _reconcile_summary_score(summary: str, suggested: float | None) -> str:
         return summary
     if all(abs(value - suggested) <= 1e-6 for value in values):
         return summary
-    return _SCORE_SUMMARY_VALUE_PATTERN.sub(lambda match: match.group(1), summary).strip("，,；;：:\s")
+    return _SCORE_SUMMARY_VALUE_PATTERN.sub(lambda match: match.group(1), summary).strip("，,；;：: \t\r\n")
 
 
 def _enum_text(value: object, allowed: set[str], default: str) -> str:

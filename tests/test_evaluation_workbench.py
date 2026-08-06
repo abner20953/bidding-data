@@ -2630,7 +2630,10 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("技术/服务要求逐项响应覆盖", extraction_guidance)
         self.assertIn("通常每个采购包控制为1至3条规则", extraction_guidance)
         self.assertIn("技术参数★条款的受控保留规则", extraction_guidance)
-        self.assertIn("技术参数★条款的受控保留规则", extraction_user)
+        # 去重后该约束只在系统侧 guidance 一份（通过 _system_prompt 进入每次提取调用），
+        # 用户任务模板不再重复携带，避免同一次调用重复发送与后续维护漂移。
+        self.assertIn("技术参数★条款的受控保留规则", worker._system_prompt(self.app, "extract_rules"))
+        self.assertNotIn("技术参数★条款的受控保留规则", extraction_user)
         self.assertIn("subjective|other", extraction_user)
         self.assertIn("category=other", extraction_user)
         self.assertIn("subjective|other", extraction_continue)
