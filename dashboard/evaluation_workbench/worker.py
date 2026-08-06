@@ -9019,8 +9019,8 @@ def _normalise_evaluation_highlights(parsed: dict, candidates: list[dict],
         seen_rule_ids: set[str] = set()
         raw_highlights = summary.get("highlights")
         for item in raw_highlights if isinstance(raw_highlights, list) else []:
-            # 每家最多 3 条，避免汇总结论面板信息过载。
-            if not isinstance(item, dict) or len(highlights) >= 3:
+            # 每家最多 6 条；前端对超过 3 条的部分按重要程度折叠，避免面板过载。
+            if not isinstance(item, dict) or len(highlights) >= 6:
                 continue
             rule_id = str(item.get("rule_id") or "")
             candidate = allowed.get((document_id, rule_id))

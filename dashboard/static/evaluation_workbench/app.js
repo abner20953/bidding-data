@@ -617,15 +617,16 @@
       const items = summary.highlights || [];
       const criticalHigh = items.filter((item) => item.level === 'critical' || item.level === 'high');
       const attention = items.filter((item) => item.level === 'attention');
-      // attention 只收在“另有 N 条关注项”折叠块里；主列表只展开 critical/high，
-      // 避免同一结论在“显示全部”时同时出现在主列表与折叠块中重复。
-      const visible = criticalHigh;
+      // 不超过 3 条时全部平铺显示；超过 3 条才按重要程度折叠：主列表展开
+      // critical/high，attention 收进“另有 N 条关注项”，避免重复也避免面板过载。
+      const showAll = !highOnly && items.length <= 3;
+      const visible = showAll ? items : criticalHigh;
       const listHtml = (list) => list.map((item) => {
         const basis = cleanDisplayText(item.basis);
         return `<li class="evaluation-highlight-${escapeHtml(item.level || 'attention')}"><strong>${escapeHtml(item.keyword)}</strong><span>${escapeHtml(cleanDisplayText(item.conclusion))}</span>${basis ? `<small>${escapeHtml(basis)}</small>` : ''}</li>`;
       }).join('');
       const headline = cleanDisplayText(summary.headline);
-      const attentionBlock = (!highOnly && attention.length)
+      const attentionBlock = (!highOnly && items.length > 3 && attention.length)
         ? `<details class="evaluation-highlight-more"><summary>另有 ${attention.length} 条关注项</summary><ul>${listHtml(attention)}</ul></details>` : '';
       return `<section class="evaluation-highlight-group"><h4>${escapeHtml(summary.bidder_name || '未命名投标人')}</h4>${headline ? `<p>${escapeHtml(headline.length > 60 ? `${headline.slice(0, 60)}…` : headline)}</p>` : ''}<ul>${listHtml(visible)}</ul>${attentionBlock}</section>`;
     }).join('') || '<p class="muted">当前筛选下没有高风险或重点关注事项。</p>';

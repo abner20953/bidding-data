@@ -1840,18 +1840,19 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         span = build("第P55-P58页")
         self.assertIn("第55-58页", span)
 
-    def test_evaluation_highlights_caps_three_per_bidder_and_shortens_headline(self):
+    def test_evaluation_highlights_caps_six_per_bidder_and_shortens_headline(self):
         candidates = [{"document_id": "bid-a", "bidder_name": "甲公司", "candidates": []}]
-        allowed = {("bid-a", f"r{i}"): {"_critical_eligible": False} for i in range(1, 6)}
+        allowed = {("bid-a", f"r{i}"): {"_critical_eligible": False} for i in range(1, 9)}
         values = worker._normalise_evaluation_highlights({"summaries": [{
             "document_id": "bid-a",
             "headline": "这是一个非常长的总览句子，需要验证是否会被压缩到四十个字以内并且加上省略号表示内容未完整展示。",
             "highlights": [
-                {"rule_id": f"r{i}", "level": "high", "keyword": f"事项{i}", "conclusion": f"结论{i}", "basis": "依据"} for i in range(1, 6)
+                {"rule_id": f"r{i}", "level": "high", "keyword": f"事项{i}", "conclusion": f"结论{i}", "basis": "依据"} for i in range(1, 9)
             ],
         }]}, candidates, allowed)
         self.assertEqual(len(values), 1)
-        self.assertLessEqual(len(values[0]["highlights"]), 3)
+        self.assertLessEqual(len(values[0]["highlights"]), 6)
+        self.assertGreater(len(values[0]["highlights"]), 3)
         self.assertLessEqual(len(values[0]["headline"]), 41)
 
     def test_highlight_display_candidate_translates_status_labels(self):
@@ -2938,7 +2939,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_subjective_user"]["content"])
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"])
         self.assertIn("统一为 partial 或需图片核验", PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v38")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v39")
 
     def test_scope_chapter_and_text_error_guidance_present(self):
         from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
@@ -2956,7 +2957,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(text_marker, PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("必须点名最具辨识度的偏离对象", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("risk_level 应为 high", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v38")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v39")
 
     def test_scope_template_mixing_enforces_high_risk_and_object_summary(self):
         raw = {
@@ -5005,7 +5006,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不限定行业或采购类型", guidance)
         scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v38")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v39")
 
     def test_full_scan_reruns_rule_evidence_but_rechecks_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")
