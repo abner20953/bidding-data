@@ -3020,6 +3020,7 @@ def _append_incomplete_marker(value: object) -> str:
 
 _SCOPE_TEMPLATE_MIXING_PATTERN = re.compile(
     r"模板混用|整章模板|非本项目(?:场景|工艺|对象|内容|范围)|场景(?:明显)?不符|不属于本项目"
+    r"|超出本项目.{0,14}范围|项目范围外|套用.{0,16}模板|与本项目.{0,12}(?:不符|无关|不一致)"
 )
 _PAGE_RANGE_PATTERN = re.compile(r"第(\d+(?:-\d+)?)页")
 _SCOPE_OBJECT_LIST_PATTERN = re.compile(r"范围画像(?:中)?不含([^，。；;]{2,60}?)(?:等工艺|等)")
@@ -9001,6 +9002,49 @@ def _highlight_display_candidate(item: dict) -> dict:
     return {key: val for key, val in value.items() if val not in (None, "")}
 
 
+def _scope_highlight_fallback_candidate(document_id: str, highlights: list[dict],
+                                        allowed: dict[tuple[str, str], dict]) -> dict | None:
+    """提炼模型漏选“范围模板混用”类高价值发现时的兜底注入。
+
+    只补“审查不满足/部分满足 + 高风险 + 模板混用类范围规则”，且该投标人尚未包含
+    该规则；普通范围疑点或已在面板中的内容不重复注入，避免把展示层变成规则噪声。
+    """
+    existing = {str(item.get("rule_id")) for item in highlights}
+    fallback = None
+    for (doc_id, rule_id), candidate in allowed.items():
+        if doc_id != document_id or rule_id in existing:
+            continue
+        if candidate.get("type") != "review":
+            continue
+        if candidate.get("status") not in {"not_satisfied", "partial"}:
+            continue
+        if candidate.get("risk_level") != "high":
+            continue
+        text = " ".join(str(candidate.get(key) or "") for key in ("reason", "evidence", "conclusion_summary"))
+        if not _SCOPE_TEMPLATE_MIXING_PATTERN.search(text):
+            continue
+        fallback = candidate
+        break
+    if not fallback:
+        return None
+    summary_text = re.sub(r"\s+", " ", _clean_model_text(fallback.get("conclusion_summary"))).strip()
+    if not summary_text:
+        summary_text = "存在项目范围外模板混用，需人工复核"
+    keyword = summary_text[:16]
+    conclusion = summary_text[:80]
+    pages = _compact_page_ranges(fallback.get("evidence"), fallback.get("reason"))
+    fact = re.sub(r"\s+", " ", _clean_model_text(fallback.get("reason")))[:110]
+    basis = f"{pages}；{fact}" if pages else fact
+    basis = basis[:120] or "范围候选已由评审规则确认，需人工复核"
+    return {
+        "rule_id": str(fallback.get("rule_id") or ""),
+        "level": "high",
+        "keyword": keyword,
+        "conclusion": conclusion,
+        "basis": basis,
+    }
+
+
 def _normalise_evaluation_highlights(parsed: dict, candidates: list[dict],
                                      allowed: dict[tuple[str, str], dict]) -> list[dict]:
     bidder_names = {item["document_id"]: item["bidder_name"] for item in candidates}
@@ -9046,6 +9090,16 @@ def _normalise_evaluation_highlights(parsed: dict, candidates: list[dict],
                 "rule_id": rule_id, "level": level, "keyword": keyword,
                 "conclusion": conclusion, "basis": basis,
             })
+        # 提炼模型可能把“范围偏离”写进 headline 却漏选对应规则；对已确认的高风险
+        # 模板混用发现做确定性兜底，保证这类结论一定出现在重要结论面板。
+        fallback = _scope_highlight_fallback_candidate(document_id, highlights, allowed)
+        if fallback:
+            if len(highlights) < 6:
+                highlights.append(fallback)
+            else:
+                attention_indexes = [index for index, item in enumerate(highlights) if item.get("level") == "attention"]
+                if attention_indexes:
+                    highlights[attention_indexes[-1]] = fallback
         highlights.sort(key=lambda item: severity_rank[item["level"]], reverse=True)
         overall_level = highlights[0]["level"] if highlights else "none"
         headline = re.sub(r"\s+", " ", _clean_model_text(summary.get("headline"))).strip()

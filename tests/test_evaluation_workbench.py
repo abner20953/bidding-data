@@ -3427,6 +3427,65 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         self.assertEqual(values[0]["highlights"][0]["level"], "attention")
 
+    def test_scope_template_mixing_highlight_injected_when_model_omits(self):
+        candidates = [{"document_id": "bid-a", "bidder_name": "甲公司", "candidates": []}]
+        allowed = {
+            ("bid-a", "quote"): {"_critical_eligible": False, "type": "review", "rule_id": "quote",
+                                 "status": "not_satisfied", "risk_level": "high",
+                                 "title": "报价一致性", "evidence": "第22页金额空白",
+                                 "reason": "报价缺失", "conclusion_summary": "报价无法核验"},
+            ("bid-a", "scope"): {"_critical_eligible": False, "type": "review", "rule_id": "scope",
+                                 "status": "not_satisfied", "risk_level": "high",
+                                 "title": "项目范围无关内容核验",
+                                 "evidence": "第775-780页高层建筑老虎口与青铅灌浇",
+                                 "reason": "正文将建筑工程施工总承包模板作为本项目方案写入→属整章模板混用",
+                                 "conclusion_summary": "施工章套用建筑工程总承包模板，工艺对象超出本项目范围"},
+        }
+        values = worker._normalise_evaluation_highlights({"summaries": [{
+            "document_id": "bid-a", "headline": "报价异常与范围偏离存疑",
+            "highlights": [{"rule_id": "quote", "level": "high", "keyword": "报价缺失",
+                            "conclusion": "报价无法核验", "basis": "第22页金额空白"}],
+        }]}, candidates, allowed)
+        self.assertEqual(len(values[0]["highlights"]), 2)
+        injected = next(item for item in values[0]["highlights"] if item["rule_id"] == "scope")
+        self.assertEqual(injected["level"], "high")
+        self.assertIn("施工章套用建筑工程总承包模板", injected["conclusion"])
+        self.assertIn("第775-780页", injected["basis"])
+
+    def test_scope_highlight_fallback_skips_low_risk_or_absent_marker(self):
+        candidates = [{"document_id": "bid-a", "bidder_name": "甲公司", "candidates": []}]
+        allowed = {
+            ("bid-a", "weak"): {"_critical_eligible": False, "type": "review",
+                                "status": "partial", "risk_level": "medium",
+                                "title": "项目范围无关内容核验",
+                                "evidence": "第775页出现通用施工规范", "reason": "与项目语境存在差异",
+                                "conclusion_summary": "部分内容需复核"},
+        }
+        values = worker._normalise_evaluation_highlights({"summaries": [{
+            "document_id": "bid-a", "headline": "无",
+            "highlights": [{"rule_id": "weak", "level": "attention", "keyword": "需复核",
+                            "conclusion": "部分内容需复核", "basis": "第775页"}],
+        }]}, candidates, allowed)
+        self.assertEqual(len(values[0]["highlights"]), 1)
+
+    def test_scope_highlight_fallback_matches_out_of_scope_phrasing(self):
+        candidates = [{"document_id": "bid-a", "bidder_name": "甲公司", "candidates": []}]
+        allowed = {
+            ("bid-a", "scope"): {"_critical_eligible": False, "type": "review", "rule_id": "scope",
+                                 "status": "not_satisfied", "risk_level": "high",
+                                 "title": "项目范围无关内容核验",
+                                 "evidence": "第740-794页出现老虎口/青铅灌浇、暴雨应急预案等章节",
+                                 "reason": "上述施工对象/工艺均超出本项目网络与机房模块化改造范围，"
+                                           "且被作为本项目施工方案写入→范围偏离候选集中体现",
+                                 "conclusion_summary": "施工章套用建筑工程总承包模板，工艺对象超出本项目范围"},
+        }
+        values = worker._normalise_evaluation_highlights({"summaries": [{
+            "document_id": "bid-a", "headline": "范围偏离存疑", "highlights": [],
+        }]}, candidates, allowed)
+        self.assertEqual(len(values[0]["highlights"]), 1)
+        self.assertEqual(values[0]["highlights"][0]["level"], "high")
+        self.assertIn("第740-794页", values[0]["highlights"][0]["basis"])
+
     def test_copying_response_rule_is_low_risk_in_review_results(self):
         rules = [{"rule_id": "copy", "title": "技术响应照抄照搬核验", "check_rule": "检查是否照抄招标参数"}]
         values = worker._normalise_review_results([{
