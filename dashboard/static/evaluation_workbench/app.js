@@ -175,8 +175,9 @@
       return `<div class="layer-block layer-block-plain">${labelHtml}${badge}<span>${escapeHtml(full)}</span></div>`;
     }
     const preview = `${full.slice(0, 160)}…`;
-    // 摘要行已展示前 160 字，展开区只接续剩余内容，避免从头重复一遍。
-    return `<details class="layer-block"><summary>${labelHtml}${badge}<span>${escapeHtml(preview)}</span></summary><div>${escapeHtml(full.slice(160))}</div></details>`;
+    // 折叠时摘要行显示前 160 字加省略号；展开后预览整行隐藏，完整内容在同一处
+    // 连贯显示，不再出现“省略号残留”或预览与正文分两段造成的断句。
+    return `<details class="layer-block"><summary>${labelHtml}${badge}<span class="layer-preview">${escapeHtml(preview)}</span><span class="layer-full">${escapeHtml(full)}</span></summary></details>`;
   }
   function layeredBlocksHtml(text) {
     const parts = String(text || '').split(/(?=【(?:图片识别|腾讯OCR|本地OCR|OCR)[^】]*】)/).filter(Boolean);
@@ -552,8 +553,8 @@
       const updated = layers.length > 1 && index < layers.length - 1 ? '<small class="layer-updated">已被后续核验更新</small>' : '';
       const summary = cleanDisplayText(layer.summary);
       const body = summary.length > 160
-        // 摘要行已展示前 160 字，展开区只接续剩余内容，避免从头重复一遍。
-        ? `<details class="layer-block"><summary><span>${escapeHtml(summary.slice(0, 160))}…</span></summary><div>${escapeHtml(summary.slice(160))}</div></details>`
+        // 与文字结论一致：展开后预览隐藏，完整内容连贯显示。
+        ? `<details class="layer-block"><summary><span class="layer-preview">${escapeHtml(summary.slice(0, 160))}…</span><span class="layer-full">${escapeHtml(summary)}</span></summary></details>`
         : `<div class="layer-block layer-block-plain"><span>${escapeHtml(summary)}</span></div>`;
       return `<div class="evidence-layer"><strong>${escapeHtml(labels[layer.source] || '补充证据')}</strong>${meta ? `<small>${escapeHtml(meta)}</small>` : ''}${updated}${body}</div>`;
     }).join('')}</details>`;
