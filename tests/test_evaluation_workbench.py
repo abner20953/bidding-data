@@ -2940,7 +2940,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_subjective_user"]["content"])
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"])
         self.assertIn("统一为 partial 或需图片核验", PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v41")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v42")
 
     def test_scope_chapter_and_text_error_guidance_present(self):
         from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
@@ -2958,7 +2958,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(text_marker, PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("必须点名最具辨识度的偏离对象", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("risk_level 应为 high", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v41")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v42")
 
     def test_scope_template_mixing_enforces_high_risk_and_object_summary(self):
         raw = {
@@ -3952,6 +3952,35 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         context2 = worker._full_scan_review_context(scan, [plain_rule], 30_000)
         self.assertNotIn("青铅灌浇", context2["text"])
         self.assertNotIn("范围偏离候选提示", context2["text"])
+
+    def test_flaw_subjective_group_limits_scope_anomaly_chunks_to_two(self):
+        chunks = [
+            {"chunk_id": "chunk_a", "start_page": 10, "end_page": 20, "text": "页面甲内容。"},
+            {"chunk_id": "chunk_b", "start_page": 40, "end_page": 50, "text": "页面乙内容。"},
+            {"chunk_id": "chunk_c", "start_page": 80, "end_page": 90, "text": "页面丙内容。"},
+        ]
+        scan = {
+            "chunks": chunks, "findings": [], "failed_chunks": [], "chunk_count": 3,
+            "project_scope": {"scope_summary": "机房与网络改造"},
+            "scope_anomalies": [
+                {"chunk_id": "chunk_a", "dimension": "偏离A", "candidate_priority": "high",
+                 "evidence": "偏离A原文", "relation": "与本项目不符"},
+                {"chunk_id": "chunk_b", "dimension": "偏离B", "candidate_priority": "medium",
+                 "evidence": "偏离B原文", "relation": "与本项目不符"},
+                {"chunk_id": "chunk_c", "dimension": "偏离C", "candidate_priority": "medium",
+                 "evidence": "偏离C原文", "relation": "与本项目不符"},
+            ],
+        }
+        flaw_rule = {
+            "rule_id": "safety", "category": "subjective", "title": "安全文明施工保障措施方案主观评分",
+            "check_rule": "无瑕疵得6分；存在瑕疵按分档扣分", "source_text": "",
+            "scoring_json": json.dumps({"max_score": 6, "kind": "manual", "items": [
+                {"name": "瑕疵档得分", "max_score": 6, "criterion": "按瑕疵档打分"}]}),
+        }
+        context = worker._full_scan_review_context(scan, [flaw_rule], 30_000)
+        included = [page for page in context["pages"] if page in {"chunk_a", "chunk_b", "chunk_c"}]
+        self.assertLessEqual(len(included), 2)
+        self.assertIn("chunk_a", included)
 
     def test_full_scan_context_reserves_raw_evidence_for_each_rule(self):
         late_a = "资质证书编号A-2026，满足资格条件。"
@@ -5167,7 +5196,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不限定行业或采购类型", guidance)
         scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v41")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v42")
 
     def test_full_scan_reruns_rule_evidence_but_rechecks_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")
@@ -6081,8 +6110,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(results["r2"]["suggested_score"], 1)
         self.assertEqual(results["r1"]["vision_status"], "ocr_applied")
 
-    def test_ocr_batch_falls_back_to_per_rule_path_when_model_misses_rule(self):
-        """批量模型漏掉某个 rule_id 时，该规则整批回退到逐条原路径。"""
+    def test_ocr_batch_adopts_covered_rules_and_falls_back_only_missing(self):
+        """批量模型漏掉某个 rule_id 时，只回退缺失规则，已 covered 规则直接采纳。"""
         document = {"document_id": "doc", "extension": ".pdf", "page_count": 50,
                     "original_name": "投标.pdf", "bidder_name": "甲"}
         rules = [
@@ -6104,14 +6133,14 @@ class EvaluationWorkbenchTests(unittest.TestCase):
                  {"page": 12, "service": "accurate", "text": "证书编号A123"},
                  {"page": 20, "service": "accurate", "text": "业绩合同"},
              ], "")), \
-             patch.object(worker, "_request_task_json", side_effect=[parsed_missing, parsed_r1, parsed_r2]) as request_json:
+             patch.object(worker, "_request_task_json", side_effect=[parsed_missing, parsed_r2]) as request_json:
             results = worker._run_ocr_batch_supplement(
                 self.app, {"task_id": "t"}, document, "objective",
                 [(rules[0], bases[0], True), (rules[1], bases[1], True)], {"profile_id": "m"},
             )
 
-        # 整批回退：r1 与 r2 都重走逐条原路径（1 次批量 + 2 次逐条）。
-        self.assertEqual(request_json.call_count, 3)
+        # 部分采纳：r1 用批量结果，r2 才回退逐条（1 次批量 + 1 次逐条）。
+        self.assertEqual(request_json.call_count, 2)
         self.assertEqual(results["r1"]["suggested_score"], 2)
         self.assertEqual(results["r2"]["suggested_score"], 1)
 

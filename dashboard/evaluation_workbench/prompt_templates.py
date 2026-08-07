@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 PROMPT_TEMPLATE_SETTING = "evaluation_workbench_prompt_templates"
-EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v41"
+EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v42"
 
 
 def _template(name: str, description: str, content: str, *placeholders: str) -> dict:

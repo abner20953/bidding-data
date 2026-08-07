@@ -5123,7 +5123,8 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
         anomaly_chunk_cap = anomaly_limit
     elif flaw_group:
         anomaly_limit = 4 if targeted else 6
-        anomaly_chunk_cap = 3
+        # 主观瑕疵组只带 1-2 个最相关页块作为参考，避免挤占方案原文预算。
+        anomaly_chunk_cap = 1 if targeted else 2
     else:
         anomaly_limit = anomaly_chunk_cap = 0
     if anomaly_limit:
@@ -6528,13 +6529,15 @@ def _run_ocr_batch_supplement(app, task, document, component, entries, profile, 
         parsed = None
     if parsed is not None:
         by_id = {str(item.get("rule_id")): item for item in parsed["results"] if isinstance(item, dict) and str(item.get("rule_id"))}
-        if all(rule["rule_id"] in by_id for rule, _ in batch_items) and all(
-            _ocr_response_coverage(by_id[rule["rule_id"]]) == "covered" for rule, _ in batch_items
-        ):
-            for rule, payload in batch_items:
-                results[rule["rule_id"]] = _apply_ocr_summary(component, rule, payload["working_result"], by_id[rule["rule_id"]], payload)
+        # 部分采纳：批量模型已返回 covered 的规则直接合并；缺失/未覆盖的规则才
+        # 逐条回退，避免一条异常让整批重跑，显著减少 OCR 归纳模型调用。
+        for rule, payload in batch_items:
+            item = by_id.get(rule["rule_id"])
+            if item is not None and _ocr_response_coverage(item) == "covered":
+                results[rule["rule_id"]] = _apply_ocr_summary(component, rule, payload["working_result"], item, payload)
+        if all(rule["rule_id"] in results for rule, _ in batch_items):
             return results
-    # 整批回退：逐条走与旧实现完全一致的路径（含重新提取），保证行为一致。
+    # 仅对未采纳批量结果的规则逐条回退（含重新提取），保持证据链语义一致。
     for rule, result, allow_tencent in entries:
         if rule["rule_id"] in results:
             continue
