@@ -2782,6 +2782,10 @@ def rule_execution_meta(rule: dict) -> dict:
     baseline_ocr_mode = str(value.get("baseline_ocr_mode") or "auto")
     if baseline_ocr_mode not in _BASELINE_OCR_MODES:
         baseline_ocr_mode = "auto"
+    clause_ids = value.get("source_clause_ids")
+    if not isinstance(clause_ids, list):
+        clause_ids = []
+    clause_ids = [str(item).strip() for item in clause_ids if str(item).strip()]
     return {
         "execution_strategy": strategy if strategy in _RULE_EXECUTION_STRATEGIES else "",
         "evidence_requirements": list(dict.fromkeys(requirements)),
@@ -2792,6 +2796,7 @@ def rule_execution_meta(rule: dict) -> dict:
         "acquisition_preset": acquisition_preset,
         "baseline_ocr_mode": baseline_ocr_mode,
         "evidence_items": _normalise_evidence_items(value.get("evidence_items")),
+        "source_clause_ids": list(dict.fromkeys(clause_ids)),
     }
 
 
@@ -2869,6 +2874,10 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
     if image_mode == "off":
         trigger = "off"
         level = "off"
+    clause_ids = payload.get("source_clause_ids", base.get("source_clause_ids"))
+    if not isinstance(clause_ids, list):
+        clause_ids = []
+    clause_ids = [str(item).strip() for item in clause_ids if str(item).strip()]
     value = {
         "execution_strategy": strategy if strategy in _RULE_EXECUTION_STRATEGIES else "",
         "evidence_requirements": normalized,
@@ -2879,6 +2888,7 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
         "acquisition_preset": preset,
         "baseline_ocr_mode": baseline_ocr_mode,
         "evidence_items": _normalise_evidence_items(payload.get("evidence_items", base.get("evidence_items"))),
+        "source_clause_ids": list(dict.fromkeys(clause_ids)),
     }
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
@@ -3255,7 +3265,13 @@ def _score_rule_title_core(value: object) -> str:
     """预检用的评分对象名归一化：去分值括注与章节导航前缀，与提取去重口径一致。"""
     text = re.sub(r"[（(][^()（）]*\d+(?:\.\d+)?\s*分[^()（）]*[)）]\s*$", "", str(value or ""))
     text = re.sub(r"(?:[-—–:：\s]*)(?:满分|最高(?:得)?分?)\s*\d+(?:\.\d+)?\s*分?", "", text)
-    text = re.sub(r"^\s*(?:(?:商务|技术|价格|服务|资格)部分|(?:客观|主观)?评分|评分项?)\s*[-—–:：_]*\s*", "", text)
+    # 章节导航前缀必须带分隔符（如“商务部分-企业业绩评分”“技术部分：货物指标”）
+    # 才剥离；“价格部分评分”“技术部分评分”这类以部分名开头的完整标题本身没有
+    # 导航分隔符，保留原样，避免被剥成“评分”后因过短而无法参与合并/预检。
+    text = re.sub(
+        r"^\s*(?:(?:商务|技术|价格|服务|资格)部分|(?:客观|主观)?评分|评分项?)\s*[-—–:：_]\s*",
+        "", text,
+    )
     return re.sub(r"[\s\W_]+", "", text).casefold()
 
 
@@ -3271,6 +3287,65 @@ def _score_sources_compatible(left: object, right: object) -> bool:
 
     shorter, longer = sorted((normalised(left), normalised(right)), key=len)
     return len(shorter) >= 20 and longer.startswith(shorter)
+
+
+def _normalise_rule_source(value: object) -> str:
+    text = re.sub(r"(?:…|\.\.\.|……)+", "", str(value or ""))
+    return re.sub(r"[\s\W_]+", "", text).casefold()
+
+
+def _score_sources_contain(left: object, right: object) -> bool:
+    """较短原文（≥30 归一字符）完整出现在较长原文中时视为同源。
+
+    覆盖“模型给同一评分项加了章节前缀/截断中间段”的跨代表述漂移；调用方负责
+    排除出现在多条规则中的公共模板句，避免把“上述方案无缺陷得X分…”类共用尾句
+    误当成合并证据。
+    """
+    shorter, longer = sorted((_normalise_rule_source(left), _normalise_rule_source(right)), key=len)
+    return len(shorter) >= 30 and shorter in longer
+
+
+def _score_rule_object_core(value: object) -> str:
+    """评分对象核心词：去“评分/评审/得分/方案/（含…）”等词尾与常见修饰。"""
+    text = _score_rule_title_core(value)
+    text = re.sub(r"(?:响应|与偏离|对照|核验|评审|评分|得分|方案|内容|情况|部分)$", "", text)
+    text = re.sub(r"含[^（）()]*$", "", text)
+    return text
+
+
+def _score_object_core_compatible(left: str, right: str) -> bool:
+    """对象核心词兼容：完全一致，或一方是另一方的完整前缀（措辞被扩展/缩写）。"""
+    if not left or not right:
+        return False
+    return left == right or (len(left) >= 4 and (left.startswith(right) or right.startswith(left)))
+
+
+def _score_scoring_structure_similar(left: dict | None, right: dict | None) -> bool:
+    """叶子结构宽松匹配：归一叶子名后分值一致且至少半数命中，视为同一计分结构。"""
+    def normalized_items(scoring: dict | None) -> list[tuple[str, float]]:
+        items = scoring.get("items") if isinstance(scoring, dict) else None
+        if not isinstance(items, list) or not items:
+            return []
+        values = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = re.sub(r"[\s\W_]+", "", str(item.get("name") or "")).casefold()
+            name = re.sub(r"(?:评分|方案|括注|（[^）]*）|（[^)]*）|含[^（）()]*)$", "", name)
+            try:
+                score = float(item.get("max_score"))
+            except (TypeError, ValueError):
+                continue
+            values.append((name, score))
+        return values
+
+    left_items = normalized_items(left)
+    right_items = normalized_items(right)
+    if not left_items or not right_items:
+        return False
+    right_map = dict(right_items)
+    matched = sum(1 for name, score in left_items if name and right_map.get(name) is not None and abs(right_map[name] - score) <= 0.001)
+    return matched >= max(1, (min(len(left_items), len(right_items)) + 1) // 2)
 
 
 def _score_scoring_structure_key(scoring: dict | None) -> tuple | None:
@@ -3328,12 +3403,40 @@ def _merge_rule_duplicate_fields(primary: dict, secondary: dict) -> dict:
     return merged
 
 
-def merge_draft_score_rule_duplicates(app, rule_set_id: str) -> int:
-    """确认前安全合并重复评分规则。
+def _rule_source_clause_ids(rule: dict) -> set[str]:
+    try:
+        meta = json.loads(rule.get("execution_meta_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    values = meta.get("source_clause_ids")
+    return {str(item).strip() for item in values if str(item).strip()} if isinstance(values, list) else set()
 
-    只处理待确认规则集：同类别、同对象名、同分值，且原文同源（截断/完整前缀）
-    或评分叶子结构逐项一致时，保留信息更全的一条，其余停用。已确认规则集不动，
-    因此不会改变任何历史结论。
+
+def _is_common_template_source(rule: dict, peers: list[dict]) -> bool:
+    """较短原文是否在 3 条以上其他规则中作为子串出现（公共模板尾句）。"""
+    source = _normalise_rule_source(rule.get("source_text"))
+    if len(source) < 30:
+        return False
+    appearances = 0
+    for peer in peers:
+        if peer.get("rule_id") == rule.get("rule_id"):
+            continue
+        if source in _normalise_rule_source(peer.get("source_text")):
+            appearances += 1
+    return appearances >= 3
+
+
+def merge_draft_score_rule_duplicates(app, rule_set_id: str) -> int:
+    """安全合并重复评分规则（draft 与已确认规则集均可执行）。
+
+    匹配采用多证据联合，全部为通用机制：
+    1) 评分条款 ID 交集（提取时持久化的 source_clause_ids，同代确定性锚）；
+    2) 原文同源（截断/完整前缀，或较短原文整体出现在较长原文中且非公共模板句）；
+    3) 评分叶子结构逐项一致；
+    4) 对象核心词相同且叶子结构半数以上匹配（覆盖标题措辞漂移）。
+    命中任一证据即保留信息更全的一条、停用其余；不删除记录，可逆。
     """
     with connection(app) as conn:
         rows = conn.execute(
@@ -3342,59 +3445,101 @@ def merge_draft_score_rule_duplicates(app, rule_set_id: str) -> int:
                ORDER BY sort_order, created_at""",
             (rule_set_id,),
         ).fetchall()
-    groups: dict[tuple[str, str, float], list[dict]] = {}
-    for row in rows:
-        rule = dict(row)
-        try:
-            scoring = json.loads(rule.get("scoring_json") or "{}")
-        except (TypeError, json.JSONDecodeError):
-            scoring = {}
-        if not isinstance(scoring, dict):
-            scoring = {}
-        max_score = _valid_max_score(scoring)
-        core = _score_rule_title_core(rule.get("title"))
-        if max_score is None or len(core) < 4:
-            continue
-        groups.setdefault((str(rule.get("category") or ""), core, float(max_score)), []).append(rule)
+    rules = [dict(row) for row in rows]
     merged_count = 0
     with connection(app) as conn:
-        for group in groups.values():
-            if len(group) < 2:
+        for index, primary in enumerate(rules):
+            if not primary.get("enabled"):
                 continue
-            primary = max(group, key=_score_rule_richness)
-            for other in group:
-                if other["rule_id"] == primary["rule_id"]:
+            primary_scoring = {}
+            try:
+                primary_scoring = json.loads(primary.get("scoring_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                pass
+            if not isinstance(primary_scoring, dict):
+                primary_scoring = {}
+            primary_max = _valid_max_score(primary_scoring)
+            primary_category = str(primary.get("category") or "")
+            if primary_max is None:
+                continue
+            primary_ids = _rule_source_clause_ids(primary)
+            primary_core = _score_rule_object_core(primary.get("title"))
+            for other in rules[index + 1:]:
+                if not other.get("enabled"):
                     continue
-                try:
-                    primary_scoring = json.loads(primary.get("scoring_json") or "{}")
-                except (TypeError, json.JSONDecodeError):
-                    primary_scoring = {}
                 try:
                     other_scoring = json.loads(other.get("scoring_json") or "{}")
                 except (TypeError, json.JSONDecodeError):
                     other_scoring = {}
-                same_source = _score_sources_compatible(primary.get("source_text"), other.get("source_text"))
+                if not isinstance(other_scoring, dict):
+                    other_scoring = {}
+                other_max = _valid_max_score(other_scoring)
+                if other_max is None or abs(primary_max - other_max) > 0.001:
+                    continue
+                if str(other.get("category") or "") != primary_category:
+                    continue
+                other_ids = _rule_source_clause_ids(other)
+                same_id = bool(primary_ids & other_ids)
+                same_prefix = _score_sources_compatible(primary.get("source_text"), other.get("source_text"))
+                contain_primary = _score_sources_contain(primary.get("source_text"), other.get("source_text"))
+                contain_other = _score_sources_contain(other.get("source_text"), primary.get("source_text"))
+                primary_common = _is_common_template_source(primary, rules)
+                other_common = _is_common_template_source(other, rules)
+                same_contain = (contain_primary and not other_common) or (contain_other and not primary_common)
                 same_structure = (
                     _score_scoring_structure_key(primary_scoring) is not None
                     and _score_scoring_structure_key(primary_scoring) == _score_scoring_structure_key(other_scoring)
                 )
-                if not (same_source or same_structure):
+                other_core = _score_rule_object_core(other.get("title"))
+                same_core = _score_object_core_compatible(primary_core, other_core)
+                similar_structure = _score_scoring_structure_similar(primary_scoring, other_scoring)
+                if not (same_id or same_prefix or same_contain or same_structure or (same_core and similar_structure)):
                     continue
-                merged = _merge_rule_duplicate_fields(primary, other)
-                conn.execute(
-                    """UPDATE ew_rules SET check_rule=?, source_text=?, source_page=?, scoring_json=?, updated_at=?
-                       WHERE rule_id=?""",
-                    (str(merged.get("check_rule") or ""), str(merged.get("source_text") or ""),
-                     merged.get("source_page"), str(merged.get("scoring_json") or primary.get("scoring_json") or "{}"),
-                     now_iso(), primary["rule_id"]),
-                )
-                conn.execute(
-                    "UPDATE ew_rules SET enabled=0, updated_at=? WHERE rule_id=?",
-                    (now_iso(), other["rule_id"]),
-                )
-                primary = merged
+                primary, other = _merge_rule_pair(conn, primary, other)
                 merged_count += 1
+        # 无论是否实际合并都刷新规则集版本，使已确认规则集的后续评审缓存失效，
+        # 避免“刚去重就复用旧结果”的误导。
+        conn.execute(
+            "UPDATE ew_rule_sets SET updated_at=? WHERE rule_set_id=?",
+            (now_iso(), rule_set_id),
+        )
     return merged_count
+
+
+def _merge_rule_pair(conn, primary: dict, other: dict) -> tuple[dict, dict]:
+    """合并两条规则：信息更全者为主，更新主规则字段并停用次规则。"""
+    if _score_rule_richness(other) > _score_rule_richness(primary):
+        primary, other = other, primary
+    merged = _merge_rule_duplicate_fields(primary, other)
+    try:
+        primary_meta = json.loads(primary.get("execution_meta_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        primary_meta = {}
+    try:
+        other_meta = json.loads(other.get("execution_meta_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        other_meta = {}
+    if not isinstance(primary_meta, dict):
+        primary_meta = {}
+    if not isinstance(other_meta, dict):
+        other_meta = {}
+    clause_ids = list(dict.fromkeys([
+        *(primary_meta.get("source_clause_ids") or []),
+        *(other_meta.get("source_clause_ids") or []),
+    ]))
+    primary_meta["source_clause_ids"] = [str(item) for item in clause_ids]
+    conn.execute(
+        """UPDATE ew_rules SET check_rule=?, source_text=?, source_page=?, scoring_json=?, execution_meta_json=?, updated_at=?
+           WHERE rule_id=?""",
+        (str(merged.get("check_rule") or ""), str(merged.get("source_text") or ""),
+         merged.get("source_page"), str(merged.get("scoring_json") or primary.get("scoring_json") or "{}"),
+         json.dumps(primary_meta, ensure_ascii=False), now_iso(), primary["rule_id"]),
+    )
+    conn.execute(
+        "UPDATE ew_rules SET enabled=0, updated_at=? WHERE rule_id=?",
+        (now_iso(), other["rule_id"]),
+    )
+    return merged, other
 
 
 def _score_rule_max_value(rule: dict) -> float | None:
@@ -3426,20 +3571,88 @@ _HARD_TENDER_ANCHOR_GROUPS = (
     ("进口产品", ("进口产品", "进口")),
 )
 
+_TENDER_SCORE_PARENT_PATTERN = re.compile(
+    r"第\s*[一二三四五六七八九十\d]+\s*部分[^（(]{0,40}?[（(]\s*(\d+(?:\.\d+)?)\s*分\s*[）)]"
+)
 
-def _hard_tender_anchor_scan(app, project_id: str, rules: list[dict]) -> list[dict]:
+
+def _tender_score_parent_ledger(text: str) -> list[dict]:
+    """本地解析评分父项分值台账（如“第一部分价格部分（30分）…第四部分技术部分（30分）”）。
+
+    纯本地正则、零模型成本；格式不规整时返回空列表，调用方静默跳过。
+    """
+    ledger: list[dict] = []
+    for match in _TENDER_SCORE_PARENT_PATTERN.finditer(text):
+        page = max(1, text[:match.start()].count("[第"))
+        label = re.sub(r"\s+", "", match.group(0))
+        try:
+            score = float(match.group(1))
+        except ValueError:
+            continue
+        if score <= 0:
+            continue
+        if ledger and ledger[-1]["page"] == page and ledger[-1]["score"] == score:
+            continue
+        ledger.append({"label": label, "score": score, "page": page})
+    return ledger
+
+
+def _score_parent_mismatches(tender_text: str, rules: list[dict]) -> list[dict]:
+    """评分父项声明分值与下属评分规则满分合计对账。"""
+    ledger = _tender_score_parent_ledger(tender_text)
+    if len(ledger) < 2:
+        return []
+    issues: list[dict] = []
+    for index, parent in enumerate(ledger):
+        next_page = ledger[index + 1]["page"] if index + 1 < len(ledger) else None
+        total = 0.0
+        member_titles: list[str] = []
+        for rule in rules:
+            if not rule.get("enabled") or str(rule.get("category") or "") not in {"objective", "subjective"}:
+                continue
+            page = rule.get("source_page")
+            if not isinstance(page, int) or page < parent["page"]:
+                continue
+            if next_page is not None and page >= next_page:
+                continue
+            scoring = {}
+            try:
+                scoring = json.loads(rule.get("scoring_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                pass
+            max_score = _valid_max_score(scoring)
+            if max_score is None:
+                continue
+            total += max_score
+            member_titles.append(str(rule.get("title") or "未命名规则"))
+        if abs(total - parent["score"]) > 0.01:
+            issues.append({
+                "severity": "warning", "code": "score_parent_mismatch",
+                "rule_id": "", "title": parent["label"],
+                "message": (
+                    f"招标评分父项“{parent['label']}”声明 {parent['score']:g} 分，"
+                    f"但该部分下启用评分规则满分合计 {total:g} 分（{'、'.join(member_titles) or '无评分规则'}）。"
+                    f"差额 {parent['score'] - total:+.2g} 分，请核对是否缺项或存在重复。"
+                ),
+            })
+    return issues
+
+
+def _hard_tender_anchor_scan(app, project_id: str, rules: list[dict], *, force: bool = False) -> list[dict]:
     """首提取兜底：招标文件出现法律/政策硬性条款而规则集未覆盖时提示。
 
     仅在没有历史已确认规则集时运行（有历史集时由“继承旧规则”机制保证完整，
-    避免长期关键词清单噪音）。返回 issue 列表，不改写任何规则。
+    避免长期关键词清单噪音）；force=True 时供规则页手动触发检查，任何项目都执行。
+    返回 issue 列表，不改写任何规则。
     """
-    with connection(app) as conn:
-        has_previous = conn.execute(
-            "SELECT 1 FROM ew_rule_sets WHERE project_id=? AND status IN ('confirmed', 'superseded') LIMIT 1",
-            (project_id,),
-        ).fetchone()
-    if has_previous:
-        return []
+    if not force:
+        with connection(app) as conn:
+            has_previous = conn.execute(
+                "SELECT 1 FROM ew_rule_sets WHERE project_id=? AND status IN ('confirmed', 'superseded') LIMIT 1",
+                (project_id,),
+            ).fetchone()
+        if has_previous:
+            return []
     tender = next((item for item in list_documents(app, project_id) if item.get("role") == "tender"), None)
     parsed_path = str((tender or {}).get("parsed_path") or "")
     if not parsed_path:
@@ -3491,6 +3704,124 @@ def _hard_tender_anchor_scan(app, project_id: str, rules: list[dict]) -> list[di
                 "message": f"招标文件出现“{label}”要求（第{pages}页），当前规则集未覆盖，建议补充对应审查规则。",
             })
     return issues
+
+
+def rule_anchor_scan(app, project_id: str) -> list[dict]:
+    """规则页手动触发的招标关键条款覆盖检查（不区分是否有历史规则集）。"""
+    _, rules = list_rules(app, project_id)
+    return _hard_tender_anchor_scan(app, project_id, rules, force=True)
+
+
+def missing_rules_from_history(app, project_id: str) -> list[dict]:
+    """当前规则集与历史已确认/已替换规则集对比，返回历史有而当前没有的规则。
+
+    匹配复用规则签名与评分对象归一，避免标题轻微漂移造成假缺失；结果只读，
+    由前端展示并供用户选择迁回。
+    """
+    current = current_rule_set(app, project_id)
+    if not current:
+        return []
+    _, current_rules = list_rules(app, project_id)
+    current_signatures = set()
+    current_score_keys = set()
+    for rule in current_rules:
+        current_signatures.add((
+            str(rule.get("category") or ""),
+            re.sub(r"\s+", "", str(rule.get("title") or "")).casefold(),
+            re.sub(r"\s+", "", str(rule.get("check_rule") or rule.get("title") or "")).casefold(),
+        ))
+        if str(rule.get("category") or "") in {"objective", "subjective"}:
+            core = _score_rule_title_core(rule.get("title"))
+            max_value = _score_rule_max_value(rule)
+            if len(core) >= 4 and max_value is not None:
+                current_score_keys.add((str(rule.get("category") or ""), core, float(max_value)))
+    with connection(app) as conn:
+        rows = conn.execute(
+            """SELECT r.*, s.version AS rule_set_version, s.status AS rule_set_status
+               FROM ew_rules r JOIN ew_rule_sets s ON s.rule_set_id = r.rule_set_id
+               WHERE s.project_id=? AND s.rule_set_id != ? AND s.status IN ('confirmed', 'superseded')
+               ORDER BY s.version DESC, r.sort_order, r.created_at""",
+            (project_id, current["rule_set_id"]),
+        ).fetchall()
+    result: list[dict] = []
+    seen = set()
+    for row in rows:
+        rule = _rule_public_value(dict(row))
+        signature = (
+            str(rule.get("category") or ""),
+            re.sub(r"\s+", "", str(rule.get("title") or "")).casefold(),
+            re.sub(r"\s+", "", str(rule.get("check_rule") or rule.get("title") or "")).casefold(),
+        )
+        if signature in current_signatures:
+            continue
+        is_score = str(rule.get("category") or "") in {"objective", "subjective"}
+        core = _score_rule_title_core(rule.get("title"))
+        max_value = _score_rule_max_value(rule)
+        if is_score and len(core) >= 4 and max_value is not None:
+            if (str(rule.get("category") or ""), core, float(max_value)) in current_score_keys:
+                continue
+        dedupe_key = (signature, rule.get("rule_id"))
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        result.append({
+            "rule_id": rule.get("rule_id"),
+            "rule_set_version": rule.get("rule_set_version"),
+            "rule_set_status": rule.get("rule_set_status"),
+            "category": rule.get("category"),
+            "title": rule.get("title"),
+            "check_rule": rule.get("check_rule"),
+            "source_text": rule.get("source_text"),
+            "source_page": rule.get("source_page"),
+            "check_mode": rule.get("check_mode"),
+            "source_type": rule.get("source_type"),
+            "scoring_json": rule.get("scoring_json"),
+            "execution_meta_json": rule.get("execution_meta_json"),
+            "enabled": bool(rule.get("enabled")),
+        })
+    return result
+
+
+def restore_rule_from_history(app, project_id: str, rule_id: str) -> dict:
+    """把历史规则集（已确认/已替换）中的一条规则迁回当前规则集。
+
+    当前为已确认规则集时先复制为待确认草稿，确认后生效；不删除历史记录，
+    规则内容、来源与启用状态原样保留。
+    """
+    rule_set = current_rule_set(app, project_id)
+    if not rule_set:
+        raise ValueError("当前没有可操作的规则集")
+    with connection(app) as conn:
+        row = conn.execute(
+            """SELECT r.* FROM ew_rules r JOIN ew_rule_sets s ON s.rule_set_id=r.rule_set_id
+               WHERE r.rule_id=? AND s.project_id=? AND s.rule_set_id != ? AND s.status IN ('confirmed', 'superseded')""",
+            (rule_id, project_id, rule_set["rule_set_id"]),
+        ).fetchone()
+        if not row:
+            raise ValueError("历史规则不存在")
+        source = dict(row)
+    if rule_set["status"] != "draft":
+        rule_set = _clone_rule_set_as_draft(app, project_id, rule_set)
+    timestamp = now_iso()
+    with connection(app) as conn:
+        position = conn.execute(
+            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM ew_rules WHERE rule_set_id=?", (rule_set["rule_set_id"],),
+        ).fetchone()[0]
+        new_rule_id = str(uuid.uuid4())
+        conn.execute(
+            """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode,
+               source_type, source_task_id, scoring_json, execution_meta_json, enabled, sort_order, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (new_rule_id, rule_set["rule_set_id"], source["category"], source["title"], source["check_rule"] or source["title"],
+             source["source_text"], source["source_page"], source["check_mode"], source["source_type"], source["source_task_id"],
+             source["scoring_json"], source["execution_meta_json"], int(bool(source["enabled"])), position, timestamp, timestamp),
+        )
+        conn.execute(
+            "UPDATE ew_rule_sets SET updated_at=? WHERE rule_set_id=?",
+            (timestamp, rule_set["rule_set_id"]),
+        )
+        restored = dict(conn.execute("SELECT * FROM ew_rules WHERE rule_id=?", (new_rule_id,)).fetchone())
+    return _rule_public_value(restored)
 
 
 def _tender_declared_total_score(app, project_id: str) -> float | None:
@@ -3628,6 +3959,15 @@ def rule_set_acquisition_validation(app, project_id: str) -> dict:
                        "rule_id": str(score_rules[0].get("rule_id") or ""), "title": "评分满分合计",
                        "message": f"招标文件明示总分为 {declared_total:g} 分，但当前启用的评分规则满分合计为 {score_total:g} 分（{titles}）。"
                                   f"明细：{ledger}。请核对各评分规则满分是否与招标文件分值构成一致。"})
+    tender = next((item for item in list_documents(app, project_id) if item.get("role") == "tender"), None)
+    tender_path = str((tender or {}).get("parsed_path") or "")
+    if tender_path:
+        try:
+            tender_text = Path(tender_path).read_text(encoding="utf-8", errors="ignore")[:500_000]
+        except OSError:
+            tender_text = ""
+        if tender_text:
+            issues.extend(_score_parent_mismatches(tender_text, rules))
     issues.extend(_hard_tender_anchor_scan(app, project_id, rules))
     return {
         "rule_set_id": rule_set["rule_set_id"], "issues": issues,

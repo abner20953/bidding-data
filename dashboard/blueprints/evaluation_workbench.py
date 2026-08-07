@@ -949,6 +949,54 @@ def rule_acquisition_validation_api(project_id):
     return jsonify(storage.rule_set_acquisition_validation(current_app, project_id))
 
 
+@evaluation_workbench_bp.route("/api/evaluation-workbench/projects/<project_id>/rules/anchor-scan", methods=["GET"])
+def rule_anchor_scan_api(project_id):
+    _init()
+    _, error = _project_or_404(project_id)
+    if error:
+        return error
+    return jsonify({"issues": storage.rule_anchor_scan(current_app, project_id)})
+
+
+@evaluation_workbench_bp.route("/api/evaluation-workbench/projects/<project_id>/rules/history-missing", methods=["GET"])
+def rule_history_missing_api(project_id):
+    _init()
+    _, error = _project_or_404(project_id)
+    if error:
+        return error
+    return jsonify({"rules": storage.missing_rules_from_history(current_app, project_id)})
+
+
+@evaluation_workbench_bp.route("/api/evaluation-workbench/projects/<project_id>/rules/restore", methods=["POST"])
+def rule_restore_api(project_id):
+    _init()
+    _, error = _project_or_404(project_id)
+    if error:
+        return error
+    data = _json_body()
+    rule_id = str(data.get("rule_id") or "")
+    if not rule_id:
+        return jsonify({"error": "缺少规则 ID"}), 400
+    try:
+        rule = storage.restore_rule_from_history(current_app, project_id, rule_id)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"rule": rule})
+
+
+@evaluation_workbench_bp.route("/api/evaluation-workbench/projects/<project_id>/rules/deduplicate", methods=["POST"])
+def rule_deduplicate_api(project_id):
+    _init()
+    _, error = _project_or_404(project_id)
+    if error:
+        return error
+    rule_set = storage.current_rule_set(current_app, project_id)
+    if not rule_set:
+        return jsonify({"error": "当前没有规则集"}), 400
+    merged = storage.merge_draft_score_rule_duplicates(current_app, rule_set["rule_set_id"])
+    return jsonify({"merged": merged, "rule_set": storage.current_rule_set(current_app, project_id)})
+
+
 @evaluation_workbench_bp.route("/api/evaluation-workbench/projects/<project_id>/review-results")
 def review_results_api(project_id):
     _init()

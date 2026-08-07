@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
@@ -1723,6 +1724,149 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         rules = storage.list_rules(self.app, self.project["project_id"])[1]
         enabled = [item for item in rules if item["enabled"]]
         self.assertEqual(len(enabled), 2)
+
+    def test_score_title_core_keeps_section_named_titles(self):
+        self.assertEqual(storage._score_rule_title_core("价格部分评分"), "价格部分评分")
+        self.assertEqual(storage._score_rule_title_core("技术部分评分"), "技术部分评分")
+        self.assertEqual(storage._score_rule_title_core("商务部分-企业业绩评分（满分9分）"), "企业业绩评分")
+        self.assertEqual(storage._score_rule_title_core("企业业绩评分（9分）"), "企业业绩评分")
+
+    def test_merge_uses_source_clause_ids_and_containment(self):
+        def add(title, source, scoring, clause_ids=None):
+            rule = storage.add_rule(self.app, self.project["project_id"], {
+                "category": "subjective", "title": title, "source_text": source,
+                "scoring": scoring,
+            })
+            if clause_ids:
+                with storage.connection(self.app) as conn:
+                    meta = json.loads(rule.get("execution_meta_json") or "{}")
+                    meta["source_clause_ids"] = clause_ids
+                    conn.execute("UPDATE ew_rules SET execution_meta_json=? WHERE rule_id=?", (json.dumps(meta, ensure_ascii=False), rule["rule_id"]))
+            return rule
+
+        # 同一条款 ID（确定性锚）
+        add("整体实施方案评分", "供应商根据项目需求编制配送、运输方案（1.5分）、安装调试（1.5分）。6分", {
+            "max_score": 6, "kind": "manual",
+            "items": [{"name": "配送方案", "max_score": 1.5, "criterion": "完整得1.5分"}, {"name": "安装调试", "max_score": 1.5, "criterion": "完整得1.5分"}],
+        }, clause_ids=["SC-abc"])
+        add("整体实施方案评审", "5.整体实施方案 供应商根据项目需求编制配送、运输方案（1.5分）、安装调试（1.5分）。6分", {
+            "max_score": 6, "kind": "manual",
+            "items": [{"name": "配送、运输供货方案", "max_score": 1.5, "criterion": "完整得1.5分"}, {"name": "安装调试（安装准备）", "max_score": 1.5, "criterion": "完整得1.5分"}],
+        }, clause_ids=["SC-abc"])
+        # 不同规则（同分值但原文/结构不同）
+        add("售后服务方案评分", "售后体系、售后内容、回访流程、备品备件各1.5分。6分", {
+            "max_score": 6, "kind": "manual",
+            "items": [{"name": "售后体系", "max_score": 1.5, "criterion": "完整得1.5分"}, {"name": "备品备件", "max_score": 1.5, "criterion": "完整得1.5分"}],
+        })
+
+        merged = storage.merge_draft_score_rule_duplicates(
+            self.app, storage.current_rule_set(self.app, self.project["project_id"])["rule_set_id"],
+        )
+
+        self.assertEqual(merged, 1)
+        rules = storage.list_rules(self.app, self.project["project_id"])[1]
+        enabled = [item for item in rules if item["enabled"]]
+        self.assertEqual(len(enabled), 2)
+        enabled_titles = {item["title"] for item in enabled}
+        self.assertTrue({"整体实施方案评分", "整体实施方案评审"} & enabled_titles)
+        self.assertIn("售后服务方案评分", {item["title"] for item in enabled})
+
+    def test_merge_uses_object_core_and_similar_structure(self):
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "产品安全耐用性可升级性兼容性评分",
+            "source_text": "投标人提供相关证明材料，能够高于招标文件要求的，得3分；不足以证明得1分；未提供不得分。",
+            "scoring": {"max_score": 3, "kind": "manual", "items": [
+                {"name": "产品安全耐用性、可升级性、兼容性、易用易维护性", "max_score": 3, "criterion": "高于招标要求得3分"},
+            ]},
+        })
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "产品安全耐用性、可升级性、兼容性、易用易维护性评分",
+            "source_text": "2.产品安全耐用性 评标委员会根据产品安全耐用性评定，投标人提供相关证明材料，能够高于招标文件要求的，得3分；不足以证明得1分；未提供不得分。",
+            "scoring": {"max_score": 3, "kind": "manual", "items": [
+                {"name": "高于招标文件要求", "max_score": 3, "criterion": "高于招标要求得3分"},
+                {"name": "不足以证明高于要求", "max_score": 1, "criterion": "不足以证明得1分"},
+                {"name": "未提供", "max_score": 0, "criterion": "未提供不得分"},
+            ]},
+        })
+
+        merged = storage.merge_draft_score_rule_duplicates(
+            self.app, storage.current_rule_set(self.app, self.project["project_id"])["rule_set_id"],
+        )
+
+        self.assertEqual(merged, 1)
+        rules = storage.list_rules(self.app, self.project["project_id"])[1]
+        enabled = [item for item in rules if item["enabled"]]
+        self.assertEqual(len(enabled), 1)
+
+    def test_deduplicate_works_on_confirmed_rule_set(self):
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "价格部分评分",
+            "source_text": "满足招标文件要求且投标价格最低的投标报价为评标基准价，其价格分为满分。其他投标人的价格分统一按照公式计算。30分 客观。",
+            "scoring": {"max_score": 30, "kind": "manual", "items": [{"name": "投标报价得分", "max_score": 30, "criterion": "按基准价公式"}]},
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        rules = storage.list_rules(self.app, self.project["project_id"])[1]
+        self.assertEqual(len([item for item in rules if item["enabled"]]), 1)
+        # 模拟修复前遗留：重复规则直接进入已确认规则集（绕过确认时合并）。
+        rule_set_id = storage.current_rule_set(self.app, self.project["project_id"])["rule_set_id"]
+        with storage.connection(self.app) as conn:
+            row = conn.execute("SELECT * FROM ew_rules WHERE rule_set_id=? LIMIT 1", (rule_set_id,)).fetchone()
+            source = dict(row)
+            conn.execute(
+                """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode,
+                   source_type, source_task_id, scoring_json, execution_meta_json, enabled, sort_order, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)""",
+                (str(uuid.uuid4()), rule_set_id, source["category"], source["title"], source["check_rule"],
+                 source["source_text"][:-1] if source["source_text"] else "", source["source_page"], source["check_mode"],
+                 source["source_type"], source["source_task_id"], source["scoring_json"], source["execution_meta_json"],
+                 99, source["created_at"], source["updated_at"]),
+            )
+
+        client = self.app.test_client()
+        response = client.post(f"/api/evaluation-workbench/projects/{self.project['project_id']}/rules/deduplicate")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["merged"], 1)
+        rules = storage.list_rules(self.app, self.project["project_id"])[1]
+        self.assertEqual(len([item for item in rules if item["enabled"]]), 1)
+
+    def test_score_parent_mismatch_detects_missing_score_rules(self):
+        tender_text = (
+            "[第1页]\n第一部分价格部分（30分）\n"
+            "[第2页]\n第二部分商务部分（11分）\n"
+            "[第3页]\n第三部分服务部分（29分）\n"
+            "[第4页]\n第四部分技术部分（30分）\n"
+        )
+        rules = [
+            {"enabled": True, "category": "objective", "source_page": 1, "title": "价格", "scoring_json": json.dumps({"max_score": 30})},
+            {"enabled": True, "category": "subjective", "source_page": 3, "title": "售后", "scoring_json": json.dumps({"max_score": 6})},
+            {"enabled": True, "category": "subjective", "source_page": 3, "title": "培训", "scoring_json": json.dumps({"max_score": 5})},
+        ]
+        issues = storage._score_parent_mismatches(tender_text, rules)
+        by_parent = {item["title"]: item for item in issues}
+        self.assertIn("第三部分服务部分（29分）", by_parent)
+        self.assertIn("差额 +18", by_parent["第三部分服务部分（29分）"]["message"])
+
+    def test_missing_rules_from_history_and_restore(self):
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "rejection", "title": "串通投标情形作无效",
+            "check_rule": "核验串通情形。", "source_text": "串通投标……",
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        old = storage.list_rules(self.app, self.project["project_id"])[1][0]
+        old_rule_id = old["rule_id"]
+        storage.update_rule(self.app, self.project["project_id"], old_rule_id, {"enabled": False})
+        with storage.connection(self.app) as conn:
+            conn.execute("UPDATE ew_rules SET source_type='ai' WHERE rule_id=?", (old_rule_id,))
+        storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-new", [])
+
+        missing = storage.missing_rules_from_history(self.app, self.project["project_id"])
+        self.assertTrue(any(item["rule_id"] == old_rule_id for item in missing))
+
+        restored = storage.restore_rule_from_history(self.app, self.project["project_id"], old_rule_id)
+        self.assertEqual(restored["title"], "串通投标情形作无效")
+        rules = storage.list_rules(self.app, self.project["project_id"])[1]
+        self.assertTrue(any(item["title"] == "串通投标情形作无效" for item in rules))
 
     def test_extract_score_from_conclusion_cases(self):
         self.assertEqual(worker._extract_score_from_conclusion("两份业绩要件齐全，建议各计3分共6分，签章需图片复核。", 9), 6)
