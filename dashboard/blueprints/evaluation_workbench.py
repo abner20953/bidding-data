@@ -66,17 +66,25 @@ def _read_git_head_commit(base: Path) -> str:
 
 
 def _current_deploy_commit() -> str:
-    """返回当前运行代码的 Git 短提交号；优先读镜像内源码，其次读挂载的宿主源码。"""
+    """返回当前运行代码的 Git 短提交号；优先环境变量，其次部署文件，最后直接读 .git。"""
     if "value" in _DEPLOY_COMMIT_CACHE:
         return _DEPLOY_COMMIT_CACHE["value"]
-    candidates = [_PROJECT_ROOT, _PROJECT_ROOT / "tools"]
-    for base in candidates:
-        value = _read_git_head_commit(base)
-        if value:
-            _DEPLOY_COMMIT_CACHE["value"] = value
-            return value
-    _DEPLOY_COMMIT_CACHE["value"] = ""
-    return ""
+    value = os.environ.get("DEPLOY_COMMIT", "").strip()[:7]
+    if not value:
+        for base in [_PROJECT_ROOT, _PROJECT_ROOT / "tools"]:
+            try:
+                value = (base / ".deploy-commit").read_text(encoding="utf-8").strip()[:7]
+            except OSError:
+                continue
+            if value:
+                break
+    if not value:
+        for base in [_PROJECT_ROOT, _PROJECT_ROOT / "tools"]:
+            value = _read_git_head_commit(base)
+            if value:
+                break
+    _DEPLOY_COMMIT_CACHE["value"] = value
+    return value
 
 
 _REPORT_ROLE_LABELS = {"tender": "主招标文件", "tender_attachment": "招标附件", "bid": "投标文件"}

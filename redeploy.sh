@@ -19,6 +19,9 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
+# 记录本次部署的提交号，供容器内工作台展示部署版本（不依赖镜像内安装 git）
+git rev-parse --short HEAD > .deploy-commit
+
 # 3. 重新构建镜像
 echo "🔨 正在重新构建 Docker 镜像..."
 # 始终保留当前镜像为上一版：下一次构建可同时引用当前版和上一版的缓存层。

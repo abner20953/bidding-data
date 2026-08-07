@@ -68,6 +68,8 @@
     const node = $('latest-run-usage');
     if (!node) return;
     if (!run || !run.finished_at) { node.textContent = '最近一次模型用量：暂无记录'; return; }
+    const taskLabels = {evaluate_all:'综合评审', compare_documents:'文件查重', extract_rules:'规则提取', review_documents:'评审', score_objective:'客观评分', score_subjective:'主观评分', parse_documents:'文件解析'};
+    const taskLabel = taskLabels[run.task_type] || run.task_type || '';
     const detail = run.metered_calls
       ? `输入 ${Number(run.prompt_tokens || 0).toLocaleString()} / 输出 ${Number(run.completion_tokens || 0).toLocaleString()} / 合计 ${Number(run.total_tokens || 0).toLocaleString()} Token`
       : `模型接口未返回 Token；已发送 ${Number(run.input_chars || 0).toLocaleString()} 字符`;
@@ -79,7 +81,8 @@
     const cache = run.prompt_tokens ? `；缓存命中 ${Math.round((run.cache_hit_tokens || 0) * 100 / run.prompt_tokens)}%` : '';
     const version = run.deploy_commit ? `版本 ${run.deploy_commit}` : '版本未记录';
     const prompt = run.prompt_version ? `（${run.prompt_version}）` : '';
-    node.textContent = `最近一次模型用量：${detail}（${run.call_count || 0} 次调用${extras.length ? '；其中' + extras.join('、') : ''}${cache}）· 结束于 ${formatLocalTime(run.finished_at)} · ${version}${prompt}`;
+    const prefix = taskLabel ? `最近一次模型用量（${taskLabel}）：` : '最近一次模型用量：';
+    node.textContent = `${prefix}${detail}（${run.call_count || 0} 次调用${extras.length ? '；其中' + extras.join('、') : ''}${cache}）· 结束于 ${formatLocalTime(run.finished_at)} · ${version}${prompt}`;
   }
   // 检查规则已单列展示；结果区只保留投标文件事实与 AI 判断，避免模型偶尔再复述规则。
   function resultExplanation(value, rule) {

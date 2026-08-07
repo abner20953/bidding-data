@@ -2102,12 +2102,16 @@ def project_token_usage(app, project_id: str) -> dict:
 
 
 def latest_evaluation_run_usage(app, project_id: str) -> dict | None:
-    """最近一次成功综合评审的用量、结束时间与运行依托版本。"""
+    """最近一次有模型/OCR 消耗的成功任务的用量、结束时间与运行依托版本。"""
     with connection(app) as conn:
         task_row = conn.execute(
-            """SELECT task_id, payload_json, started_at, finished_at FROM ew_tasks
-               WHERE project_id=? AND task_type='evaluate_all' AND status='success'
-               ORDER BY finished_at DESC LIMIT 1""",
+            """SELECT t.task_id, t.task_type, t.payload_json, t.started_at, t.finished_at
+               FROM ew_tasks t
+               WHERE t.project_id=? AND t.status='success'
+                 AND (EXISTS (SELECT 1 FROM ew_model_calls m WHERE m.task_id=t.task_id)
+                      OR EXISTS (SELECT 1 FROM ew_ocr_usage_ledger o WHERE o.task_id=t.task_id)
+                      OR EXISTS (SELECT 1 FROM ew_local_ocr_runs r WHERE r.task_id=t.task_id))
+               ORDER BY t.finished_at DESC LIMIT 1""",
             (project_id,),
         ).fetchone()
         if not task_row:
@@ -2165,6 +2169,7 @@ def latest_evaluation_run_usage(app, project_id: str) -> dict | None:
     }
     usage["ocr_requests"] = int(ocr_row["ocr_requests"] or 0) if ocr_row else 0
     usage["local_ocr_pages"] = int(local_ocr_row["local_ocr_pages"] or 0) if local_ocr_row else 0
+    usage["task_type"] = str(task_row["task_type"] or "")
     usage["finished_at"] = task_row["finished_at"]
     usage["deploy_commit"] = str(payload.get("deploy_commit") or "")
     usage["prompt_version"] = str(payload.get("prompt_version") or "")

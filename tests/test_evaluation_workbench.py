@@ -5696,6 +5696,27 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(latest["prompt_version"], "v-test")
         self.assertTrue(latest["finished_at"])
 
+    def test_latest_run_prefers_most_recent_consuming_task(self):
+        evaluate = storage.create_task(self.app, self.project["project_id"], "evaluate_all", {"prompt_version": "v1", "deploy_commit": "aaa1111"})
+        storage.record_model_call(self.app, evaluate["task_id"], self.project["project_id"], "review", None,
+                                  input_chars=100, usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
+        storage.update_task(self.app, evaluate["task_id"], status="success", result={"ok": True})
+        time.sleep(1)
+        compare = storage.create_task(self.app, self.project["project_id"], "compare_documents", {"prompt_version": "v2", "deploy_commit": "bbb2222"})
+        storage.record_model_call(self.app, compare["task_id"], self.project["project_id"], "compare_ai", None,
+                                  input_chars=200, usage={"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30})
+        storage.update_task(self.app, compare["task_id"], status="success", result={"ok": True})
+        time.sleep(1)
+        parse = storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        storage.update_task(self.app, parse["task_id"], status="success", result={"ok": True})
+
+        response = self.app.test_client().get(f"/api/evaluation-workbench/projects/{self.project['project_id']}/token-usage")
+
+        latest = response.get_json()["latest_run"]
+        self.assertEqual(latest["task_type"], "compare_documents")
+        self.assertEqual(latest["total_tokens"], 30)
+        self.assertEqual(latest["deploy_commit"], "bbb2222")
+
     def test_combined_task_can_reuse_matching_completed_input(self):
         self._add_pdf("tender.pdf", "tender", "", "资质得5分，技术方案满分10分。")
         self._add_pdf("bid.pdf", "bid", "甲公司", "具备资质，技术方案完整。")

@@ -20,6 +20,7 @@ manual.html
 test_env/
 data/
 .env
+.deploy-commit
 # 临时补丁/调试脚本（一次性工具，不入版本库）
 tmp/
 scratch/
