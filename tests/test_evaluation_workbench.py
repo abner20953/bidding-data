@@ -2989,6 +2989,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             "evidence_items": [{"name": "证书", "requirement": "核验编号"}],
             "score_items": [{"item_id": "a", "status": "unresolved"}],
             "field_checks": [],
+            "summary": "前序图片结论", "coverage": "covered", "conclusion_scope": "partial",
+            "needs_more_image": True, "conflict_level": "possible",
         }
         compact = worker._compact_text_result(result)
         self.assertNotIn("evidence_layers", compact)
@@ -2998,6 +3000,12 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(compact["conclusion_summary"], "摘要")
         self.assertEqual(len(compact["evidence_items"]), 1)
         self.assertEqual(compact["score_items"][0]["item_id"], "a")
+        # 图片/OCR 解析协议别名键必须保留，供跨批上下文使用。
+        self.assertEqual(compact["summary"], "前序图片结论")
+        self.assertEqual(compact["coverage"], "covered")
+        self.assertEqual(compact["conclusion_scope"], "partial")
+        self.assertTrue(compact["needs_more_image"])
+        self.assertEqual(compact["conflict_level"], "possible")
 
     def test_scope_template_mixing_enforces_high_risk_and_object_summary(self):
         raw = {

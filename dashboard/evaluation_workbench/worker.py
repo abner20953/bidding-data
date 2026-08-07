@@ -6346,6 +6346,8 @@ _COMPACT_TEXT_RESULT_KEYS = (
     "suggested_score", "max_score", "needs_ocr", "coverage_status",
     "vision_status", "vision_pages", "evidence_pages", "calculation",
     "score_items", "field_checks",
+    # 图片/OCR 解析结果协议使用的别名键，跨批上下文必须保留。
+    "summary", "coverage", "conclusion_scope", "needs_more_image", "conflict_level",
 )
 
 
