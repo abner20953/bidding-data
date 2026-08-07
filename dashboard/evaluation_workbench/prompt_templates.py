@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 PROMPT_TEMPLATE_SETTING = "evaluation_workbench_prompt_templates"
-EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v42"
+EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v43"
 
 
 def _template(name: str, description: str, content: str, *placeholders: str) -> dict:
@@ -302,21 +302,19 @@ PROMPT_TEMPLATES["evaluate_all_visual_contract"] = _template(
     "图片识别任务的固定输出字段与证据边界；与可修改的业务指令分离。",
     "只返回合法 JSON，不得使用 Markdown。必须包含 status、suggested_score、evidence、reason、risk_level、confidence、"
     "coverage、conclusion_scope、evidence_pages、irrelevant_pages、score_items、field_checks、conflict_level、needs_more_image、requested_pages。"
-    "coverage 只描述本次传入图片是否包含规则相关事实；conclusion_scope 描述文字、OCR、前序图片和本次图片合并后，"
-    "整条规则能否完成判断。evidence_pages 只能列本次实际看到且形成直接证据的 PDF 页，必须是传入页的子集；"
+    "evidence_pages 只能列本次实际看到且形成直接证据的 PDF 页，必须是传入页的子集；"
     "若 text_result 中含 prior_image_batches，必须合并前序批次事实，不得只根据当前页重新判断。评分规则的 score_items"
     "只列可以由已发送图片直接支持的叶子项或封顶项；未覆盖项必须标 unresolved。"
-    "未覆盖、模糊或未出现的字段不是冲突。只有同一主体、同一材料、同一字段在文字与图片中均清晰可见且逐字不同，"
-    "才可在 field_checks 中写 conflict；material 冲突必须提供双方非空的逐字值。证据和理由不复述规则。"
+    "只有同一主体、同一材料、同一字段在文字与图片中均清晰可见且逐字不同，"
+    "才可在 field_checks 中写 conflict；material 冲突必须提供双方非空的逐字值。"
 )
 PROMPT_TEMPLATES["evaluate_all_ocr_contract"] = _template(
     "综合评审 · OCR 结果协议",
     "腾讯或本地 OCR 任务共用的固定输出字段与证据边界；与可修改的业务指令分离。",
     "只返回合法 JSON，不得使用 Markdown。必须包含 status、suggested_score、evidence、reason、risk_level、confidence、"
-    "coverage、conclusion_scope、evidence_pages。coverage 只表示本次 OCR 文字是否覆盖规则相关材料；"
-    "conclusion_scope 表示结合既有文字后整条规则是否足以完成判断。evidence_pages 只能列本次 OCR 实际识别页中直接形成证据的 PDF 页，"
+    "coverage、conclusion_scope、evidence_pages。evidence_pages 只能列本次 OCR 实际识别页中直接形成证据的 PDF 页，"
     "不得机械列出全部处理页。OCR 未识别到、字迹模糊、签章/勾选/版式无法判断时不得写不满足或不得分；"
-    "只保留可见文字事实并标记为 partial 或 none。证据和理由不复述规则。"
+    "只保留可见文字事实并标记为 partial 或 none。"
 )
 PROMPT_TEMPLATES["evaluate_all_visual_user"]["required_literals"] = (
     '"coverage"', '"conclusion_scope"', '"evidence_pages"', '"field_checks"', '"conflict_level"', '"requested_pages"',

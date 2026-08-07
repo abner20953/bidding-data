@@ -6340,13 +6340,35 @@ def _ocr_supplement_extract(app, task, document, rule, result, level, *,
     }, None
 
 
+_COMPACT_TEXT_RESULT_KEYS = (
+    "rule_id", "status", "risk_level", "confidence", "evidence_quality",
+    "evidence", "reason", "conclusion_summary", "page_hint",
+    "suggested_score", "max_score", "needs_ocr", "coverage_status",
+    "vision_status", "vision_pages", "evidence_pages", "calculation",
+    "score_items", "field_checks",
+)
+
+
+def _compact_text_result(result: dict) -> dict:
+    """OCR/图片补充提示只回传模型决策所需字段。
+
+    evidence_layers、visual_page_candidates 等大对象只用于内部编排和落库，模型
+    侧不需要；整份重发会让每个 OCR/视觉调用白白多送数千字符。
+    """
+    compact = {key: result[key] for key in _COMPACT_TEXT_RESULT_KEYS if key in result}
+    items = result.get("evidence_items")
+    if isinstance(items, list) and items:
+        compact["evidence_items"] = [dict(item) for item in items if isinstance(item, dict)][:12]
+    return compact
+
+
 def _ocr_summarize_prompt(app, payload: dict, rule: dict, document: dict) -> str:
     prompt = storage.render_prompt_template(
         app, "evaluate_all_ocr_user",
         rule=json.dumps(_visual_rule_packet(rule), ensure_ascii=False, separators=(",", ":")),
         document_name=document.get("original_name") or "投标文件",
         bidder_name=document.get("bidder_name") or document.get("original_name") or "投标人",
-        text_result=json.dumps(payload["working_result"], ensure_ascii=False, separators=(",", ":")),
+        text_result=json.dumps(_compact_text_result(payload["working_result"]), ensure_ascii=False, separators=(",", ":")),
         ocr_service=payload["service_labels"],
         ocr_pages="、".join(f"P{page}" for page in payload["pages"]),
         ocr_text=payload["ocr_text"],
@@ -6596,7 +6618,7 @@ def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: d
     prompt = storage.render_prompt_template(
         app, "evaluate_all_ocr_user", rule=json.dumps(_visual_rule_packet(rule), ensure_ascii=False, separators=(",", ":")),
         document_name=document.get("original_name") or "投标文件", bidder_name=document.get("bidder_name") or document.get("original_name") or "投标人",
-        text_result=json.dumps(working_result, ensure_ascii=False, separators=(",", ":")), ocr_service=service_labels,
+        text_result=json.dumps(_compact_text_result(working_result), ensure_ascii=False, separators=(",", ":")), ocr_service=service_labels,
         ocr_pages="、".join(f"P{page}" for page in pages), ocr_text=ocr_text,
     )
     prompt += "\n\n【系统输出与证据协议】\n" + storage.render_prompt_template(app, "evaluate_all_ocr_contract")
@@ -7705,10 +7727,10 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
                 attempted_pages.append(page)
         # 第二批必须看到第一批已识别事实，否则两批页面永远无法形成一个完整结论。
         # 复用既有 text_result 占位符，兼容用户已保存的自定义提示词。
-        prior_context = dict(result)
+        prior_context = _compact_text_result(result)
         if responses:
             prior_context["prior_image_batches"] = [
-                {"pages": batch_pages, "result": parsed_value}
+                {"pages": batch_pages, "result": _compact_text_result(parsed_value) if isinstance(parsed_value, dict) else parsed_value}
                 for batch_pages, parsed_value in responses
             ]
         prompt = storage.render_prompt_template(

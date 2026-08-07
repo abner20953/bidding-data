@@ -2940,7 +2940,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_subjective_user"]["content"])
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"])
         self.assertIn("统一为 partial 或需图片核验", PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v42")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v43")
 
     def test_scope_chapter_and_text_error_guidance_present(self):
         from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
@@ -2958,7 +2958,46 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(text_marker, PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("必须点名最具辨识度的偏离对象", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("risk_level 应为 high", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v42")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v43")
+
+    def test_ocr_visual_contracts_deduplicated_but_keep_hard_constraints(self):
+        from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
+        ocr_contract = PROMPT_TEMPLATES["evaluate_all_ocr_contract"]["content"]
+        visual_contract = PROMPT_TEMPLATES["evaluate_all_visual_contract"]["content"]
+        ocr_user = PROMPT_TEMPLATES["evaluate_all_ocr_user"]["content"]
+        visual_user = PROMPT_TEMPLATES["evaluate_all_visual_user"]["content"]
+        # 契约只保留协议必需字段与独有约束，删除与用户模板语义重复的解释句。
+        self.assertNotIn("coverage 只表示本次 OCR 文字是否覆盖规则相关材料", ocr_contract)
+        self.assertNotIn("证据和理由不复述规则", ocr_contract)
+        self.assertNotIn("coverage 只描述本次传入图片是否包含规则相关事实", visual_contract)
+        self.assertNotIn("未覆盖、模糊或未出现的字段不是冲突", visual_contract)
+        # 硬约束仍在：字段清单、证据页边界、material 冲突逐字值要求。
+        self.assertIn("coverage、conclusion_scope、evidence_pages", ocr_contract)
+        self.assertIn("不得机械列出全部处理页", ocr_contract)
+        self.assertIn("material 冲突必须提供双方非空的逐字值", visual_contract)
+        # 被去重的约束在用户模板里仍然存在，去重不丢信息。
+        self.assertIn("coverage=covered 仅表示OCR文字覆盖到规则相关材料", ocr_user)
+        self.assertIn("证据与理由不得复述规则", ocr_user)
+        self.assertIn("都不是冲突，conflict_level 应保持 none", visual_user)
+
+    def test_compact_text_result_drops_internal_objects(self):
+        result = {
+            "rule_id": "r1", "status": "partial", "evidence": "证据", "reason": "理由",
+            "conclusion_summary": "摘要", "coverage_status": "partial", "vision_status": "ocr_applied_partial",
+            "evidence_layers": [{"source": "local_ocr", "summary": "大段内容"}],
+            "visual_page_candidates": [1, 2], "vision_message": "长消息",
+            "evidence_items": [{"name": "证书", "requirement": "核验编号"}],
+            "score_items": [{"item_id": "a", "status": "unresolved"}],
+            "field_checks": [],
+        }
+        compact = worker._compact_text_result(result)
+        self.assertNotIn("evidence_layers", compact)
+        self.assertNotIn("visual_page_candidates", compact)
+        self.assertNotIn("vision_message", compact)
+        self.assertEqual(compact["status"], "partial")
+        self.assertEqual(compact["conclusion_summary"], "摘要")
+        self.assertEqual(len(compact["evidence_items"]), 1)
+        self.assertEqual(compact["score_items"][0]["item_id"], "a")
 
     def test_scope_template_mixing_enforces_high_risk_and_object_summary(self):
         raw = {
@@ -5196,7 +5235,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不限定行业或采购类型", guidance)
         scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v42")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v43")
 
     def test_full_scan_reruns_rule_evidence_but_rechecks_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")
