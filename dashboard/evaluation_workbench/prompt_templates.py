@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 PROMPT_TEMPLATE_SETTING = "evaluation_workbench_prompt_templates"
-EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v44"
+EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v45"
 
 
 def _template(name: str, description: str, content: str, *placeholders: str) -> dict:
@@ -483,6 +483,28 @@ _TEXT_ERROR_LINE_GUIDANCE = (
 )
 PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"] += "\n\n" + _SCOPE_CHAPTER_TEMPLATE_GUIDANCE
 PROMPT_TEMPLATES["evaluate_all_review_user"]["content"] += "\n\n" + _TEXT_ERROR_LINE_GUIDANCE
+
+
+
+# 跨页/跨章节一致性类规则的证据覆盖约束（2026-08-07 补充，通用）
+_CONSISTENCY_EVIDENCE_COVERAGE_GUIDANCE = (
+    "对需要跨页/跨章节核对一致性的规则（关键要素、口径、完整性类），"
+    "若证据包未覆盖同一事实的全部出现位置，不得判 satisfied，"
+    "应判 partial 并列出未覆盖或缺失的页码/原文位置。"
+)
+PROMPT_TEMPLATES["evaluate_all_review_user"]["content"] += "\n\n" + _CONSISTENCY_EVIDENCE_COVERAGE_GUIDANCE
+
+
+
+# 表格/表单完整性事实的提取保护（2026-08-07 补充，通用）
+_FORM_COMPLETENESS_EXTRACTION_GUIDANCE = (
+    "可独立核验的表格/表单完整性事实不得因与其它规则主题相似而被合并删除："
+    "如商务/技术偏差表必须逐条对应、注明全部偏差、承诺除所列偏差外响应全部要求，"
+    "偏差表日期/金额/税率等字段与投标函、封面的一致性，分项报价表完整性等，"
+    "即使与“形式评审/响应性评审/报价表”主题相近，也必须在某条规则中完整承接；"
+    "只允许把多个完整性事实并入同一条规则，不允许整体丢弃其中任一可独立改变结论的事实。"
+)
+PROMPT_TEMPLATES["extract_rules_validation_guidance"]["content"] += "\n\n" + _FORM_COMPLETENESS_EXTRACTION_GUIDANCE
 
 
 

@@ -2940,7 +2940,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_subjective_user"]["content"])
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"])
         self.assertIn("统一为 partial 或需图片核验", PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v44")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v45")
 
     def test_scope_chapter_and_text_error_guidance_present(self):
         from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
@@ -2958,7 +2958,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(text_marker, PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("必须点名最具辨识度的偏离对象", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("risk_level 应为 high", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v44")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v45")
 
     def test_ocr_visual_contracts_deduplicated_but_keep_hard_constraints(self):
         from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
@@ -4104,6 +4104,54 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         included = [page for page in context["pages"] if page in {"chunk_a", "chunk_b", "chunk_c"}]
         self.assertLessEqual(len(included), 2)
         self.assertIn("chunk_a", included)
+
+    def test_consistency_extraction_and_evidence_guidance_present(self):
+        from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
+        # A：提取环节保护表格/表单完整性事实不被合并删除。
+        self.assertIn("表格/表单完整性事实", PROMPT_TEMPLATES["extract_rules_validation_guidance"]["content"])
+        self.assertIn("偏差表日期/金额/税率等字段", PROMPT_TEMPLATES["extract_rules_validation_guidance"]["content"])
+        # C：一致性类规则证据未覆盖全部位置时不得判 satisfied。
+        self.assertIn("未覆盖同一事实的全部出现位置", PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
+
+    def test_consistency_signal_chunks_recalls_value_pages(self):
+        chunks = [
+            {"chunk_id": "chunk_a", "text": "普通技术方案正文，无特殊数值。"},
+            {"chunk_id": "chunk_b", "text": "对于整体需求变化在总工作量5%以内的调整，不再额外收取费用。"},
+            {"chunk_id": "chunk_c", "text": "投标总报价699690.00元，投标有效期90天，日期2026年7月27日。"},
+            {"chunk_id": "chunk_d", "text": "证书编号ABC123，有效期至2027-06-30。"},
+        ]
+        rule = {"rule_id": "r1", "title": "投标文件关键要素内部一致性",
+                "check_rule": "核对关键要素与主要响应口径前后是否一致", "execution_strategy": "consistency"}
+        extra = worker._consistency_signal_chunks(chunks, [rule], per_rule_limit=2)
+        self.assertLessEqual(len(extra), 2)
+        self.assertEqual(extra[0], "chunk_b")
+        self.assertIn("chunk_c", extra)
+        # 非 consistency 策略不触发信号页召回。
+        plain = {"rule_id": "r2", "title": "技术方案", "check_rule": "按方案完整性评分",
+                 "execution_strategy": "section"}
+        self.assertEqual(worker._consistency_signal_chunks(chunks, [plain], per_rule_limit=2), [])
+
+    def test_full_scan_context_adds_consistency_signal_chunks_only_for_normal_run(self):
+        scan = {
+            "chunks": [
+                {"chunk_id": "chunk_a", "start_page": 1, "end_page": 10, "text": "普通技术方案正文。"},
+                {"chunk_id": "chunk_b", "start_page": 360, "end_page": 370,
+                 "text": "变更管理：工作量变动在整体工作量5%以内不再额外收取费用。"},
+                {"chunk_id": "chunk_c", "start_page": 460, "end_page": 469,
+                 "text": "投标总报价699690.00元，有效期90天，日期2026年。"},
+            ],
+            "findings": [], "failed_chunks": [], "chunk_count": 3,
+            "scope_anomalies": [], "project_scope": {},
+        }
+        rule = {"rule_id": "r1", "category": "other", "title": "投标文件关键要素内部一致性",
+                "check_rule": "核对关键要素与主要响应口径前后是否一致", "execution_strategy": "consistency"}
+        context = worker._full_scan_review_context(scan, [rule], 30_000)
+        self.assertIn("chunk_b", context["pages"])
+        self.assertIn("chunk_c", context["pages"])
+        # 补评保持原行为：不额外补信号页。
+        targeted = worker._full_scan_review_context(scan, [rule], 30_000, targeted=True)
+        self.assertNotIn("chunk_b", targeted["pages"])
+        self.assertNotIn("chunk_c", targeted["pages"])
 
     def test_full_scan_context_reserves_raw_evidence_for_each_rule(self):
         late_a = "资质证书编号A-2026，满足资格条件。"
@@ -5319,7 +5367,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不限定行业或采购类型", guidance)
         scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v44")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v45")
 
     def test_full_scan_reruns_rule_evidence_but_rechecks_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")

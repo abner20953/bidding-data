@@ -5015,6 +5015,43 @@ def _is_scope_consistency_rule(rule: dict) -> bool:
     return False
 
 
+_CONSISTENCY_VALUE_SIGNAL_PATTERNS = (
+    re.compile(r"(?:%|％)\s*\d+|\d+\s*(?:%|％)|比例|阈值|以内|不超过|不少于|封顶|上限"),
+    re.compile(r"有效期|发证日期|签发日期|(?:19|20)\d{2}[年./-]\d{1,2}|至\s*(?:19|20)\d{2}"),
+    re.compile(r"金额|价格|报价|合计|小写|大写|单价|[￥¥]\s*\d|\d[\d,]*\.?\d*\s*元"),
+    re.compile(r"编号|证书号|No\.?|序列号|统一社会信用代码|许可证号|登记号"),
+    re.compile(r"型号|规格|品牌|Model|版本"),
+)
+
+
+def _consistency_signal_chunks(chunks: list[dict], rules: list[dict], per_rule_limit: int = 2) -> list[str]:
+    """为关键要素/口径一致性规则补充“承诺性数值/日期信号页”。
+
+    这类规则需要跨页核对同一承诺性数值（阈值、比例、金额、税率、有效期、日期等）
+    是否一致；仅按规则文本锚点选页会漏掉这些页面。这里按通用信号从全文块中
+    召回最多 per_rule_limit×规则数 个页块，不依赖任何项目或行业词表。
+    只返回命中信号的非空页块 id，按文档顺序去重。
+    """
+    consistency_count = sum(
+        1 for rule in rules if _rule_execution_strategy(rule) == "consistency"
+    )
+    if not consistency_count:
+        return []
+    limit = max(1, per_rule_limit * consistency_count)
+    extra: list[str] = []
+    for chunk in chunks:
+        text = str(chunk.get("text") or "")
+        if not text.strip():
+            continue
+        if any(pattern.search(text) for pattern in _CONSISTENCY_VALUE_SIGNAL_PATTERNS):
+            chunk_id = str(chunk.get("chunk_id") or "")
+            if chunk_id and chunk_id not in extra:
+                extra.append(chunk_id)
+        if len(extra) >= limit:
+            break
+    return extra
+
+
 _FLAW_SCORING_MARKERS = (
     "瑕疵", "套用", "针对性", "完整性", "合理性", "可行性", "科学性", "规范性", "实用性", "专业性",
 )
@@ -5093,6 +5130,13 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
     for chunk_id in select_rule_chunks(scan.get("chunks", []), rules, per_rule=per_rule):
         if chunk_id not in selected_ids:
             selected_ids.append(chunk_id)
+    # 首次综合评审时为“关键要素/口径一致性”规则补入承诺性数值/日期信号页，
+    # 避免模型因上下文缺页而漏报“同一要素在不同页面不一致”。
+    # 补评（targeted）保持原行为，不额外加页，避免挤占直接证据。
+    if not targeted and strategy == "consistency":
+        for chunk_id in _consistency_signal_chunks(scan.get("chunks", []), rules, per_rule_limit=2):
+            if chunk_id and chunk_id not in selected_ids:
+                selected_ids.append(chunk_id)
     review_categories = {"qualification", "compliance", "substantive", "rejection", "other"}
     is_review_group = any(item.get("category") in review_categories for item in rules)
     has_scope_rule = any(_is_scope_consistency_rule(item) for item in rules)
