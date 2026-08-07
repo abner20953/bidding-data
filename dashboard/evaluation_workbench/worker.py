@@ -3820,12 +3820,15 @@ def _score_result_from_model(rule_id: str, suggested: float | None, max_score: f
     if force_needs_ocr and raw.get("needs_ocr") is not True:
         raw = {**raw, "needs_ocr": True}
     confidence = _enum_text(raw.get("confidence"), {"high", "medium", "low"}, "medium")
+    recovered = None
     # 模型偶发只写“建议X分”而未填结构化建议分；文字层兜底提取暂定分，避免
     # 摘要与建议分列互相矛盾。否定式/封顶/扣分语境由提取函数内部排除。
     if suggested is None and confidence in {"high", "medium"}:
-        suggested = _extract_score_from_conclusion(
+        recovered = _extract_score_from_conclusion(
             f"{raw.get('summary') or ''} {raw.get('reason') or ''} {raw.get('calculation') or ''}", max_score,
         )
+        if recovered is not None:
+            suggested = recovered
     needs_ocr = raw.get("needs_ocr") is True
     evidence = _truncate_field(_score_evidence_text(raw), 2000)
     has_evidence = bool(evidence)
@@ -3852,6 +3855,10 @@ def _score_result_from_model(rule_id: str, suggested: float | None, max_score: f
         "requires_review": not auto_ready,
         "review_reason": "" if auto_ready else "未得到高置信、可引用的建议分，需人工复核。",
     }
+    # 记录“分数由文字恢复”：契约冲突（建议分为空但文字含确定分）的可见标记，
+    # 供定向重试与前端留痕；重试成功后该标记会被移除。
+    if suggested is not None and recovered is not None:
+        result["score_recovered"] = True
     # 计分过程以结构化证据层保留（前端证据链可展开），不再与判断理由混在同一字段。
     if calculation:
         result = _append_evidence_layer(
@@ -4290,6 +4297,48 @@ def _tender_scope_baseline(documents: list[dict]) -> str:
     return "\n".join(parts)[:1_500_000]
 
 
+_ITEM_LIST_SECTION_PATTERN = re.compile(
+    r"(?:货物需求一览表|货物需求清单|采购清单|设备清单|货物清单|分项报价(?:表)?|需求一览表|采购需求清单|招标货物清单|采购内容及要求|采购标的清单|采购设备清单)"
+)
+_ITEM_ROW_PATTERN = re.compile(
+    r"^\s*(\d{1,3})\s+([\u4e00-\u9fffA-Za-z0-9·（）()\-—]{2,40}?)\s+(\d+(?:\.\d+)?)\s*"
+    r"(个|台|套|只|根|块|组|批|付|间|张|把|条|架|部|件|米|平方米|双|对|辆|座|门|副|顶|册|盒|本|面|排|列|行|层|级|人次|台套|套件|支|桶|袋|卷|包|箱|樘|床|艘|位|项|份)",
+    re.MULTILINE,
+)
+_ITEM_NAME_STOP_TERMS = {"项目", "项目概况", "项目内容", "采购项目", "招标文件", "投标文件", "说明", "一览表", "清单", "情况", "要求", "标准", "名称"}
+
+
+def _extract_tender_item_names(text: str) -> list[str]:
+    """本地识别招标采购清单品名，供范围判断使用；不发送给模型、零 token 成本。
+
+    只在“货物需求/采购清单/分项报价”等章节内按“序号+品名+数量+单位”行提取，
+    去重后最多保留 500 条。识别不完整时调用方仍以招标原文为最终依据。
+    """
+    section_start = None
+    for match in _ITEM_LIST_SECTION_PATTERN.finditer(text):
+        if section_start is None or match.start() < section_start:
+            section_start = match.start()
+    if section_start is None:
+        return []
+    section = text[section_start:section_start + 600_000]
+    names: list[str] = []
+    seen: set[str] = set()
+    for match in _ITEM_ROW_PATTERN.finditer(section):
+        name = re.sub(r"\s+", "", match.group(2)).strip("（()）·-—")
+        if len(name) < 2 or len(name) > 40:
+            continue
+        if any(term in name for term in _ITEM_NAME_STOP_TERMS):
+            continue
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+        if len(names) >= 500:
+            break
+    return names
+
+
 def _scope_prompt_profile(value: dict) -> dict:
     """去掉仅供本地回收使用的字段，保持发送给模型的范围画像紧凑且稳定。"""
     return {key: value.get(key) for key in SCOPE_PROFILE_FIELDS if key in value}
@@ -4467,7 +4516,9 @@ def _project_scope_profile(app, task: dict, profile: dict, documents: list[dict]
     }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
     cached = storage.get_project_scope_checkpoint(app, task["project_id"], scope_key)
     if cached is not None:
-        return _normalise_scope_profile(cached)
+        cached_scope = _normalise_scope_profile(cached)
+        cached_scope["_tender_item_names"] = _extract_tender_item_names(_tender_scope_baseline(documents))
+        return cached_scope
     prompt = storage.render_prompt_template(
         app, "evaluate_all_scope_profile_user", project_name=project.get("name") or "未填写",
         rules=_stable_prompt_json(rule_packet), tender_text=tender_text,
@@ -4480,6 +4531,7 @@ def _project_scope_profile(app, task: dict, profile: dict, documents: list[dict]
     except InvalidJsonResponse as exc:
         parsed = _repair_invalid_json(app, task, profile, "evaluate_all_scope_profile_json_repair", exc, "project_identity")
     scope = _normalise_scope_profile(parsed)
+    scope["_tender_item_names"] = _extract_tender_item_names(_tender_scope_baseline(documents))
     storage.save_project_scope_checkpoint(app, task["project_id"], scope_key, scope)
     return scope
 
@@ -5390,11 +5442,17 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
             })
     scope_packet = ""
     if is_review_group and has_scope_rule:
+        item_names = (scan.get("project_scope") or {}).get("_tender_item_names") or []
+        item_appendix = (
+            "\n\n【采购清单品名（本地识别，仅用于范围判断；识别可能有遗漏，仍以招标文件原文为最终依据）】\n"
+            + "、".join(str(name) for name in item_names[:500])
+        ) if item_names else ""
         scope_packet = (
             "\n\n【项目范围画像（来自招标文件和已确认规则）】\n"
             + json.dumps(_scope_prompt_profile(scan.get("project_scope", {})), ensure_ascii=False, separators=(",", ":"))
             + "\n\n【项目范围偏离候选（仅供结合原页和规则核验，不是既成结论）】\n"
             + json.dumps(scope_anomalies[:anomaly_limit], ensure_ascii=False, separators=(",", ":"))
+            + item_appendix
         )
     elif flaw_group:
         scope_packet = (
@@ -7031,37 +7089,60 @@ def _apply_document_evidence_guard(document: dict, component: str, rule: dict, r
     }
 
 
-_CROSS_BID_EMPTY_CLAIM_PATTERN = re.compile(
-    r"单[包标][^。；;]{0,24}(?:不足以|无法|不能)|需[要]?跨投标人|需[要]?跨标段|需[要]?结合其他投标人"
-    r"|无法独立判断|单标段扫描范围|单包扫描范围|交由评审环节结合|交由评委会|无法由文本判定|未提供跨投标人信息"
+_CROSS_BID_BEHAVIOUR_TERM_PATTERN = re.compile(
+    r"(?:串通|围标|陪标|联合体|弄虚作假|虚假|恶意)[\u4e00-\u9fff]{0,8}"
 )
-_CROSS_BID_LOCAL_MISSING_PATTERN = re.compile(
-    r"(?:未提供|未出具|未附|未见|缺失|空白)[^。；;]{0,14}(?:承诺|声明)|(?:承诺|声明)[^。；;]{0,14}(?:缺失|空白|未提供|未附)"
+_CROSS_BID_DECLARATION_PATTERN = re.compile(
+    r"(?:不存在|无|未|没有|不涉及|未曾|不会)[^。；;]{0,24}(?:串通|围标|陪标|联合体|弄虚作假|虚假|恶意)"
+    r"|(?:串通|围标|陪标|联合体|弄虚作假|虚假|恶意)[^。；;]{0,24}(?:不存在|无|未|没有|不涉及|未曾|不会)"
 )
-_CROSS_BID_UNIFIED_SUFFIX = "本卷书面承诺已核验；跨投标人横向比对由文件查重承接。"
 
 
-def _normalise_cross_bid_review_result(component: str, rule: dict, result: dict) -> dict:
-    """跨投标人规则的单家结论归一化。
+def _local_cross_bid_review(rule: dict, document: dict) -> dict:
+    """cross_bid 规则单家阶段本地核验：只检索本卷否定声明，不调用模型。
 
-    单家阶段只核验本卷书面声明，横向比对由查重模块承接。本卷已有实质发现
-    （承诺/声明缺失或明确不满足）时保留原结论；否则去掉“单包不足以判定”
-    这类空转句，统一为可展示的本卷结论口径，避免每家重复输出无价值表述。
+    横向比对由查重模块承接；本卷声明存在性用通用否定声明结构检索，结果始终
+    需人工复核（废标级规则），不产生“单包不足以判定”类空转结论。
     """
-    if component != "review" or _rule_execution_strategy(rule) != "cross_bid":
-        return result
-    if result.get("status") == "not_satisfied":
-        return result
-    reason = str(result.get("reason") or "")
-    summary = str(result.get("conclusion_summary") or "")
-    if _CROSS_BID_LOCAL_MISSING_PATTERN.search(f"{reason} {summary}"):
-        return result
-    cleaned = _CROSS_BID_EMPTY_CLAIM_PATTERN.sub("", reason)
-    cleaned = re.sub(r"[\s，。；;：:、→\-]+$", "", cleaned).strip()
-    result = dict(result)
-    result["conclusion_summary"] = _CROSS_BID_UNIFIED_SUFFIX
-    result["reason"] = f"{cleaned} {_CROSS_BID_UNIFIED_SUFFIX}".strip() if cleaned else _CROSS_BID_UNIFIED_SUFFIX
-    return result
+    rule_id = str(rule.get("rule_id") or "")
+    path = Path(str(document.get("parsed_path") or ""))
+    text = ""
+    if path.is_file():
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            text = ""
+    evidence = ""
+    page_hint = None
+    for match in _CROSS_BID_DECLARATION_PATTERN.finditer(text):
+        page = text[:match.start()].count("[第") or 1
+        snippet = re.sub(r"\s+", " ", text[max(0, match.start() - 20):match.end() + 30]).strip()
+        evidence = snippet[:180]
+        page_hint = page
+        break
+    unified = "本卷书面声明已本地核验；跨投标人横向比对由文件查重承接。"
+    if evidence:
+        status = "satisfied"
+        evidence_quality = "sufficient"
+        reason = f"本卷检索到否定声明：{evidence}。{unified}"
+    else:
+        status = "not_found"
+        evidence_quality = "missing"
+        reason = f"本卷未检索到针对横向禁止情形的明确否定声明。{unified}"
+    return {
+        "rule_id": rule_id,
+        "status": status,
+        "evidence": evidence,
+        "page_hint": f"第{page_hint}页" if page_hint else None,
+        "reason": reason,
+        "conclusion_summary": unified,
+        "risk_level": "low",
+        "confidence": "medium",
+        "evidence_quality": evidence_quality,
+        "automation_status": "needs_review",
+        "requires_review": True,
+        "review_reason": "横向比对由文件查重模块承接；本卷仅核验书面声明，需人工复核。",
+    }
 
 
 def _should_run_multimodal_after_ocr(strategy: str, result: dict) -> bool:
@@ -8321,6 +8402,15 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
             and _raw_result_text_incomplete(component, item)
         }
         incomplete_rules = [item for item in rules if item["rule_id"] in incomplete_rule_ids]
+        # 契约冲突：建议分为空但文字含确定分（score_recovered 标记）同样走定向补评；
+        # 重试成功移除标记，失败保留兜底分数与标记供人工复核。
+        recovered_rule_ids = {
+            str(item.get("rule_id")) for item in results
+            if isinstance(item, dict) and item.get("score_recovered")
+        }
+        for rule in rules:
+            if rule["rule_id"] in recovered_rule_ids and rule["rule_id"] not in incomplete_rule_ids:
+                incomplete_rules.append(rule)
         if incomplete_rules and allow_missing_retry and not targeted_retry:
             storage.update_task(app, task["task_id"], message=f"{label} 有 {len(incomplete_rules)} 条结论输出不完整，正在仅补评对应规则")
             retried = _run_combined_batch(
@@ -9004,6 +9094,18 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
     components = component_specs
     for component, component_rules, run in components:
         component_rules = [rule for rule in component_rules if rule["rule_id"] not in reused_rule_ids[component]]
+        # cross_bid 规则单家不调用模型：本地检索本卷否定声明即可，横向比对由
+        # 查重模块承接，避免“单包不足以判定”空转结论与无谓模型消耗。
+        cross_bid_rules = [
+            rule for rule in component_rules
+            if component == "review" and _rule_execution_strategy(rule) == "cross_bid"
+        ]
+        if cross_bid_rules and run:
+            local_results = [_local_cross_bid_review(rule, document) for rule in cross_bid_rules]
+            storage.save_review_results(app, run["review_run_id"], document["document_id"], local_results)
+            completed_results[component].update({item["rule_id"]: item for item in local_results})
+        cross_bid_ids = {rule["rule_id"] for rule in cross_bid_rules}
+        component_rules = [rule for rule in component_rules if rule["rule_id"] not in cross_bid_ids]
         rules_by_id = {str(rule["rule_id"]): rule for rule in component_rules}
         # 长文件已有全文扫描索引时，按重合证据页重组规则，减少不同组重复携带同一页。
         groups = _evaluation_rule_batches(component, component_rules, scan_index=scan_index)
@@ -9044,10 +9146,6 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
             results = _with_scan_visual_candidates(results, scan_index, document)
             results = [
                 _apply_document_evidence_guard(document, component, rules_by_id[str(item["rule_id"])], item)
-                for item in results if str(item.get("rule_id") or "") in rules_by_id
-            ]
-            results = [
-                _normalise_cross_bid_review_result(component, rules_by_id[str(item["rule_id"])], item)
                 for item in results if str(item.get("rule_id") or "") in rules_by_id
             ]
             # 每个规则组成功后立即持久化；后续组异常时，页面仍能获得已完成部分。
@@ -9538,6 +9636,8 @@ def _fallback_bidder_highlights(document_id: str, bidder_name: str,
     return {
         "document_id": document_id, "bidder_name": bidder_name,
         "overall_level": overall, "headline": headline, "highlights": highlights,
+        # 标记由本地结果生成（非模型提炼），供定向重试与前端留痕。
+        "source": "local_fallback",
     }
 
 
@@ -9643,7 +9743,36 @@ def _summarise_evaluation_highlights(app, task: dict, profile: dict) -> list[dic
         parsed = _repair_invalid_json(
             app, task, profile, "evaluate_all_highlights_json_repair", exc, "summaries",
         )
-    return _normalise_evaluation_highlights(parsed, candidates, allowed)
+    values = _normalise_evaluation_highlights(parsed, candidates, allowed)
+    # 对“整家漏掉→本地兜底”的条目做一次模型定向重试：只为该投标人提炼，
+    # 成功则替换为模型结果；失败保留本地兜底并带 source 标记，不静默代劳。
+    for index, value in enumerate(values):
+        if value.get("source") != "local_fallback":
+            continue
+        document_id = value.get("document_id")
+        bidder_candidates = [item for item in candidates if item.get("document_id") == document_id]
+        if not bidder_candidates:
+            continue
+        retry_prompt = storage.render_prompt_template(
+            app, "evaluate_all_highlights_user",
+            candidates=json.dumps(bidder_candidates, ensure_ascii=False, separators=(",", ":")),
+        )
+        try:
+            retried = _request_task_json(
+                app, task, profile, "evaluate_all_highlights_bidder_retry",
+                _system_prompt(app, "evaluate_all_highlights"), retry_prompt,
+                context_mode="result_highlights_bidder_retry",
+                max_tokens=_output_token_budget(profile, min(4_000, 1_000 + len(bidder_candidates) * 500)),
+                thinking_mode="disabled",
+            )
+        except (ValueError, InvalidJsonResponse):
+            continue
+        normalised = _normalise_evaluation_highlights(
+            retried if isinstance(retried, dict) else {}, [value], allowed,
+        )
+        if normalised and not normalised[0].get("source"):
+            values[index] = normalised[0]
+    return values
 
 
 def _evaluate_all(app, task: dict) -> dict:

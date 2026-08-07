@@ -1849,34 +1849,6 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             storage.update_rule(self.app, self.project["project_id"], rule_id, {"check_rule": "修改规则内容"})
 
-    def test_cross_bid_review_result_is_normalised(self):
-        rule = {"rule_id": "r1", "execution_strategy": "cross_bid"}
-        normal = worker._normalise_cross_bid_review_result("review", rule, {
-            "rule_id": "r1", "status": "partial",
-            "reason": "串通投标需跨投标人交叉比对账户、编制单位、联系人、报价规律等→单标段扫描范围不足以独立判断，需人工跨标段核验",
-            "conclusion_summary": "单包不足以判定，需结合其他投标人材料统一核验。",
-        })
-        self.assertIn("本卷书面承诺已核验", normal["conclusion_summary"])
-        self.assertNotIn("单标段扫描范围", normal["reason"])
-        self.assertIn("本卷书面承诺已核验", normal["reason"])
-
-        kept = worker._normalise_cross_bid_review_result("review", rule, {
-            "rule_id": "r1", "status": "not_satisfied",
-            "reason": "未提供书面承诺，串通情形无法核验", "conclusion_summary": "未提供承诺书",
-        })
-        self.assertEqual(kept["conclusion_summary"], "未提供承诺书")
-
-        missing = worker._normalise_cross_bid_review_result("review", rule, {
-            "rule_id": "r1", "status": "partial",
-            "reason": "未提供承诺书，需人工核验", "conclusion_summary": "承诺缺失",
-        })
-        self.assertIn("未提供承诺书", missing["reason"])
-
-        non_review = worker._normalise_cross_bid_review_result("objective", rule, {
-            "rule_id": "r1", "status": "partial", "reason": "原文保留", "conclusion_summary": "摘要保留",
-        })
-        self.assertEqual(non_review["reason"], "原文保留")
-
     def test_replace_rules_keeps_manual_rules_but_replaces_ai_rules(self):
         storage.add_rule(self.app, self.project["project_id"], {
             "category": "compliance", "title": "投标函出具与实质性承诺",
@@ -2028,6 +2000,61 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn("投标有效期", labels)
         self.assertNotIn("串通投标", labels)
         self.assertIn("联合体", labels)
+
+    def test_extract_tender_item_names_parses_purchase_list(self):
+        text = (
+            "第一章 采购需求\n"
+            "货物需求一览表\n"
+            "1 乐器储藏柜 6 个\n"
+            "2 写生凳 50 个\n"
+            "3 起跑器 12 个\n"
+            "4 台阶试验测试仪 1 台\n"
+            "注：以上为采购清单。\n"
+        )
+        names = worker._extract_tender_item_names(text)
+        self.assertIn("乐器储藏柜", names)
+        self.assertIn("写生凳", names)
+        self.assertIn("起跑器", names)
+        self.assertIn("台阶试验测试仪", names)
+
+    def test_local_cross_bid_review_detects_declaration(self):
+        doc = {"parsed_path": str(self.temp_dir / "bid.txt"), "document_id": "d1"}
+        Path(doc["parsed_path"]).write_text(
+            "本公司不存在串通投标情形，并承诺与其他供应商无围标、陪标行为。",
+            encoding="utf-8",
+        )
+        rule = {"rule_id": "r1", "title": "串通投标情形作无效", "check_rule": "核验串通情形。", "source_text": "串通投标……"}
+        result = worker._local_cross_bid_review(rule, doc)
+        self.assertEqual(result["status"], "satisfied")
+        self.assertIn("本卷书面声明已本地核验", result["conclusion_summary"])
+        self.assertIn("不存在串通投标情形", result["reason"])
+
+        Path(doc["parsed_path"]).write_text("本公司声明内容见原件。", encoding="utf-8")
+        result = worker._local_cross_bid_review(rule, doc)
+        self.assertEqual(result["status"], "not_found")
+        self.assertIn("未检索到", result["reason"])
+
+    def test_score_result_from_model_marks_recovered_score(self):
+        raw = {"summary": "业绩齐全，建议计6分。", "confidence": "medium"}
+        result = worker._score_result_from_model("r1", None, 9.0, raw)
+        self.assertEqual(result["suggested_score"], 6.0)
+        self.assertTrue(result.get("score_recovered"))
+
+        raw = {"summary": "业绩齐全，建议计6分。", "confidence": "medium", "suggested_score": 6}
+        result = worker._score_result_from_model("r1", 6.0, 9.0, raw)
+        self.assertFalse(result.get("score_recovered", False))
+
+    def test_fallback_bidder_highlights_marked_as_local(self):
+        allowed = {
+            ("d1", "r1"): {
+                "rule_id": "r1", "type": "review", "status": "not_satisfied",
+                "risk_level": "high", "title": "项目范围无关内容核验",
+                "conclusion_summary": "发现模板混用", "reason": "原文矛盾", "evidence": "第5页",
+            },
+        }
+        fallback = worker._fallback_bidder_highlights("d1", "甲公司", allowed)
+        self.assertIsNotNone(fallback)
+        self.assertEqual(fallback.get("source"), "local_fallback")
 
     def test_acquisition_validation_warns_when_score_total_differs_from_tender_declared(self):
         self._add_pdf("tender.pdf", "tender", "", "用于建立解析文件")
@@ -4178,6 +4205,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
                               "evidence_items": [{"name": "项目一", "page_hint": "1", "validity": "valid", "reason": "同类型"}],
                               "calculation": "1项×3分=3分", "reason": "建议得3分", "confidence": "high"}]},
                 {"summaries": []},
+                # 本地兜底条目会触发一次“仅为该投标人提炼”的模型定向重试；重试仍空则保留本地兜底。
+                {"summaries": []},
             ],
         ) as request_json:
             finished = self._run_next_task()
@@ -4186,7 +4215,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(finished["status"], "success")
         self.assertEqual(finished["result"]["full_scan_document_count"], 1)
         self.assertEqual(finished["result"]["full_scan_batch_count"], 1)
-        self.assertEqual(request_json.call_count, 3)
+        self.assertEqual(request_json.call_count, 4)
         self.assertIn("全文证据扫描", request_json.call_args_list[0].args[2])
         self.assertEqual(results[0]["suggested_score"], 3.0)
         self.assertIn("AI共识别1项", results[0]["evidence"])
