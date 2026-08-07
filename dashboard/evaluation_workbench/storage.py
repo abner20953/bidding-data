@@ -1,4 +1,4 @@
-"""工作台 SQLite 与文件存储。保持与现有业务模块隔离。"""
+﻿"""工作台 SQLite 与文件存储。保持与现有业务模块隔离。"""
 
 from __future__ import annotations
 
@@ -141,6 +141,8 @@ def task_prompt_template_fingerprint(app, task_type: str) -> str | None:
             "extract_rules_finalise_user", "extract_rules_finalise_boundary_focus",
             "extract_rules_finalise_merge_focus", "extract_rules_supplement_user",
             "extract_rules_qualification_supplement_user",
+            "extract_rules_hard_anchor_supplement_user",
+            "extract_rules_scoring_structure_repair_user",
             "extract_rules_scoring_reconcile_user",
             "json_repair", "json_repair_user",
         },
@@ -3131,10 +3133,10 @@ def update_rule(app, project_id: str, rule_id: str, payload: dict) -> dict:
 
 def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: list[dict]) -> dict:
     with connection(app) as conn:
-        # 新一轮 AI 提取采用“继承 + 去重”而非整批替换：上一版已确认规则集中
-        # 启用的规则全部作为候选带入新草稿（含纯 AI 规则，沿用其启用状态），
-        # 与新提取结果按 signature/评分对象去重。这样即使某次提取漏掉条款，
-        # 旧规则也不会静默丢失；用户确认时仍可停用任何不需要的规则。
+        # 提取管线内部保证完整性（评分条款/资格条款/硬性条款自动补漏 + 结构修复），
+        # 因此新一轮 AI 提取对纯 AI 规则采用整批替换：旧 AI 规则由新结果完整重建，
+        # 避免继承叠加产生重复；人工补充或人工修改过的规则（manual/ai_edited）
+        # 无条件保留并沿用启用状态，用户维护内容不丢失。
         current = conn.execute(
             """SELECT * FROM ew_rule_sets WHERE project_id = ?
                AND status IN ('confirmed', 'draft') ORDER BY version DESC LIMIT 1""",
@@ -3144,7 +3146,7 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
         if current:
             preserved = conn.execute(
                 """SELECT * FROM ew_rules WHERE rule_set_id = ?
-                   AND (source_type IN ('manual', 'ai_edited') OR (source_type = 'ai' AND enabled = 1))
+                   AND source_type IN ('manual', 'ai_edited')
                    ORDER BY sort_order, created_at""",
                 (current["rule_set_id"],),
             ).fetchall()
@@ -3638,21 +3640,19 @@ def _score_parent_mismatches(tender_text: str, rules: list[dict]) -> list[dict]:
     return issues
 
 
-def _hard_tender_anchor_scan(app, project_id: str, rules: list[dict], *, force: bool = False) -> list[dict]:
+def _hard_tender_anchor_scan(app, project_id: str, rules: list[dict]) -> list[dict]:
     """首提取兜底：招标文件出现法律/政策硬性条款而规则集未覆盖时提示。
 
-    仅在没有历史已确认规则集时运行（有历史集时由“继承旧规则”机制保证完整，
-    避免长期关键词清单噪音）；force=True 时供规则页手动触发检查，任何项目都执行。
-    返回 issue 列表，不改写任何规则。
+    仅在没有历史已确认规则集时运行（有历史集时由提取管线内部的硬性条款自动
+    补漏保证完整，避免长期关键词清单噪音）。返回 issue 列表，不改写任何规则。
     """
-    if not force:
-        with connection(app) as conn:
-            has_previous = conn.execute(
-                "SELECT 1 FROM ew_rule_sets WHERE project_id=? AND status IN ('confirmed', 'superseded') LIMIT 1",
-                (project_id,),
-            ).fetchone()
-        if has_previous:
-            return []
+    with connection(app) as conn:
+        has_previous = conn.execute(
+            "SELECT 1 FROM ew_rule_sets WHERE project_id=? AND status IN ('confirmed', 'superseded') LIMIT 1",
+            (project_id,),
+        ).fetchone()
+    if has_previous:
+        return []
     tender = next((item for item in list_documents(app, project_id) if item.get("role") == "tender"), None)
     parsed_path = str((tender or {}).get("parsed_path") or "")
     if not parsed_path:
@@ -3706,122 +3706,7 @@ def _hard_tender_anchor_scan(app, project_id: str, rules: list[dict], *, force: 
     return issues
 
 
-def rule_anchor_scan(app, project_id: str) -> list[dict]:
-    """规则页手动触发的招标关键条款覆盖检查（不区分是否有历史规则集）。"""
-    _, rules = list_rules(app, project_id)
-    return _hard_tender_anchor_scan(app, project_id, rules, force=True)
 
-
-def missing_rules_from_history(app, project_id: str) -> list[dict]:
-    """当前规则集与历史已确认/已替换规则集对比，返回历史有而当前没有的规则。
-
-    匹配复用规则签名与评分对象归一，避免标题轻微漂移造成假缺失；结果只读，
-    由前端展示并供用户选择迁回。
-    """
-    current = current_rule_set(app, project_id)
-    if not current:
-        return []
-    _, current_rules = list_rules(app, project_id)
-    current_signatures = set()
-    current_score_keys = set()
-    for rule in current_rules:
-        current_signatures.add((
-            str(rule.get("category") or ""),
-            re.sub(r"\s+", "", str(rule.get("title") or "")).casefold(),
-            re.sub(r"\s+", "", str(rule.get("check_rule") or rule.get("title") or "")).casefold(),
-        ))
-        if str(rule.get("category") or "") in {"objective", "subjective"}:
-            core = _score_rule_title_core(rule.get("title"))
-            max_value = _score_rule_max_value(rule)
-            if len(core) >= 4 and max_value is not None:
-                current_score_keys.add((str(rule.get("category") or ""), core, float(max_value)))
-    with connection(app) as conn:
-        rows = conn.execute(
-            """SELECT r.*, s.version AS rule_set_version, s.status AS rule_set_status
-               FROM ew_rules r JOIN ew_rule_sets s ON s.rule_set_id = r.rule_set_id
-               WHERE s.project_id=? AND s.rule_set_id != ? AND s.status IN ('confirmed', 'superseded')
-               ORDER BY s.version DESC, r.sort_order, r.created_at""",
-            (project_id, current["rule_set_id"]),
-        ).fetchall()
-    result: list[dict] = []
-    seen = set()
-    for row in rows:
-        rule = _rule_public_value(dict(row))
-        signature = (
-            str(rule.get("category") or ""),
-            re.sub(r"\s+", "", str(rule.get("title") or "")).casefold(),
-            re.sub(r"\s+", "", str(rule.get("check_rule") or rule.get("title") or "")).casefold(),
-        )
-        if signature in current_signatures:
-            continue
-        is_score = str(rule.get("category") or "") in {"objective", "subjective"}
-        core = _score_rule_title_core(rule.get("title"))
-        max_value = _score_rule_max_value(rule)
-        if is_score and len(core) >= 4 and max_value is not None:
-            if (str(rule.get("category") or ""), core, float(max_value)) in current_score_keys:
-                continue
-        dedupe_key = (signature, rule.get("rule_id"))
-        if dedupe_key in seen:
-            continue
-        seen.add(dedupe_key)
-        result.append({
-            "rule_id": rule.get("rule_id"),
-            "rule_set_version": rule.get("rule_set_version"),
-            "rule_set_status": rule.get("rule_set_status"),
-            "category": rule.get("category"),
-            "title": rule.get("title"),
-            "check_rule": rule.get("check_rule"),
-            "source_text": rule.get("source_text"),
-            "source_page": rule.get("source_page"),
-            "check_mode": rule.get("check_mode"),
-            "source_type": rule.get("source_type"),
-            "scoring_json": rule.get("scoring_json"),
-            "execution_meta_json": rule.get("execution_meta_json"),
-            "enabled": bool(rule.get("enabled")),
-        })
-    return result
-
-
-def restore_rule_from_history(app, project_id: str, rule_id: str) -> dict:
-    """把历史规则集（已确认/已替换）中的一条规则迁回当前规则集。
-
-    当前为已确认规则集时先复制为待确认草稿，确认后生效；不删除历史记录，
-    规则内容、来源与启用状态原样保留。
-    """
-    rule_set = current_rule_set(app, project_id)
-    if not rule_set:
-        raise ValueError("当前没有可操作的规则集")
-    with connection(app) as conn:
-        row = conn.execute(
-            """SELECT r.* FROM ew_rules r JOIN ew_rule_sets s ON s.rule_set_id=r.rule_set_id
-               WHERE r.rule_id=? AND s.project_id=? AND s.rule_set_id != ? AND s.status IN ('confirmed', 'superseded')""",
-            (rule_id, project_id, rule_set["rule_set_id"]),
-        ).fetchone()
-        if not row:
-            raise ValueError("历史规则不存在")
-        source = dict(row)
-    if rule_set["status"] != "draft":
-        rule_set = _clone_rule_set_as_draft(app, project_id, rule_set)
-    timestamp = now_iso()
-    with connection(app) as conn:
-        position = conn.execute(
-            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM ew_rules WHERE rule_set_id=?", (rule_set["rule_set_id"],),
-        ).fetchone()[0]
-        new_rule_id = str(uuid.uuid4())
-        conn.execute(
-            """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode,
-               source_type, source_task_id, scoring_json, execution_meta_json, enabled, sort_order, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (new_rule_id, rule_set["rule_set_id"], source["category"], source["title"], source["check_rule"] or source["title"],
-             source["source_text"], source["source_page"], source["check_mode"], source["source_type"], source["source_task_id"],
-             source["scoring_json"], source["execution_meta_json"], int(bool(source["enabled"])), position, timestamp, timestamp),
-        )
-        conn.execute(
-            "UPDATE ew_rule_sets SET updated_at=? WHERE rule_set_id=?",
-            (timestamp, rule_set["rule_set_id"]),
-        )
-        restored = dict(conn.execute("SELECT * FROM ew_rules WHERE rule_id=?", (new_rule_id,)).fetchone())
-    return _rule_public_value(restored)
 
 
 def _tender_declared_total_score(app, project_id: str) -> float | None:

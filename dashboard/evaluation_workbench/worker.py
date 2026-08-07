@@ -908,14 +908,18 @@ def _score_clause_packets(text: str, limit: int = 240) -> list[dict]:
                 lines[position] for position in range(index, max(-1, index - 300), -1)
                 if re.fullmatch(r"\[第\d+页\]", lines[position])
             ), "")
-            # 使用完整条款而非仅末两行生成 ID；否则“每提供一类得 1 分”这类通用
-            # 计分行在跨页时会失去证书/业绩/人员等区分信息，进而误判为已覆盖。
-            identity = f"{page_marker}\n{value}"
-            identity_digest_source = re.sub(r"\s+", "", identity or compact)
+            # 稳定条款 ID：按“页码 + 该页内条款顺序”生成，不依赖内容哈希。
+            # 招标文件与解析顺序稳定时，同一评分条款跨版本 ID 相同，继承/覆盖
+            # 审计/补漏都用它做确定性锚；打包逻辑调整只影响“同代确定、跨代尽力”。
+            page_match = re.search(r"第\s*(\d+)\s*页", page_marker)
+            page = int(page_match.group(1)) if page_match else 0
+            seq = sum(1 for existing in packets if existing.get("source_page") == page) + 1
+            clause_id = f"SC-{page}-{seq}" if page else f"SC-{len(packets) + 1}"
             packets.append({
-                "clause_id": f"SC-{hashlib.sha1(identity_digest_source.encode('utf-8')).hexdigest()[:10]}",
+                "clause_id": clause_id,
                 "text": value,
                 "score_line": line[:360],
+                "source_page": page,
                 "package_numbers": sorted(_score_packet_package_numbers(lines, index)),
             })
         if len(packets) >= limit:
@@ -1160,6 +1164,75 @@ def _qualification_rule_supplement_prompt(app, qualification_packets: list[objec
         app, "extract_rules_qualification_supplement_user",
         existing_rules=json.dumps(existing, ensure_ascii=False, separators=(",", ":")),
         packet_text=_qualification_packet_prompt_text(qualification_packets),
+    )
+
+
+def _hard_tender_anchor_gaps(rules: list[dict], text: str) -> list[dict]:
+    """本地扫描招标文本中的法律/政策硬性条款，返回规则集未覆盖的缺口（含原文上下文）。"""
+    combined = "\n".join(
+        f"{str(rule.get('title') or '')} {str(rule.get('check_rule') or '')} {str(rule.get('source_text') or '')}"
+        for rule in rules if isinstance(rule, dict)
+    )
+    gaps: list[dict] = []
+    for label, terms in storage._HARD_TENDER_ANCHOR_GROUPS:
+        if not any(term in text for term in terms):
+            continue
+        if any(term in combined for term in terms):
+            continue
+        position = next((text.find(term) for term in terms if term in text), -1)
+        if position < 0:
+            continue
+        gaps.append({
+            "label": label,
+            "terms": list(terms),
+            "context": text[max(0, position - 80):position + 220],
+        })
+    return gaps
+
+
+def _hard_anchor_supplement_prompt(app, gaps: list[dict], existing_rules: list[dict]) -> str:
+    existing = [
+        {"category": item.get("category"), "title": item.get("title"), "check_rule": item.get("check_rule")}
+        for item in existing_rules if isinstance(item, dict)
+    ]
+    packet_text = "\n\n".join(
+        f"【{item['label']}】\n{item['context']}" for item in gaps
+    )
+    return storage.render_prompt_template(
+        app, "extract_rules_hard_anchor_supplement_user",
+        existing_rules=json.dumps(existing, ensure_ascii=False, separators=(",", ":")),
+        packet_text=packet_text,
+    )
+
+
+def _score_structure_issues(rules: list[dict]) -> list[dict]:
+    """评分规则叶子合计低于满分（且非计数型）时视为结构残缺，进入定向修复。"""
+    issues: list[dict] = []
+    for rule in rules:
+        if not isinstance(rule, dict) or rule.get("category") not in {"objective", "subjective"}:
+            continue
+        scoring = rule.get("scoring") if isinstance(rule.get("scoring"), dict) else {}
+        max_score = storage._valid_max_score(scoring)
+        items_total = storage._score_items_total(scoring)
+        if max_score is None or items_total is None:
+            continue
+        if max_score - items_total > 0.01 and not storage._is_counting_score_rule(scoring):
+            issues.append(rule)
+    return issues
+
+
+def _score_structure_repair_prompt(app, rules: list[dict]) -> str:
+    payload = [
+        {
+            "category": item.get("category"), "title": item.get("title"),
+            "check_rule": item.get("check_rule"), "source_text": item.get("source_text"),
+            "scoring": item.get("scoring"),
+        }
+        for item in rules
+    ]
+    return storage.render_prompt_template(
+        app, "extract_rules_scoring_structure_repair_user",
+        rules=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
     )
 
 
@@ -2491,6 +2564,74 @@ def _extract_rules(app, task: dict) -> dict:
     # 错压缩进普通技术覆盖项。仅在三项原文条件同时存在、且规则集尚未承接时补一条；
     # 不对一般技术参数、格式★或只有交叉引用的条款做任何推断。
     rules = _ensure_technical_star_requirement_rule(rules, text, package_number)
+    # 硬性条款覆盖补漏：招标文本出现法律/政策硬性条款而规则集未覆盖时，
+    # 用小上下文定向补提，使“提取完整”在流程内部闭环，不依赖事后人工检查。
+    hard_anchor_supplement_count = hard_anchor_supplement_failures = 0
+    hard_gaps = _hard_tender_anchor_gaps(rules, text)
+    if hard_gaps:
+        storage.update_task(app, task["task_id"], message="正在核验硬性条款覆盖并补充遗漏项")
+        try:
+            supplement = _request_task_json(
+                app, task, profile, "extract_rules_hard_anchor_supplement", system_prompt,
+                _hard_anchor_supplement_prompt(app, hard_gaps, rules),
+                document_id=tender["document_id"], context_mode="hard_anchor_coverage",
+                max_tokens=_output_token_budget(profile, 3_500), thinking_mode="disabled",
+            )
+            supplement_rules = supplement.get("rules") if isinstance(supplement, dict) else None
+            if isinstance(supplement_rules, list):
+                kept = [
+                    item for item in supplement_rules if isinstance(item, dict)
+                    and str(item.get("title", "")).strip()
+                    and item.get("category") in {"qualification", "compliance", "substantive", "rejection", "other"}
+                ]
+                kept = _filter_rules_for_package(kept, package_number)
+                before = len(rules)
+                rules = _dedupe_rule_candidates([*rules, *kept])
+                rules = _filter_inapplicable_template_rules(rules, text)
+                hard_anchor_supplement_count = max(0, len(rules) - before)
+        except ValueError as exc:
+            hard_anchor_supplement_failures = 1
+            storage.update_task(app, task["task_id"], message=f"部分硬性条款补充未完成：{exc}")
+    # 评分结构定向修复：叶子合计低于满分的评分规则自动重提修正，避免“4.5 vs 6”
+    # 这类截断错误带着残缺分值进入待确认规则集。
+    score_structure_repair_count = score_structure_repair_failures = 0
+    structure_issues = _score_structure_issues(rules)
+    if structure_issues:
+        storage.update_task(app, task["task_id"], message="正在修复评分规则结构（叶子合计与满分不一致）")
+        try:
+            supplement = _request_task_json(
+                app, task, profile, "extract_rules_scoring_structure_repair", system_prompt,
+                _score_structure_repair_prompt(app, structure_issues[:3]),
+                document_id=tender["document_id"], context_mode="score_structure_repair",
+                max_tokens=_output_token_budget(profile, 3_500), thinking_mode="disabled",
+            )
+            supplement_rules = supplement.get("rules") if isinstance(supplement, dict) else None
+            if isinstance(supplement_rules, list):
+                repaired = 0
+                for candidate in supplement_rules:
+                    if not isinstance(candidate, dict) or candidate.get("category") not in {"objective", "subjective"}:
+                        continue
+                    scoring = candidate.get("scoring") if isinstance(candidate.get("scoring"), dict) else {}
+                    candidate_max = storage._valid_max_score(scoring)
+                    candidate_total = storage._score_items_total(scoring)
+                    if candidate_max is None or candidate_total is None or abs(candidate_max - candidate_total) > 0.01:
+                        continue
+                    for index, current in enumerate(rules):
+                        if not isinstance(current, dict) or current.get("category") != candidate.get("category"):
+                            continue
+                        current_scoring = current.get("scoring") if isinstance(current.get("scoring"), dict) else {}
+                        current_max = storage._valid_max_score(current_scoring)
+                        if current_max is None or abs(current_max - candidate_max) > 0.001:
+                            continue
+                        if storage._score_rule_title_core(current.get("title")) != storage._score_rule_title_core(candidate.get("title")):
+                            continue
+                        rules[index] = candidate
+                        repaired += 1
+                        break
+                score_structure_repair_count = repaired
+        except ValueError as exc:
+            score_structure_repair_failures = 1
+            storage.update_task(app, task["task_id"], message=f"评分结构修复未完成：{exc}")
     # 质量门控偶尔会遗漏“异常低价解释”等评审过程事项。它们既没有可执行分值，
     # 也不能由投标文件单独完成，不能以零分评分规则的形式进入待确认规则集。
     before_procedural_filter = len(rules)
@@ -2519,6 +2660,10 @@ def _extract_rules(app, task: dict) -> dict:
             "quality_gate_dropped_count": quality_gate["dropped_count"],
             "quality_gate_failure_count": quality_gate["failure_count"],
             "quality_gate_recovered_score_count": quality_gate["recovered_score_count"],
+            "hard_anchor_supplement_count": hard_anchor_supplement_count,
+            "hard_anchor_supplement_failure_count": hard_anchor_supplement_failures,
+            "score_structure_repair_count": score_structure_repair_count,
+            "score_structure_repair_failure_count": score_structure_repair_failures,
             "finalisation_applied": finalisation["applied"],
             "finalisation_dropped_count": finalisation["dropped_count"],
             "finalisation_rewritten_count": finalisation["rewritten_count"],

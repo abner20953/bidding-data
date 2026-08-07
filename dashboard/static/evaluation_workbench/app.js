@@ -10,7 +10,6 @@
   let visionConfiguration = {enabled:false, default_profile_id:null};
   let ocrConfiguration = {enabled:false, services:[]};
   let hasCurrentRules = false;
-  let activeProjectRuleSetStatus = '';
   const defaultDocumentTitle = document.title;
   let completionTicker = null;
   let cachedHighlights = [];
@@ -472,7 +471,7 @@
       request(`/projects/${activeProject}/rules`),
       request(`/projects/${activeProject}/rules/acquisition-validation`).catch(() => ({issues:[]})),
     ]);
-    const set = data.rule_set; const isDraft = set?.status === 'draft'; const isConfirmed = set?.status === 'confirmed'; activeProjectRuleSetStatus = set?.status || ''; hasCurrentRules = data.rules.length > 0;
+    const set = data.rule_set; const isDraft = set?.status === 'draft'; const isConfirmed = set?.status === 'confirmed'; hasCurrentRules = data.rules.length > 0;
     const acquisitionIssuesByRule = new Map();
     for (const issue of Array.isArray(validation?.issues) ? validation.issues : []) {
       const ids = Array.isArray(issue?.rule_ids) && issue.rule_ids.length ? issue.rule_ids : (issue?.rule_id ? [issue.rule_id] : []);
@@ -491,9 +490,6 @@
       || String(left.title || '').localeCompare(String(right.title || ''), 'zh-CN')
     ));
     const enabledCount = data.rules.filter((r) => Boolean(r.enabled)).length; $('rule-set-meta').textContent = set ? `版本 ${set.version} · ${set.status === 'confirmed' ? '已确认' : set.status === 'draft' ? '待确认' : '已替换'} · 已启用 ${enabledCount}/${data.rules.length} 条${set.source_task_id ? ' · AI 提取结果' : ''}` : '尚未提取或添加规则。'; $('confirm-rules').disabled = !isDraft;
-    for (const id of ['deduplicate-rules', 'anchor-scan-rules', 'restore-history-rules']) {
-      $(id).disabled = !set;
-    }
     const acquisitionCounts = displayRules.reduce((counts, rule) => { const key = simpleAcquisitionMode(rule); counts[key] = (counts[key] || 0) + 1; return counts; }, {recommended:0, adaptive:0, text_only:0, local_ocr:0, smart:0, always:0, custom:0});
     const toolbar = isDraft && displayRules.length ? `<div class="rule-acquisition-toolbar"><div><strong>核验方式</strong><span class="muted"> 默认按 AI 对证据类型的判断执行；也可明确限定为纯文字、本地 OCR，或追加腾讯 OCR／多模态增强。</span><small>当前：AI 建议 ${acquisitionCounts.recommended || 0} 条 · 文字优先 ${acquisitionCounts.adaptive || 0} 条 · 纯文字 ${acquisitionCounts.text_only || 0} 条 · 本地 OCR ${acquisitionCounts.local_ocr || 0} 条 · 智能增强 ${acquisitionCounts.smart || 0} 条 · 强制增强 ${acquisitionCounts.always || 0} 条${acquisitionCounts.custom ? ` · 专家自定义 ${acquisitionCounts.custom} 条` : ''}</small><small>${escapeHtml(acquisitionCapabilityNote())}</small></div><div class="rule-acquisition-toolbar-actions"><button class="restore-acquisition-recommendations" type="button">已启用规则采用 AI 建议</button><details class="rule-acquisition-help"><summary>如何选择？</summary><div class="rule-acquisition-help-popover"><p><strong>按 AI 建议：</strong>系统按每条规则的证据类型自动选择（推荐）。<strong>纯文字核验：</strong>只审已解析全文，最快。<strong>文字优先：</strong>先审全文，不足才补本地 OCR（免费）。<strong>本地 OCR 核验：</strong>全文之外固定补扫关键页（免费）。<strong>智能增强核验：</strong>本地 OCR 不够时才调腾讯 OCR／多模态（按量计费）。<strong>强制增强核验：</strong>无论文字是否充分都调腾讯 OCR／多模态（按量计费）。</p><p>快速／标准／充分只控制增强核验的页数上限；本地 OCR 仍按有限候选页和缓存执行。</p></div></details></div></div>` : '';
     $('rules').innerHTML = displayRules.length ? `${toolbar}<div class="rule-card-list">${displayRules.map((r) => {
@@ -736,40 +732,6 @@
   updateManualRuleScoringFields();
   $('add-manual-rule').onclick = async () => { try { const category = $('manual-rule-category').value; const isScoring = ['objective', 'subjective'].includes(category); const rawMaxScore = $('manual-rule-max-score').value; const maxScore = Number(rawMaxScore); if (isScoring && (!Number.isFinite(maxScore) || maxScore <= 0)) { alert('客观分和主观分规则必须填写大于 0 的满分。'); return; } const payload = {category, title:$('manual-rule-title').value, check_rule:$('manual-rule-check').value, source_text:$('manual-rule-source').value, ocr_required:$('manual-rule-ocr').checked}; if (isScoring) payload.scoring = {max_score:maxScore, kind:category === 'objective' ? $('manual-rule-score-kind').value : 'manual'}; await request(`/projects/${activeProject}/rules`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}); $('manual-rule-title').value = ''; $('manual-rule-check').value = ''; $('manual-rule-source').value = ''; $('manual-rule-max-score').value = ''; $('manual-rule-ocr').checked = false; updateManualRuleScoringFields(); await refreshRules(); } catch (error) { alert(error.message); } };
   $('confirm-rules').onclick = async () => { try { const validation = await request(`/projects/${activeProject}/rules/acquisition-validation`); const issues = Array.isArray(validation.issues) ? validation.issues : []; if (issues.length) { const brief = issues.slice(0, 6).map((item) => `• ${item.title}：${item.message}`).join('\n'); const extra = issues.length > 6 ? `\n另有 ${issues.length - 6} 条提示。` : ''; if (!confirm(`增强核验预检发现 ${issues.length} 条提示：\n${brief}${extra}\n\n仍要确认当前规则集吗？`)) return; } await request(`/projects/${activeProject}/rules/confirm`, {method:'POST'}); await refreshRules(); } catch (error) { alert(error.message); } };
-  $('deduplicate-rules').onclick = async () => {
-    if (!confirm('将按评分条款 ID、原文同源与评分结构对当前规则集的重复评分规则执行去重：保留信息更全的一条，其余停用（可随时重新启用，不删除记录）。是否继续？')) return;
-    try {
-      const data = await request(`/projects/${activeProject}/rules/deduplicate`, {method:'POST'});
-      alert(`已完成去重：合并/停用 ${data.merged} 条重复评分规则。`);
-      await refreshRules();
-    } catch (error) { alert(error.message); }
-  };
-  $('anchor-scan-rules').onclick = async () => {
-    try {
-      const data = await request(`/projects/${activeProject}/rules/anchor-scan`);
-      const issues = Array.isArray(data.issues) ? data.issues : [];
-      if (!issues.length) { alert('未发现招标文件关键条款覆盖缺口。'); return; }
-      alert(issues.map((item) => `• ${item.title}：${item.message}`).join('\n'));
-    } catch (error) { alert(error.message); }
-  };
-  $('restore-history-rules').onclick = async () => {
-    try {
-      const data = await request(`/projects/${activeProject}/rules/history-missing`);
-      const rules = Array.isArray(data.rules) ? data.rules : [];
-      if (!rules.length) { alert('没有可恢复的历史规则（当前规则集已包含全部历史规则）。'); return; }
-      const listed = rules.map((rule, index) => `${index + 1}. [v${rule.rule_set_version || '?'}] ${rule.title}`).join('\n');
-      const choice = window.prompt(`历史规则集中有 ${rules.length} 条未出现在当前规则集，输入要恢复的序号（多个用逗号分隔）：\n${listed}`);
-      if (choice === null || !choice.trim()) return;
-      const indexes = [...new Set(choice.split(/[,，\s]+/).map((item) => parseInt(item, 10)).filter((item) => Number.isInteger(item) && item >= 1 && item <= rules.length))];
-      if (!indexes.length) return;
-      const confirmed = confirm(`将恢复 ${indexes.length} 条规则到当前规则集${activeProjectRuleSetStatus === 'confirmed' ? '（已确认规则集会先复制为待确认草稿，确认后生效）' : ''}。是否继续？`);
-      if (!confirmed) return;
-      for (const index of indexes) {
-        await request(`/projects/${activeProject}/rules/restore`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({rule_id:rules[index - 1].rule_id})});
-      }
-      await refreshRules();
-    } catch (error) { alert(error.message); }
-  };
   $('start-evaluate-all').onclick = async () => { try { const profile_id = $('all-profile').value; const rulesData = await request(`/projects/${activeProject}/rules`); const visionRules = rulesData.rules.filter((rule) => rule.enabled && rule.vision_trigger !== 'off' && rule.vision_level !== 'off' && !['ocr_only', 'off'].includes(rule.image_mode || 'auto')); if (visionConfiguration.enabled && visionRules.length) { const selected = modelProfiles.find((item) => item.profile_id === profile_id); const fallback = modelProfiles.find((item) => item.profile_id === visionConfiguration.default_profile_id && item.enabled && item.capabilities?.vision); if (!selected?.capabilities?.vision && fallback && !confirm(`当前评审模型“${selected?.display_name || '所选模型'}”不是多模态模型；仅需要图片外观核验的规则将改用“${fallback.display_name}”，文字评审与 OCR 仍使用当前模型。是否继续？`)) return; } const projectData = await request(`/projects/${activeProject}`); const lastSuccessfulEvaluation = (projectData.tasks || []).find((task) => task.task_type === 'evaluate_all' && task.status === 'success'); if (lastSuccessfulEvaluation && !confirm('该项目已完成过综合评审。再次运行将按当前文件、规则和模型完整重跑，耗时较长；新结果产生前旧结果仍会展示。是否强制重新评审？')) return; await request(`/projects/${activeProject}/tasks`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({task_type:'evaluate_all', profile_id, ...(lastSuccessfulEvaluation ? {force_rerun:true} : {})})}); await refreshProject(); await Promise.all([refreshReview(), refreshScores(), refreshUsage()]); } catch (error) { alert(error.message); } };
   function closeModels() { $('models-panel').classList.add('hidden'); document.body.classList.remove('modal-open'); resetModelForm(); }
   function closePrompts() { $('prompts-panel').classList.add('hidden'); document.body.classList.remove('modal-open'); }
