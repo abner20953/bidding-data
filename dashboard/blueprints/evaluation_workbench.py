@@ -23,6 +23,31 @@ evaluation_workbench_bp = Blueprint("evaluation_workbench", __name__)
 TASK_PROMPT_VERSION = EVALUATION_PROMPT_VERSION
 MODEL_CONFIGURATION_PASSWORD = "108"
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_PROCESS_STARTED_AT = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+_DEPLOY_COMMIT_CACHE: dict[str, str] = {}
+
+
+def _current_deploy_commit() -> str:
+    """返回当前运行代码的 Git 短提交号；优先读镜像内源码，其次读挂载的宿主源码。"""
+    if "value" in _DEPLOY_COMMIT_CACHE:
+        return _DEPLOY_COMMIT_CACHE["value"]
+    candidates = [_PROJECT_ROOT, _PROJECT_ROOT / "tools"]
+    for base in candidates:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(base), "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, timeout=5,
+            )
+            value = result.stdout.strip()
+            if result.returncode == 0 and value:
+                _DEPLOY_COMMIT_CACHE["value"] = value
+                return value
+        except (OSError, subprocess.SubprocessError):
+            continue
+    _DEPLOY_COMMIT_CACHE["value"] = ""
+    return ""
+
 
 _REPORT_ROLE_LABELS = {"tender": "主招标文件", "tender_attachment": "招标附件", "bid": "投标文件"}
 _REPORT_PARSE_STATUS_LABELS = {"pending": "待解析", "queued": "排队中", "running": "解析中", "success": "解析完成", "error": "解析失败"}
@@ -576,6 +601,7 @@ def tasks_api(project_id):
         payload = {
             "profile_id": requested_profile_id,
             "prompt_version": TASK_PROMPT_VERSION,
+            "deploy_commit": _current_deploy_commit(),
             "force_rerun": data.get("force_rerun") is True,
         }
         if retry_failed_task_id:
@@ -601,7 +627,20 @@ def token_usage_api(project_id):
     _, error = _project_or_404(project_id)
     if error:
         return error
-    return jsonify({"usage": storage.project_token_usage(current_app, project_id)})
+    return jsonify({
+        "usage": storage.project_token_usage(current_app, project_id),
+        "latest_run": storage.latest_evaluation_run_usage(current_app, project_id),
+    })
+
+
+@evaluation_workbench_bp.route("/api/evaluation-workbench/build-info")
+def build_info_api():
+    _init()
+    return jsonify({
+        "commit": _current_deploy_commit(),
+        "deployed_at": _PROCESS_STARTED_AT,
+        "prompt_version": TASK_PROMPT_VERSION,
+    })
 
 
 @evaluation_workbench_bp.route("/api/evaluation-workbench/projects/<project_id>/tasks", methods=["GET"])

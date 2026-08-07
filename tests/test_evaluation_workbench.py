@@ -5667,6 +5667,35 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(usage["total_tokens"], 120)
         self.assertEqual(usage["input_chars"], 123)
 
+    def test_build_info_endpoint_returns_version_metadata(self):
+        response = self.app.test_client().get("/api/evaluation-workbench/build-info")
+
+        self.assertEqual(response.status_code, 200)
+        info = response.get_json()
+        self.assertIn("commit", info)
+        self.assertIn("deployed_at", info)
+        self.assertIn("prompt_version", info)
+
+    def test_token_usage_endpoint_includes_latest_evaluation_run(self):
+        task = storage.create_task(
+            self.app, self.project["project_id"], "evaluate_all",
+            {"profile_id": None, "prompt_version": "v-test", "deploy_commit": "abc123"},
+        )
+        storage.record_model_call(self.app, task["task_id"], self.project["project_id"], "review", None,
+                                  input_chars=456, usage={"prompt_tokens": 200, "completion_tokens": 40, "total_tokens": 240})
+        storage.update_task(self.app, task["task_id"], status="success", result={"ok": True})
+
+        response = self.app.test_client().get(f"/api/evaluation-workbench/projects/{self.project['project_id']}/token-usage")
+
+        self.assertEqual(response.status_code, 200)
+        latest = response.get_json()["latest_run"]
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest["total_tokens"], 240)
+        self.assertEqual(latest["call_count"], 1)
+        self.assertEqual(latest["deploy_commit"], "abc123")
+        self.assertEqual(latest["prompt_version"], "v-test")
+        self.assertTrue(latest["finished_at"])
+
     def test_combined_task_can_reuse_matching_completed_input(self):
         self._add_pdf("tender.pdf", "tender", "", "资质得5分，技术方案满分10分。")
         self._add_pdf("bid.pdf", "bid", "甲公司", "具备资质，技术方案完整。")

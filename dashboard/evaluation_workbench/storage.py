@@ -2101,6 +2101,76 @@ def project_token_usage(app, project_id: str) -> dict:
     return usage
 
 
+def latest_evaluation_run_usage(app, project_id: str) -> dict | None:
+    """最近一次成功综合评审的用量、结束时间与运行依托版本。"""
+    with connection(app) as conn:
+        task_row = conn.execute(
+            """SELECT task_id, payload_json, started_at, finished_at FROM ew_tasks
+               WHERE project_id=? AND task_type='evaluate_all' AND status='success'
+               ORDER BY finished_at DESC LIMIT 1""",
+            (project_id,),
+        ).fetchone()
+        if not task_row:
+            return None
+        task_id = task_row["task_id"]
+        row = conn.execute(
+            """SELECT COUNT(*) AS call_count, COALESCE(SUM(input_chars), 0) AS input_chars,
+               COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+               COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+               COALESCE(SUM(total_tokens), 0) AS total_tokens,
+               COALESCE(SUM(cache_hit_tokens), 0) AS cache_hit_tokens,
+               SUM(CASE WHEN total_tokens IS NOT NULL THEN 1 ELSE 0 END) AS metered_calls
+               FROM ew_model_calls WHERE task_id = ?""", (task_id,)
+        ).fetchone()
+        family_rows = conn.execute(
+            """SELECT CASE
+                        WHEN context_mode LIKE 'vision%' THEN 'vision'
+                        WHEN context_mode = 'tencent_ocr' THEN 'tencent_ocr'
+                        WHEN context_mode = 'local_ocr' THEN 'local_ocr'
+                        ELSE 'text' END AS family,
+                      COUNT(*) AS call_count,
+                      COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                      COALESCE(SUM(input_chars), 0) AS input_chars
+               FROM ew_model_calls WHERE task_id = ?
+               GROUP BY family""", (task_id,),
+        ).fetchall()
+        ocr_row = conn.execute(
+            "SELECT COALESCE(SUM(billed_units), 0) AS ocr_requests FROM ew_ocr_usage_ledger WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        local_ocr_row = conn.execute(
+            """SELECT COUNT(DISTINCT c.document_id || ':' || c.page_number) AS local_ocr_pages
+               FROM ew_ocr_page_cache c
+               JOIN ew_documents d ON d.document_id = c.document_id
+               JOIN ew_tasks t ON t.task_id = ?
+               WHERE d.project_id=? AND c.service='rapidocr_local'
+                 AND c.created_at >= COALESCE(t.started_at, t.created_at)
+                 AND c.created_at <= COALESCE(t.finished_at, c.created_at)""",
+            (task_id, project_id),
+        ).fetchone()
+    try:
+        payload = json.loads(task_row["payload_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    usage = dict(row)
+    usage["families"] = {
+        str(item["family"]): {
+            "call_count": item["call_count"],
+            "total_tokens": item["total_tokens"],
+            "input_chars": item["input_chars"],
+        }
+        for item in family_rows
+    }
+    usage["ocr_requests"] = int(ocr_row["ocr_requests"] or 0) if ocr_row else 0
+    usage["local_ocr_pages"] = int(local_ocr_row["local_ocr_pages"] or 0) if local_ocr_row else 0
+    usage["finished_at"] = task_row["finished_at"]
+    usage["deploy_commit"] = str(payload.get("deploy_commit") or "")
+    usage["prompt_version"] = str(payload.get("prompt_version") or "")
+    return usage
+
+
 def task_recovery_summary(app, task_id: str) -> dict[str, int]:
     """按实际模型调用区分结构化恢复路径，供任务结果和运行监控使用。"""
     with connection(app) as conn:
