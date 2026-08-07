@@ -28,23 +28,53 @@ _PROCESS_STARTED_AT = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 _DEPLOY_COMMIT_CACHE: dict[str, str] = {}
 
 
+def _read_git_head_commit(base: Path) -> str:
+    """不依赖 git 命令，直接读取 .git 的 HEAD 得到短提交号。"""
+    git_dir = base / ".git"
+    if git_dir.is_file():
+        # git worktree 场景：.git 是文本文件，指向真实 git 目录。
+        try:
+            raw = git_dir.read_text(encoding="utf-8").strip()
+            if raw.startswith("gitdir:"):
+                target = raw[len("gitdir:"):].strip()
+                git_dir = (target if Path(target).is_absolute() else base / target).resolve()
+        except OSError:
+            return ""
+    if not git_dir.is_dir():
+        return ""
+    try:
+        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    if head.startswith("ref:"):
+        ref = head[len("ref:"):].strip()
+        ref_path = git_dir / ref
+        try:
+            if ref_path.is_file():
+                return ref_path.read_text(encoding="utf-8").strip()[:7]
+        except OSError:
+            pass
+        try:
+            packed = (git_dir / "packed-refs").read_text(encoding="utf-8", errors="ignore")
+            for line in packed.splitlines():
+                if line and not line.startswith("#") and line.strip().endswith(ref):
+                    return line.split()[0][:7]
+        except OSError:
+            pass
+        return ""
+    return head[:7]
+
+
 def _current_deploy_commit() -> str:
     """返回当前运行代码的 Git 短提交号；优先读镜像内源码，其次读挂载的宿主源码。"""
     if "value" in _DEPLOY_COMMIT_CACHE:
         return _DEPLOY_COMMIT_CACHE["value"]
     candidates = [_PROJECT_ROOT, _PROJECT_ROOT / "tools"]
     for base in candidates:
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(base), "rev-parse", "--short", "HEAD"],
-                capture_output=True, text=True, timeout=5,
-            )
-            value = result.stdout.strip()
-            if result.returncode == 0 and value:
-                _DEPLOY_COMMIT_CACHE["value"] = value
-                return value
-        except (OSError, subprocess.SubprocessError):
-            continue
+        value = _read_git_head_commit(base)
+        if value:
+            _DEPLOY_COMMIT_CACHE["value"] = value
+            return value
     _DEPLOY_COMMIT_CACHE["value"] = ""
     return ""
 
