@@ -9154,6 +9154,116 @@ def _scope_highlight_fallback_candidate(document_id: str, highlights: list[dict]
     }
 
 
+def _fallback_highlight_rank(candidate: dict) -> tuple:
+    """兜底候选排序：审查结论优先，再按状态/风险/置信度，评分按得分比例。"""
+    if candidate.get("type") == "score":
+        try:
+            ratio = float(candidate.get("suggested_score") or 0) / max(
+                1e-9, float(candidate.get("max_score") or 1))
+        except (TypeError, ValueError):
+            ratio = 1.0
+        return (1, 0 if ratio <= 0.5 else 1, ratio, 0)
+    status_rank = {"not_satisfied": 0, "not_found": 1, "partial": 2}.get(
+        str(candidate.get("status") or ""), 3)
+    risk_rank = {"high": 0, "medium": 1, "low": 2}.get(
+        str(candidate.get("risk_level") or ""), 2)
+    confidence_rank = {"high": 0, "medium": 1, "low": 2}.get(
+        str(candidate.get("confidence") or ""), 1)
+    return (0, status_rank, risk_rank, confidence_rank)
+
+
+def _fallback_highlight_level(candidate: dict) -> str:
+    """兜底条目定级：明确不满足/材料未找到且高风险的给 high，其余给 attention。"""
+    if candidate.get("type") == "score":
+        return "attention"
+    status = str(candidate.get("status") or "")
+    risk = str(candidate.get("risk_level") or "")
+    if status == "not_satisfied" and risk == "high":
+        return "high"
+    if status == "not_found" and risk in {"high", "medium"}:
+        return "high"
+    if status == "partial" and risk == "high":
+        return "high"
+    return "attention"
+
+
+def _fallback_highlight_text(candidate: dict) -> tuple[str, str, str]:
+    """从已落库候选组装 keyword/conclusion/basis，不新增任何模型外事实。"""
+    summary = re.sub(r"\s+", " ", _clean_model_text(candidate.get("conclusion_summary"))).strip()
+    title = re.sub(r"\s+", " ", _clean_model_text(candidate.get("title"))).strip()
+    keyword = (summary or title)[:16]
+    conclusion = summary[:80] or re.sub(r"\s+", " ", _clean_model_text(candidate.get("reason")))[:80]
+    pages = _compact_page_ranges(candidate.get("evidence"), candidate.get("reason"))
+    fact = re.sub(r"\s+", " ", _clean_model_text(candidate.get("reason")))[:110]
+    basis = f"{pages}；{fact}" if pages else fact
+    basis = basis[:120] or "该候选已由评审规则确认，需人工复核"
+    return keyword, conclusion, basis
+
+
+def _fallback_bidder_highlights(document_id: str, bidder_name: str,
+                                allowed: dict[tuple[str, str], dict]) -> dict | None:
+    """提炼模型整家漏掉时，用该投标人已确认的候选组装兜底重要结论。
+
+    只对存在合格候选（审查不满足/部分/未找到且风险中高，或评分明显低分）的
+    投标人生成，最多 3 条；无合格候选的家（如全部为 OCR 待识别、低风险）不生成，
+    避免把“待核验”误报成高风险。内容全部来自已落库结论，不调用模型。
+    """
+    items: list[dict] = []
+    for (doc_id, _rule_id), candidate in allowed.items():
+        if doc_id != document_id:
+            continue
+        if candidate.get("type") == "review":
+            if candidate.get("status") not in {"not_satisfied", "partial", "not_found"}:
+                continue
+            if candidate.get("risk_level") not in {"high", "medium"}:
+                continue
+        elif candidate.get("type") == "score":
+            try:
+                ratio = float(candidate.get("suggested_score") or 0) / max(
+                    1e-9, float(candidate.get("max_score") or 1))
+            except (TypeError, ValueError):
+                continue
+            if ratio > 0.5:
+                continue
+        else:
+            continue
+        items.append(candidate)
+    if not items:
+        return None
+    items.sort(key=_fallback_highlight_rank)
+    highlights: list[dict] = []
+    seen_rule_ids: set[str] = set()
+    for candidate in items:
+        rule_id = str(candidate.get("rule_id") or "")
+        if not rule_id or rule_id in seen_rule_ids:
+            continue
+        seen_rule_ids.add(rule_id)
+        level = _fallback_highlight_level(candidate)
+        if "照抄" in str(candidate.get("title") or "") and level in {"critical", "high"}:
+            level = "attention"
+        keyword, conclusion, basis = _fallback_highlight_text(candidate)
+        if not keyword or not conclusion:
+            continue
+        highlights.append({
+            "rule_id": rule_id, "level": level, "keyword": keyword,
+            "conclusion": conclusion, "basis": basis,
+        })
+        if len(highlights) >= 3:
+            break
+    if not highlights:
+        return None
+    overall = max(highlights, key=lambda item: {"high": 2, "attention": 1}.get(item["level"], 0))["level"]
+    headline = re.sub(r"\s+", " ", _clean_model_text(highlights[0].get("conclusion") or highlights[0].get("keyword"))).strip()
+    if len(headline) > 40:
+        headline = f"{headline[:40].rstrip()}…"
+    if not headline:
+        headline = f"存在 {len(highlights)} 项需人工复核事项"
+    return {
+        "document_id": document_id, "bidder_name": bidder_name,
+        "overall_level": overall, "headline": headline, "highlights": highlights,
+    }
+
+
 def _normalise_evaluation_highlights(parsed: dict, candidates: list[dict],
                                      allowed: dict[tuple[str, str], dict]) -> list[dict]:
     bidder_names = {item["document_id"]: item["bidder_name"] for item in candidates}
@@ -9219,6 +9329,17 @@ def _normalise_evaluation_highlights(parsed: dict, candidates: list[dict],
             "overall_level": overall_level, "headline": headline,
             "highlights": highlights,
         })
+    # 提炼模型可能整家漏掉：对有合格候选但模型未返回的投标人，用已落库候选兜底，
+    # 保证“有实质问题的投标人”不会从重要结论面板消失。
+    for group in candidates:
+        document_id = str(group.get("document_id") or "")
+        if document_id in seen_documents:
+            continue
+        fallback = _fallback_bidder_highlights(
+            document_id, str(group.get("bidder_name") or "未命名投标人"), allowed,
+        )
+        if fallback:
+            values.append(fallback)
     return values
 
 

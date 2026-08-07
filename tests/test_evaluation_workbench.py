@@ -2940,7 +2940,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_subjective_user"]["content"])
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"])
         self.assertIn("统一为 partial 或需图片核验", PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v43")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v44")
 
     def test_scope_chapter_and_text_error_guidance_present(self):
         from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
@@ -2958,7 +2958,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(text_marker, PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("必须点名最具辨识度的偏离对象", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("risk_level 应为 high", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v43")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v44")
 
     def test_ocr_visual_contracts_deduplicated_but_keep_hard_constraints(self):
         from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
@@ -3577,6 +3577,82 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(len(values[0]["highlights"]), 1)
         self.assertEqual(values[0]["highlights"][0]["level"], "high")
         self.assertIn("第740-794页", values[0]["highlights"][0]["basis"])
+
+    def test_highlights_fallback_covers_bidder_missed_by_model(self):
+        candidates = [
+            {"document_id": "bid-a", "bidder_name": "甲公司", "candidates": []},
+            {"document_id": "bid-b", "bidder_name": "乙公司", "candidates": []},
+        ]
+        allowed = {
+            ("bid-a", "scope"): {"_critical_eligible": False, "type": "review", "rule_id": "scope",
+                                 "status": "not_satisfied", "risk_level": "high", "title": "项目范围无关内容核验",
+                                 "evidence": "第561-569页出现华福证券内容", "reason": "与本项目范围不符→属模板混用",
+                                 "conclusion_summary": "投标文件混入其他项目范围内容"},
+            ("bid-b", "consistency"): {"_critical_eligible": False, "type": "review", "rule_id": "consistency",
+                                       "status": "not_satisfied", "risk_level": "high", "title": "关键要素内部一致性",
+                                       "evidence": "第370页变更阈值5%", "reason": "变更阈值5%与招标20%不一致",
+                                       "conclusion_summary": "变更管理阈值与招标要求不一致"},
+            ("bid-b", "qual"): {"_critical_eligible": False, "type": "review", "rule_id": "qual",
+                                "status": "partial", "risk_level": "medium", "title": "投标人资格要求",
+                                "evidence": "第16页目录", "reason": "部分资格材料待核验",
+                                "conclusion_summary": "资格材料部分缺失待核验"},
+            ("bid-b", "score"): {"_critical_eligible": False, "type": "score", "rule_id": "score",
+                                 "title": "管理体系认证评分", "suggested_score": 1.5, "max_score": 3.0,
+                                 "evidence": "第15页", "reason": "仅一项证书可确认",
+                                 "conclusion_summary": "认证证书证据不足"},
+        }
+        values = worker._normalise_evaluation_highlights({"summaries": [{
+            "document_id": "bid-a", "headline": "范围混用需复核",
+            "highlights": [{"rule_id": "scope", "level": "high", "keyword": "范围混用",
+                            "conclusion": "投标文件混入其他项目范围内容", "basis": "第561-569页"}],
+        }]}, candidates, allowed)
+        by_bidder = {item["bidder_name"]: item for item in values}
+        self.assertEqual(set(by_bidder.keys()), {"甲公司", "乙公司"})
+        # 模型已返回的家保持原样，不重复生成。
+        self.assertEqual(len(by_bidder["甲公司"]["highlights"]), 1)
+        # 被漏掉的家自动兜底，最多 3 条且按重要程度排序。
+        fallback = by_bidder["乙公司"]
+        self.assertLessEqual(len(fallback["highlights"]), 3)
+        self.assertEqual(fallback["highlights"][0]["level"], "high")
+        self.assertIn("第370页", fallback["highlights"][0]["basis"])
+        self.assertEqual(fallback["overall_level"], "high")
+
+    def test_highlights_fallback_skips_bidder_without_qualified_candidates(self):
+        candidates = [{"document_id": "bid-c", "bidder_name": "丙公司", "candidates": []}]
+        allowed = {
+            ("bid-c", "scan"): {"_critical_eligible": False, "type": "review", "rule_id": "scan",
+                                "status": "ocr_required", "risk_level": "low", "title": "资格核验",
+                                "evidence": "", "reason": "扫描件待识别", "conclusion_summary": ""},
+            ("bid-c", "score"): {"_critical_eligible": False, "type": "score", "rule_id": "score",
+                                 "title": "业绩评分", "suggested_score": 8, "max_score": 10,
+                                 "evidence": "", "reason": "正常", "conclusion_summary": ""},
+        }
+        values = worker._normalise_evaluation_highlights({"summaries": []}, candidates, allowed)
+        self.assertEqual(values, [])
+
+    def test_highlights_fallback_level_mapping(self):
+        self.assertEqual(worker._fallback_highlight_level(
+            {"type": "review", "status": "not_satisfied", "risk_level": "high"}), "high")
+        self.assertEqual(worker._fallback_highlight_level(
+            {"type": "review", "status": "not_found", "risk_level": "medium"}), "high")
+        self.assertEqual(worker._fallback_highlight_level(
+            {"type": "review", "status": "partial", "risk_level": "medium"}), "attention")
+        self.assertEqual(worker._fallback_highlight_level(
+            {"type": "score", "suggested_score": 1, "max_score": 10}), "attention")
+        # 部分满足+中风险应能进入兜底（条数上限内）。
+        candidates = [{"document_id": "bid-a", "bidder_name": "甲公司", "candidates": []}]
+        allowed = {
+            ("bid-a", "r1"): {"_critical_eligible": False, "type": "review", "rule_id": "r1",
+                              "status": "not_satisfied", "risk_level": "high", "title": "资格要求",
+                              "reason": "未提供证明", "conclusion_summary": "资格证明缺失"},
+            ("bid-a", "r3"): {"_critical_eligible": False, "type": "review", "rule_id": "r3",
+                              "status": "partial", "risk_level": "medium", "title": "技术方案",
+                              "reason": "部分覆盖", "conclusion_summary": "方案部分覆盖"},
+        }
+        values = worker._normalise_evaluation_highlights({"summaries": []}, candidates, allowed)
+        levels = {item["rule_id"]: item["level"] for item in values[0]["highlights"]}
+        self.assertEqual(levels["r1"], "high")
+        self.assertEqual(levels["r3"], "attention")
 
     def test_copying_response_rule_is_low_risk_in_review_results(self):
         rules = [{"rule_id": "copy", "title": "技术响应照抄照搬核验", "check_rule": "检查是否照抄招标参数"}]
@@ -5243,7 +5319,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不限定行业或采购类型", guidance)
         scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v43")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v44")
 
     def test_full_scan_reruns_rule_evidence_but_rechecks_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")
