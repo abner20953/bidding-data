@@ -3014,8 +3014,16 @@ def complete_missing_rule_scores(app, rule_set_id: str) -> int:
 
 def update_rule(app, project_id: str, rule_id: str, payload: dict) -> dict:
     rule_set = current_rule_set(app, project_id)
-    if not rule_set or rule_set["status"] != "draft":
-        raise ValueError("只能修改待确认规则集中的规则")
+    if not rule_set:
+        raise ValueError("当前没有可修改的规则集")
+    # 已确认规则集只开放“启用/停用”这一纯执行过滤操作：可逆、不改历史结论，
+    # 且修改会刷新规则集版本，使后续综合评审不复用包含旧启用状态的结果缓存。
+    # 规则内容、评分口径与取证策略仍必须回到待确认规则集修改。
+    only_enabled = set(payload) <= {"enabled"}
+    if rule_set["status"] not in {"draft", "confirmed"} or (
+        rule_set["status"] == "confirmed" and not only_enabled
+    ):
+        raise ValueError("已确认规则集只能调整启用状态；修改规则内容请先重新提取规则")
     with connection(app) as conn:
         row = conn.execute("SELECT * FROM ew_rules WHERE rule_id = ? AND rule_set_id = ?", (rule_id, rule_set["rule_set_id"])).fetchone()
         if not row:
@@ -3187,6 +3195,9 @@ def confirm_rule_set(app, project_id: str) -> dict:
     # 评分条款的明确满分。这样不会让异常低价解释等事项以 0 分规则阻塞确认。
     disable_non_file_scoring_process_rules(app, rule_set["rule_set_id"])
     complete_missing_rule_scores(app, rule_set["rule_set_id"])
+    # 确认前把“同一计分事实被评分表不同章节/截断副本重复成多条”的评分规则安全合并，
+    # 避免重复计分导致总分虚高；只停用次规则、保留信息更全者，不删除记录。
+    merge_draft_score_rule_duplicates(app, rule_set["rule_set_id"])
     with connection(app) as conn:
         count = conn.execute("SELECT COUNT(*) FROM ew_rules WHERE rule_set_id = ? AND enabled = 1", (rule_set["rule_set_id"],)).fetchone()[0]
         if not count:
@@ -3208,8 +3219,147 @@ def confirm_rule_set(app, project_id: str) -> dict:
 def _score_rule_title_core(value: object) -> str:
     """预检用的评分对象名归一化：去分值括注与章节导航前缀，与提取去重口径一致。"""
     text = re.sub(r"[（(][^()（）]*\d+(?:\.\d+)?\s*分[^()（）]*[)）]\s*$", "", str(value or ""))
+    text = re.sub(r"(?:[-—–:：\s]*)(?:满分|最高(?:得)?分?)\s*\d+(?:\.\d+)?\s*分?", "", text)
     text = re.sub(r"^\s*(?:(?:商务|技术|价格|服务|资格)部分|(?:客观|主观)?评分|评分项?)\s*[-—–:：_]*\s*", "", text)
     return re.sub(r"[\s\W_]+", "", text).casefold()
+
+
+def _score_sources_compatible(left: object, right: object) -> bool:
+    """两段评分原文是否同源：一方为另一方去省略号后的完整前缀（截断副本）。
+
+    与提取管线口径一致；确认前合并与提取去重共用同一守卫，避免把原文真正不同
+    的评分项误并。
+    """
+    def normalised(value: object) -> str:
+        text = re.sub(r"(?:…|\.\.\.|……)+", "", str(value or ""))
+        return re.sub(r"[\s\W_]+", "", text).casefold()
+
+    shorter, longer = sorted((normalised(left), normalised(right)), key=len)
+    return len(shorter) >= 20 and longer.startswith(shorter)
+
+
+def _score_scoring_structure_key(scoring: dict | None) -> tuple | None:
+    """评分叶子结构指纹：叶子名称、分值、条件归一后逐项一致才视为同一计分事实。"""
+    items = scoring.get("items") if isinstance(scoring, dict) else None
+    if not isinstance(items, list) or not items:
+        return None
+    values: list[tuple[str, float, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            return None
+        name = re.sub(r"[\s\W_]+", "", str(item.get("name") or "")).casefold()
+        try:
+            score = float(item.get("max_score"))
+        except (TypeError, ValueError):
+            return None
+        criterion = re.sub(r"[\s\W_]+", "", str(item.get("criterion") or "")).casefold()
+        values.append((name, score, criterion))
+    return tuple(values)
+
+
+def _score_rule_richness(rule: dict) -> tuple[int, int, int]:
+    try:
+        scoring = json.loads(rule.get("scoring_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        scoring = {}
+    items = scoring.get("items") if isinstance(scoring, dict) else []
+    return (len(items) if isinstance(items, list) else 0,
+            len(str(rule.get("check_rule") or "")),
+            len(str(rule.get("source_text") or "")))
+
+
+def _merge_rule_duplicate_fields(primary: dict, secondary: dict) -> dict:
+    """合并同一评分事实的互补字段，选择信息更全者为主规则。"""
+    merged = dict(primary)
+    for key in ("check_rule", "source_text"):
+        if len(str(secondary.get(key) or "")) > len(str(merged.get(key) or "")):
+            merged[key] = secondary[key]
+    if not merged.get("source_page"):
+        merged["source_page"] = secondary.get("source_page")
+    try:
+        primary_scoring = json.loads(primary.get("scoring_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        primary_scoring = {}
+    try:
+        secondary_scoring = json.loads(secondary.get("scoring_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        secondary_scoring = {}
+    if not isinstance(primary_scoring, dict):
+        primary_scoring = {}
+    if not isinstance(secondary_scoring, dict):
+        secondary_scoring = {}
+    if len(secondary_scoring.get("items") or []) > len(primary_scoring.get("items") or []):
+        merged["scoring_json"] = json.dumps(secondary_scoring, ensure_ascii=False)
+    return merged
+
+
+def merge_draft_score_rule_duplicates(app, rule_set_id: str) -> int:
+    """确认前安全合并重复评分规则。
+
+    只处理待确认规则集：同类别、同对象名、同分值，且原文同源（截断/完整前缀）
+    或评分叶子结构逐项一致时，保留信息更全的一条，其余停用。已确认规则集不动，
+    因此不会改变任何历史结论。
+    """
+    with connection(app) as conn:
+        rows = conn.execute(
+            """SELECT * FROM ew_rules
+               WHERE rule_set_id=? AND category IN ('objective', 'subjective') AND enabled=1
+               ORDER BY sort_order, created_at""",
+            (rule_set_id,),
+        ).fetchall()
+    groups: dict[tuple[str, str, float], list[dict]] = {}
+    for row in rows:
+        rule = dict(row)
+        try:
+            scoring = json.loads(rule.get("scoring_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            scoring = {}
+        if not isinstance(scoring, dict):
+            scoring = {}
+        max_score = _valid_max_score(scoring)
+        core = _score_rule_title_core(rule.get("title"))
+        if max_score is None or len(core) < 4:
+            continue
+        groups.setdefault((str(rule.get("category") or ""), core, float(max_score)), []).append(rule)
+    merged_count = 0
+    with connection(app) as conn:
+        for group in groups.values():
+            if len(group) < 2:
+                continue
+            primary = max(group, key=_score_rule_richness)
+            for other in group:
+                if other["rule_id"] == primary["rule_id"]:
+                    continue
+                try:
+                    primary_scoring = json.loads(primary.get("scoring_json") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    primary_scoring = {}
+                try:
+                    other_scoring = json.loads(other.get("scoring_json") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    other_scoring = {}
+                same_source = _score_sources_compatible(primary.get("source_text"), other.get("source_text"))
+                same_structure = (
+                    _score_scoring_structure_key(primary_scoring) is not None
+                    and _score_scoring_structure_key(primary_scoring) == _score_scoring_structure_key(other_scoring)
+                )
+                if not (same_source or same_structure):
+                    continue
+                merged = _merge_rule_duplicate_fields(primary, other)
+                conn.execute(
+                    """UPDATE ew_rules SET check_rule=?, source_text=?, source_page=?, scoring_json=?, updated_at=?
+                       WHERE rule_id=?""",
+                    (str(merged.get("check_rule") or ""), str(merged.get("source_text") or ""),
+                     merged.get("source_page"), str(merged.get("scoring_json") or primary.get("scoring_json") or "{}"),
+                     now_iso(), primary["rule_id"]),
+                )
+                conn.execute(
+                    "UPDATE ew_rules SET enabled=0, updated_at=? WHERE rule_id=?",
+                    (now_iso(), other["rule_id"]),
+                )
+                primary = merged
+                merged_count += 1
+    return merged_count
 
 
 def _score_rule_max_value(rule: dict) -> float | None:
@@ -3315,9 +3465,13 @@ def rule_set_acquisition_validation(app, project_id: str) -> dict:
         if len(group) < 2:
             continue
         titles = "；".join(str(item.get("title") or "未命名规则") for item in group[:4])
-        issues.append({"severity": "warning", "code": "duplicate_score_rule",
-                       "rule_id": str(group[0].get("rule_id") or ""), "title": str(group[0].get("title") or "评分规则"),
-                       "message": f"疑似同一评分事实的重复规则（均 {max_value:g} 分）：{titles}。重复计分会导致总分虚高，请核对后仅保留一条。"})
+        issues.append({
+            "severity": "warning", "code": "duplicate_score_rule",
+            "rule_id": str(group[0].get("rule_id") or ""),
+            "rule_ids": [str(item.get("rule_id") or "") for item in group],
+            "title": str(group[0].get("title") or "评分规则"),
+            "message": f"疑似同一评分事实的重复规则（均 {max_value:g} 分）：{titles}。重复计分会导致总分虚高，请核对后仅保留一条。",
+        })
     # 招标声明总分与启用评分规则满分合计交叉校验：提取可能把评分表标题分值
     # （如“商务评分标准（15分）”）误作规则满分，使合计偏离招标文件明示的
     # “（总分100分）”。只提示不阻断，由人工核对各规则满分是否与分值构成一致。

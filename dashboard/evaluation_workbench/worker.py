@@ -1475,15 +1475,8 @@ def _rule_signature(item: dict) -> tuple[str, str, str]:
 
 
 def _normalise_rule_title(value: object) -> str:
-    text = re.sub(r"[（(]\s*(?:满分|最高(?:得)?分?)\s*\d+(?:\.\d+)?\s*分?\s*[)）]", "", str(value or ""))
-    text = re.sub(r"(?:[-—–:：\s]*)(?:满分|最高(?:得)?分?)\s*\d+(?:\.\d+)?\s*分?", "", text)
-    # 分段提取时，模型有时会把“商务部分-”“评分-”这类章节标签写进标题，另一次
-    # 又只保留实际计分对象。它们不是两个评分事实，归一化时去掉这些纯导航前缀。
-    text = re.sub(r"^\s*(?:(?:商务|技术|价格|服务|资格)部分|(?:客观|主观)?评分|评分项?)\s*[-—–:：_]*\s*", "", text)
-    # “（9分）”“（6分，含服务团队/响应时间）”等带分值括注也只是分值的另一种写法，
-    # 去掉后同一评分对象的标题才有一致锚点；不含数字分值的括注保持原样。
-    text = re.sub(r"[（(][^()（）]*\d+(?:\.\d+)?\s*分[^()（）]*[)）]\s*$", "", text)
-    return re.sub(r"[\s\W_]+", "", text).casefold()
+    # 与确认前预检/合并共用同一归一化口径，避免两处规则漂移导致重复评分漏判。
+    return storage._score_rule_title_core(value)
 
 
 def _score_source_fingerprint(value: object) -> str:
@@ -1548,17 +1541,8 @@ def _score_rule_soft_key(item: dict) -> tuple[object, ...] | None:
 
 
 def _score_sources_compatible(left: object, right: object) -> bool:
-    """两段评分原文是否同源：一方为另一方去省略号后的完整前缀（截断副本）。
-
-    至少要求 20 个归一化字符的完整前缀重合，且必须由标题软键先行限定同一对象
-    与同一分值；缺原文或仅有松散相似时不合并，留待确认前预检提示人工核对。
-    """
-    def normalised(value: object) -> str:
-        text = re.sub(r"(?:…|\.\.\.|……)+", "", str(value or ""))
-        return re.sub(r"[\s\W_]+", "", text).casefold()
-
-    shorter, longer = sorted((normalised(left), normalised(right)), key=len)
-    return len(shorter) >= 20 and longer.startswith(shorter)
+    """两段评分原文是否同源；与存储层确认前合并共用同一实现。"""
+    return storage._score_sources_compatible(left, right)
 
 
 def _dedupe_rule_candidates(items: list[dict]) -> list[dict]:
@@ -3078,9 +3062,46 @@ def _enrich_scope_summary(evidence: object, reason: object, summary: object) -> 
 
 
 _SCORE_SUMMARY_VALUE_PATTERN = re.compile(
-    r"((?:建议|暂计|应计|应为|合计|总计|得|共)[^。；;]{0,16}?)"
+    r"((?:建议|暂计|应计|应为|合计|总计|得|共|计)[^。；;]{0,16}?)"
     r"(?<![0-9.\-—–～~至])(\d+(?:\.\d+)?)\s*分"
 )
+_SCORE_CONCLUSION_VETO_PATTERN = re.compile(
+    r"暂不给定|暂不给分|暂不计分|无法确定|不能确定|无法判定|不给定分|不采纳"
+)
+_SCORE_CONCLUSION_CAP_PATTERN = re.compile(r"封顶|上限|满分|最高|最多|不超过|至多")
+
+
+def _extract_score_from_conclusion(value: object, max_score: float) -> float | None:
+    """摘要/理由里出现明确建议分但结构化建议分为空时，提取暂定分兜底。
+
+    只认“建议/暂计/应计/共计/合计/得/共/计”等确定动词后的分值；否定式
+    （暂不给定/暂不给分/无法确定）、封顶/上限语境和“每处扣X分”式表述一律不提取。
+    多分值歧义时先剔除封顶语境，取最后一个确定分（结论通常落在句末）。
+    """
+    if max_score <= 0:
+        return None
+    text = str(value or "")
+    if _SCORE_CONCLUSION_VETO_PATTERN.search(text):
+        return None
+    boundary_chars = "。，；、！？：()（）"
+    candidates: list[float] = []
+    for match in _SCORE_SUMMARY_VALUE_PATTERN.finditer(text):
+        # 封顶/上限判定只在当前分句内有效，避免“暂计9分封顶，先按两项计6分”
+        # 里前一分句的“封顶”误伤后一分句的确定分。
+        segment_start = max((text.rfind(char, 0, match.start()) for char in boundary_chars), default=-1) + 1
+        segment_end = min(
+            (value for value in (text.find(char, match.end()) for char in boundary_chars) if value != -1),
+            default=len(text),
+        )
+        if _SCORE_CONCLUSION_CAP_PATTERN.search(text[segment_start:segment_end]):
+            continue
+        try:
+            candidates.append(float(match.group(2)))
+        except ValueError:
+            continue
+    if not candidates:
+        return None
+    return min(max_score, max(0.0, candidates[-1]))
 
 
 def _reconcile_summary_score(summary: str, suggested: float | None) -> str:
@@ -3650,6 +3671,12 @@ def _score_result_from_model(rule_id: str, suggested: float | None, max_score: f
     if force_needs_ocr and raw.get("needs_ocr") is not True:
         raw = {**raw, "needs_ocr": True}
     confidence = _enum_text(raw.get("confidence"), {"high", "medium", "low"}, "medium")
+    # 模型偶发只写“建议X分”而未填结构化建议分；文字层兜底提取暂定分，避免
+    # 摘要与建议分列互相矛盾。否定式/封顶/扣分语境由提取函数内部排除。
+    if suggested is None and confidence in {"high", "medium"}:
+        suggested = _extract_score_from_conclusion(
+            f"{raw.get('summary') or ''} {raw.get('reason') or ''} {raw.get('calculation') or ''}", max_score,
+        )
     needs_ocr = raw.get("needs_ocr") is True
     evidence = _truncate_field(_score_evidence_text(raw), 2000)
     has_evidence = bool(evidence)
@@ -3767,7 +3794,8 @@ def _rule_execution_strategy(rule: dict) -> str:
     explicit = str(rule.get("execution_strategy") or "").strip()
     if explicit in {"point", "counting", "section", "consistency", "cross_bid", "visual", "external"}:
         # visual/external 的最终文本审查仍按点状路由；它们的证据要求由独立字段控制。
-        return "point" if explicit in {"visual", "external", "cross_bid"} else explicit
+        # cross_bid 保留独立标记：单家阶段只做本卷文字核验，不得进入 OCR/图片增强。
+        return "point" if explicit in {"visual", "external"} else explicit
     raw = " ".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text"))
     if any(term in raw for term in ("公司名称", "项目名称", "前后", "一致", "无关公司", "无关项目", "全文")):
         return "consistency"
@@ -6498,6 +6526,13 @@ def _apply_ocr_summary(component: str, rule: dict, working_result: dict, parsed:
     # 采纳层有 summary 就覆盖为最新结论，没有则清空（前端回退到最新层摘要，
     # 绝不显示可能已被本轮核验推翻的文字层旧结论）。
     merged["conclusion_summary"] = _normalise_conclusion_summary(parsed.get("summary"))
+    if component != "review" and suggested is None and max_score > 0:
+        extracted = _extract_score_from_conclusion(
+            f"{merged['conclusion_summary']} {reconciled_reason or ''} {parsed.get('calculation') or ''}", max_score,
+        )
+        if extracted is not None and merged.get("confidence") in {"high", "medium"}:
+            suggested = extracted
+            merged = {**merged, "suggested_score": suggested}
     if component != "review" and suggested is not None:
         merged["conclusion_summary"] = _reconcile_summary_score(merged["conclusion_summary"], suggested)
     # 本地 OCR 归纳模型会判定是否仍有外观事实待核验；该信号只在本轮任务内流转，
@@ -6845,6 +6880,39 @@ def _apply_document_evidence_guard(document: dict, component: str, rule: dict, r
         "review_reason": "扫描型文件尚未形成该评分规则的完整证据覆盖，暂不建议计分。",
         "reason": note,
     }
+
+
+_CROSS_BID_EMPTY_CLAIM_PATTERN = re.compile(
+    r"单[包标][^。；;]{0,24}(?:不足以|无法|不能)|需[要]?跨投标人|需[要]?跨标段|需[要]?结合其他投标人"
+    r"|无法独立判断|单标段扫描范围|单包扫描范围|交由评审环节结合|交由评委会|无法由文本判定|未提供跨投标人信息"
+)
+_CROSS_BID_LOCAL_MISSING_PATTERN = re.compile(
+    r"(?:未提供|未出具|未附|未见|缺失|空白)[^。；;]{0,14}(?:承诺|声明)|(?:承诺|声明)[^。；;]{0,14}(?:缺失|空白|未提供|未附)"
+)
+_CROSS_BID_UNIFIED_SUFFIX = "本卷书面承诺已核验；跨投标人横向比对由文件查重承接。"
+
+
+def _normalise_cross_bid_review_result(component: str, rule: dict, result: dict) -> dict:
+    """跨投标人规则的单家结论归一化。
+
+    单家阶段只核验本卷书面声明，横向比对由查重模块承接。本卷已有实质发现
+    （承诺/声明缺失或明确不满足）时保留原结论；否则去掉“单包不足以判定”
+    这类空转句，统一为可展示的本卷结论口径，避免每家重复输出无价值表述。
+    """
+    if component != "review" or _rule_execution_strategy(rule) != "cross_bid":
+        return result
+    if result.get("status") == "not_satisfied":
+        return result
+    reason = str(result.get("reason") or "")
+    summary = str(result.get("conclusion_summary") or "")
+    if _CROSS_BID_LOCAL_MISSING_PATTERN.search(f"{reason} {summary}"):
+        return result
+    cleaned = _CROSS_BID_EMPTY_CLAIM_PATTERN.sub("", reason)
+    cleaned = re.sub(r"[\s，。；;：:、→\-]+$", "", cleaned).strip()
+    result = dict(result)
+    result["conclusion_summary"] = _CROSS_BID_UNIFIED_SUFFIX
+    result["reason"] = f"{cleaned} {_CROSS_BID_UNIFIED_SUFFIX}".strip() if cleaned else _CROSS_BID_UNIFIED_SUFFIX
+    return result
 
 
 def _should_run_multimodal_after_ocr(strategy: str, result: dict) -> bool:
@@ -7956,6 +8024,13 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
     )
     # 视觉层是当前最新采纳层：有 summary 覆盖为最新结论，无则清空回退前端摘要逻辑。
     merged["conclusion_summary"] = _normalise_conclusion_summary(parsed.get("summary"))
+    if suggested is None and max_score > 0 and not has_conflict:
+        extracted = _extract_score_from_conclusion(
+            f"{merged['conclusion_summary']} {parsed.get('reason') or ''} {parsed.get('calculation') or ''}", max_score,
+        )
+        if extracted is not None and merged.get("confidence") in {"high", "medium"}:
+            suggested = extracted
+            merged = {**merged, "suggested_score": suggested}
     if suggested is not None:
         merged["conclusion_summary"] = _reconcile_summary_score(merged["conclusion_summary"], suggested)
     merged = _append_evidence_layer(
@@ -8822,6 +8897,10 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
                 _apply_document_evidence_guard(document, component, rules_by_id[str(item["rule_id"])], item)
                 for item in results if str(item.get("rule_id") or "") in rules_by_id
             ]
+            results = [
+                _normalise_cross_bid_review_result(component, rules_by_id[str(item["rule_id"])], item)
+                for item in results if str(item.get("rule_id") or "") in rules_by_id
+            ]
             # 每个规则组成功后立即持久化；后续组异常时，页面仍能获得已完成部分。
             if component == "review" and run:
                 storage.save_review_results(app, run["review_run_id"], document["document_id"], results)
@@ -8865,6 +8944,10 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
             for rule in component_rules:
                 if rule["rule_id"] in reused_rule_ids[component]:
                     continue
+                if _rule_execution_strategy(rule) == "cross_bid":
+                    # 跨投标人规则单家阶段只核验本卷书面声明，横向比对由查重模块承接，
+                    # 不进入本地 OCR 批量，避免“单包不足以判定”空转消耗。
+                    continue
                 base = completed_results[component].get(rule["rule_id"])
                 if not base:
                     continue
@@ -8898,8 +8981,9 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
             label = rule.get("title") or rule.get("check_rule")
             merged = base
             image_strategy = _rule_image_strategy(rule)
-            baseline_required = ocr_enabled and _local_ocr_baseline_required(rule, merged, component)
-            enhancement_requested = trigger != "off" and level != "off" and image_mode != "off"
+            is_cross_bid = _rule_execution_strategy(rule) == "cross_bid"
+            baseline_required = ocr_enabled and not is_cross_bid and _local_ocr_baseline_required(rule, merged, component)
+            enhancement_requested = not is_cross_bid and trigger != "off" and level != "off" and image_mode != "off"
             # “智能升级”不因规则属于证书/字段类就无条件消耗腾讯额度；只有原文字
             # 证据不足，或人工选择“每次均升级”时才开放高精度复核。
             tencent_upgrade_requested = enhancement_requested and (

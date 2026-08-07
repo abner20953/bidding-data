@@ -1685,6 +1685,106 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         duplicate = [item for item in validation["issues"] if item["code"] == "duplicate_score_rule"]
         self.assertEqual(len(duplicate), 1)
         self.assertIn("企业业绩", duplicate[0]["message"])
+        self.assertEqual(len(duplicate[0]["rule_ids"]), 2)
+
+    def test_confirm_rule_set_merges_duplicate_score_rules(self):
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "企业业绩评分（9分）",
+            "source_text": "近三年同类项目业绩，要求提供合同首页、金额页、签字盖章页、供货明细单，每提供一份得3分，最高得9分。",
+            "scoring": {"max_score": 9, "kind": "manual"},
+        })
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "商务部分-企业业绩评分（满分9分）",
+            "source_text": "近三年同类项目业绩，要求提供合同首页、金额页、签字盖章页、供货明细单，每提供一份得3分，最高得9分。本款仅指供应商自身业绩。",
+            "scoring": {"max_score": 9, "kind": "manual"},
+        })
+
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+
+        rules = storage.list_rules(self.app, self.project["project_id"])[1]
+        enabled = [item for item in rules if item["enabled"]]
+        self.assertEqual(len(enabled), 1)
+        self.assertIn("仅指供应商自身业绩", enabled[0]["source_text"])
+
+    def test_confirm_rule_set_keeps_distinct_score_rules(self):
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "subjective", "title": "售后服务方案评分（6分）",
+            "source_text": "售后体系/响应机制、售后内容/人员配备、回访/故障流程、备品备件，各1.5分。",
+            "scoring": {"max_score": 6, "kind": "manual"},
+        })
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "subjective", "title": "实施进度计划评分（6分）",
+            "source_text": "进度控制计划、时间进度安排、保障措施、应急预案，各1.5分。",
+            "scoring": {"max_score": 6, "kind": "manual"},
+        })
+
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+
+        rules = storage.list_rules(self.app, self.project["project_id"])[1]
+        enabled = [item for item in rules if item["enabled"]]
+        self.assertEqual(len(enabled), 2)
+
+    def test_extract_score_from_conclusion_cases(self):
+        self.assertEqual(worker._extract_score_from_conclusion("两份业绩要件齐全，建议各计3分共6分，签章需图片复核。", 9), 6)
+        self.assertEqual(worker._extract_score_from_conclusion("暂计9分封顶，先按两项完整计6分。", 9), 6)
+        self.assertEqual(worker._extract_score_from_conclusion("方案完整无缺陷得6分；存在缺陷每处扣0.5分。", 6), 6)
+        self.assertEqual(worker._extract_score_from_conclusion("未提供任何证书，建议0分。", 2), 0)
+        self.assertIsNone(worker._extract_score_from_conclusion("报告待核，暂不给分。", 9))
+        self.assertIsNone(worker._extract_score_from_conclusion("无法确定是否满足，需人工复核。", 9))
+        self.assertIsNone(worker._extract_score_from_conclusion("满分9分，评审时按证明认定。", 9))
+
+    def test_rule_execution_strategy_keeps_cross_bid(self):
+        self.assertEqual(worker._rule_execution_strategy({"execution_strategy": "cross_bid"}), "cross_bid")
+        self.assertEqual(worker._rule_execution_strategy({"execution_strategy": "visual"}), "point")
+
+    def test_confirmed_rule_set_allows_enabled_toggle_only(self):
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "业绩评分（9分）",
+            "source_text": "近三年同类项目业绩，每提供一份得3分，最高得9分。",
+            "scoring": {"max_score": 9, "kind": "manual"},
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        rules = storage.list_rules(self.app, self.project["project_id"])[1]
+        rule_id = rules[0]["rule_id"]
+        before = storage.current_rule_set(self.app, self.project["project_id"])["updated_at"]
+        time.sleep(1)
+
+        storage.update_rule(self.app, self.project["project_id"], rule_id, {"enabled": False})
+
+        rules = storage.list_rules(self.app, self.project["project_id"])[1]
+        self.assertFalse(rules[0]["enabled"])
+        after = storage.current_rule_set(self.app, self.project["project_id"])["updated_at"]
+        self.assertNotEqual(before, after)
+        with self.assertRaises(ValueError):
+            storage.update_rule(self.app, self.project["project_id"], rule_id, {"check_rule": "修改规则内容"})
+
+    def test_cross_bid_review_result_is_normalised(self):
+        rule = {"rule_id": "r1", "execution_strategy": "cross_bid"}
+        normal = worker._normalise_cross_bid_review_result("review", rule, {
+            "rule_id": "r1", "status": "partial",
+            "reason": "串通投标需跨投标人交叉比对账户、编制单位、联系人、报价规律等→单标段扫描范围不足以独立判断，需人工跨标段核验",
+            "conclusion_summary": "单包不足以判定，需结合其他投标人材料统一核验。",
+        })
+        self.assertIn("本卷书面承诺已核验", normal["conclusion_summary"])
+        self.assertNotIn("单标段扫描范围", normal["reason"])
+        self.assertIn("本卷书面承诺已核验", normal["reason"])
+
+        kept = worker._normalise_cross_bid_review_result("review", rule, {
+            "rule_id": "r1", "status": "not_satisfied",
+            "reason": "未提供书面承诺，串通情形无法核验", "conclusion_summary": "未提供承诺书",
+        })
+        self.assertEqual(kept["conclusion_summary"], "未提供承诺书")
+
+        missing = worker._normalise_cross_bid_review_result("review", rule, {
+            "rule_id": "r1", "status": "partial",
+            "reason": "未提供承诺书，需人工核验", "conclusion_summary": "承诺缺失",
+        })
+        self.assertIn("未提供承诺书", missing["reason"])
+
+        non_review = worker._normalise_cross_bid_review_result("objective", rule, {
+            "rule_id": "r1", "status": "partial", "reason": "原文保留", "conclusion_summary": "摘要保留",
+        })
+        self.assertEqual(non_review["reason"], "原文保留")
 
     def test_acquisition_validation_warns_when_score_total_differs_from_tender_declared(self):
         self._add_pdf("tender.pdf", "tender", "", "用于建立解析文件")
