@@ -496,7 +496,7 @@
       const checkContent = isDraft ? `<textarea class="rule-check-rule" data-rule="${r.rule_id}" rows="4">${escapeHtml(r.check_rule || r.title)}</textarea>` : `<div class="rule-text">${escapeHtml(r.check_rule || r.title)}</div>`;
       const summary = acquisitionSummary(r);
       const sourceLabel = r.source_type === 'ai' ? 'AI 提取' : r.source_type === 'global' ? '通用规则库' : ['ai_edited', 'ai_locked'].includes(r.source_type) ? 'AI 提取 · 人工修改' : '人工补充';
-      const enabledControl = (isDraft || isConfirmed) ? `<label class="rule-enabled-control" title="${isDraft ? '仅影响当前规则集；重新提取规则后会重新选择' : '停用只影响后续评审执行，历史结果保留'}"><input class="rule-enabled" data-rule="${r.rule_id}" type="checkbox" ${r.enabled ? 'checked' : ''}><span>启用</span></label>` : (r.enabled ? '' : '<span class="tag rule-disabled">未启用</span>');
+      const enabledControl = (isDraft || isConfirmed) ? `<label class="rule-enabled-control" title="停用只影响后续评审执行，历史结果保留；启停状态会随下次重新提取继承"><input class="rule-enabled" data-rule="${r.rule_id}" type="checkbox" ${r.enabled ? 'checked' : ''}><span>启用</span></label>` : (r.enabled ? '' : '<span class="tag rule-disabled">未启用</span>');
       const recommendation = r.acquisition_recommendation || {acquisition_preset:'off', vision_level:'off'};
       const simpleChoice = simpleAcquisitionMode(r);
       const selectionLevel = ['low', 'standard', 'high'].includes(r.vision_level) ? r.vision_level : 'standard';
@@ -726,7 +726,7 @@
   $('parse-documents').onclick = () => queue('parse_documents'); $('start-compare').onclick = () => queue('compare_documents', {force_rerun:true});
   const highlightToggle = $('highlights-high-only');
   if (highlightToggle) highlightToggle.onclick = () => { highlightToggle.classList.toggle('active'); renderEvaluationHighlights(cachedHighlights); };
-  $('extract-rules').onclick = async () => { if (hasCurrentRules && !confirm('重新提取会以新的 AI 结果和全部通用规则替换当前待确认规则集；通用规则按规则库的默认选择状态进入项目。已确认的历史规则和结果不会删除，是否继续？')) return; try { const profile_id = $('rule-profile').value; await request(`/projects/${activeProject}/tasks`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({task_type:'extract_rules', profile_id, force_rerun:true})}); await refreshProject(); } catch (error) { alert(error.message); } };
+  $('extract-rules').onclick = async () => { if (hasCurrentRules && !confirm('重新提取会以新的 AI 结果与当前规则集合并去重（人工/编辑规则继续保留，纯 AI 规则仅继承启用中的，启停状态沿用），并导入全部通用规则；已确认的历史规则和结果不会删除。是否继续？')) return; try { const profile_id = $('rule-profile').value; await request(`/projects/${activeProject}/tasks`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({task_type:'extract_rules', profile_id, force_rerun:true})}); await refreshProject(); } catch (error) { alert(error.message); } };
   function updateManualRuleScoringFields() { const category = $('manual-rule-category').value; const isScoring = ['objective', 'subjective'].includes(category); $('manual-rule-max-score-field').classList.toggle('hidden', !isScoring); $('manual-rule-max-score').required = isScoring; $('manual-rule-score-kind-field').classList.toggle('hidden', category !== 'objective'); }
   $('manual-rule-category').onchange = updateManualRuleScoringFields;
   updateManualRuleScoringFields();

@@ -3215,8 +3215,12 @@ def _is_score_fragment_continuation(lines: list[str], index: int) -> bool:
         return False
     previous = ""
     for value in reversed(lines[max(0, index - 8):index]):
-        if str(value or "").strip() and not re.fullmatch(r"\[第\d+页\]", str(value).strip()):
-            previous = re.sub(r"\s+", "", str(value))
+        clean = str(value or "").strip()
+        # 跨页时上一行常是页脚页码（纯数字）或页标记，跳过它们才能看到真正的
+        # 评分项上下文（如“实施进度计划…时间进度安排”），否则续行会被误判成
+        # 独立计分行，生成缺失前半段叶子的残缺评分规则。
+        if clean and not re.fullmatch(r"\[第\d+页\]", clean) and not re.fullmatch(r"\d{1,4}", clean):
+            previous = re.sub(r"\s+", "", clean)
             break
     return bool(previous and ("分" in previous or "计划" in previous or "方案" in previous))
 _DIRECTORY_LEADER_PATTERN = re.compile(r"[.．·…]{2,}|\s{3,}")

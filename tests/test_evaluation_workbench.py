@@ -1786,6 +1786,128 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         })
         self.assertEqual(non_review["reason"], "原文保留")
 
+    def test_replace_rules_inherits_previous_confirmed_rules(self):
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "compliance", "title": "投标函出具与实质性承诺",
+            "check_rule": "核验投标函是否出具并包含实质性承诺。",
+            "source_text": "投标函……",
+        })
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "企业业绩评分（9分）",
+            "source_text": "近三年同类项目业绩，每提供一份得3分，最高得9分。",
+            "scoring": {"max_score": 9, "kind": "manual"},
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        with storage.connection(self.app) as conn:
+            conn.execute("UPDATE ew_rules SET source_type='ai' WHERE rule_set_id=?", (
+                storage.current_rule_set(self.app, self.project["project_id"])["rule_set_id"],))
+
+        storage.replace_rules_from_extraction(
+            self.app, self.project["project_id"], "task-inherit",
+            [{"category": "compliance", "title": "投标报价不得超过最高限价", "check_rule": "核验报价未超限价。",
+              "source_text": "最高限价……"}],
+        )
+
+        rules = storage.list_rules(self.app, self.project["project_id"])[1]
+        titles = {item["title"]: item for item in rules}
+        self.assertIn("投标函出具与实质性承诺", titles)
+        self.assertIn("企业业绩评分（9分）", titles)
+        self.assertIn("投标报价不得超过最高限价", titles)
+        self.assertTrue(titles["企业业绩评分（9分）"]["enabled"])
+
+    def test_replace_rules_does_not_inherit_disabled_rules(self):
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "rejection", "title": "串通投标情形作无效",
+            "check_rule": "核验串通情形。", "source_text": "串通投标……",
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        rule_id = storage.list_rules(self.app, self.project["project_id"])[1][0]["rule_id"]
+        storage.update_rule(self.app, self.project["project_id"], rule_id, {"enabled": False})
+        with storage.connection(self.app) as conn:
+            conn.execute("UPDATE ew_rules SET source_type='ai' WHERE rule_id=?", (rule_id,))
+
+        storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-inherit", [])
+
+        rules = storage.list_rules(self.app, self.project["project_id"])[1]
+        self.assertNotIn("串通投标情形作无效", {item["title"] for item in rules})
+
+    def test_score_leaf_total_below_warns_and_counting_exempt(self):
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "subjective", "title": "实施进度计划评分（6分）",
+            "source_text": "进度控制计划1.5、时间进度安排1.5、保障措施1.5、应急预案1.5。",
+            "scoring": {"max_score": 6, "kind": "manual", "items": [
+                {"name": "保障措施", "max_score": 1.5, "criterion": "完整得1.5分"},
+                {"name": "应急预案", "max_score": 1.5, "criterion": "完整得1.5分"},
+                {"name": "应急保障措施", "max_score": 1.5, "criterion": "完整得1.5分"},
+            ]},
+        })
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "企业业绩评分（9分）",
+            "source_text": "近三年同类项目业绩，每提供一份得3分，最高得9分。",
+            "scoring": {"max_score": 9, "kind": "manual", "items": [
+                # 叶子只写单份分值（3 分）而满分 9 分：只有计数型豁免生效时才不误报。
+                {"name": "企业业绩", "max_score": 3, "criterion": "每提供一份合格合同得3分，最高得9分"},
+            ]},
+        })
+
+        validation = storage.rule_set_acquisition_validation(self.app, self.project["project_id"])
+        below = [item for item in validation["issues"] if item["code"] == "score_leaf_total_below"]
+        self.assertEqual(len(below), 1)
+        self.assertIn("实施进度计划", below[0]["title"])
+
+    def test_hard_tender_anchor_scan_only_for_first_extraction(self):
+        self._add_pdf("tender.pdf", "tender", "", "用于建立解析文件")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "other", "title": "技术方案内部一致性核验",
+            "check_rule": "核验技术方案内部一致性。",
+        })
+        tender = next(item for item in storage.list_documents(self.app, self.project["project_id"]) if item["role"] == "tender")
+        Path(tender["parsed_path"]).write_text(
+            "投标有效期不少于90日历天；不接受联合体投标；串通投标的作无效处理；信用中国查询。\n" * 2,
+            encoding="utf-8",
+        )
+
+        validation = storage.rule_set_acquisition_validation(self.app, self.project["project_id"])
+        missing = [item for item in validation["issues"] if item["code"].startswith("tender_requirement_")]
+        self.assertTrue(missing)
+
+        # 已有历史确认规则集后不再跑关键词扫描（继承机制兜底）。
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "compliance", "title": "投标有效期", "check_rule": "核验投标有效期不少于90日历天。",
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-again", [])
+        validation = storage.rule_set_acquisition_validation(self.app, self.project["project_id"])
+        missing = [item for item in validation["issues"] if item["code"].startswith("tender_requirement_")]
+        self.assertEqual(missing, [])
+
+    def test_score_clause_packet_includes_item_heading_and_continuation(self):
+        text = (
+            "[第34页]\n"
+            "1.组织实施保障 6 分 供应商提供本项目保障计划、重点难点分析和解决方案（1.5分）。\n"
+            "2.售后服务方案 6 分 供应商提供完善的售后服务体系（1.5分）。\n"
+            "3.培训方案 5 分 提供培训目标（1分）。\n"
+            "4.实施进度计划 6 分 供应商提供完善的进度控制计划（1.5分）、时间进度安排（时间进度表）\n"
+            "[第35页]\n"
+            "32\n"
+            "（1.5分）、保障措施（1.5分）、应急预案（1.5分）。上述方案无缺陷得6分。\n"
+        )
+        packets = worker._score_clause_packets(text)
+        progress = next(
+            (item for item in packets if "保障措施" in str(item.get("text") or "")),
+            None,
+        )
+        self.assertIsNotNone(progress)
+        packet_text = str(progress.get("text") or "")
+        self.assertIn("实施进度计划", packet_text)
+        self.assertIn("进度控制计划", packet_text)
+        self.assertIn("时间进度安排", packet_text)
+        self.assertIn("保障措施", packet_text)
+        self.assertIn("应急预案", packet_text)
+        self.assertIn("6 分", packet_text)
+
     def test_acquisition_validation_warns_when_score_total_differs_from_tender_declared(self):
         self._add_pdf("tender.pdf", "tender", "", "用于建立解析文件")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
@@ -6059,7 +6181,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(scoring["max_score"], 10.0)
         self.assertEqual(scoring["source"], "manual")
 
-    def test_reextract_preserves_edited_content_but_resets_all_selection_states(self):
+    def test_reextract_preserves_edited_content_and_selection_states(self):
         first = storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-1", [{
             "category": "qualification", "title": "营业执照", "check_rule": "核验营业执照", "source_text": "应提供营业执照。",
         }])
@@ -6085,8 +6207,10 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         manual = next(item for item in refreshed if item["title"] == "人工补充承诺")
         self.assertEqual(edited["source_type"], "ai_edited")
         self.assertEqual(manual["source_type"], "manual")
-        self.assertEqual(edited["enabled"], 1)
-        self.assertEqual(manual["enabled"], 1)
+        # 新设计：人工/编辑规则无条件继承并沿用启用状态，不再重置为启用，
+        # 避免“用户停用的规则在重新提取后复活”。
+        self.assertEqual(edited["enabled"], 0)
+        self.assertEqual(manual["enabled"], 0)
 
     def test_reextract_does_not_preserve_ai_rule_selection_only_changes(self):
         storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-1", [{

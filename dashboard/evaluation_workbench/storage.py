@@ -2979,6 +2979,36 @@ def _valid_max_score(scoring: dict | None) -> float | None:
     return value if math.isfinite(value) and value > 0 else None
 
 
+def _score_items_total(scoring: dict | None) -> float | None:
+    """评分叶子项正分合计；负分项（扣分项）不计入。"""
+    items = scoring.get("items") if isinstance(scoring, dict) else None
+    if not isinstance(items, list) or not items:
+        return None
+    total = 0.0
+    for item in items:
+        if not isinstance(item, dict):
+            return None
+        try:
+            value = float(item.get("max_score"))
+        except (TypeError, ValueError):
+            return None
+        if value > 0:
+            total += value
+    return total
+
+
+def _is_counting_score_rule(scoring: dict | None) -> bool:
+    """计数型评分豁免：每提供一份/一项得 X 分、最高 Y 分的规则，
+    其叶子可能只写单份分值而小于满分，属合法结构，不做“截断”误报。"""
+    items = scoring.get("items") if isinstance(scoring, dict) else None
+    if not isinstance(items, list) or len(items) != 1:
+        return False
+    criterion = str(items[0].get("criterion") or "") if isinstance(items[0], dict) else ""
+    if "每" not in criterion or "得" not in criterion:
+        return False
+    return bool(re.search(r"(?:最高|最多|满分|上限)[^。；;]{0,8}\d+(?:\.\d+)?\s*分", criterion))
+
+
 def complete_missing_rule_scores(app, rule_set_id: str) -> int:
     """为 AI 漏填但原文有明确总分的评分项补齐满分。"""
     updated = 0
@@ -3091,17 +3121,21 @@ def update_rule(app, project_id: str, rule_id: str, payload: dict) -> dict:
 
 def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: list[dict]) -> dict:
     with connection(app) as conn:
-        # 新一轮 AI 提取刷新普通 AI 规则。人工补充及人工修改过内容/评分口径的
-        # AI 规则继续迁移，但上一版本的启用勾选一律不迁移，新草稿统一重新启用。
-        # 历史 ai_locked 无法区分“只改勾选”与“改过内容”，不再迁移；今后内容修改
-        # 使用 ai_edited 明确记录，彻底切断重新提取与上一次勾选状态的关系。
+        # 新一轮 AI 提取采用“继承 + 去重”而非整批替换：上一版已确认规则集中
+        # 启用的规则全部作为候选带入新草稿（含纯 AI 规则，沿用其启用状态），
+        # 与新提取结果按 signature/评分对象去重。这样即使某次提取漏掉条款，
+        # 旧规则也不会静默丢失；用户确认时仍可停用任何不需要的规则。
         current = conn.execute(
-            "SELECT * FROM ew_rule_sets WHERE project_id = ? ORDER BY version DESC LIMIT 1", (project_id,)
+            """SELECT * FROM ew_rule_sets WHERE project_id = ?
+               AND status IN ('confirmed', 'draft') ORDER BY version DESC LIMIT 1""",
+            (project_id,),
         ).fetchone()
         preserved = []
         if current:
             preserved = conn.execute(
-                "SELECT * FROM ew_rules WHERE rule_set_id = ? AND source_type IN ('manual', 'ai_edited') ORDER BY sort_order, created_at",
+                """SELECT * FROM ew_rules WHERE rule_set_id = ?
+                   AND (source_type IN ('manual', 'ai_edited') OR (source_type = 'ai' AND enabled = 1))
+                   ORDER BY sort_order, created_at""",
                 (current["rule_set_id"],),
             ).fetchall()
         prior = conn.execute("SELECT MAX(version) FROM ew_rule_sets WHERE project_id = ?", (project_id,)).fetchone()[0] or 0
@@ -3132,7 +3166,8 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (str(uuid.uuid4()), rule_set["rule_set_id"], row["category"], row["title"], row["check_rule"] or row["title"],
                  row["source_text"], row["source_page"], "ocr" if row["check_mode"] == "ocr" else "auto",
-                 row["source_type"], row["source_task_id"], row["scoring_json"], row["execution_meta_json"], 0 if row["check_mode"] == "ocr" else 1, index, timestamp, timestamp),
+                 row["source_type"], row["source_task_id"], row["scoring_json"], row["execution_meta_json"],
+                 int(bool(row["enabled"])), index, timestamp, timestamp),
             )
             preserved_rule_count += 1
         for index, item in enumerate(rules):
@@ -3382,6 +3417,81 @@ _TENDER_TOTAL_SCORE_PATTERNS = (
     re.compile(r"(?<![项条款节])满分\s*[为（(]?\s*(\d+(?:\.\d+)?)\s*分"),
 )
 
+_HARD_TENDER_ANCHOR_GROUPS = (
+    ("投标有效期", ("投标有效期", "90日历天", "90 日历天", "90个日历天")),
+    ("联合体", ("联合体", "联合投标")),
+    ("法定代表人/授权委托", ("法定代表人身份证明", "授权委托书", "法定代表人证明")),
+    ("串通投标", ("串通投标", "串通")),
+    ("失信记录核查", ("信用中国", "失信", "政府采购网")),
+    ("进口产品", ("进口产品", "进口")),
+)
+
+
+def _hard_tender_anchor_scan(app, project_id: str, rules: list[dict]) -> list[dict]:
+    """首提取兜底：招标文件出现法律/政策硬性条款而规则集未覆盖时提示。
+
+    仅在没有历史已确认规则集时运行（有历史集时由“继承旧规则”机制保证完整，
+    避免长期关键词清单噪音）。返回 issue 列表，不改写任何规则。
+    """
+    with connection(app) as conn:
+        has_previous = conn.execute(
+            "SELECT 1 FROM ew_rule_sets WHERE project_id=? AND status IN ('confirmed', 'superseded') LIMIT 1",
+            (project_id,),
+        ).fetchone()
+    if has_previous:
+        return []
+    tender = next((item for item in list_documents(app, project_id) if item.get("role") == "tender"), None)
+    parsed_path = str((tender or {}).get("parsed_path") or "")
+    if not parsed_path:
+        return []
+    try:
+        text = Path(parsed_path).read_text(encoding="utf-8", errors="ignore")[:500_000]
+    except OSError:
+        return []
+    issues: list[dict] = []
+    enabled_text = {
+        "title": "、".join(str(rule.get("title") or "") for rule in rules if rule.get("enabled")),
+        "check_rule": "、".join(str(rule.get("check_rule") or "") for rule in rules if rule.get("enabled")),
+        "source_text": "、".join(str(rule.get("source_text") or "") for rule in rules if rule.get("enabled")),
+    }
+    disabled_text = {
+        "title": "、".join(str(rule.get("title") or "") for rule in rules if not rule.get("enabled")),
+        "check_rule": "、".join(str(rule.get("check_rule") or "") for rule in rules if not rule.get("enabled")),
+        "source_text": "、".join(str(rule.get("source_text") or "") for rule in rules if not rule.get("enabled")),
+    }
+    for label, terms in _HARD_TENDER_ANCHOR_GROUPS:
+        page_hits = [
+            text[:position].count("[第") + 1
+            for term in terms
+            for position in [match.start() for match in re.finditer(re.escape(term), text)][:3]
+        ]
+        if not page_hits:
+            continue
+        enabled_hit = any(
+            term in enabled_text["title"] or term in enabled_text["check_rule"] or term in enabled_text["source_text"]
+            for term in terms
+        )
+        disabled_hit = any(
+            term in disabled_text["title"] or term in disabled_text["check_rule"] or term in disabled_text["source_text"]
+            for term in terms
+        )
+        if enabled_hit:
+            continue
+        pages = "、".join(str(page) for page in sorted(set(page_hits))[:6])
+        if disabled_hit:
+            issues.append({
+                "severity": "warning", "code": "tender_requirement_disabled",
+                "rule_id": "", "title": label,
+                "message": f"招标文件出现“{label}”要求（第{pages}页），规则集中已有对应规则但处于停用状态，请确认是否需要启用。",
+            })
+        else:
+            issues.append({
+                "severity": "warning", "code": "tender_requirement_missing",
+                "rule_id": "", "title": label,
+                "message": f"招标文件出现“{label}”要求（第{pages}页），当前规则集未覆盖，建议补充对应审查规则。",
+            })
+    return issues
+
 
 def _tender_declared_total_score(app, project_id: str) -> float | None:
     """从招标文件解析文本读取明示总分（如“（总分100分）”），取出现次数最多的分值。
@@ -3484,15 +3594,41 @@ def rule_set_acquisition_validation(app, project_id: str) -> dict:
         max_value = _score_rule_max_value(rule)
         if max_value is None:
             continue
+        try:
+            scoring = json.loads(rule.get("scoring_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            scoring = {}
+        if not isinstance(scoring, dict):
+            scoring = {}
+        items_total = _score_items_total(scoring)
+        # 只对“叶子合计低于满分”报警（疑似截断/漏项）；计数型规则（每份得X分、
+        # 最高Y分）豁免；高于满分多为档位计分，不挂警告避免噪音。
+        if (
+            items_total is not None
+            and max_value - items_total > 0.01
+            and not _is_counting_score_rule(scoring)
+        ):
+            issues.append({
+                "severity": "warning", "code": "score_leaf_total_below",
+                "rule_id": str(rule.get("rule_id") or ""), "title": str(rule.get("title") or "评分规则"),
+                "message": f"“{rule.get('title')}”满分 {max_value:g} 分，但评分子项合计 {items_total:g} 分，"
+                           f"疑似跨页截断或漏项，请核对评分表原文。",
+            })
         score_total += max_value
         score_rules.append(rule)
     if declared_total is not None and score_rules and abs(score_total - declared_total) > 0.01:
         titles = "；".join(str(rule.get("title") or "未命名规则") for rule in score_rules[:6])
         if len(score_rules) > 6:
             titles += f" 等{len(score_rules)}条"
+        ledger = "、".join(
+            f"{str(rule.get('title') or '未命名规则')}（{_score_rule_max_value(rule):g} 分）"
+            for rule in score_rules
+        )
         issues.append({"severity": "warning", "code": "score_total_mismatch",
                        "rule_id": str(score_rules[0].get("rule_id") or ""), "title": "评分满分合计",
-                       "message": f"招标文件明示总分为 {declared_total:g} 分，但当前启用的评分规则满分合计为 {score_total:g} 分（{titles}）。请核对各评分规则满分是否与招标文件分值构成一致。"})
+                       "message": f"招标文件明示总分为 {declared_total:g} 分，但当前启用的评分规则满分合计为 {score_total:g} 分（{titles}）。"
+                                  f"明细：{ledger}。请核对各评分规则满分是否与招标文件分值构成一致。"})
+    issues.extend(_hard_tender_anchor_scan(app, project_id, rules))
     return {
         "rule_set_id": rule_set["rule_set_id"], "issues": issues,
         "summary": {"enabled": sum(1 for rule in rules if rule.get("enabled")), "active": active},
