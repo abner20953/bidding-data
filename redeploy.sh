@@ -19,8 +19,10 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# 记录本次部署的提交号，供容器内工作台展示部署版本（不依赖镜像内安装 git）
-git rev-parse --short HEAD > .deploy-commit
+# 固化本次部署对应的提交号。容器启动时同时以环境变量注入该值，避免旧的
+# .deploy-commit 文件被 Docker 缓存层或挂载路径误用，导致页面显示历史版本。
+DEPLOY_COMMIT_VALUE="$(git rev-parse --short HEAD)"
+printf '%s\n' "$DEPLOY_COMMIT_VALUE" > .deploy-commit
 
 # 3. 重新构建镜像
 echo "🔨 正在重新构建 Docker 镜像..."
@@ -90,6 +92,7 @@ docker run -d \
   --name bidding-app \
   --restart always \
   -p 80:7860 \
+  -e "DEPLOY_COMMIT=$DEPLOY_COMMIT_VALUE" \
   -v $(pwd)/results:/app/results \
   -v $(pwd)/file:/app/file \
   -v $(pwd)/dashboard/static/uploads:/app/dashboard/static/uploads \

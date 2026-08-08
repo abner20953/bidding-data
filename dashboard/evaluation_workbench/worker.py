@@ -1669,7 +1669,13 @@ def _dedupe_rule_candidates(items: list[dict]) -> list[dict]:
             for index, existing in enumerate(merged):
                 if _score_rule_soft_key(existing) != soft_key:
                     continue
-                if _score_sources_compatible(existing.get("source_text"), item.get("source_text")):
+                existing_source = storage._normalise_rule_source(existing.get("source_text"))
+                item_source = storage._normalise_rule_source(item.get("source_text"))
+                # 同一段招标原文即使不足“截断前缀”最小长度，仍是比分段模型附加的
+                # 条款编号更可靠的同一事实锚点。只接受完全相等且长度足够的原文，
+                # 不会把两个仅共享模板句的评分项合并。
+                exact_source = len(existing_source) >= 12 and existing_source == item_source
+                if exact_source or _score_sources_compatible(existing.get("source_text"), item.get("source_text")):
                     target_index = index
                     break
         if target_index is not None:

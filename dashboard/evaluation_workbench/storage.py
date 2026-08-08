@@ -3225,25 +3225,19 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
         conn.execute("INSERT INTO ew_rule_sets(rule_set_id, project_id, version, status, source_task_id, created_at, updated_at) VALUES (:rule_set_id, :project_id, :version, :status, :source_task_id, :created_at, :updated_at)", rule_set)
         signatures = set()
         # 编辑规则保留用户内容，但不能再把它们当作与新一轮提取无关的“孤岛”。
-        # 下面按确定性条款 ID 或同源原文重新挂接；无法可靠挂接时宁可同时保留并
-        # 在确认前阻断，也不基于标题相似度静默吞掉人工维护内容。
-        preserved_score_keys = set()
-        preserved_score_rules: list[dict] = []
+        # 对任何类别均以“同类 + 标题对象 + 同源条款”重挂接：人工维护的口径不丢，
+        # 新一轮的条款锚点得以更新，也不会同时插入一条新的 AI 副本。
+        # 无法证明同源时宁可并存，绝不只凭相似标题静默吞掉人工规则。
+        preserved_edited_rules: list[dict] = []
         preserved_rule_count = 0
         for index, row in enumerate(preserved):
             row_value = dict(row)
-            row_category = str(row["category"] or "")
-            if row_category in {"objective", "subjective"} and row["source_type"] == "ai_edited":
-                row_core = _score_rule_title_core(row["title"])
-                row_max = _score_rule_max_value(row_value)
-                if len(row_core) >= 4 and row_max is not None:
-                    preserved_score_keys.add((row_category, row_core, row_max))
             new_rule_id = str(uuid.uuid4())
             # 后续与本轮候选挂接时必须指向新规则集中的记录，而不是已经 superseded
             # 的旧 rule_id。
             row_value["rule_id"] = new_rule_id
-            if row_category in {"objective", "subjective"} and row["source_type"] == "ai_edited":
-                preserved_score_rules.append(row_value)
+            if row["source_type"] == "ai_edited":
+                preserved_edited_rules.append(row_value)
             signature = (
                 row["category"], re.sub(r"\s+", "", row["title"]).casefold(),
                 re.sub(r"\s+", "", row["check_rule"] or row["title"]).casefold(),
@@ -3268,28 +3262,12 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
                 continue
             check_rule = str(item.get("check_rule", "")).strip() or title
             signature = (category, re.sub(r"\s+", "", title).casefold(), re.sub(r"\s+", "", check_rule).casefold())
-            if category in {"objective", "subjective"}:
-                item_core = _score_rule_title_core(title)
-                item_max = _score_rule_max_value(item)
-                matching_edited = _matching_preserved_score_rule(item, preserved_score_rules)
-                if matching_edited is not None:
-                    # 将本轮稳定条款 ID 回填到保留规则。用户编辑的标题、检查口径、
-                    # 启用状态仍完整保留；新 AI 副本不再重复进入规则集。
-                    _attach_extracted_score_identity(conn, matching_edited, item)
-                    continue
-                if len(item_core) >= 4 and item_max is not None and (category, item_core, item_max) in preserved_score_keys:
-                    # 仅标题同名同分不足以判定同一事实。该分支保留原有兼容性，但只
-                    # 对同源/同结构规则生效，避免“证书评分”等泛标题误吞独立条款。
-                    compatible = any(
-                        str(row.get("category") or "") == category
-                        and _score_rule_max_value(row) == item_max
-                        and _score_rule_title_core(row.get("title")) == item_core
-                        and (_score_sources_compatible(row.get("source_text"), item.get("source_text"))
-                             or _score_scoring_structure_similar(_safe_scoring_json(row), _safe_scoring_json(item)))
-                        for row in preserved_score_rules
-                    )
-                    if compatible:
-                        continue
+            matching_edited = _matching_preserved_edited_rule(item, preserved_edited_rules)
+            if matching_edited is not None:
+                # 用户编辑的名称、检查口径、启用状态及取证策略保持不变；仅同步本轮
+                # 重新定位到的页码与条款 ID。这样“重新提取”不会产生编辑版 + AI 版。
+                _attach_extracted_rule_identity(conn, matching_edited, item)
+                continue
             if signature in signatures:
                 continue
             signatures.add(signature)
@@ -3341,27 +3319,72 @@ def _safe_scoring_json(rule: dict) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def _matching_preserved_score_rule(candidate: dict, preserved: list[dict]) -> dict | None:
-    """为已编辑评分规则寻找可证明同源的新候选。
+def _rule_title_identity(value: object, category: object = "") -> str:
+    """规则对象的稳定标题键，忽略章节导航与机器附注的条款编号。
 
-    仅接受稳定条款 ID 交集或招标原文同源两类确定性依据；标题相似、同分值都
-    不能单独作为“同一条款”的依据，避免覆盖人工维护的独立评分项。
+    该键只用于“标题对象是否一致”的第一道门，不能单独认定同一规则；后续仍要求
+    原文或条款 ID 同源，避免把不同的证书、参数或资格要求错误合并。
+    """
+    text = str(value or "")
+    # 模型会把锚点写成“（SC-37-2，35分）”一类尾注；它是来源索引而不是规则对象。
+    text = re.sub(
+        r"[（(]\s*[A-Za-z]{1,16}[A-Za-z0-9_#-]*(?:\s*[-_]\s*[A-Za-z0-9_#-]+)*(?:\s*[,，;；:]\s*\d+(?:\.\d+)?\s*分)?\s*[)）]\s*$",
+        "", text,
+    )
+    if str(category or "") in {"objective", "subjective"}:
+        return _score_rule_title_core(text)
+    text = re.sub(r"^\s*(?:(?:商务|技术|价格|服务|资格|符合性|实质性)部分|(?:资格性|符合性|实质性|废标|其他)审查)\s*[-—–:：_]\s*", "", text)
+    return re.sub(r"[\s\W_]+", "", text).casefold()
+
+
+def _rule_titles_compatible(left: object, right: object, category: object) -> bool:
+    first = _rule_title_identity(left, category)
+    second = _rule_title_identity(right, category)
+    if not first or not second:
+        return False
+    return first == second or (min(len(first), len(second)) >= 6 and (first in second or second in first))
+
+
+def _rule_candidates_same_fact(existing: dict, candidate: dict) -> bool:
+    """判断编辑规则与新候选是否可证明同一招标事实。
+
+    身份由“同分类、同对象、同源锚点”共同构成。评分规则还必须同满分，避免相同
+    对象在不同评分档位被错误吸收。该逻辑服务于重新提取落库，不依赖任何项目文本。
     """
     category = str(candidate.get("category") or "")
-    max_score = _score_rule_max_value(candidate)
-    candidate_ids = {str(item).strip() for item in candidate.get("source_clause_ids") or [] if str(item).strip()}
+    if category != str(existing.get("category") or ""):
+        return False
+    titles_compatible = _rule_titles_compatible(existing.get("title"), candidate.get("title"), category)
+    if category in {"objective", "subjective"}:
+        existing_max = _score_rule_max_value(existing)
+        candidate_max = _score_rule_max_value(candidate)
+        if existing_max is None or candidate_max is None or abs(existing_max - candidate_max) > 0.001:
+            return False
+        # 评分提取时标题常在“评分对象”和“材料名称”间切换；同分类、同满分、同一
+        # 段原文是比标题更强的同一事实证据。非评分规则不能采用这条宽松规则。
+        left_source = _normalise_rule_source(existing.get("source_text"))
+        right_source = _normalise_rule_source(candidate.get("source_text"))
+        if len(left_source) >= 20 and left_source == right_source:
+            return True
+    if not titles_compatible:
+        return False
+    existing_ids = _rule_source_clause_ids(existing)
+    candidate_ids = {str(value).strip() for value in candidate.get("source_clause_ids") or [] if str(value).strip()}
+    if existing_ids and candidate_ids and existing_ids & candidate_ids:
+        return True
+    source_left, source_right = existing.get("source_text"), candidate.get("source_text")
+    return _score_sources_compatible(source_left, source_right) or _score_sources_contain(source_left, source_right)
+
+
+def _matching_preserved_edited_rule(candidate: dict, preserved: list[dict]) -> dict | None:
+    """为已编辑规则寻找可证明同源的新候选，人工补充规则不参与自动匹配。"""
     for rule in preserved:
-        if str(rule.get("category") or "") != category or _score_rule_max_value(rule) != max_score:
-            continue
-        existing_ids = _rule_source_clause_ids(rule)
-        if candidate_ids and existing_ids and candidate_ids & existing_ids:
-            return rule
-        if _score_sources_compatible(rule.get("source_text"), candidate.get("source_text")):
+        if _rule_candidates_same_fact(rule, candidate):
             return rule
     return None
 
 
-def _attach_extracted_score_identity(conn, preserved: dict, candidate: dict) -> None:
+def _attach_extracted_rule_identity(conn, preserved: dict, candidate: dict) -> None:
     """把新一轮提取的稳定条款身份附回已编辑规则，保留用户可见内容。"""
     try:
         meta = json.loads(preserved.get("execution_meta_json") or "{}")
@@ -3427,7 +3450,14 @@ def confirm_rule_set(app, project_id: str) -> dict:
 
 def _score_rule_title_core(value: object) -> str:
     """预检用的评分对象名归一化：去分值括注与章节导航前缀，与提取去重口径一致。"""
-    text = re.sub(r"[（(][^()（）]*\d+(?:\.\d+)?\s*分[^()（）]*[)）]\s*$", "", str(value or ""))
+    text = str(value or "")
+    # “（SC-37-2，35分）”之类尾注是模型/分段提取附加的条款定位信息，不是评分
+    # 对象本身。先剥离它，才能把同一评分条款的带锚点/不带锚点副本稳定归并。
+    text = re.sub(
+        r"[（(]\s*[A-Za-z]{1,16}[A-Za-z0-9_#-]*(?:\s*[-_]\s*[A-Za-z0-9_#-]+)*(?:\s*[,，;；:]\s*\d+(?:\.\d+)?\s*分)?\s*[)）]\s*$",
+        "", text,
+    )
+    text = re.sub(r"[（(][^()（）]*\d+(?:\.\d+)?\s*分[^()（）]*[)）]\s*$", "", text)
     text = re.sub(r"(?:[-—–:：\s]*)(?:满分|最高(?:得)?分?)\s*\d+(?:\.\d+)?\s*分?", "", text)
     # 章节导航前缀必须带分隔符（如“商务部分-企业业绩评分”“技术部分：货物指标”）
     # 才剥离；“价格部分评分”“技术部分评分”这类以部分名开头的完整标题本身没有

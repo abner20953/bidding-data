@@ -6872,6 +6872,72 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(score_rules[0]["source_page"], 18)
         self.assertIn("score-cert-1", score_rules[0]["source_clause_ids"])
 
+    def test_reextract_reattaches_edited_non_score_rule_without_duplicate(self):
+        """非评分规则同样按同源条款重挂接，不能因改过取证策略而叠加一条 AI 副本。"""
+        storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-1", [{
+            "category": "qualification", "title": "营业执照",
+            "check_rule": "核验营业执照", "source_text": "投标人须提供有效的营业执照复印件。",
+            "source_clause_ids": ["Q-1"],
+        }])
+        _, initial = storage.list_rules(self.app, self.project["project_id"])
+        original = next(item for item in initial if item["source_type"] == "ai")
+        storage.update_rule(self.app, self.project["project_id"], original["rule_id"], {
+            "check_rule": "核验营业执照、统一社会信用代码及有效状态。",
+            "acquisition_preset": "smart", "image_mode": "auto",
+        })
+
+        storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-2", [{
+            "category": "qualification", "title": "资格性审查-营业执照",
+            "check_rule": "提供营业执照复印件并核验有效性。",
+            "source_text": "投标人须提供有效的营业执照复印件。",
+            "source_page": 12, "source_clause_ids": ["Q-1"],
+        }])
+
+        _, refreshed = storage.list_rules(self.app, self.project["project_id"])
+        rules = [item for item in refreshed if item["category"] == "qualification"]
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0]["source_type"], "ai_edited")
+        self.assertEqual(rules[0]["check_rule"], "核验营业执照、统一社会信用代码及有效状态。")
+        self.assertEqual(rules[0]["source_page"], 12)
+        self.assertIn("Q-1", rules[0]["source_clause_ids"])
+
+    def test_reextract_does_not_merge_edited_rules_from_shared_source_only(self):
+        """同一段原文中的不同要求必须并存，标题对象不同不能只因同源而被吞并。"""
+        storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-1", [{
+            "category": "qualification", "title": "营业执照",
+            "check_rule": "核验营业执照", "source_text": "投标人须提供营业执照和法定代表人身份证明。",
+        }])
+        _, initial = storage.list_rules(self.app, self.project["project_id"])
+        original = next(item for item in initial if item["source_type"] == "ai")
+        storage.update_rule(self.app, self.project["project_id"], original["rule_id"], {"check_rule": "核验营业执照有效性"})
+
+        storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-2", [{
+            "category": "qualification", "title": "法定代表人身份证明",
+            "check_rule": "核验法定代表人身份证明", "source_text": "投标人须提供营业执照和法定代表人身份证明。",
+        }])
+        _, refreshed = storage.list_rules(self.app, self.project["project_id"])
+        self.assertEqual(len([item for item in refreshed if item["category"] == "qualification"]), 2)
+
+    def test_score_title_core_ignores_trailing_machine_clause_marker(self):
+        self.assertEqual(
+            storage._score_rule_title_core("技术参数#与△指标响应得分（SC-37-2，35分）"),
+            storage._score_rule_title_core("技术参数#与△指标响应得分（35分）"),
+        )
+
+    def test_score_dedupe_merges_same_source_with_different_machine_clause_marker(self):
+        source = "技术参数中#项与△项每项响应得分，满分35分。"
+        rules = worker._dedupe_rule_candidates([{
+            "category": "objective", "title": "技术参数#与△指标响应得分（35分）",
+            "check_rule": "核验#与△项", "source_text": source,
+            "source_clause_ids": ["SC-37"], "scoring": {"max_score": 35},
+        }, {
+            "category": "objective", "title": "技术参数#与△指标响应得分（SC-37-2，35分）",
+            "check_rule": "核验#与△项响应", "source_text": source,
+            "source_clause_ids": ["SC-37-2"], "scoring": {"max_score": 35},
+        }])
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(set(rules[0]["source_clause_ids"]), {"SC-37", "SC-37-2"})
+
     def test_confirm_rule_set_blocks_declared_total_mismatch(self):
         """明示总分不守恒不能进入综合评审，避免错误总分传播。"""
         storage.add_rule(self.app, self.project["project_id"], {
