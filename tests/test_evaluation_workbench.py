@@ -1052,6 +1052,15 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(kept_after_overreach, rules)
         self.assertEqual(overreach_stats["failure_count"], 1)
 
+    def test_rule_cleanup_uses_one_global_stage_for_each_rule_set_size(self):
+        # 小规则集没有最终规范化，保留原质量门控；大规则集交给两轮最终规范化，
+        # 避免对同一候选再发一次语义相近的长输出调用。
+        self.assertFalse(worker._needs_pre_finalisation_quality_gate(0))
+        self.assertTrue(worker._needs_pre_finalisation_quality_gate(2))
+        self.assertTrue(worker._needs_pre_finalisation_quality_gate(worker.RULE_FINALISATION_MIN_RULES - 1))
+        self.assertFalse(worker._needs_pre_finalisation_quality_gate(worker.RULE_FINALISATION_MIN_RULES))
+        self.assertFalse(worker._needs_pre_finalisation_quality_gate(36))
+
     def test_final_rule_operations_rewrite_merge_and_drop_without_touching_scores(self):
         task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
         profile = storage.get_model_profile(self.app, None)
@@ -2100,7 +2109,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result["level"], "high")
 
-    def test_acquisition_validation_warns_when_score_total_differs_from_tender_declared(self):
+    def test_acquisition_validation_blocks_confirmation_when_score_total_differs_from_tender_declared(self):
         self._add_pdf("tender.pdf", "tender", "", "用于建立解析文件")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
         self._run_next_task()
@@ -2127,8 +2136,9 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(len(mismatch), 1)
         self.assertIn("100", mismatch[0]["message"])
         self.assertIn("80", mismatch[0]["message"])
-        # 确认不被该预检阻断
-        self.assertEqual(storage.confirm_rule_set(self.app, self.project["project_id"])["status"], "confirmed")
+        # 总分不守恒属于可由本地确定性校验识别的错误，不能进入综合评审。
+        with self.assertRaisesRegex(ValueError, "启用的评分规则满分合计"):
+            storage.confirm_rule_set(self.app, self.project["project_id"])
 
     def test_acquisition_validation_silent_when_score_total_matches_tender_declared(self):
         self._add_pdf("tender.pdf", "tender", "", "用于建立解析文件")
@@ -4547,6 +4557,57 @@ class EvaluationWorkbenchTests(unittest.TestCase):
                  "execution_strategy": "section"}
         self.assertEqual(worker._consistency_signal_chunks(chunks, [plain], per_rule_limit=2), [])
 
+    def test_form_date_consistency_packet_detects_stale_response_form_date(self):
+        chunks = [
+            {"chunk_id": "chunk_a", "start_page": 10, "end_page": 10, "text": (
+                "[第10页] 技术条款偏离表\n投标人：甲公司（盖章）\n日期：2012年6月8日"
+            )},
+            {"chunk_id": "chunk_b", "start_page": 20, "end_page": 20, "text": (
+                "[第20页] 投标函\n投标人：甲公司（盖章）\n日期：2026年7月31日"
+            )},
+            {"chunk_id": "chunk_c", "start_page": 30, "end_page": 30, "text": (
+                "[第30页] 执行标准：GB50343-2012；人员履历：2012年参加工作。"
+            )},
+        ]
+        packet = worker._form_date_consistency_packet(
+            chunks, {"_tender_response_dates": ["2026年7月31日"]},
+        )
+        self.assertEqual([item["date"] for item in packet["form_dates"]], ["2012年6月8日", "2026年7月31日"])
+        self.assertNotIn("GB50343-2012", json.dumps(packet, ensure_ascii=False))
+        self.assertIn("跨年异常", packet["reason"])
+
+    def test_form_date_observation_handles_long_form_signature_page_and_chinese_year(self):
+        chunks = [
+            {"chunk_id": "chunk_a", "text": "[第10页] 技术偏离表\n（中间有多页参数内容）"},
+            {"chunk_id": "chunk_b", "text": "[第18页] 投标人：甲公司（盖章）\n日期：二〇一二年"},
+            {"chunk_id": "chunk_c", "text": "[第30页] 投标函\n投标人：甲公司（盖章）\n日期：2026年7月31日"},
+        ]
+        packet = worker._form_date_consistency_packet(chunks, {"_tender_response_dates": ["2026年7月31日"]})
+        self.assertEqual([item["page"] for item in packet["form_dates"]], [18, 30])
+        self.assertEqual([item["year"] for item in packet["form_dates"]], [2012, 2026])
+
+    def test_form_date_guard_makes_missed_consistency_result_reviewable(self):
+        rule = {"rule_id": "r1", "title": "投标文件关键要素内部一致性",
+                "check_rule": "核对项目名称、金额、日期等关键要素前后一致", "execution_strategy": "consistency"}
+        packet = {
+            "reason": "固定响应表单的填写日期存在跨年异常，需与本项目时点及其他表单交叉核验。",
+            "form_dates": [
+                {"form": "技术条款偏离表", "page": 10, "date": "2012年6月8日"},
+                {"form": "投标函", "page": 20, "date": "2026年7月31日"},
+            ],
+        }
+        result = worker._apply_form_date_consistency_guard([{
+            "rule_id": "r1", "status": "satisfied", "evidence": "", "reason": "未见异常",
+            "conclusion_summary": "满足", "risk_level": "low", "confidence": "high",
+            "evidence_quality": "sufficient", "automation_status": "ready_for_batch_confirmation",
+            "requires_review": False,
+        }], [rule], packet)[0]
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["risk_level"], "medium")
+        self.assertTrue(result["requires_review"])
+        self.assertIn("2012年6月8日", result["evidence"])
+        self.assertIn("旧模板残留", result["review_reason"])
+
     def test_full_scan_context_adds_consistency_signal_chunks_only_for_normal_run(self):
         scan = {
             "chunks": [
@@ -5785,7 +5846,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
         self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v45")
 
-    def test_full_scan_reruns_rule_evidence_but_rechecks_previous_scope_candidate(self):
+    def test_full_scan_does_not_reinject_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")
         document.update({"text_length": 30_000, "parsed_path": str(self.temp_dir / "unused.txt")})
         chunk = {"chunk_id": "chunk_1", "start_page": 1, "end_page": 10,
@@ -5813,8 +5874,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             )
 
         scan_piece.assert_called_once()
-        self.assertEqual(result["scope_anomalies"][0]["evidence"], old_candidate["evidence"])
-        self.assertEqual(result["scope_anomalies"][0]["candidate_source"], "prior_scan")
+        # 历史模型的风险判断不能作为新一轮范围结论的输入；本轮未报告即为空。
+        self.assertEqual(result["scope_anomalies"], [])
 
     def test_full_scan_prompt_requires_topic_and_concrete_object_scope_checks(self):
         prompt = worker._full_scan_prompt(
@@ -6782,6 +6843,63 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(request_json.call_count, 2)
         self.assertEqual(results["r1"]["suggested_score"], 2)
         self.assertEqual(results["r2"]["suggested_score"], 1)
+
+    def test_reextract_reattaches_clause_identity_to_edited_score_rule(self):
+        """编辑后的规则可保留，但必须回到新一轮提取的稳定条款台账。"""
+        storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-1", [{
+            "category": "objective", "title": "认证材料评分",
+            "check_rule": "核验认证材料", "source_text": "投标人提供有效质量管理体系认证证书复印件的，得 5 分。",
+            "scoring": {"max_score": 5},
+        }])
+        _, initial_rules = storage.list_rules(self.app, self.project["project_id"])
+        original = next(item for item in initial_rules if item["source_type"] == "ai")
+        storage.update_rule(self.app, self.project["project_id"], original["rule_id"], {
+            "check_rule": "核验有效的质量管理体系认证材料，满足时得分。",
+        })
+
+        storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-2", [{
+            "category": "objective", "title": "管理体系认证得分",
+            "check_rule": "质量管理体系认证有效得 5 分",
+            "source_text": "投标人提供有效质量管理体系认证证书复印件的，得 5 分。",
+            "source_page": 18, "source_clause_ids": ["score-cert-1"],
+            "scoring": {"max_score": 5},
+        }])
+
+        _, refreshed = storage.list_rules(self.app, self.project["project_id"])
+        score_rules = [item for item in refreshed if item["category"] == "objective"]
+        self.assertEqual(len(score_rules), 1)
+        self.assertEqual(score_rules[0]["source_type"], "ai_edited")
+        self.assertEqual(score_rules[0]["source_page"], 18)
+        self.assertIn("score-cert-1", score_rules[0]["source_clause_ids"])
+
+    def test_confirm_rule_set_blocks_declared_total_mismatch(self):
+        """明示总分不守恒不能进入综合评审，避免错误总分传播。"""
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "技术评分",
+            "check_rule": "按技术方案评分", "source_text": "技术方案满分 90 分。",
+            "scoring": {"max_score": 90, "kind": "manual"},
+        })
+        with patch.object(storage, "_tender_declared_total_score", return_value=100):
+            with self.assertRaisesRegex(ValueError, "启用的评分规则满分合计"):
+                storage.confirm_rule_set(self.app, self.project["project_id"])
+
+    def test_task_fingerprint_changes_when_runtime_release_changes(self):
+        """未改提示词的逻辑修复也不能错误复用旧任务结果。"""
+        original_cache = storage._RUNTIME_CODE_CACHE
+        try:
+            storage._RUNTIME_CODE_CACHE = None
+            with patch.object(storage, "runtime_release_fingerprint", return_value="release-a"):
+                first = storage.task_input_fingerprint(
+                    self.app, self.project["project_id"], "extract_rules", None, worker.PROMPT_VERSION,
+                )
+            storage._RUNTIME_CODE_CACHE = None
+            with patch.object(storage, "runtime_release_fingerprint", return_value="release-b"):
+                second = storage.task_input_fingerprint(
+                    self.app, self.project["project_id"], "extract_rules", None, worker.PROMPT_VERSION,
+                )
+            self.assertNotEqual(first, second)
+        finally:
+            storage._RUNTIME_CODE_CACHE = original_cache
 
 
 if __name__ == "__main__":

@@ -67,6 +67,70 @@ _PREVIOUS_DEFAULT_EXTRACT_RULES_USER_SHA256 = "a4bb928f79c5e954c155a344ae817231a
 # 完全一致时才升级，任何人工编辑（哪怕一个字符）都会被保留。
 _V16_DEFAULT_EXTRACT_RULES_USER_SHA256 = "faca26909a0098c11c32ee238dbaa167e52c8bc85a767922abbdb87f9027cd29"
 _V16_DEFAULT_EXTRACT_RULES_CONTINUE_SHA256 = "922d2d7c6e8df3fa6851cd214d7e36d8949e5c02d194f9ad95850a78be5ba5d1"
+_RUNTIME_RELEASE_CACHE: str | None = None
+_RUNTIME_CODE_CACHE: str | None = None
+
+
+def runtime_release_fingerprint() -> str:
+    """返回当前运行代码的可公开版本标识，用于任务复现与缓存隔离。
+
+    部署脚本会写入 ``.deploy-commit``；本地开发则优先读取 Git HEAD。两者都不可用
+    时返回 ``unknown``。不调用 git 子进程，也不读取任何凭据。
+    """
+    global _RUNTIME_RELEASE_CACHE
+    if _RUNTIME_RELEASE_CACHE is not None:
+        return _RUNTIME_RELEASE_CACHE
+    value = str(os.environ.get("DEPLOY_COMMIT") or "").strip()[:40]
+    root = Path(__file__).resolve().parents[2]
+    if not value:
+        try:
+            value = (root / ".deploy-commit").read_text(encoding="utf-8").strip()[:40]
+        except OSError:
+            pass
+    if not value:
+        git_dir = root / ".git"
+        try:
+            if git_dir.is_file():
+                raw = git_dir.read_text(encoding="utf-8").strip()
+                if raw.startswith("gitdir:"):
+                    target = raw.split(":", 1)[1].strip()
+                    git_dir = (Path(target) if Path(target).is_absolute() else root / target).resolve()
+            head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+            if head.startswith("ref:"):
+                ref = head.split(":", 1)[1].strip()
+                value = (git_dir / ref).read_text(encoding="utf-8").strip()[:40]
+            else:
+                value = head[:40]
+        except OSError:
+            pass
+    _RUNTIME_RELEASE_CACHE = value or "unknown"
+    return _RUNTIME_RELEASE_CACHE
+
+
+def runtime_code_fingerprint() -> str:
+    """返回核心运行源码指纹，补足开发期未提交修改的缓存失效。
+
+    部署提交号便于人工追溯，但同一提交下的本地测试改动也会改变结果；这里只散列
+    工作台核心模块的源码，不读取业务文件、数据库、提示词覆盖或敏感配置。
+    """
+    global _RUNTIME_CODE_CACHE
+    if _RUNTIME_CODE_CACHE is not None:
+        return _RUNTIME_CODE_CACHE
+    root = Path(__file__).resolve().parents[2]
+    digest = hashlib.sha256(runtime_release_fingerprint().encode("utf-8"))
+    for relative in (
+        "dashboard/evaluation_workbench/storage.py",
+        "dashboard/evaluation_workbench/worker.py",
+        "dashboard/evaluation_workbench/ai_gateway.py",
+        "dashboard/evaluation_workbench/prompt_templates.py",
+        "dashboard/evaluation_workbench/local_ocr_gateway.py",
+    ):
+        try:
+            digest.update((root / relative).read_bytes())
+        except OSError:
+            digest.update(relative.encode("utf-8"))
+    _RUNTIME_CODE_CACHE = digest.hexdigest()
+    return _RUNTIME_CODE_CACHE
 
 
 def _validate_api_key_characters(api_key: str) -> None:
@@ -1384,6 +1448,10 @@ def task_input_fingerprint(app, project_id: str, task_type: str, profile_id: str
     uses_rules = task_type in {"review_documents", "score_objective", "score_subjective", "evaluate_all"}
     value = {
         "task_type": task_type,
+        # 代码逻辑变更同样会改变结果。此前只有提示词版本参与键，导致未改提示词的
+        # 修复可能错误复用旧任务结果，掩盖真实差异。
+        "runtime_release": runtime_release_fingerprint(),
+        "runtime_code": runtime_code_fingerprint(),
         "prompt_version": prompt_version,
         "documents": sorted((item["document_id"], item["sha256"], item.get("updated_at"), item.get("parse_status")) for item in documents if item["role"] in relevant_roles),
         "rule_set": (rule_set or {}).get("rule_set_id") if uses_rules else None,
@@ -3156,15 +3224,26 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
         conn.execute("UPDATE ew_rule_sets SET status = 'superseded', updated_at = ? WHERE project_id = ? AND status != 'superseded'", (timestamp, project_id))
         conn.execute("INSERT INTO ew_rule_sets(rule_set_id, project_id, version, status, source_task_id, created_at, updated_at) VALUES (:rule_set_id, :project_id, :version, :status, :source_task_id, :created_at, :updated_at)", rule_set)
         signatures = set()
+        # 编辑规则保留用户内容，但不能再把它们当作与新一轮提取无关的“孤岛”。
+        # 下面按确定性条款 ID 或同源原文重新挂接；无法可靠挂接时宁可同时保留并
+        # 在确认前阻断，也不基于标题相似度静默吞掉人工维护内容。
         preserved_score_keys = set()
+        preserved_score_rules: list[dict] = []
         preserved_rule_count = 0
         for index, row in enumerate(preserved):
+            row_value = dict(row)
             row_category = str(row["category"] or "")
-            if row_category in {"objective", "subjective"}:
+            if row_category in {"objective", "subjective"} and row["source_type"] == "ai_edited":
                 row_core = _score_rule_title_core(row["title"])
-                row_max = _score_rule_max_value(dict(row))
+                row_max = _score_rule_max_value(row_value)
                 if len(row_core) >= 4 and row_max is not None:
                     preserved_score_keys.add((row_category, row_core, row_max))
+            new_rule_id = str(uuid.uuid4())
+            # 后续与本轮候选挂接时必须指向新规则集中的记录，而不是已经 superseded
+            # 的旧 rule_id。
+            row_value["rule_id"] = new_rule_id
+            if row_category in {"objective", "subjective"} and row["source_type"] == "ai_edited":
+                preserved_score_rules.append(row_value)
             signature = (
                 row["category"], re.sub(r"\s+", "", row["title"]).casefold(),
                 re.sub(r"\s+", "", row["check_rule"] or row["title"]).casefold(),
@@ -3176,7 +3255,7 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
                 """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode,
                    source_type, source_task_id, scoring_json, execution_meta_json, enabled, sort_order, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (str(uuid.uuid4()), rule_set["rule_set_id"], row["category"], row["title"], row["check_rule"] or row["title"],
+                (new_rule_id, rule_set["rule_set_id"], row["category"], row["title"], row["check_rule"] or row["title"],
                  row["source_text"], row["source_page"], "ocr" if row["check_mode"] == "ocr" else "auto",
                  row["source_type"], row["source_task_id"], row["scoring_json"], row["execution_meta_json"],
                  int(bool(row["enabled"])), index, timestamp, timestamp),
@@ -3192,9 +3271,25 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
             if category in {"objective", "subjective"}:
                 item_core = _score_rule_title_core(title)
                 item_max = _score_rule_max_value(item)
-                if len(item_core) >= 4 and item_max is not None and (category, item_core, item_max) in preserved_score_keys:
-                    # 人工修改/补充过的同名同分评分规则已保留，跳过重复提取，避免重复计分。
+                matching_edited = _matching_preserved_score_rule(item, preserved_score_rules)
+                if matching_edited is not None:
+                    # 将本轮稳定条款 ID 回填到保留规则。用户编辑的标题、检查口径、
+                    # 启用状态仍完整保留；新 AI 副本不再重复进入规则集。
+                    _attach_extracted_score_identity(conn, matching_edited, item)
                     continue
+                if len(item_core) >= 4 and item_max is not None and (category, item_core, item_max) in preserved_score_keys:
+                    # 仅标题同名同分不足以判定同一事实。该分支保留原有兼容性，但只
+                    # 对同源/同结构规则生效，避免“证书评分”等泛标题误吞独立条款。
+                    compatible = any(
+                        str(row.get("category") or "") == category
+                        and _score_rule_max_value(row) == item_max
+                        and _score_rule_title_core(row.get("title")) == item_core
+                        and (_score_sources_compatible(row.get("source_text"), item.get("source_text"))
+                             or _score_scoring_structure_similar(_safe_scoring_json(row), _safe_scoring_json(item)))
+                        for row in preserved_score_rules
+                    )
+                    if compatible:
+                        continue
             if signature in signatures:
                 continue
             signatures.add(signature)
@@ -3234,6 +3329,60 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
     return rule_set
 
 
+def _safe_scoring_json(rule: dict) -> dict:
+    """读取评分结构；损坏的历史 JSON 视为空结构，绝不影响重新提取。"""
+    value = rule.get("scoring") if isinstance(rule, dict) else None
+    if isinstance(value, dict):
+        return value
+    try:
+        value = json.loads((rule or {}).get("scoring_json") or "{}")
+    except (AttributeError, TypeError, json.JSONDecodeError):
+        value = {}
+    return value if isinstance(value, dict) else {}
+
+
+def _matching_preserved_score_rule(candidate: dict, preserved: list[dict]) -> dict | None:
+    """为已编辑评分规则寻找可证明同源的新候选。
+
+    仅接受稳定条款 ID 交集或招标原文同源两类确定性依据；标题相似、同分值都
+    不能单独作为“同一条款”的依据，避免覆盖人工维护的独立评分项。
+    """
+    category = str(candidate.get("category") or "")
+    max_score = _score_rule_max_value(candidate)
+    candidate_ids = {str(item).strip() for item in candidate.get("source_clause_ids") or [] if str(item).strip()}
+    for rule in preserved:
+        if str(rule.get("category") or "") != category or _score_rule_max_value(rule) != max_score:
+            continue
+        existing_ids = _rule_source_clause_ids(rule)
+        if candidate_ids and existing_ids and candidate_ids & existing_ids:
+            return rule
+        if _score_sources_compatible(rule.get("source_text"), candidate.get("source_text")):
+            return rule
+    return None
+
+
+def _attach_extracted_score_identity(conn, preserved: dict, candidate: dict) -> None:
+    """把新一轮提取的稳定条款身份附回已编辑规则，保留用户可见内容。"""
+    try:
+        meta = json.loads(preserved.get("execution_meta_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    prior_ids = [str(item).strip() for item in meta.get("source_clause_ids") or [] if str(item).strip()]
+    candidate_ids = [str(item).strip() for item in candidate.get("source_clause_ids") or [] if str(item).strip()]
+    meta["source_clause_ids"] = list(dict.fromkeys([*prior_ids, *candidate_ids]))
+    source_page = preserved.get("source_page")
+    if not isinstance(source_page, int) and isinstance(candidate.get("source_page"), int):
+        source_page = candidate["source_page"]
+    conn.execute(
+        "UPDATE ew_rules SET source_page=?, execution_meta_json=?, updated_at=? WHERE rule_id=?",
+        (source_page, json.dumps(meta, ensure_ascii=False), now_iso(), preserved["rule_id"]),
+    )
+    preserved["source_page"] = source_page
+    preserved["execution_meta_json"] = json.dumps(meta, ensure_ascii=False)
+
+
 def confirm_rule_set(app, project_id: str) -> dict:
     rule_set = current_rule_set(app, project_id)
     if not rule_set:
@@ -3245,6 +3394,19 @@ def confirm_rule_set(app, project_id: str) -> dict:
     # 确认前把“同一计分事实被评分表不同章节/截断副本重复成多条”的评分规则安全合并，
     # 避免重复计分导致总分虚高；只停用次规则、保留信息更全者，不删除记录。
     merge_draft_score_rule_duplicates(app, rule_set["rule_set_id"])
+    # 评分规则不是普通提示项：若招标文件已明确总分，而当前启用规则无法守恒，
+    # 继续确认会把错误直接带入所有投标人的总分。只阻断“重复/总分/叶子截断”
+    # 这三类可由本地确定性校验识别的问题；图片能力、OCR 可用性等仍保持 warning。
+    validation = rule_set_acquisition_validation(app, project_id)
+    blockers = [
+        item for item in validation.get("issues", [])
+        if item.get("code") in {"duplicate_score_rule", "score_total_mismatch", "score_leaf_total_below"}
+    ]
+    if blockers:
+        details = "；".join(str(item.get("message") or "评分规则校验失败") for item in blockers[:3])
+        if len(blockers) > 3:
+            details += f"；另有{len(blockers) - 3}项"
+        raise ValueError(f"当前评分规则集未通过确认校验：{details}")
     with connection(app) as conn:
         count = conn.execute("SELECT COUNT(*) FROM ew_rules WHERE rule_set_id = ? AND enabled = 1", (rule_set["rule_set_id"],)).fetchone()[0]
         if not count:
@@ -3565,7 +3727,9 @@ _TENDER_TOTAL_SCORE_PATTERNS = (
 )
 
 _HARD_TENDER_ANCHOR_GROUPS = (
-    ("投标有效期", ("投标有效期", "90日历天", "90 日历天", "90个日历天")),
+    # 期限数值必须由当前招标原文解释，不能把某个项目常见的 90 日历天写成
+    # 通用锚点；这里只负责发现“投标有效期”这一类条款是否被规则承接。
+    ("投标有效期", ("投标有效期",)),
     ("联合体", ("联合体", "联合投标")),
     ("法定代表人/授权委托", ("法定代表人身份证明", "授权委托书", "法定代表人证明")),
     ("串通投标", ("串通投标", "串通")),

@@ -48,6 +48,28 @@ COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v3"
 COMPARE_AI_BATCH_SIZE = 8
 
 
+def _task_execution_metadata(app, task: dict, profile: dict | None = None) -> dict:
+    """记录足以解释一次结果差异的公开运行指纹，不记录提示正文或任何密钥。"""
+    active_profile = profile or {}
+    return {
+        "runtime_release": storage.runtime_release_fingerprint(),
+        "runtime_code": storage.runtime_code_fingerprint(),
+        "prompt_version": PROMPT_VERSION,
+        "prompt_templates": storage.task_prompt_template_fingerprint(app, str(task.get("task_type") or "")),
+        "input_fingerprint": str((task.get("payload") or {}).get("input_fingerprint") or ""),
+        "model": {
+            "profile_id": active_profile.get("profile_id"),
+            "model_name": active_profile.get("model_name"),
+            "updated_at": active_profile.get("updated_at"),
+            "thinking_mode": active_profile.get("thinking_mode"),
+        } if active_profile else {},
+        "ocr_pipeline": {
+            "local_parser_version": LOCAL_OCR_PARSER_VERSION,
+            "tencent_parser_version": OCR_PARSER_VERSION,
+        },
+    }
+
+
 class _EvaluationRequestGate:
     """规则提取/综合评审的模型请求闸门；稳定时按档案上限升档，限流时逐级回退。"""
 
@@ -2079,6 +2101,11 @@ RULE_QUALITY_GATE_REASONS = {
 _EXPLICIT_SCORE_TEXT_PATTERN = re.compile(r"(?:满分|最高(?:得)?分|得\s*\d+(?:\.\d+)?\s*分|每.{0,20}\d+(?:\.\d+)?\s*分|扣\s*\d+(?:\.\d+)?\s*分|分值)")
 
 
+def _needs_pre_finalisation_quality_gate(rule_count: int) -> bool:
+    """小规则集没有最终规范化时，才保留旧质量门控作为唯一全局整理。"""
+    return rule_count < RULE_FINALISATION_MIN_RULES and rule_count >= RULE_QUALITY_GATE_MIN_RULES
+
+
 def _quality_gate_rule_packet(items: list[dict], *, include_ids: bool) -> str:
     """构造小而完整的最终审计输入；限制单字段长度，但绝不截断规则数组。"""
     values = []
@@ -2509,9 +2536,36 @@ def _extract_rules(app, task: dict) -> dict:
     mapped_candidates = [
         item for item in raw_rules if isinstance(item, dict) and str(item.get("title", "")).strip()
         and isinstance(item.get("category"), str)
-        and item.get("category") in {"qualification", "compliance", "substantive", "rejection", "objective", "subjective"}
+        and item.get("category") in {"qualification", "compliance", "substantive", "rejection", "objective", "subjective", "other"}
     ]
     mapped_candidates = _filter_rules_for_package(mapped_candidates, package_number)
+    # 硬性条款补漏属于候选生成，不属于最终结果补丁。必须在统一编译前加入，
+    # 让它经历同一套语义去重、覆盖审计和最终边界整理，避免同一事实在尾部绕过治理。
+    hard_anchor_supplement_count = hard_anchor_supplement_failures = 0
+    hard_gaps = _hard_tender_anchor_gaps(mapped_candidates, text)
+    if hard_gaps:
+        storage.update_task(app, task["task_id"], message="正在核验硬性条款覆盖并补充遗漏项")
+        try:
+            supplement = _request_task_json(
+                app, task, profile, "extract_rules_hard_anchor_supplement", system_prompt,
+                _hard_anchor_supplement_prompt(app, hard_gaps, mapped_candidates),
+                document_id=tender["document_id"], context_mode="hard_anchor_coverage",
+                max_tokens=_output_token_budget(profile, 3_500), thinking_mode="disabled",
+            )
+            supplement_rules = supplement.get("rules") if isinstance(supplement, dict) else None
+            if isinstance(supplement_rules, list):
+                kept = [
+                    item for item in supplement_rules if isinstance(item, dict)
+                    and str(item.get("title", "")).strip()
+                    and item.get("category") in {"qualification", "compliance", "substantive", "rejection", "other"}
+                ]
+                kept = _filter_rules_for_package(kept, package_number)
+                before = len(_dedupe_rule_candidates(mapped_candidates))
+                mapped_candidates = _dedupe_rule_candidates([*mapped_candidates, *kept])
+                hard_anchor_supplement_count = max(0, len(mapped_candidates) - before)
+        except ValueError as exc:
+            hard_anchor_supplement_failures = 1
+            storage.update_task(app, task["task_id"], message=f"部分硬性条款补充未完成：{exc}")
     compilation_failure_count = 0
     try:
         candidates, coverage_missing_rules, compilation_used = _compile_rule_candidates(
@@ -2552,9 +2606,18 @@ def _extract_rules(app, task: dict) -> dict:
     # 的父子重叠消除，避免同一评分事实被综合评审重复执行和重复计分。
     rules = _prune_overlapping_score_aggregates(rules)
     rules = _filter_inapplicable_template_rules(_filter_rules_for_package(rules, package_number), text)
-    rules, quality_gate = _final_rule_quality_gate(
-        app, task, profile, system_prompt, rules, score_packets,
-    )
+    # 大规则集后续已执行两轮、可追溯的最终规范化（文件边界与重复归并）；
+    # 不再额外叠加语义相近的质量门控，减少一次长输出模型调用。小规则集仍保留
+    # 质量门控，确保没有最终规范化时不降低原有清理能力。
+    if _needs_pre_finalisation_quality_gate(len(rules)):
+        rules, quality_gate = _final_rule_quality_gate(
+            app, task, profile, system_prompt, rules, score_packets,
+        )
+    else:
+        quality_gate = {
+            "applied": False, "dropped_count": 0, "failure_count": 0,
+            "recovered_score_count": 0, "skipped_by_finalisation": True,
+        }
     rules, finalisation = _finalise_rule_operations(
         app, task, profile, system_prompt, rules,
     )
@@ -2564,34 +2627,6 @@ def _extract_rules(app, task: dict) -> dict:
     # 错压缩进普通技术覆盖项。仅在三项原文条件同时存在、且规则集尚未承接时补一条；
     # 不对一般技术参数、格式★或只有交叉引用的条款做任何推断。
     rules = _ensure_technical_star_requirement_rule(rules, text, package_number)
-    # 硬性条款覆盖补漏：招标文本出现法律/政策硬性条款而规则集未覆盖时，
-    # 用小上下文定向补提，使“提取完整”在流程内部闭环，不依赖事后人工检查。
-    hard_anchor_supplement_count = hard_anchor_supplement_failures = 0
-    hard_gaps = _hard_tender_anchor_gaps(rules, text)
-    if hard_gaps:
-        storage.update_task(app, task["task_id"], message="正在核验硬性条款覆盖并补充遗漏项")
-        try:
-            supplement = _request_task_json(
-                app, task, profile, "extract_rules_hard_anchor_supplement", system_prompt,
-                _hard_anchor_supplement_prompt(app, hard_gaps, rules),
-                document_id=tender["document_id"], context_mode="hard_anchor_coverage",
-                max_tokens=_output_token_budget(profile, 3_500), thinking_mode="disabled",
-            )
-            supplement_rules = supplement.get("rules") if isinstance(supplement, dict) else None
-            if isinstance(supplement_rules, list):
-                kept = [
-                    item for item in supplement_rules if isinstance(item, dict)
-                    and str(item.get("title", "")).strip()
-                    and item.get("category") in {"qualification", "compliance", "substantive", "rejection", "other"}
-                ]
-                kept = _filter_rules_for_package(kept, package_number)
-                before = len(rules)
-                rules = _dedupe_rule_candidates([*rules, *kept])
-                rules = _filter_inapplicable_template_rules(rules, text)
-                hard_anchor_supplement_count = max(0, len(rules) - before)
-        except ValueError as exc:
-            hard_anchor_supplement_failures = 1
-            storage.update_task(app, task["task_id"], message=f"部分硬性条款补充未完成：{exc}")
     # 评分结构定向修复：叶子合计低于满分的评分规则自动重提修正，避免“4.5 vs 6”
     # 这类截断错误带着残缺分值进入待确认规则集。
     score_structure_repair_count = score_structure_repair_failures = 0
@@ -2660,6 +2695,7 @@ def _extract_rules(app, task: dict) -> dict:
             "quality_gate_dropped_count": quality_gate["dropped_count"],
             "quality_gate_failure_count": quality_gate["failure_count"],
             "quality_gate_recovered_score_count": quality_gate["recovered_score_count"],
+            "quality_gate_skipped_by_finalisation": bool(quality_gate.get("skipped_by_finalisation")),
             "hard_anchor_supplement_count": hard_anchor_supplement_count,
             "hard_anchor_supplement_failure_count": hard_anchor_supplement_failures,
             "score_structure_repair_count": score_structure_repair_count,
@@ -2669,7 +2705,8 @@ def _extract_rules(app, task: dict) -> dict:
             "finalisation_rewritten_count": finalisation["rewritten_count"],
             "finalisation_merged_count": finalisation["merged_count"],
             "finalisation_failure_count": finalisation["failure_count"],
-            "preserved_rule_count": rule_set.get("preserved_rule_count", 0), "split_retry_count": split_retry_count}
+            "preserved_rule_count": rule_set.get("preserved_rule_count", 0), "split_retry_count": split_retry_count,
+            "execution_metadata": _task_execution_metadata(app, task, profile)}
 
 
 def _review_documents(app, task: dict) -> dict:
@@ -3892,7 +3929,6 @@ FULL_SCAN_CHUNK_CHARS = 14_000
 # 首轮只建立候选证据索引：每个页块携带一次完整的精简规则目录。正常情况下
 # 不再形成“页块 × 规则批次”的矩阵；若模型确实输出超长，才仅拆规则目录一次。
 FULL_SCAN_CATALOG_RULE_CHARS = 220
-SCOPE_ANOMALY_CACHE_VERSION = "scope-anomaly-candidates-v1"
 EVIDENCE_MANIFEST_VERSION = "page-chunks-v1"
 # 二次复核上下文上限。全文首轮已覆盖所有页面，此处只装入候选证据和重点原文。
 EVALUATION_BATCH_CONTEXT_CHARS = 64_000
@@ -4733,6 +4769,7 @@ def _scan_document_fulltext(app, task: dict, profile: dict, document: dict, rule
     catalog = _full_scan_catalog(rules)
     scan_key = hashlib.sha256(json.dumps({
         "version": PROMPT_VERSION,
+        "runtime_release": storage.runtime_release_fingerprint(),
         # 全文扫描只绑定它实际使用的系统指令、扫描模板、规则目录和范围画像。
         # 这样修改最终评分/展示提示词时可复用已完成的全文证据扫描，不减少任何页块。
         # 强制重跑仍代表用户要求重新获得模型扫描判断，不能复用旧页块扫描结果。
@@ -4741,13 +4778,6 @@ def _scan_document_fulltext(app, task: dict, profile: dict, document: dict, rule
         "catalog": catalog, "project_scope": project_scope,
         "system": system_prompt,
         "template": storage.prompt_template(app, "evaluate_all_full_scan_user"),
-    }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
-    # 范围候选的稳定缓存不绑定评审规则目录。规则变化仍会重新生成规则证据，但不会
-    # 让同一原文中已经发现的高价值范围线索消失；候选会在最终规则中重新判断。
-    scope_scan_key = hashlib.sha256(json.dumps({
-        "version": SCOPE_ANOMALY_CACHE_VERSION,
-        "project_scope": project_scope,
-        "scope_guidance": storage.prompt_template(app, "evaluate_all_scope_anomaly_guidance"),
     }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
     findings: list[dict] = []
     scope_anomalies: list[dict] = []
@@ -4763,48 +4793,28 @@ def _scan_document_fulltext(app, task: dict, profile: dict, document: dict, rule
         for index, chunk in enumerate(chunks):
             chunk_hash = hashlib.sha256(str(chunk.get("text") or "").encode("utf-8")).hexdigest()
             checkpoint = storage.get_evaluation_scan_checkpoint(app, document["document_id"], scan_key, chunk["chunk_id"], chunk_hash)
-            stable_scope = storage.get_evaluation_scan_checkpoint(
-                app, document["document_id"], scope_scan_key, chunk["chunk_id"], chunk_hash,
-            )
-            stable_candidates = stable_scope.get("scope_anomalies", []) if isinstance(stable_scope, dict) else []
-            historical_candidates = storage.previous_scope_anomalies(
-                app, document["document_id"],
-                int(chunk.get("start_page") or 0), int(chunk.get("end_page") or 0),
-            )
-            chunk_text_compact = re.sub(r"\s+", "", str(chunk.get("text") or ""))
-            historical_candidates = [
-                item for item in historical_candidates
-                if _scope_candidate_evidence_visible(item, chunk_text_compact)
-            ]
             if checkpoint is not None:
-                # 兼容 v3 已落库的纯 findings 检查点，避免升级时浪费一次扫描。
+                # 只复用完全相同扫描键的当前结果；不再从其他历史任务回收带风险
+                # 判断的候选，避免一次误报长期影响后续项目复跑。
                 if isinstance(checkpoint, list):
-                    value = {"findings": checkpoint, "scope_anomalies": _merge_scope_anomalies([], stable_candidates + historical_candidates)}
+                    value = {"findings": checkpoint, "scope_anomalies": []}
                 elif isinstance(checkpoint, dict):
-                    value = {"findings": checkpoint.get("findings") or [], "scope_anomalies": _merge_scope_anomalies(
-                        checkpoint.get("scope_anomalies") or [], stable_candidates + historical_candidates,
-                    )}
+                    value = {"findings": checkpoint.get("findings") or [], "scope_anomalies": checkpoint.get("scope_anomalies") or []}
                 else:
                     value = {"findings": [], "scope_anomalies": []}
                 per_chunk[index] = (value, [])
                 continue
             futures[executor.submit(
                 _run_full_scan_piece, app, task, profile, document, catalog, chunk, project_scope, system_prompt,
-            )] = (index, chunk, chunk_hash, stable_candidates, historical_candidates)
+            )] = (index, chunk, chunk_hash)
         for future in as_completed(futures):
-            index, chunk, chunk_hash, stable_candidates, historical_candidates = futures[future]
+            index, chunk, chunk_hash = futures[future]
             result = future.result()
-            merged_scope = _merge_scope_anomalies(
-                result[0]["scope_anomalies"], stable_candidates + historical_candidates,
-            )
+            merged_scope = _merge_scope_anomalies(result[0]["scope_anomalies"], [])
             result[0]["scope_anomalies"] = merged_scope
             compact_retry_count += result[1]
             split_retry_count += result[2]
             if not result[3]:
-                storage.save_evaluation_scan_checkpoint(
-                    app, task["project_id"], document["document_id"], scope_scan_key,
-                    chunk["chunk_id"], chunk_hash, {"scope_anomalies": merged_scope},
-                )
                 storage.save_evaluation_scan_checkpoint(
                     app, task["project_id"], document["document_id"], scan_key, chunk["chunk_id"], chunk_hash, result[0],
                 )
@@ -5253,6 +5263,204 @@ _CONSISTENCY_VALUE_SIGNAL_PATTERNS = (
 )
 
 
+# “日期”在标准编号、履历、合同和证照中都很常见。这里不直接全局搜索年份，而是
+# 只收集固定响应表单中、与落款/签署位置相邻的日期；这既能发现旧模板残留，又不会
+# 把 GB 编号、人员经历或历史业绩误作本项目填写日期。
+_RESPONSE_FORM_DATE_HEADINGS = re.compile(
+    r"偏离表|响应表|投标函|报价函|授权委托书|法定代表人(?:（单位负责人）)?身份证明|"
+    r"承诺函|声明函|开标一览表|报价表"
+)
+_RESPONSE_FORM_DATE_LABEL = re.compile(r"日期|落款|投标人|供应商|法定代表人|授权代表|签字|签章|盖章")
+_RESPONSE_FORM_DATE_VALUE = re.compile(
+    r"(?<![A-Za-z0-9])((?:(?:19|20)\d{2}|[〇○零一二三四五六七八九]{4})"
+    r"(?:\s*(?:年|[./-])\s*\d{1,2}(?:\s*(?:月|[./-])\s*\d{1,2}\s*日?)?|\s*年))"
+)
+_FORM_DATE_EXCLUSION = re.compile(
+    r"GB(?:/T)?\s*[-－]?\d|标准|规范|出生|成立时间|经营期限|毕业|任职|履历|业绩|合同|"
+    r"生产日期|出厂日期|设备|仪器",
+    re.IGNORECASE,
+)
+
+
+def _response_date_year(value: object) -> int | None:
+    """归一阿拉伯/中文数字年份；仅供日期差异的本地证据定位。"""
+    match = re.match(r"\s*((?:19|20)\d{2}|[〇○零一二三四五六七八九]{4})", str(value or ""))
+    if not match:
+        return None
+    year = match.group(1)
+    if year.isdigit():
+        return int(year)
+    mapping = str.maketrans({"〇": "0", "○": "0", "零": "0", "一": "1", "二": "2", "三": "3", "四": "4", "五": "5", "六": "6", "七": "7", "八": "8", "九": "9"})
+    normalized = year.translate(mapping)
+    return int(normalized) if normalized.isdigit() else None
+
+
+def _form_date_page_fragments(chunks: list[dict]):
+    """按真实页码拆开连续页块，供固定表单日期定位复用。"""
+    marker = re.compile(r"\[第(\d+)页\]")
+    for chunk in chunks:
+        text = str(chunk.get("text") or "")
+        markers = list(marker.finditer(text))
+        if not markers:
+            yield chunk, None, text, 0
+            continue
+        for index, current in enumerate(markers):
+            end = markers[index + 1].start() if index + 1 < len(markers) else len(text)
+            yield chunk, int(current.group(1)), text[current.end():end], current.end()
+
+
+def _form_date_kind(text: str) -> str:
+    """给固定表单日期一个可读类别；类别仅说明取证位置，不参与业务裁断。"""
+    match = _RESPONSE_FORM_DATE_HEADINGS.search(text)
+    return match.group(0) if match else "固定响应表单续页"
+
+
+def _response_form_date_observations(chunks: list[dict], *, limit: int = 16) -> list[dict]:
+    """本地提取固定响应表单的落款日期候选，避免模型抽样遗漏关键的旧模板日期。
+
+    只在表单标题页或其后两页中收集，且日期周边必须出现落款/签署标签；裸年份、
+    标准号和履历年份均被排除。结果是证据线索而非自动废标结论。
+    """
+    values: list[dict] = []
+    seen: set[tuple[str, int | None, str]] = set()
+    trailing_form_pages = 0
+    for chunk, page, body, body_offset in _form_date_page_fragments(chunks):
+        heading_match = _RESPONSE_FORM_DATE_HEADINGS.search(body)
+        signature_page = bool(re.search(r"日期|落款", body) and re.search(r"投标人|供应商|签字|签章|盖章|法定代表人|授权代表", body))
+        if heading_match:
+            trailing_form_pages = 2
+        elif signature_page:
+            # 长偏离表的末页经常只保留“投标人（盖章）/日期”而不重复表头；以
+            # 签署字段组合识别为固定表单续页，避免两页窗口漏掉真正的落款。
+            trailing_form_pages = 0
+        elif trailing_form_pages > 0:
+            trailing_form_pages -= 1
+        else:
+            continue
+        form_kind = _form_date_kind(body)
+        for match in _RESPONSE_FORM_DATE_VALUE.finditer(body):
+            local_start = max(0, match.start() - 180)
+            local_end = min(len(body), match.end() + 180)
+            context = body[local_start:local_end]
+            # 仅收集签署/落款邻域中的填写日期，避免一张表内列举的历史项目日期混入。
+            if not _RESPONSE_FORM_DATE_LABEL.search(context) or _FORM_DATE_EXCLUSION.search(context):
+                continue
+            value = re.sub(r"\s+", "", match.group(1))
+            year = _response_date_year(value)
+            if year is None:
+                continue
+            signature = (str(chunk.get("chunk_id") or ""), page, value)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            values.append({
+                "chunk_id": str(chunk.get("chunk_id") or ""),
+                "page": page,
+                "form": form_kind,
+                "date": value,
+                "year": year,
+                "offset": body_offset + match.start(),
+                "evidence": _clean_model_text(context)[:220],
+            })
+            if len(values) >= limit:
+                return values
+    return values
+
+
+def _tender_response_date_references(text: object, *, limit: int = 8) -> list[str]:
+    """从招标文件的公告/开标/递交等时点中提取项目日期参照，不读取历史材料日期。"""
+    value = str(text or "")
+    references: list[str] = []
+    for match in _RESPONSE_FORM_DATE_VALUE.finditer(value):
+        context = value[max(0, match.start() - 120):match.end() + 120]
+        if not re.search(r"投标(?:截止|文件)|开标|递交|公告|发售|获取|响应文件", context):
+            continue
+        if _FORM_DATE_EXCLUSION.search(context):
+            continue
+        date = re.sub(r"\s+", "", match.group(1))
+        if date not in references:
+            references.append(date)
+        if len(references) >= limit:
+            break
+    return references
+
+
+def _form_date_consistency_packet(chunks: list[dict], project_scope: dict) -> dict:
+    """构造固定表单时点的一致性证据包，并只在存在可复核差异时交给最终审查。"""
+    observations = _response_form_date_observations(chunks)
+    if not observations:
+        return {}
+    tender_dates = list(project_scope.get("_tender_response_dates") or []) if isinstance(project_scope, dict) else []
+    tender_years = {year for value in tender_dates if (year := _response_date_year(value)) is not None}
+    years = {int(item["year"]) for item in observations}
+    # 同一响应文件的固定表单落款年份不同，就应作为可复核候选：跨自然年可能确有
+    # 合理原因，但也可能是旧模板残留，因此只提示人工复核，绝不在此直接定性。
+    divergent_years = len(years) >= 2
+    tender_outlier = bool(tender_years and any(
+        year < min(tender_years) - 1 or year > max(tender_years) + 1 for year in years
+    ))
+    if not divergent_years and not tender_outlier:
+        return {}
+    return {
+        "tender_reference_dates": tender_dates,
+        "form_dates": observations,
+        "reason": "固定响应表单的填写日期存在跨年异常，需与本项目时点及其他表单交叉核验。",
+    }
+
+
+def _apply_form_date_consistency_guard(results: list[dict], rules: list[dict], packet: dict) -> list[dict]:
+    """将已确定的固定表单日期差异写入一致性结论，避免模型偶发漏回该事实。
+
+    这不是以年份或项目为条件的业务补丁：仅在本地已识别到固定表单落款跨年异常时，
+    对原本就要求核对日期一致性的规则补充可复核事实；不改变任何废标或评分结论。
+    """
+    if not packet:
+        return results
+    consistency_ids = {
+        str(rule.get("rule_id") or "") for rule in rules
+        if _rule_execution_strategy(rule) == "consistency"
+        and any(token in " ".join(str(rule.get(key) or "") for key in ("title", "check_rule"))
+                for token in ("日期", "时点", "关键要素", "一致"))
+    }
+    if not consistency_ids:
+        return results
+    facts = []
+    for item in packet.get("form_dates") or []:
+        page = item.get("page")
+        facts.append(f"{item.get('form') or '固定表单'}第{page or '?'}页落款为{item.get('date')}")
+    if not facts:
+        return results
+    evidence = "；".join(facts[:8])
+    reason = str(packet.get("reason") or "固定响应表单日期需交叉核验。")
+    updated: list[dict] = []
+    for item in results:
+        if str(item.get("rule_id") or "") not in consistency_ids:
+            updated.append(item)
+            continue
+        current_status = str(item.get("status") or "manual")
+        # 仅凭日期差异不直接定性为无效；将“满足”回落为待复核，原有更强的否定结论保留。
+        status = "partial" if current_status == "satisfied" else current_status
+        merged_evidence = _merge_supplement_text(str(item.get("evidence") or ""), evidence, limit=2000)
+        merged_reason = _merge_reason_text(reason, str(item.get("reason") or ""), limit=2000)
+        summary = str(item.get("conclusion_summary") or "")
+        if not summary or current_status == "satisfied":
+            summary = "发现固定响应表单日期跨年差异，需重点复核。"
+        updated.append({
+            **item,
+            "status": status,
+            "evidence": merged_evidence,
+            "reason": merged_reason,
+            "conclusion_summary": summary,
+            "risk_level": "medium" if item.get("risk_level") == "low" else item.get("risk_level"),
+            "confidence": "high",
+            "evidence_quality": "sufficient",
+            "automation_status": "needs_review",
+            "requires_review": True,
+            "review_reason": "固定响应表单的落款日期存在可复核差异，需人工确认是否为旧模板残留。",
+        })
+    return updated
+
+
 def _consistency_signal_chunks(chunks: list[dict], rules: list[dict], per_rule_limit: int = 2) -> list[str]:
     """为关键要素/口径一致性规则补充“承诺性数值/日期信号页”。
 
@@ -5267,7 +5475,16 @@ def _consistency_signal_chunks(chunks: list[dict], rules: list[dict], per_rule_l
     if not consistency_count:
         return []
     limit = max(1, per_rule_limit * consistency_count)
+    # 有明确跨年差异时，固定表单日期页优先进入最终上下文。这里最多额外保留四个
+    # 页块，避免把一致性核验退化为全文重发，也避免早期通用数值页挤掉真正的落款页。
+    temporal = _form_date_consistency_packet(chunks, {})
     extra: list[str] = []
+    for item in temporal.get("form_dates", []):
+        chunk_id = str(item.get("chunk_id") or "")
+        if chunk_id and chunk_id not in extra:
+            extra.append(chunk_id)
+        if len(extra) >= min(4, max(limit, 1)):
+            break
     for chunk in chunks:
         text = str(chunk.get("text") or "")
         if not text.strip():
@@ -5310,6 +5527,20 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
         unique_findings.append(item)
     findings = unique_findings
     strategy = _scan_strategy(rules)
+    # 对固定响应表单落款日期建立独立证据包。它只在本地存在跨年差异时出现，
+    # 不改变普通规则上下文，也不依赖全文扫描模型恰好回收该页。
+    form_date_packet = _form_date_consistency_packet(
+        scan.get("chunks", []), scan.get("project_scope", {}) if isinstance(scan.get("project_scope"), dict) else {},
+    ) if strategy == "consistency" else {}
+    form_date_chunk_ids: list[str] = []
+    form_date_offsets: dict[str, int] = {}
+    for item in form_date_packet.get("form_dates", []):
+        chunk_id = str(item.get("chunk_id") or "")
+        if not chunk_id:
+            continue
+        if chunk_id not in form_date_chunk_ids:
+            form_date_chunk_ids.append(chunk_id)
+        form_date_offsets.setdefault(chunk_id, max(0, int(item.get("offset") or 0)))
     # 先为每条规则保留一条最直接的证据，再按诊断价值补充其余页面。旧实现按
     # 扫描顺序加入，文档前部的普通命中会挤掉后部更有力的反证或计分材料。
     priority_rank = {"high": 0, "medium": 1, "low": 2}
@@ -5366,6 +5597,13 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
         for chunk_id in _consistency_signal_chunks(scan.get("chunks", []), rules, per_rule_limit=2):
             if chunk_id and chunk_id not in selected_ids:
                 selected_ids.append(chunk_id)
+    # 日期差异页优先于普通数值页；即使本轮是定向补评，也必须带入这项已确定的
+    # 关键事实，不能因为“只补评”再次漏掉旧模板落款。
+    if form_date_chunk_ids:
+        for chunk_id in reversed(form_date_chunk_ids):
+            if chunk_id in selected_ids:
+                selected_ids.remove(chunk_id)
+            selected_ids.insert(0, chunk_id)
     review_categories = {"qualification", "compliance", "substantive", "rejection", "other"}
     is_review_group = any(item.get("category") in review_categories for item in rules)
     has_scope_rule = any(_is_scope_consistency_rule(item) for item in rules)
@@ -5464,14 +5702,21 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
         f"首轮为当前规则组报告 {len(findings)} 条候选证据。"
         "首轮未报告候选不等于技术失败，应结合规则给出‘全文扫描未发现’或其他最可能建议。"
     )
+    form_date_packet_text = ""
+    if form_date_packet:
+        form_date_packet_text = (
+            "\n\n【固定响应表单日期交叉核验（本地定位的原文候选，非既成废标结论）】\n"
+            + json.dumps(form_date_packet, ensure_ascii=False, separators=(",", ":"))
+        )
+        header += "已发现固定响应表单日期跨年差异，必须结合以下原文逐页核验。"
     if failed_root_ids:
         header += f"有 {len(failed_root_ids)} 个首轮格式异常页块，下面已附原文供本轮直接复核。"
     # 证据目录最多占 30%，且始终保留有效 JSON；原页至少获得约三分之二的上下文预算。
     prefix_budget = min(max(3_200, char_limit // 3), max(3_200, int(char_limit * 0.30)))
-    static_prefix = f"{header}{scope_packet}\n\n【首轮 AI 候选证据】\n"
+    static_prefix = f"{header}{form_date_packet_text}{scope_packet}\n\n【首轮 AI 候选证据】\n"
     if len(static_prefix) > prefix_budget:
         # 范围画像只是辅助线索；它过大时优先保留总览和候选原文，不能挤掉文件原页。
-        static_prefix = f"{header}\n\n【首轮 AI 候选证据】\n"
+        static_prefix = f"{header}{form_date_packet_text}\n\n【首轮 AI 候选证据】\n"
     findings_budget = max(300, prefix_budget - len(static_prefix) - len("\n\n【重点原文】\n"))
     selected_finding_values: list[dict] = []
     findings_size = 2
@@ -5494,6 +5739,12 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
     ledger = scan.get("evidence_ledger", {}) if isinstance(scan.get("evidence_ledger"), dict) else {}
     fallback_by_rule = select_rule_chunk_evidence_map(scan.get("chunks", []), rules, per_rule=1)
     fallback_offsets: dict[str, int] = {}
+    # 日期异常页是本规则组的确定性直接证据，先分配原文位置，防止被普通命中页
+    # 挤出上下文预算。
+    for chunk_id in form_date_chunk_ids:
+        if chunk_id not in required_ids:
+            required_ids.append(chunk_id)
+        fallback_offsets.setdefault(chunk_id, form_date_offsets.get(chunk_id, 0))
     for rule in rules:
         rule_id = str(rule.get("rule_id") or "")
         finding = best_by_rule.get(rule_id)
@@ -5556,6 +5807,7 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
         "mode": "full_scan_evidence",
         "pages": included,
         "unmatched_rule_ids": [],
+        "form_date_consistency": form_date_packet,
     }
 
 
@@ -8390,6 +8642,24 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
         else:
             # 兼容异常元数据或旧解析记录；正常长文件会在调用前建立全文扫描索引。
             context = build_rule_context(document["parsed_path"], rules, context_limit, allow_partial=True)
+    # 短文件不经过全文扫描索引；仍需以同一套本地逻辑保护固定表单日期的交叉核验。
+    # 这项证据包很小，只在存在跨年异常时写入，不会扩大普通审查的上下文或 token。
+    if component == "review" and not context.get("form_date_consistency"):
+        context_chunks = (scan_index or {}).get("chunks") if scan_index else None
+        if not context_chunks:
+            context_chunks = split_full_text_chunks(document["parsed_path"], FULL_SCAN_CHUNK_CHARS, overlap_pages=1)
+        packet_scope = (scan_index or {}).get("project_scope") if scan_index else {}
+        packet = _form_date_consistency_packet(context_chunks or [], packet_scope if isinstance(packet_scope, dict) else {})
+        if packet:
+            context = {
+                **context,
+                "form_date_consistency": packet,
+                "text": (
+                    "【固定响应表单日期交叉核验（本地定位的原文候选，非既成废标结论）】\n"
+                    + json.dumps(packet, ensure_ascii=False, separators=(",", ":"))
+                    + "\n\n" + str(context.get("text") or "")
+                )[:context_limit],
+            }
     unmatched_rule_ids = set(context.get("unmatched_rule_ids") or [])
     if unmatched_rule_ids:
         payload = [{**item, "context_unmatched": item["rule_id"] in unmatched_rule_ids} for item in payload]
@@ -8409,6 +8679,10 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
         results, missing_rules = _normalise_partial_combined_results(
             component, parsed["results"], rules, tender_baseline,
         )
+        if component == "review":
+            results = _apply_form_date_consistency_guard(
+                results, rules, context.get("form_date_consistency") or {},
+            )
         # 模型可能返回合法 JSON 但证据/理由半句截断（如“…已填写，但”）。这类行
         # 按缺失规则同样只补评受影响条目，不重发整组；仅做一次，避免无限重试。
         incomplete_rule_ids = {
@@ -9841,6 +10115,11 @@ def _evaluate_all(app, task: dict) -> dict:
     # 范围画像供模型理解项目；完整招标文本只供本地校验“该对象是否已列入采购范围”，
     # 不进入任何提示词，既避免长清单抽样遗漏，也不增加模型输入 token。
     project_scope["_tender_scope_baseline"] = _tender_scope_baseline(all_documents)
+    # 固定表单日期的本地一致性核验只需要招标文件中的项目时点，不把完整招标文本
+    # 重复送入模型。该字段仅作为最终证据包的参照，旧项目/旧缓存缺失时仍可正常运行。
+    project_scope["_tender_response_dates"] = _tender_response_date_references(
+        project_scope["_tender_scope_baseline"],
+    )
     compact_retry_count = split_retry_count = 0
     manual_fallback_rule_count = 0
     evidence_ledger_rule_count = evidence_ledger_empty_rule_count = 0
@@ -9966,7 +10245,8 @@ def _evaluate_all(app, task: dict) -> dict:
             "completion_state": "partial_success" if failed_units else "complete",
             "failed_units": failed_units,
             "highlights": highlights, "highlight_failure_count": highlight_failure_count,
-            "prompt_version": PROMPT_VERSION}
+            "prompt_version": PROMPT_VERSION,
+            "execution_metadata": _task_execution_metadata(app, task, profile)}
 
 
 def run_task(app, task: dict) -> None:
@@ -9987,7 +10267,12 @@ def run_task(app, task: dict) -> None:
             result = _evaluate_all(app, task)
         else:
             raise ValueError(f"暂不支持的任务类型：{task['task_type']}")
-        storage.update_task(app, task["task_id"], progress=100, message="任务完成", status="success", result=result)
+        partial = isinstance(result, dict) and result.get("completion_state") == "partial_success"
+        storage.update_task(
+            app, task["task_id"], progress=100,
+            message="任务部分完成，可仅重跑失败项" if partial else "任务完成",
+            status="success", result=result,
+        )
     except (ComparisonLimitError, ValueError) as exc:
         storage.update_task(app, task["task_id"], status="error", error=str(exc), message="任务失败")
     except Exception as exc:

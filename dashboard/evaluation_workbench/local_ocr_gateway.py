@@ -168,18 +168,26 @@ class _ServeWorker:
         if proc is None:
             return
         try:
-            if proc.stdin:
-                proc.stdin.close()
-        except OSError:
-            pass
-        try:
-            proc.terminate()
+            if proc.poll() is None:
+                proc.terminate()
             proc.wait(timeout=5)
-        except (OSError, subprocess.TimeoutExpired):
+        except subprocess.TimeoutExpired:
             try:
                 proc.kill()
+                proc.wait(timeout=5)
             except OSError:
                 pass
+        except OSError:
+            pass
+        finally:
+            # Popen 不会替调用方关闭 stdin/stdout 包装流。评审持续运行时若只终止
+            # 子进程而遗留流对象，会逐步耗尽文件描述符并表现为随机 OCR/模型异常。
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                try:
+                    if stream is not None:
+                        stream.close()
+                except (OSError, ValueError):
+                    pass
 
 
 class _ServePool:

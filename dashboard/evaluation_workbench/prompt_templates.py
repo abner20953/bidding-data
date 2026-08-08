@@ -56,6 +56,30 @@ PROMPT_TEMPLATES = {
     "evaluate_all_user": _template("综合评审 · 任务", "兼容综合审查、评分及 JSON 输出要求。", "{{retry_note}}对同一份投标文件完成下列三类工作，并只返回一个合法 JSON 对象：\n{\"review_results\":[{\"rule_id\":\"规则ID\",\"status\":\"satisfied|not_satisfied|partial|not_found|manual|ocr_required\",\"evidence\":\"原文摘录\",\"page_hint\":null,\"reason\":\"理由与疑点\",\"summary\":\"一句话最终结论（≤60字）\",\"risk_level\":\"low|medium|high\",\"confidence\":\"high|medium|low\",\"evidence_quality\":\"sufficient|limited|missing\"}],\"objective_scores\":[{\"rule_id\":\"规则ID\",\"met\":true|false|null,\"suggested_score\":数字或null,\"matched_count\":数字或null,\"needs_ocr\":true|false,\"evidence\":\"原文摘录\",\"calculation\":\"计分过程\",\"reason\":\"判断理由\",\"summary\":\"一句话最终结论（≤60字）\",\"confidence\":\"high|medium|low\"}],\"subjective_scores\":[{\"rule_id\":\"规则ID\",\"suggested_score\":数字,\"needs_ocr\":true|false,\"evidence\":\"原文摘录\",\"reason\":\"得扣分理由\",\"summary\":\"一句话最终结论（≤60字）\",\"confidence\":\"high|medium|low\"}]}\n\n严格要求：不得使用 Markdown 代码块、不得在 JSON 前后添加说明、所有字符串必须使用标准 JSON 双引号和转义。{{limits}}\n审查规则：{{review_rules}}\n客观评分规则：{{objective_rules}}\n主观评分规则：{{subjective_rules}}\n所有结果均由人工审核，应积极给出最可能的判断、疑点和建议分。需要 OCR 或证据不完整时仍可基于可见材料给暂定建议并明确核验点；不得编造证据，评分不得超过 scoring.max_score。\n投标文件：{{document_name}}；投标人：{{bidder_name}}\n原文：\n{{text}}", "retry_note", "limits", "review_rules", "objective_rules", "subjective_rules", "document_name", "bidder_name", "text"),
 }
 
+# 默认提示词由“基础模板 + 命名扩展片段”一次组装。业务补充只登记在这里，避免
+# 运行时在文件各处直接改写 content，造成来源、顺序和缓存指纹难以审计。
+_PROMPT_BASE_CONTENT = {
+    template_id: str(meta.get("content") or "")
+    for template_id, meta in PROMPT_TEMPLATES.items()
+}
+_PROMPT_EXTENSION_GROUPS: dict[str, list[tuple[str, str]]] = {}
+
+
+def _extend_prompt(template_id: str, group: str, suffix: str) -> None:
+    """登记默认提示词的命名扩展；模块加载结束后统一物化。"""
+    if template_id not in PROMPT_TEMPLATES:
+        raise KeyError(f"未知提示词模板：{template_id}")
+    text = str(suffix or "")
+    if text:
+        _PROMPT_EXTENSION_GROUPS.setdefault(template_id, []).append((group, text))
+
+
+def _materialise_prompt_extensions() -> None:
+    """按登记顺序组装默认内容，保留旧版片段顺序和用户可编辑的最终文本。"""
+    for template_id, base in _PROMPT_BASE_CONTENT.items():
+        suffixes = [text for _, text in _PROMPT_EXTENSION_GROUPS.get(template_id, [])]
+        PROMPT_TEMPLATES[template_id]["content"] = base + "".join(suffixes)
+
 # 正式评审依据和技术要求边界属于业务口径，而不是系统角色。集中到可维护的
 # 通用业务指令后，提取、补充和回收批次会共享同一套判断标准。
 _EXTRACT_RULES_FORMAL_REVIEW_GUIDANCE = (
@@ -69,7 +93,7 @@ _EXTRACT_RULES_FORMAL_REVIEW_GUIDANCE = (
     "任何“未提供视为不响应”“任一参数未达标即否决”“无效投标”等后果，只有原文明确写明"
     "或可直接对应正式评审依据时才能写入 check_rule；不得由技术参数、星号、常识或语气自行推演。"
 )
-PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += "\n\n" + _EXTRACT_RULES_FORMAL_REVIEW_GUIDANCE
+_extend_prompt("extract_rules_guidance", "评审依据边界", "\n\n" + _EXTRACT_RULES_FORMAL_REVIEW_GUIDANCE)
 
 # 采购需求中成组、编号且可由当前投标文件核验的技术/服务要求，虽然未必是
 # 正式否决项或独立评分项，仍具有人工评审价值。将它们压缩为少量覆盖规则，
@@ -85,23 +109,23 @@ _EXTRACT_RULES_TECHNICAL_COVERAGE_GUIDANCE = (
     "不响应等原文没有的后果。仅属于中标后实际履约、验收流程、付款、现场交付动作且招标文件"
     "未要求投标文件现在作出方案或承诺的内容，仍不得生成规则。"
 )
-PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += "\n\n" + _EXTRACT_RULES_TECHNICAL_COVERAGE_GUIDANCE
-PROMPT_TEMPLATES["extract_rules_compile_user"]["content"] += (
+_extend_prompt("extract_rules_guidance", "技术服务覆盖", "\n\n" + _EXTRACT_RULES_TECHNICAL_COVERAGE_GUIDANCE)
+_extend_prompt("extract_rules_compile_user", "技术服务覆盖", (
     "\n\n技术/服务覆盖规则编译补充：category=other 的逐项响应覆盖候选应按当前采购包和连续主题"
     "合并为少量规则，完整保留原编号与叶子要求；不得与概括性“全部响应”规则并存，也不得改写为"
     "qualification/compliance/substantive/rejection 或添加原文没有的否决、扣分后果。合并候选已有 evidence_items 时，"
     "须合并、去重并保留其独立叶子取证清单；不得因合并展示而把多个独立材料压成一个泛化材料。"
-)
-PROMPT_TEMPLATES["extract_rules_coverage_user"]["content"] += (
+))
+_extend_prompt("extract_rules_coverage_user", "技术服务覆盖", (
     "\n\n覆盖审计补充：除会改变正式结论或分值的条款外，还要核对当前采购包成组、编号、可由投标文件"
     "核验的技术/服务叶子要求，是否已由1至3条 category=other 的逐项响应覆盖规则完整承接。"
     "若未承接，可作为 missing_rules 补充；不得把每个叶子要求拆成大量独立规则。"
-)
-PROMPT_TEMPLATES["extract_rules_quality_gate_user"]["content"] += (
+))
+_extend_prompt("extract_rules_quality_gate_user", "技术服务覆盖", (
     "\n\n质量门控补充：category=other 且完整列出当前采购包技术/服务叶子要求的逐项响应覆盖规则，"
     "具有独立人工复核价值，不属于 umbrella、not_scoring_rule 或 unsupported_cross_reference；"
     "只有与另一覆盖规则重复、跨错采购包、未列具体叶子要求或完全属于投后履约时才可剔除。"
-)
+))
 
 # 技术参数中的★并不当然构成否决项；但采购文件同时明确“★为实质性指标”、
 # 明确不满足后果、并要求当前投标文件提交相应证明材料时，普通技术覆盖规则或
@@ -118,7 +142,7 @@ _EXTRACT_RULES_TECHNICAL_STAR_EVIDENCE_GUIDANCE = (
     "允许后续按规则选择图片识别；只有图片外观是唯一决定性事实时才把整条设为 ocr_required=true。"
     "若缺少上述任一条件，仍按普通技术要求或交叉引用处理，不得因★符号自行推定否决后果。"
 )
-PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += "\n\n" + _EXTRACT_RULES_TECHNICAL_STAR_EVIDENCE_GUIDANCE
+_extend_prompt("extract_rules_guidance", "星号实质性与证明材料", "\n\n" + _EXTRACT_RULES_TECHNICAL_STAR_EVIDENCE_GUIDANCE)
 
 # 正式资格评审表的条目不是可随意删去的“资料汇总”。这一口径与项目行业无关，
 # 用于防止资格门槛被同一材料的评分项或名称一致性规则错误替代。
@@ -130,7 +154,7 @@ _EXTRACT_RULES_QUALIFICATION_COVERAGE_GUIDANCE = (
     "笼统声明不能替代具体材料、期限、替代条件和最低数量。资格业绩的最低数量、有效期和合同"
     "证明要求，与同一业绩的客观加分是两项独立规则，必须同时保留。"
 )
-PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += "\n\n" + _EXTRACT_RULES_QUALIFICATION_COVERAGE_GUIDANCE
+_extend_prompt("extract_rules_guidance", "资格条款覆盖", "\n\n" + _EXTRACT_RULES_QUALIFICATION_COVERAGE_GUIDANCE)
 
 # 规则执行元数据不改变已有字段或人工勾选口径。它让后续综合评审按证据类型和
 # 规则结构路由，而不是从标题关键词猜测；旧版自定义模板未输出时仍由代码回退。
@@ -138,7 +162,7 @@ _EXTRACT_RULE_EXECUTION_METADATA_GUIDANCE = """
 
 每条 AI 规则还应尽量补充 execution_strategy、evidence_requirements、applicability 三个字段；它们只描述后续取证方式，不得改变规则本身。execution_strategy 只能是 point（单点材料）、counting（需要逐项累计/去重）、section（需要通读完整章节或方案）、consistency（需要全文前后/范围一致性核验）、cross_bid（必须横向比较多家投标文件）、visual（关键结论仅靠图片外观）或 external（需外部核验）。evidence_requirements 是 text、visual、cross_bid、external 的数组：文字和图片都可分别支持同一规则时同时写 text、visual；不要把“可能附有证照”误写为仅 visual。applicability 形如 {"scope":"all|package|conditional|unknown","package_ids":[数字]}，包别无法从原文可靠判断时写 unknown。新增字段缺失时系统会兼容旧规则，但不得因节省篇幅省略评分、资格或否决条款的既有内容。
 """.strip()
-PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += "\n\n" + _EXTRACT_RULE_EXECUTION_METADATA_GUIDANCE
+_extend_prompt("extract_rules_guidance", "规则执行元数据", "\n\n" + _EXTRACT_RULE_EXECUTION_METADATA_GUIDANCE)
 
 # 规则集可以为人工阅读合并展示，但合并不能让多个可独立核验的材料在图片取证时
 # 争抢同一个候选页预算。该字段是可选的、纯取证元数据：旧提示词和旧规则没有它时
@@ -152,7 +176,7 @@ _EXTRACT_RULE_COMPOUND_EVIDENCE_GUIDANCE = (
     "文字、OCR 或图片证据，不生成子规则、不单独给分、不改变原文后果。只有确有两个以上独立叶子事实时才返回；"
     "单一材料、概括性章节或无法从原文可靠拆开的要求不要凑项。"
 )
-PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += "\n\n" + _EXTRACT_RULE_COMPOUND_EVIDENCE_GUIDANCE
+_extend_prompt("extract_rules_guidance", "复合材料取证", "\n\n" + _EXTRACT_RULE_COMPOUND_EVIDENCE_GUIDANCE)
 
 # 证据性质是综合评审的业务判断口径，供全文扫描、规则审查和评分子流程共同使用。
 _EVALUATE_ALL_EVIDENCE_GUIDANCE = (
@@ -165,9 +189,13 @@ _EVALUATE_ALL_EVIDENCE_GUIDANCE = (
     "“（采购文件中明确的所属行业）”“（中型企业、小型企业、微型企业）”这类括号内说明通常是表单保留的提示，"
     "在相邻字段已有明确行业或唯一企业类型填写时不得单独视为缺项；只有应填写位置本身为空、互斥选项未作唯一选择、"
     "或同一字段留下相互矛盾的实际填写值时，才报告填写不完整。"
+    "对偏离表、投标函、授权书、声明函、承诺函等固定响应表单的落款/签署日期，"
+    "必须作为当前投标文件的填写值与同文件其他表单及项目时点交叉核验；若存在明显跨年差异，"
+    "应列出各页原文并提示可能沿用旧模板，不能因该页只是表单或与技术参数无关而忽略。"
+    "合同、业绩、证照、人员履历、标准规范中的历史日期不属于本项异常。"
     "文字层可确认存在歧义时应给 partial，只有勾选、签章或图片外观决定结论时才标记 ocr_required。"
 )
-PROMPT_TEMPLATES["evaluate_all_guidance"]["content"] += "\n\n" + _EVALUATE_ALL_EVIDENCE_GUIDANCE
+_extend_prompt("evaluate_all_guidance", "综合评审证据口径", "\n\n" + _EVALUATE_ALL_EVIDENCE_GUIDANCE)
 
 # 条件性模板、总项目名称和声明函的文字/图片双通道，是不同项目都会出现的解释边界。
 # 统一放在可维护提示词中，避免通过某个行业或某份文件的关键词打补丁。
@@ -198,8 +226,8 @@ _APPLICABILITY_AND_RESULT_CONSISTENCY_GUIDANCE = (
     "保留不满足结论。技术/服务逐项响应覆盖规则必须以简明台账列出“已覆盖、部分覆盖、未找到”叶子项"
     "及证据页；不得只写笼统的“部分覆盖”。"
 )
-PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += "\n\n" + _APPLICABILITY_AND_RESULT_CONSISTENCY_GUIDANCE
-PROMPT_TEMPLATES["evaluate_all_guidance"]["content"] += "\n\n" + _APPLICABILITY_AND_RESULT_CONSISTENCY_GUIDANCE
+_extend_prompt("extract_rules_guidance", "适用范围与结论一致性", "\n\n" + _APPLICABILITY_AND_RESULT_CONSISTENCY_GUIDANCE)
+_extend_prompt("evaluate_all_guidance", "适用范围与结论一致性", "\n\n" + _APPLICABILITY_AND_RESULT_CONSISTENCY_GUIDANCE)
 PROMPT_TEMPLATES["evaluate_all_visual_user"] = _template(
     "综合评审 · 图片识别补充",
     "仅对已启用图片识别的单条规则和候选页面进行补充判断。",
@@ -277,7 +305,7 @@ PROMPT_TEMPLATES["evaluate_all_ocr_batch_user"] = _template(
     "证据与理由不得复述规则。\n待归纳规则：\n{{items}}\n投标文件：{{document_name}}；投标人：{{bidder_name}}",
     "items", "document_name", "bidder_name",
 )
-PROMPT_TEMPLATES["evaluate_all_visual_user"]["content"] += (
+_extend_prompt("evaluate_all_visual_user", "图片找页与跨层合并", (
     "\n\n找页补充：图片标签 Pn 是系统实际发送的 PDF 页，不得以目录或印刷页码替代。"
     "若 text_result 含 prior_image_batches，必须以文字证据与图片证据的合并覆盖给出最终建议，并重新给出整条规则的 suggested_score；多材料规则应明确已覆盖与未覆盖项。"
     "对证书、证件、执照、许可、签章等视觉优先材料，先在本次图片中直接逐字读取与规则有关的名称、编号、日期、有效期、型号、数量等可见字段，"
@@ -289,8 +317,8 @@ PROMPT_TEMPLATES["evaluate_all_visual_user"]["content"] += (
     "suggested_score 为 null 时不得写任何确定分值结论，只写已核验事实与待核验事项。"
     "规则含多个独立子项（evidence_items）时，每个子项只写一句“对象+结论+页码+未决项”，不复述规格参数或原文明细；"
     "evidence 合计最多400字，reason 合计最多160字。层结论只写核实结果与缺口：同一批多份证书/材料只列“共N份、关键字段已核验/未核验”，不逐份转写证书编号、有效期等明细。"
-)
-PROMPT_TEMPLATES["evaluate_all_ocr_user"]["content"] += (
+))
+_extend_prompt("evaluate_all_ocr_user", "OCR 分层取证", (
     "\n\n识别层级：本地 RapidOCR 是候选页的基础文字层；腾讯 OCR 仅用于关键字段、证照证件或基础识别不完整页的精确复核。"
     "无论来源，Pn 仅指系统实际 PDF 页；关键字段逐字引用，模糊字不得补全。"
     "客观分只总结材料类别、数量、有效性和计分结论，不得逐行抄录OCR全文；层结论只写核实结果与缺口，不逐字段转写证书编号、有效期等明细。"
@@ -298,7 +326,7 @@ PROMPT_TEMPLATES["evaluate_all_ocr_user"]["content"] += (
     "suggested_score 为 null 时不得写任何确定分值结论，只写已核验事实与待核验事项。"
     "规则含多个独立子项（evidence_items）时，每个子项只写一句“对象+结论+页码+未决项”，不复述规格参数或原文明细；"
     "evidence 合计最多400字，reason 合计最多160字。层结论只写核实结果与缺口：同一批多份证书/材料只列“共N份、关键字段已核验/未核验”，不逐份转写证书编号、有效期等明细。"
-)
+))
 PROMPT_TEMPLATES["evaluate_all_visual_contract"] = _template(
     "综合评审 · 图片识别结果协议",
     "图片识别任务的固定输出字段与证据边界；与可修改的业务指令分离。",
@@ -341,71 +369,71 @@ PROMPT_TEMPLATES["evaluate_all_visual_locator_user"] = _template(
     "本次联系表包含的页码组：{{candidate_pages}}",
     "rule", "document_name", "bidder_name", "candidate_pages",
 )
-PROMPT_TEMPLATES["extract_rules_validation_guidance"]["content"] += (
+_extend_prompt("extract_rules_validation_guidance", "条件模板与声明函", (
     " 条件模板的前提必须由当前采购包原文中的明确勾选、明确说明或直接陈述支持；仅出现“如有/如允许/"
     "当……时/★号条款”字样而未定位具体已启用事实时，删除该候选。中小企业声明函应把可读取的填写"
     "完整性保留为文字审查，签章和勾选外观另作 OCR 条件，不得把两者混成仅 OCR 的规则。"
-)
-PROMPT_TEMPLATES["evaluate_all_scope_profile_user"]["content"] += (
+))
+_extend_prompt("evaluate_all_scope_profile_user", "多包范围", (
     "\n\n多包项目中必须同时保留总项目名称、当前采购包号和当前采购包名称的关系：总项目名称用于标识"
     "整个采购项目，不能被视为当前包之外的异常；当前包号、预算、工作内容和交付范围才是判断混包的依据。"
-)
-PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"] += (
+))
+_extend_prompt("evaluate_all_full_scan_user", "多包范围", (
     "\n\n范围偏离补充：总项目名称与招标文件一致、且项目编号及当前包号正确时，不报告为无关项目或混包；"
     "只有实质报价、技术方案、交付清单或承诺明确对应其他包，才报告候选。对于 category=other 的逐项"
     "响应覆盖规则，优先返回叶子项的支持/部分/未找到证据，避免只返回概括性承诺。"
-)
-PROMPT_TEMPLATES["evaluate_all_review_user"]["content"] += (
+))
+_extend_prompt("evaluate_all_review_user", "审查结果口径", (
     "\n\n补充判定：不存在可定位的★具体条款时，不得把未提供★逐项对照表判为不满足或高风险。总项目名称"
     "加正确包号是正常格式。中小企业声明函应先检查文字字段完整性，扫描/签章/勾选外观才标 OCR。对于"
     "逐项响应覆盖规则，evidence 使用“已覆盖：…；部分：…；未找到：…”的简明台账，必要时可至600字；"
     "reason 最多220字。参数只有在交付要求无法兼容时才判矛盾；比较符边界相等时属于满足。"
     "表格分区标题和相似设备不得误作缺项或替代证据；大段复述只有替代自主方案时才判照抄。"
     "status、风险与理由必须相互一致。"
-)
-PROMPT_TEMPLATES["evaluate_all_review_user"]["content"] += (
+))
+_extend_prompt("evaluate_all_review_user", "文本覆盖不足", (
     " 若输入附有‘机器可读文本覆盖不足’提示，文本未命中不能作为材料缺失或规则满足依据；"
     "除非本轮证据包已包含实际 OCR/图片识别的直接事实，否则返回 ocr_required、low 风险和 missing 证据。"
-)
-PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += (
+))
+_extend_prompt("extract_rules_guidance", "评分跨页连续性", (
     " 评分表跨页时，下一页以“（X分）、……”开头的文字通常是上一页评分项的续行：必须与上一页标题、"
     "全部子项和扣分逻辑合并为同一规则，不得另起通用的“服务/应急方案”等错误规则。"
-)
-PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += (
+))
+_extend_prompt("extract_rules_guidance", "证据维度", (
     " 每条规则应同时在 evidence_requirements 标明结论所需的证据维度：text=可检索文字或表格，"
     "document=材料本体是否提供，field=材料内编号/日期/金额/型号等关键字段，visual=签章、版式、扫描图片或外观，"
     "cross_bid=需横向比较，external=需外部核验。它们只说明取证计划，不生成新的重复规则；"
     "同一结论规则的材料存在、字段和图片要求应写在同一条 check_rule 中，避免拆成多条重复审查点。"
-)
-PROMPT_TEMPLATES["extract_rules_guidance"]["content"] += (
+))
+_extend_prompt("extract_rules_guidance", "评分规则边界", (
     " 评分规则编译必须以评分表的一个完整行/一个明确总分为边界：同一评分条款ID、同一计分对象和同一满分"
     "只能保留一条规则，标题的“商务部分/评分/满分X分”等导航文字不是独立评分事实；应把分档、证书类别、"
     "数量、封顶和跨页续行收进该规则的 scoring.items。反之，不同计分对象、不同满分或独立可累计子项不得误合并。"
     "不得使用“接续子项”“第X页续”等占位标题，必须回溯相邻页的最近明确编号/标题。"
     "“允许代理商投标”“可接受某种方式”等许可性表述本身不等于须提供授权/证明；只有原文明确要求当前投标文件"
     "提交某份材料时才生成相应规则。政策、管理要求或采购背景也只有明确要求投标人当前声明、承诺或提交材料时才成为审查点。"
-)
-PROMPT_TEMPLATES["evaluate_all_objective_user"]["content"] += (
+))
+_extend_prompt("evaluate_all_objective_user", "客观分逐项核验", (
     " 对业绩、证书等按件计分材料，必须以每个独立项目的完整要件清单判断：已见通知书、目录或列表不等于"
     "该项目可计分；只有本规则要求的合同首页、金额、签章、明细等要件均被本次证据覆盖时才计入已确认数量。"
     "若仅补看部分页面，只报告已确认和未确认项目，不得在理由中给出与 suggested_score 不一致的最终总分。"
-)
-PROMPT_TEMPLATES["evaluate_all_objective_user"]["content"] += (
+))
+_extend_prompt("evaluate_all_objective_user", "客观分文本覆盖", (
     " 若输入附有‘机器可读文本覆盖不足’提示，不能把文本未命中直接计为0分或满分；"
     "应设置 needs_ocr=true、suggested_score=null，并说明待核验的材料要件。"
-)
-PROMPT_TEMPLATES["evaluate_all_subjective_user"]["content"] += (
+))
+_extend_prompt("evaluate_all_subjective_user", "主观分具体依据", (
     " 非满分时，calculation 必须至少写明一项可定位的具体缺项、缺陷、档位差距或扣分依据；"
     "不得仅以‘内容一般’‘不够详细’‘有待完善’等空泛表述作为扣分理由。"
-)
-PROMPT_TEMPLATES["evaluate_all_subjective_user"]["content"] += (
+))
+_extend_prompt("evaluate_all_subjective_user", "主观分文本覆盖", (
     " 若输入附有‘机器可读文本覆盖不足’提示，未见方案文字不等于方案缺失；"
     "应设置 needs_ocr=true、suggested_score=null，待 OCR 或图片识别取得实际方案内容后再建议评分。"
-)
-PROMPT_TEMPLATES["evaluate_all_cross_bid_price_user"]["content"] += (
+))
+_extend_prompt("evaluate_all_cross_bid_price_user", "报价暂定建议", (
     "\n\n报价分为暂定建议：报价口径可识别时应输出 quoted_price；不得自行改变招标公式或提前认定资格"
     "符合性是否通过。系统会按可识别报价复算常见比例公式并由人工最终确认有效报价范围。"
-)
+))
 PROMPT_TEMPLATES["extract_rules_quality_gate_user"]["content"] = (
     PROMPT_TEMPLATES["extract_rules_quality_gate_user"]["content"]
     .replace("以及已启用通用规则；", "以及全部通用规则；通用规则是否默认选择只影响项目内初始勾选，不影响本轮去重保护；")
@@ -426,10 +454,12 @@ for _rule_template_id in ("extract_rules_user", "extract_rules_continue_user", "
     PROMPT_TEMPLATES[_rule_template_id]["content"] = (
         PROMPT_TEMPLATES[_rule_template_id]["content"]
         .replace('"ocr_required":false,"scoring"', '"ocr_required":false,"evidence_requirements":["text|document|field|visual|cross_bid|external"],"scoring"')
-        + "\n\n取证元数据：每条规则可返回 evidence_requirements。text=文字/表格；document=材料本体；"
-          "field=材料内编号、日期、金额、型号等字段；visual=签章、勾选、图片或外观；cross_bid=横向比较；external=外部核验。"
-          "它们只服务同一条结论规则的取证计划，不得把同一材料拆成多条重复规则。"
-          "每条输出都必须保留该字段；只要已解析文字或表格可能直接完成判断，就必须包含 text，且不得仅因材料名含证书、报告、复印件、扫描件而设置 ocr_required=true。"
+    )
+    _extend_prompt(
+        _rule_template_id, "取证元数据", "\n\n取证元数据：每条规则可返回 evidence_requirements。text=文字/表格；document=材料本体；"
+        "field=材料内编号、日期、金额、型号等字段；visual=签章、勾选、图片或外观；cross_bid=横向比较；external=外部核验。"
+        "它们只服务同一条结论规则的取证计划，不得把同一材料拆成多条重复规则。"
+        "每条输出都必须保留该字段；只要已解析文字或表格可能直接完成判断，就必须包含 text，且不得仅因材料名含证书、报告、复印件、扫描件而设置 ocr_required=true。"
     )
 
 
@@ -445,7 +475,7 @@ _SUMMARY_CONTRACT_TEMPLATE_IDS = (
     "evaluate_all_visual_user", "evaluate_all_ocr_user", "evaluate_all_ocr_batch_user",
 )
 for _summary_template_id in _SUMMARY_CONTRACT_TEMPLATE_IDS:
-    PROMPT_TEMPLATES[_summary_template_id]["content"] += "\n\n" + _SUMMARY_CONTRACT
+    _extend_prompt(_summary_template_id, "结果摘要契约", "\n\n" + _SUMMARY_CONTRACT)
 
 
 
@@ -453,9 +483,9 @@ for _summary_template_id in _SUMMARY_CONTRACT_TEMPLATE_IDS:
 _EVIDENCE_TRACEABILITY_GUIDANCE = (
     '涉及报价、金额、价格的结论，必须直接引用原文中实际存在的数字及其页码；文本层无法定位具体金额时，不得写出具体数字（如“2026元”），应写“文本层未提取到报价，需人工核对原件”。核验声明函、承诺函等固定表单时，须检查填写值是否明显不合理（单位、数量级异常）以及模板占位符（如“（企业名称）”“（标的名称）”）是否未删除，发现时必须在理由中显式提示。同一规则下，证据形态相同的投标人必须给相同状态：仅有“已提供”声明、无证书/凭证可核验字段的，统一为 partial 或需图片核验，不得判 satisfied；satisfied 结论不得同时标注“需人工复核/待核验”。'
 )
-PROMPT_TEMPLATES["evaluate_all_review_user"]["content"] += "\n\n" + _EVIDENCE_TRACEABILITY_GUIDANCE
-PROMPT_TEMPLATES["evaluate_all_objective_user"]["content"] += "\n\n" + _EVIDENCE_TRACEABILITY_GUIDANCE
-PROMPT_TEMPLATES["evaluate_all_cross_bid_price_user"]["content"] += "\n\n" + _EVIDENCE_TRACEABILITY_GUIDANCE
+_extend_prompt("evaluate_all_review_user", "金额与声明函溯源", "\n\n" + _EVIDENCE_TRACEABILITY_GUIDANCE)
+_extend_prompt("evaluate_all_objective_user", "金额与声明函溯源", "\n\n" + _EVIDENCE_TRACEABILITY_GUIDANCE)
+_extend_prompt("evaluate_all_cross_bid_price_user", "金额与声明函溯源", "\n\n" + _EVIDENCE_TRACEABILITY_GUIDANCE)
 
 
 
@@ -463,7 +493,7 @@ PROMPT_TEMPLATES["evaluate_all_cross_bid_price_user"]["content"] += "\n\n" + _EV
 _SCOPE_PROFILE_REVIEW_GUIDANCE = (
     '范围偏离判断以系统生成的“项目范围画像”为唯一基准（画像覆盖采购对象、核心任务、服务对象、技术主题、设备/材料、交付物、实施地域、适用标准等，字段按实际项目生成、可为空）：画像中未包含的任何具体对象、主体、技术、材料、服务、地域、标准或交付物，若上下文表明被作为本项目的响应、承诺、方案或报价写入，即为范围偏离候选；不限定行业或采购类型，也不依赖任何固定词表。章节上位主题相关（安全、施工、运维、培训、售后等）不等于其中具体内容属于本项目，必须逐项对照画像，不得整章放行。法规、标准、通用管理规定的引用、示例、历史业绩、资质证照中的合理出现不作为候选。可解释性检验：该具体内容能否由本项目范围画像合理解释？删去后是否影响响应或方案的完整性？不能解释且可删的，更可能是模板混用或无关内容，应作为候选提示页码。'
 )
-PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"] += "\n\n" + _SCOPE_PROFILE_REVIEW_GUIDANCE
+_extend_prompt("evaluate_all_scope_anomaly_guidance", "范围画像核验", "\n\n" + _SCOPE_PROFILE_REVIEW_GUIDANCE)
 
 
 
@@ -483,8 +513,8 @@ _TEXT_ERROR_LINE_GUIDANCE = (
     "重复错位片段等）时，应作为文字错误线索写入 reason，给出页码并注明“疑为复制粘贴或 OCR 断字，"
     "需人工确认”；不得忽略为纯 OCR 噪声，也不得单独据此判废标或否定性结论。"
 )
-PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"] += "\n\n" + _SCOPE_CHAPTER_TEMPLATE_GUIDANCE
-PROMPT_TEMPLATES["evaluate_all_review_user"]["content"] += "\n\n" + _TEXT_ERROR_LINE_GUIDANCE
+_extend_prompt("evaluate_all_scope_anomaly_guidance", "章节模板混用", "\n\n" + _SCOPE_CHAPTER_TEMPLATE_GUIDANCE)
+_extend_prompt("evaluate_all_review_user", "正文文字异常", "\n\n" + _TEXT_ERROR_LINE_GUIDANCE)
 
 
 
@@ -494,7 +524,7 @@ _CONSISTENCY_EVIDENCE_COVERAGE_GUIDANCE = (
     "若证据包未覆盖同一事实的全部出现位置，不得判 satisfied，"
     "应判 partial 并列出未覆盖或缺失的页码/原文位置。"
 )
-PROMPT_TEMPLATES["evaluate_all_review_user"]["content"] += "\n\n" + _CONSISTENCY_EVIDENCE_COVERAGE_GUIDANCE
+_extend_prompt("evaluate_all_review_user", "一致性证据覆盖", "\n\n" + _CONSISTENCY_EVIDENCE_COVERAGE_GUIDANCE)
 
 
 
@@ -506,7 +536,7 @@ _FORM_COMPLETENESS_EXTRACTION_GUIDANCE = (
     "即使与“形式评审/响应性评审/报价表”主题相近，也必须在某条规则中完整承接；"
     "只允许把多个完整性事实并入同一条规则，不允许整体丢弃其中任一可独立改变结论的事实。"
 )
-PROMPT_TEMPLATES["extract_rules_validation_guidance"]["content"] += "\n\n" + _FORM_COMPLETENESS_EXTRACTION_GUIDANCE
+_extend_prompt("extract_rules_validation_guidance", "表单完整性保护", "\n\n" + _FORM_COMPLETENESS_EXTRACTION_GUIDANCE)
 
 
 
@@ -520,7 +550,13 @@ _SCOPE_SUMMARY_RISK_GUIDANCE = (
     "全文扫描中该候选的优先级应为 high，最终审查中 risk_level 应为 high"
     "（是否最终排除仍由人工裁决），不要因措辞像通用规范而整体降为 medium。"
 )
-PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"] += "\n\n" + _SCOPE_SUMMARY_RISK_GUIDANCE
+_extend_prompt("evaluate_all_scope_anomaly_guidance", "范围结论摘要", "\n\n" + _SCOPE_SUMMARY_RISK_GUIDANCE)
+
+# 上述少量结构化协议模板在定义后会做字段兼容变换；先把这些基础变换固化，再
+# 统一附加命名业务片段。最终对外仍只有每个模板的一份完整可编辑文本。
+for _template_id, _meta in PROMPT_TEMPLATES.items():
+    _PROMPT_BASE_CONTENT[_template_id] = str(_meta.get("content") or "")
+_materialise_prompt_extensions()
 
 PROMPT_TEMPLATE_PRESENTATION = {
     # 日常优先修改：不承载运行时 JSON 协议。
