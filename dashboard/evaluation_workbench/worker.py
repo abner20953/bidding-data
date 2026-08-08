@@ -1305,6 +1305,12 @@ def _normalise_reconciled_scoring_rules(value: object, score_packets: list[objec
     # 每个原始评分条款均须明确映射，防止模型为删重而静默丢掉叶子项。
     if any(not _score_packet_is_covered(packet, rules) for packet in score_packets):
         return None
+    # 结构复核的输出必须满足“一个原文评分条款只有一个最终归属”。可由父项
+    # 叶子结构证明的重叠在本地收敛；其余冲突不能交给后续页面或综合评审猜测，
+    # 直接拒绝本次模型改写并回退到上游候选，避免用不完整的复核结果覆盖原始证据。
+    rules, ledger = _canonicalise_score_ledger(rules, score_packets)
+    if ledger["conflict_count"]:
+        return None
     return rules
 
 
@@ -1800,6 +1806,60 @@ def _prune_overlapping_score_aggregates(rules: list[dict]) -> list[dict]:
         if len(matched_children) >= 2:
             removable.update(matched_children)
     return [item for index, item in enumerate(values) if index not in removable]
+
+
+def _score_rule_clause_ids(rule: dict) -> set[str]:
+    """返回评分规则引用的稳定原文条款 ID。"""
+    values = rule.get("source_clause_ids") if isinstance(rule, dict) else None
+    return {str(value).strip() for value in values if str(value).strip()} if isinstance(values, list) else set()
+
+
+def _score_ledger_conflicts(rules: list[dict], score_packets: list[object]) -> list[dict]:
+    """检测同一评分原文条款被多个最终规则占用的歧义。
+
+    ``source_clause_ids`` 是评分条款与最终规则之间的确定性锚点。一条原文评分
+    条款可以由一个包含多个叶子的规则承接，但不能同时成为两个独立评分规则的
+    分值来源，否则综合评审会重复计分。此处只报告无法由本地父子结构证明的剩余
+    冲突；已证明的重复会在 ``_canonicalise_score_ledger`` 中先被收敛。
+    """
+    known_ids = {_score_packet_id(packet) for packet in score_packets if _score_packet_id(packet)}
+    owners: dict[str, list[dict]] = {}
+    for rule in rules:
+        if str(rule.get("category") or "") not in {"objective", "subjective"}:
+            continue
+        for clause_id in _score_rule_clause_ids(rule) & known_ids:
+            owners.setdefault(clause_id, []).append(rule)
+    conflicts = []
+    for clause_id, values in owners.items():
+        if len(values) < 2:
+            continue
+        conflicts.append({
+            "clause_id": clause_id,
+            "titles": [str(item.get("title") or "未命名评分规则") for item in values],
+        })
+    return conflicts
+
+
+def _canonicalise_score_ledger(rules: list[dict], score_packets: list[object]) -> tuple[list[dict], dict]:
+    """用原文评分条款台账收敛可证明重复，保留无法证明的歧义供确认前阻断。
+
+    不按标题相似或分值巧合删除评分项：仅复用已存在的同源去重和“父项叶子完整
+    覆盖子项”规则。这样既不会因模型的父子重复把同一分值执行两次，也不会因为
+    本地猜测丢掉独立计分事实。
+    """
+    before = len(rules)
+    deduped = _dedupe_rule_candidates(rules)
+    pruned = _dedupe_rule_candidates(_prune_overlapping_score_aggregates(deduped))
+    # 父项虽然在文字上列出了子项，也可能没有引用全部子项的原文条款 ID。
+    # 此时移除子项会造成“去重后反而漏掉评分原文”，故仅在收敛结果仍完整覆盖
+    # 台账时采用；否则保留子项，并交由唯一归属校验显式报告冲突。
+    result = pruned if all(_score_packet_is_covered(packet, pruned) for packet in score_packets) else deduped
+    conflicts = _score_ledger_conflicts(result, score_packets)
+    return result, {
+        "merged_count": max(0, before - len(result)),
+        "conflict_count": len(conflicts),
+        "conflicts": conflicts,
+    }
 
 
 _SCORE_SECTION_HEADER_PATTERN = re.compile(
@@ -2721,8 +2781,7 @@ def _extract_rules(app, task: dict) -> dict:
     )
     # 最终规范化可能重写/合并评分候选，必须再做一次确定性同源去重；随后将
     # “某部分共 X 分”的导航标题移出可执行规则，仅保留其作为评分守恒台账。
-    rules = _dedupe_rule_candidates(rules)
-    rules = _prune_overlapping_score_aggregates(rules)
+    rules, score_ledger = _canonicalise_score_ledger(rules, score_packets)
     rules, score_summary_excluded_count = _drop_non_executable_score_section_summaries(rules)
     rules = _filter_inapplicable_template_rules(_filter_rules_for_package(rules, package_number), text)
     # 模型分段提取和后续去重均可能把“技术★实质性指标 + 证明材料 + 明确无效后果”
@@ -2762,6 +2821,14 @@ def _extract_rules(app, task: dict) -> dict:
                             continue
                         if storage._score_rule_title_core(current.get("title")) != storage._score_rule_title_core(candidate.get("title")):
                             continue
+                        # 定向结构修复只能补全同一条评分规则的叶子项，不能借机
+                        # 改写其原文归属。保留当前已验证的条款 ID，避免模型返回
+                        # 看似完整、实际已映射到另一评分条款的替代规则。
+                        current_ids = _score_rule_clause_ids(current)
+                        candidate_ids = _score_rule_clause_ids(candidate)
+                        if candidate_ids and current_ids and not candidate_ids.issubset(current_ids):
+                            continue
+                        candidate["source_clause_ids"] = list(current_ids or candidate_ids)
                         rules[index] = candidate
                         repaired += 1
                         break
@@ -2774,6 +2841,13 @@ def _extract_rules(app, task: dict) -> dict:
     before_procedural_filter = len(rules)
     rules = [item for item in rules if not _is_non_file_scoring_process(item)]
     excluded_rule_count += before_procedural_filter - len(rules)
+    # 评分结构修复会替换单条规则的结构化内容，因此在落库前重新执行一次
+    # 台账收口。这里仍只合并可证明的同源/父子重复；剩余冲突交由确认前校验
+    # 明确阻断，绝不以静默删除换取一个表面正常的总分。
+    rules, final_score_ledger = _canonicalise_score_ledger(rules, score_packets)
+    score_ledger["merged_count"] += final_score_ledger["merged_count"]
+    score_ledger["conflict_count"] = final_score_ledger["conflict_count"]
+    score_ledger["conflicts"] = final_score_ledger["conflicts"]
     rules = _normalise_visual_rule_policies(rules)
     if not rules:
         raise ValueError("模型未提取到可确认的有效规则，请检查招标文件文本或更换模型")
@@ -2803,6 +2877,8 @@ def _extract_rules(app, task: dict) -> dict:
             "hard_anchor_supplement_failure_count": hard_anchor_supplement_failures,
             "score_structure_repair_count": score_structure_repair_count,
             "score_structure_repair_failure_count": score_structure_repair_failures,
+            "score_ledger_merged_count": score_ledger["merged_count"],
+            "score_ledger_conflict_count": score_ledger["conflict_count"],
             "finalisation_applied": finalisation["applied"],
             "finalisation_dropped_count": finalisation["dropped_count"],
             "finalisation_rewritten_count": finalisation["rewritten_count"],

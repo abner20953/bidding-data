@@ -3435,7 +3435,7 @@ def confirm_rule_set(app, project_id: str) -> dict:
     validation = rule_set_acquisition_validation(app, project_id)
     blockers = [
         item for item in validation.get("issues", [])
-        if item.get("code") in {"duplicate_score_rule", "score_total_mismatch", "score_leaf_total_below"}
+        if item.get("code") in {"duplicate_score_rule", "score_source_conflict", "score_total_mismatch", "score_leaf_total_below"}
     ]
     if blockers:
         details = "；".join(str(item.get("message") or "评分规则校验失败") for item in blockers[:3])
@@ -3621,6 +3621,26 @@ def _rule_source_clause_ids(rule: dict) -> set[str]:
         meta = {}
     values = meta.get("source_clause_ids")
     return {str(item).strip() for item in values if str(item).strip()} if isinstance(values, list) else set()
+
+
+def _score_source_ownership_conflicts(rules: list[dict]) -> list[dict]:
+    """返回同一评分原文条款被多个启用评分规则占用的冲突。
+
+    仅检查提取管线生成的 ``SC-`` 评分条款 ID。人工规则或资格条款不带此类
+    锚点，不会被误报；同一条款落到多条启用规则则必然存在重复计分或父子分值
+    归属不清，必须在确认前处理。
+    """
+    owners: dict[str, list[dict]] = {}
+    for rule in rules:
+        if not rule.get("enabled") or str(rule.get("category") or "") not in {"objective", "subjective"}:
+            continue
+        for clause_id in _rule_source_clause_ids(rule):
+            if clause_id.startswith("SC-"):
+                owners.setdefault(clause_id, []).append(rule)
+    return [
+        {"clause_id": clause_id, "rules": values}
+        for clause_id, values in owners.items() if len(values) > 1
+    ]
 
 
 def _is_common_template_source(rule: dict, peers: list[dict]) -> bool:
@@ -4018,6 +4038,20 @@ def rule_set_acquisition_validation(app, project_id: str) -> dict:
             "rule_ids": [str(item.get("rule_id") or "") for item in group],
             "title": str(group[0].get("title") or "评分规则"),
             "message": f"疑似同一评分事实的重复规则（均 {max_value:g} 分）：{titles}。重复计分会导致总分虚高，请核对后仅保留一条。",
+        })
+    # 评分条款 ID 是提取阶段按原文位置生成的稳定台账锚点。同一 ID 同时落到两条
+    # 启用评分规则时，即使标题或满分不同，也会造成父子项重复或续页片段被误当成
+    # 独立分值。此处不替用户猜测该删哪一条，而是显式阻断确认，保留全部证据供编辑。
+    for conflict in _score_source_ownership_conflicts(rules):
+        group = conflict["rules"]
+        titles = "；".join(str(item.get("title") or "未命名规则") for item in group[:4])
+        issues.append({
+            "severity": "warning", "code": "score_source_conflict",
+            "rule_id": str(group[0].get("rule_id") or ""),
+            "rule_ids": [str(item.get("rule_id") or "") for item in group],
+            "title": str(group[0].get("title") or "评分规则"),
+            "message": f"评分原文条款 {conflict['clause_id']} 同时被多个评分规则引用：{titles}。"
+                       "请合并为一个包含完整叶子项的规则，或保留唯一归属，避免重复计分。",
         })
     # 招标声明总分与启用评分规则满分合计交叉校验：提取可能把评分表标题分值
     # （如“商务评分标准（15分）”）误作规则满分，使合计偏离招标文件明示的

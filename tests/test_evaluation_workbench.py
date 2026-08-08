@@ -1697,6 +1697,22 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("企业业绩", duplicate[0]["message"])
         self.assertEqual(len(duplicate[0]["rule_ids"]), 2)
 
+    def test_acquisition_validation_blocks_conflicting_score_clause_owners(self):
+        first = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "报价评分", "check_rule": "按公式计分",
+            "source_clause_ids": ["SC-9-1"], "scoring": {"max_score": 30, "kind": "manual"},
+        })
+        second = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "报价公式续行", "check_rule": "按续行计分",
+            "source_clause_ids": ["SC-9-1"], "scoring": {"max_score": 5, "kind": "manual"},
+        })
+        validation = storage.rule_set_acquisition_validation(self.app, self.project["project_id"])
+        conflicts = [item for item in validation["issues"] if item["code"] == "score_source_conflict"]
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(set(conflicts[0]["rule_ids"]), {first["rule_id"], second["rule_id"]})
+        with self.assertRaisesRegex(ValueError, "SC-9-1"):
+            storage.confirm_rule_set(self.app, self.project["project_id"])
+
     def test_confirm_rule_set_merges_duplicate_score_rules(self):
         storage.add_rule(self.app, self.project["project_id"], {
             "category": "objective", "title": "企业业绩评分（9分）",
@@ -5757,6 +5773,66 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         manual = {"category": "subjective", "title": "培训方案5分评分", "source_type": "ai_edited", "scoring": {"max_score": 5}}
         result = worker._prune_overlapping_score_aggregates([aggregate, *children, manual])
         self.assertEqual([item["title"] for item in result], ["服务方案29分评分", "培训方案5分评分"])
+
+    def test_score_ledger_keeps_one_owner_when_parent_explicitly_contains_children(self):
+        packets = [
+            {"clause_id": "SC-1", "text": "培训方案5分"},
+            {"clause_id": "SC-2", "text": "售后服务方案6分"},
+        ]
+        parent = {
+            "category": "subjective", "title": "服务方案评分", "source_type": "ai",
+            "source_clause_ids": ["SC-1", "SC-2"],
+            "scoring": {"max_score": 11, "items": [
+                {"name": "培训方案", "max_score": 5},
+                {"name": "售后服务方案", "max_score": 6},
+            ]},
+        }
+        children = [
+            {"category": "subjective", "title": "培训方案评分", "source_type": "ai",
+             "source_clause_ids": ["SC-1"], "scoring": {"max_score": 5}},
+            {"category": "subjective", "title": "售后服务方案评分", "source_type": "ai",
+             "source_clause_ids": ["SC-2"], "scoring": {"max_score": 6}},
+        ]
+        result, ledger = worker._canonicalise_score_ledger([parent, *children], packets)
+        self.assertEqual([item["title"] for item in result], ["服务方案评分"])
+        self.assertEqual(ledger["conflict_count"], 0)
+
+    def test_score_ledger_rejects_ambiguous_source_clause_owner(self):
+        packets = [{"clause_id": "SC-1", "text": "投标报价最高30分"}]
+        rules = [
+            {"category": "objective", "title": "投标报价评分", "check_rule": "按报价公式计分",
+             "source_text": "投标报价最高30分", "source_clause_ids": ["SC-1"],
+             "scoring": {"max_score": 30, "kind": "manual"}},
+            {"category": "objective", "title": "投标报价公式续行", "check_rule": "按报价公式续行计分",
+             "source_text": "投标报价最高30分", "source_clause_ids": ["SC-1"],
+             "scoring": {"max_score": 5, "kind": "manual"}},
+        ]
+        _, ledger = worker._canonicalise_score_ledger(rules, packets)
+        self.assertEqual(ledger["conflict_count"], 1)
+        self.assertIsNone(worker._normalise_reconciled_scoring_rules(rules, packets))
+
+    def test_score_ledger_never_prunes_children_when_parent_loses_clause_coverage(self):
+        packets = [
+            {"clause_id": "SC-1", "text": "培训方案5分"},
+            {"clause_id": "SC-2", "text": "售后服务方案6分"},
+        ]
+        parent = {
+            "category": "subjective", "title": "服务方案评分", "source_type": "ai",
+            "source_clause_ids": ["SC-1"],
+            "scoring": {"max_score": 11, "items": [
+                {"name": "培训方案", "max_score": 5},
+                {"name": "售后服务方案", "max_score": 6},
+            ]},
+        }
+        children = [
+            {"category": "subjective", "title": "培训方案评分", "source_type": "ai",
+             "source_clause_ids": ["SC-1"], "scoring": {"max_score": 5}},
+            {"category": "subjective", "title": "售后服务方案评分", "source_type": "ai",
+             "source_clause_ids": ["SC-2"], "scoring": {"max_score": 6}},
+        ]
+        result, ledger = worker._canonicalise_score_ledger([parent, *children], packets)
+        self.assertEqual(len(result), 3)
+        self.assertEqual(ledger["conflict_count"], 1)
 
     def test_coverage_rule_catalog_keeps_leaf_requirements(self):
         rule = {
