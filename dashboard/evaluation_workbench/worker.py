@@ -1756,6 +1756,52 @@ def _prune_overlapping_score_aggregates(rules: list[dict]) -> list[dict]:
     return [item for index, item in enumerate(values) if index not in removable]
 
 
+_SCORE_SECTION_HEADER_PATTERN = re.compile(
+    r"^\s*(?:第\s*[一二三四五六七八九十\d]+\s*部分\s*)?"
+    r"(?:价格|商务|技术|服务|资格)(?:部分)?(?:客观|主观)?(?:评分|评审项)?\s*"
+    r"[（(]\s*\d+(?:\.\d+)?\s*分\s*[）)]\s*(?:[（(][^）)]{0,30}[）)])?\s*$"
+)
+
+
+def _is_non_executable_score_section_summary(item: dict) -> bool:
+    """识别“某部分共 X 分”这类评分表导航标题，避免误作为可执行评分规则。
+
+    章节总分是评分守恒台账，不是一个可对投标文件单独计分的事实。仅当原文/标题
+    明确是章节标题，或唯一叶子也只表达“由评委认定、以细则为准”时才移除；包含
+    具体对象、条件、公式或分档的单项评分规则绝不受影响。
+    """
+    if str(item.get("category") or "") not in {"objective", "subjective"}:
+        return False
+    scoring = item.get("scoring") if isinstance(item.get("scoring"), dict) else {}
+    if storage._valid_max_score(scoring) is None:
+        return False
+    title = str(item.get("title") or "")
+    source = str(item.get("source_text") or "").strip()
+    compact_source = re.sub(r"\s+", "", source)
+    compact_title = re.sub(r"\s+", "", title)
+    if _SCORE_SECTION_HEADER_PATTERN.fullmatch(compact_source):
+        return True
+    header_title = bool(re.search(
+        r"(?:第[一二三四五六七八九十\d]+部分)?(?:价格|商务|技术|服务|资格)部分(?:客观|主观)?(?:评分|评审项)?[（(].*?\d+(?:\.\d+)?分",
+        compact_title,
+    ))
+    items = scoring.get("items") if isinstance(scoring.get("items"), list) else []
+    if not header_title or len(items) != 1 or not isinstance(items[0], dict):
+        return False
+    criterion = str(items[0].get("criterion") or "")
+    # 没有任何可执行条件、仅要求“共同认定/详见评分表”的规则是标题摘要；
+    # “每项、提供、公式、分档”等明确计分口径出现时保留。
+    generic_summary = bool(re.search(r"共同认定|具体子项|评分细则|评分表为准|现场评分", criterion))
+    executable_detail = bool(re.search(r"每(?:项|份|有)|提供|满足|公式|扣[0-9一二三四五六七八九十]|得[0-9一二三四五六七八九十]", source + criterion))
+    return generic_summary and not executable_detail
+
+
+def _drop_non_executable_score_section_summaries(rules: list[dict]) -> tuple[list[dict], int]:
+    """从候选规则中剔除评分章节汇总标题，并返回实际剔除数量。"""
+    kept = [item for item in rules if not _is_non_executable_score_section_summary(item)]
+    return kept, len(rules) - len(kept)
+
+
 # 这些模式描述的是“必须看图像外观才能核验”的证据形态，而不是某个项目的业务词。
 # AI 仍负责理解规则；这里仅作为保守兜底，避免把未执行 OCR 的证照、签章或凭证
 # 因文本未命中直接判成高风险不满足。
@@ -2627,7 +2673,11 @@ def _extract_rules(app, task: dict) -> dict:
     rules, finalisation = _finalise_rule_operations(
         app, task, profile, system_prompt, rules,
     )
+    # 最终规范化可能重写/合并评分候选，必须再做一次确定性同源去重；随后将
+    # “某部分共 X 分”的导航标题移出可执行规则，仅保留其作为评分守恒台账。
+    rules = _dedupe_rule_candidates(rules)
     rules = _prune_overlapping_score_aggregates(rules)
+    rules, score_summary_excluded_count = _drop_non_executable_score_section_summaries(rules)
     rules = _filter_inapplicable_template_rules(_filter_rules_for_package(rules, package_number), text)
     # 模型分段提取和后续去重均可能把“技术★实质性指标 + 证明材料 + 明确无效后果”
     # 错压缩进普通技术覆盖项。仅在三项原文条件同时存在、且规则集尚未承接时补一条；
@@ -2702,6 +2752,7 @@ def _extract_rules(app, task: dict) -> dict:
             "quality_gate_failure_count": quality_gate["failure_count"],
             "quality_gate_recovered_score_count": quality_gate["recovered_score_count"],
             "quality_gate_skipped_by_finalisation": bool(quality_gate.get("skipped_by_finalisation")),
+            "score_summary_excluded_count": score_summary_excluded_count,
             "hard_anchor_supplement_count": hard_anchor_supplement_count,
             "hard_anchor_supplement_failure_count": hard_anchor_supplement_failures,
             "score_structure_repair_count": score_structure_repair_count,

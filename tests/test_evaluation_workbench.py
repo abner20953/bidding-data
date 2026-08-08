@@ -6938,6 +6938,38 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(len(rules), 1)
         self.assertEqual(set(rules[0]["source_clause_ids"]), {"SC-37", "SC-37-2"})
 
+    def test_score_dedupe_merges_formula_suffix_for_same_source(self):
+        source = "投标报价得分=（评标基准价/投标报价）×10，最低报价得满分。"
+        rules = worker._dedupe_rule_candidates([{
+            "category": "objective", "title": "投标报价得分",
+            "source_text": source, "scoring": {"max_score": 10},
+        }, {
+            "category": "objective", "title": "投标报价得分计算（10分）",
+            "source_text": source, "scoring": {"max_score": 10},
+        }])
+        self.assertEqual(len(rules), 1)
+
+    def test_score_section_summary_is_not_an_executable_rule(self):
+        rules, excluded = worker._drop_non_executable_score_section_summaries([{
+            "category": "subjective", "title": "服务部分评分（29分）",
+            "source_text": "第三部分服务部分（29 分）",
+            "scoring": {"max_score": 29, "items": [{"name": "服务部分评分", "max_score": 29, "criterion": "由评标委员会依据服务评分细则共同认定"}]},
+        }, {
+            "category": "subjective", "title": "售后服务方案评分（6分）",
+            "source_text": "提供售后服务方案，内容完整得6分。",
+            "scoring": {"max_score": 6, "items": [{"name": "售后服务", "max_score": 6, "criterion": "提供完整方案得6分"}]},
+        }])
+        self.assertEqual(excluded, 1)
+        self.assertEqual([item["title"] for item in rules], ["售后服务方案评分（6分）"])
+
+    def test_generic_score_section_summary_does_not_remove_detailed_single_item_score(self):
+        rule = {
+            "category": "objective", "title": "相关认证证书评分（2分）",
+            "source_text": "提供有效质量管理体系认证证书得2分。",
+            "scoring": {"max_score": 2, "items": [{"name": "认证证书", "max_score": 2, "criterion": "提供有效证书得2分"}]},
+        }
+        self.assertFalse(worker._is_non_executable_score_section_summary(rule))
+
     def test_confirm_rule_set_blocks_declared_total_mismatch(self):
         """明示总分不守恒不能进入综合评审，避免错误总分传播。"""
         storage.add_rule(self.app, self.project["project_id"], {

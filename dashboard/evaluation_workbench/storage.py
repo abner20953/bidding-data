@@ -3466,6 +3466,9 @@ def _score_rule_title_core(value: object) -> str:
         r"^\s*(?:(?:商务|技术|价格|服务|资格)部分|(?:客观|主观)?评分|评分项?)\s*[-—–:：_]\s*",
         "", text,
     )
+    # “投标报价得分计算”“价格评分公式”只是同一评分对象的计算口径表述，不能
+    # 因尾部动作词不同成为两条可执行评分规则。
+    text = re.sub(r"(?:得分|评分)(?:计算|公式)\s*$", lambda match: match.group(0)[:2], text)
     return re.sub(r"[\s\W_]+", "", text).casefold()
 
 
