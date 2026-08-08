@@ -1887,7 +1887,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         rules = storage.list_rules(self.app, self.project["project_id"])[1]
         titles = {item["title"]: item for item in rules}
-        # 人工/编辑规则保留；纯 AI 规则由新提取整批替换（提取管线内部保证完整性）。
+        # 人工补充独立保留；AI 规则由本轮提取整批替换。
         self.assertIn("投标函出具与实质性承诺", titles)
         self.assertNotIn("企业业绩评分（9分）", titles)
         self.assertIn("投标报价不得超过最高限价", titles)
@@ -6514,7 +6514,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(scoring["max_score"], 10.0)
         self.assertEqual(scoring["source"], "manual")
 
-    def test_reextract_preserves_edited_content_and_selection_states(self):
+    def test_reextract_keeps_manual_but_replaces_edited_rules(self):
         first = storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-1", [{
             "category": "qualification", "title": "营业执照", "check_rule": "核验营业执照", "source_text": "应提供营业执照。",
         }])
@@ -6535,15 +6535,11 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         _, refreshed = storage.list_rules(self.app, self.project["project_id"])
 
         self.assertEqual(first["version"] + 1, second["version"])
-        self.assertEqual(second["preserved_rule_count"], 2)
-        edited = next(item for item in refreshed if item["title"] == "营业执照")
+        self.assertEqual(second["preserved_rule_count"], 1)
         manual = next(item for item in refreshed if item["title"] == "人工补充承诺")
-        self.assertEqual(edited["source_type"], "ai_edited")
         self.assertEqual(manual["source_type"], "manual")
-        # 新设计：人工/编辑规则无条件继承并沿用启用状态，不再重置为启用，
-        # 避免“用户停用的规则在重新提取后复活”。
-        self.assertEqual(edited["enabled"], 0)
         self.assertEqual(manual["enabled"], 0)
+        self.assertFalse(any(item["title"] == "营业执照" for item in refreshed))
 
     def test_reextract_does_not_preserve_ai_rule_selection_only_changes(self):
         storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-1", [{
@@ -6567,7 +6563,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(extracted_again["source_type"], "ai")
         self.assertEqual(extracted_again["enabled"], 1)
 
-    def test_reextract_skips_ai_duplicate_of_edited_score_rule(self):
+    def test_reextract_does_not_inherit_edited_score_rule(self):
         storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-1", [{
             "category": "objective", "title": "相关证书评分（5分）",
             "check_rule": "满分5分，按证书类别独立计分：①质量管理体系认证证书有效得1分",
@@ -6596,8 +6592,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         certificate_rules = [item for item in refreshed if item["title"] == "相关证书评分（5分）"]
         self.assertEqual(len(certificate_rules), 1)
-        self.assertEqual(certificate_rules[0]["source_type"], "ai_edited")
-        self.assertEqual(certificate_rules[0]["check_rule"], "核验投标文件是否附有效期内管理体系认证证书复印件：(1)质量管理体系认证证书得1分")
+        self.assertEqual(certificate_rules[0]["source_type"], "ai")
+        self.assertEqual(certificate_rules[0]["check_rule"], "满分5分，按证书类别独立计分：①质量管理体系认证证书有效得1分")
         performance_rules = [item for item in refreshed if item["title"] == "相关业绩评分（8分）"]
         self.assertEqual(len(performance_rules), 1)
         self.assertEqual(performance_rules[0]["source_type"], "ai")
@@ -6619,11 +6615,17 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(enabled["通用许可证"], 1)
 
     def test_force_rerun_is_persisted_in_task_payload(self):
-        self._add_pdf("bid.pdf", "bid", "甲公司", "已提供资质。")
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "已提供资质。")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
         self._run_next_task()
-        storage.add_rule(self.app, self.project["project_id"], {"category": "qualification", "title": "资质"})
+        rule = storage.add_rule(self.app, self.project["project_id"], {"category": "qualification", "title": "资质"})
         storage.confirm_rule_set(self.app, self.project["project_id"])
+        previous = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        storage.update_task(self.app, previous["task_id"], status="success")
+        review_run = storage.create_review_run(self.app, self.project["project_id"], previous["task_id"], "profile-1")
+        storage.save_review_results(self.app, review_run["review_run_id"], document["document_id"], [{
+            "rule_id": rule["rule_id"], "status": "satisfied", "evidence": "旧结论", "risk_level": "low",
+        }])
 
         with patch("dashboard.blueprints.evaluation_workbench._start_worker_if_needed"):
             response = self.app.test_client().post(
@@ -6634,6 +6636,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
         self.assertTrue(response.get_json()["task"]["payload"]["force_rerun"])
         self.assertTrue(response.get_json()["task"]["payload"]["input_fingerprint"])
+        self.assertEqual(storage.latest_review_results(self.app, self.project["project_id"]), (None, []))
 
     def test_printable_report_is_generated_on_demand(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案。")
@@ -6692,8 +6695,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(result["status"], "satisfied")
         self.assertEqual(result["coverage_status"], "covered")
 
-    def test_rule_set_changes_do_not_hide_most_recent_review_and_score_results(self):
-        """新增/编辑规则或重新提取生成新版本后，最近一次有结果的运行仍应可见。"""
+    def test_reextract_clears_previous_review_and_score_results(self):
+        """重新提取后不展示或复用上一轮综合评审结果。"""
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案：稳定运行。")
         rule = storage.add_rule(self.app, self.project["project_id"], {
             "category": "qualification", "title": "资质", "check_rule": "核验资质",
@@ -6710,26 +6713,19 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.save_score_results(self.app, score_run["score_run_id"], document["document_id"], [{
             "rule_id": rule["rule_id"], "suggested_score": 5.0, "max_score": 5.0,
         }])
-        # 用户随后新增规则会生成更高版本的待确认草稿；结果仍应可见。
-        storage.add_rule(self.app, self.project["project_id"], {"category": "compliance", "title": "响应"})
-
-        run, results = storage.latest_review_results(self.app, self.project["project_id"])
-        self.assertIsNotNone(run)
-        self.assertEqual([item["rule_id"] for item in results], [rule["rule_id"]])
-        score_run, score_rows = storage.latest_score_results(self.app, self.project["project_id"], "objective")
-        self.assertIsNotNone(score_run)
-        self.assertEqual([item["rule_id"] for item in score_rows], [rule["rule_id"]])
-
-        # 重新提取规则会把旧确认版本标记为 superseded 并生成新草稿；历史结果仍保留展示。
+        # 重新提取会把旧规则和旧结果一并移出当前工作台。
         storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-2", [{
             "category": "qualification", "title": "投标人资质", "check_rule": "核验投标人资质",
         }])
         run, results = storage.latest_review_results(self.app, self.project["project_id"])
-        self.assertIsNotNone(run)
-        self.assertEqual([item["rule_id"] for item in results], [rule["rule_id"]])
+        self.assertIsNone(run)
+        self.assertEqual(results, [])
+        score_run, score_rows = storage.latest_score_results(self.app, self.project["project_id"], "objective")
+        self.assertIsNone(score_run)
+        self.assertEqual(score_rows, [])
 
-    def test_acquisition_setting_change_locks_ai_rule_across_reextract(self):
-        """用户调整 AI 规则的图片取证设置后，重新提取时该规则应整体保留。"""
+    def test_acquisition_setting_change_does_not_lock_ai_rule_across_reextract(self):
+        """取证设置是执行参数，不能把 AI 规则固化成跨版本的人工编辑规则。"""
         storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-1", [{
             "category": "qualification", "title": "营业执照", "check_rule": "核验营业执照", "source_text": "应提供营业执照。",
         }])
@@ -6739,15 +6735,14 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             "acquisition_preset": "smart", "image_mode": "auto",
             "vision_trigger": "text_fallback", "vision_level": "standard",
         })
-        self.assertEqual(tuned["source_type"], "ai_edited")
+        self.assertEqual(tuned["source_type"], "ai")
 
         storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-2", [{
             "category": "qualification", "title": "营业执照", "check_rule": "核验营业执照", "source_text": "应提供营业执照。",
         }])
         _, refreshed = storage.list_rules(self.app, self.project["project_id"])
         preserved = next(item for item in refreshed if item["title"] == "营业执照")
-        self.assertEqual(preserved["source_type"], "ai_edited")
-        self.assertEqual(preserved["vision_trigger"], "text_fallback")
+        self.assertEqual(preserved["source_type"], "ai")
         self.assertEqual(len([item for item in refreshed if item["title"] == "营业执照"]), 1)
 
     def test_profile_parallel_limit_scales_with_document_count(self):
@@ -6922,8 +6917,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(results["r1"]["suggested_score"], 2)
         self.assertEqual(results["r2"]["suggested_score"], 1)
 
-    def test_reextract_reattaches_clause_identity_to_edited_score_rule(self):
-        """编辑后的规则可保留，但必须回到新一轮提取的稳定条款台账。"""
+    def test_reextract_uses_new_score_rule_identity(self):
+        """重新提取只使用本轮评分条款锚点，不继承旧编辑内容。"""
         storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-1", [{
             "category": "objective", "title": "认证材料评分",
             "check_rule": "核验认证材料", "source_text": "投标人提供有效质量管理体系认证证书复印件的，得 5 分。",
@@ -6946,12 +6941,12 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         _, refreshed = storage.list_rules(self.app, self.project["project_id"])
         score_rules = [item for item in refreshed if item["category"] == "objective"]
         self.assertEqual(len(score_rules), 1)
-        self.assertEqual(score_rules[0]["source_type"], "ai_edited")
+        self.assertEqual(score_rules[0]["source_type"], "ai")
         self.assertEqual(score_rules[0]["source_page"], 18)
         self.assertIn("score-cert-1", score_rules[0]["source_clause_ids"])
 
-    def test_reextract_reattaches_edited_non_score_rule_without_duplicate(self):
-        """非评分规则同样按同源条款重挂接，不能因改过取证策略而叠加一条 AI 副本。"""
+    def test_reextract_uses_new_non_score_rule_content(self):
+        """重新提取不继承旧规则的内容或取证设置。"""
         storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-1", [{
             "category": "qualification", "title": "营业执照",
             "check_rule": "核验营业执照", "source_text": "投标人须提供有效的营业执照复印件。",
@@ -6974,13 +6969,13 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         _, refreshed = storage.list_rules(self.app, self.project["project_id"])
         rules = [item for item in refreshed if item["category"] == "qualification"]
         self.assertEqual(len(rules), 1)
-        self.assertEqual(rules[0]["source_type"], "ai_edited")
-        self.assertEqual(rules[0]["check_rule"], "核验营业执照、统一社会信用代码及有效状态。")
+        self.assertEqual(rules[0]["source_type"], "ai")
+        self.assertEqual(rules[0]["check_rule"], "提供营业执照复印件并核验有效性。")
         self.assertEqual(rules[0]["source_page"], 12)
         self.assertIn("Q-1", rules[0]["source_clause_ids"])
 
-    def test_reextract_does_not_merge_edited_rules_from_shared_source_only(self):
-        """同一段原文中的不同要求必须并存，标题对象不同不能只因同源而被吞并。"""
+    def test_reextract_leaves_unmatched_edited_rule_in_history_even_with_shared_source(self):
+        """不同对象不能按共享原文误挂接；旧编辑规则不应污染新版。"""
         storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-1", [{
             "category": "qualification", "title": "营业执照",
             "check_rule": "核验营业执照", "source_text": "投标人须提供营业执照和法定代表人身份证明。",
@@ -6994,7 +6989,31 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             "check_rule": "核验法定代表人身份证明", "source_text": "投标人须提供营业执照和法定代表人身份证明。",
         }])
         _, refreshed = storage.list_rules(self.app, self.project["project_id"])
-        self.assertEqual(len([item for item in refreshed if item["category"] == "qualification"]), 2)
+        rules = [item for item in refreshed if item["category"] == "qualification"]
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0]["title"], "法定代表人身份证明")
+
+    def test_candidate_dedupe_merges_only_same_non_score_fact(self):
+        """同一原文同一对象的分段副本应收敛，不同对象即使同源也必须保留。"""
+        source = "投标人须提供有效营业执照和法定代表人身份证明。"
+        rules = worker._dedupe_rule_candidates([
+            {"category": "qualification", "title": "营业执照", "check_rule": "核验营业执照", "source_text": source, "source_clause_ids": ["Q-1"]},
+            {"category": "qualification", "title": "资格性审查-营业执照", "check_rule": "核验营业执照有效性", "source_text": source, "source_clause_ids": ["Q-1"]},
+            {"category": "qualification", "title": "法定代表人身份证明", "check_rule": "核验法定代表人身份证明", "source_text": source, "source_clause_ids": ["Q-1"]},
+        ])
+
+        self.assertEqual(len(rules), 2)
+        self.assertEqual(sum(item["title"] == "法定代表人身份证明" for item in rules), 1)
+
+    def test_unmapped_ai_score_rule_blocks_confirmation(self):
+        """没有原文评分台账锚点的纯 AI 评分规则不能进入已确认规则集。"""
+        storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-score", [{
+            "category": "objective", "title": "认证材料评分", "check_rule": "核验认证材料",
+            "source_text": "提供认证材料得 3 分。", "scoring": {"max_score": 3},
+        }])
+
+        with self.assertRaisesRegex(ValueError, "未能唯一挂接"):
+            storage.confirm_rule_set(self.app, self.project["project_id"])
 
     def test_score_title_core_ignores_trailing_machine_clause_marker(self):
         self.assertEqual(
@@ -7063,7 +7082,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         }
         self.assertFalse(worker._is_non_executable_score_section_summary(rule))
 
-    def test_reextract_auto_disables_proven_duplicate_edited_score_rules(self):
+    def test_reextract_auto_disables_proven_duplicate_score_rules(self):
         source = "投标产品提供有效节能产品认证证书每项1分，环境标志产品认证证书每项1分，满分2分。"
         storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-1", [{
             "category": "objective", "title": "认证证书评分（2分）", "check_rule": "核验证书",
@@ -7079,13 +7098,21 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             storage.update_rule(self.app, self.project["project_id"], rule["rule_id"], {"check_rule": rule["check_rule"] + "（人工维护）"})
             storage.update_rule(self.app, self.project["project_id"], rule["rule_id"], {"enabled": True})
 
-        rule_set = storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-2", [])
+        rule_set = storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-2", [{
+            "category": "objective", "title": "认证证书评分（2分）", "check_rule": "核验证书",
+            "source_text": source, "source_page": 34,
+            "scoring": {"max_score": 2, "items": [{"name": "节能证书", "max_score": 1}, {"name": "环境证书", "max_score": 1}]},
+        }, {
+            "category": "objective", "title": "节能/环境标志产品认证证书评分", "check_rule": "核验证书有效期",
+            "source_text": source, "source_page": 34,
+            "scoring": {"max_score": 2, "items": [{"name": "节能证书", "max_score": 1}, {"name": "环境证书", "max_score": 1}]},
+        }])
         _, refreshed = storage.list_rules(self.app, self.project["project_id"])
         scores = [item for item in refreshed if item["category"] == "objective"]
         self.assertEqual(len(scores), 2)
         self.assertEqual(sum(1 for item in scores if item["enabled"]), 1)
         self.assertEqual(rule_set["auto_merged_score_rule_count"], 1)
-        self.assertTrue(any("人工维护" in item["check_rule"] for item in scores if item["enabled"]))
+        self.assertFalse(any("人工维护" in item["check_rule"] for item in scores))
 
     def test_confirm_rule_set_blocks_declared_total_mismatch(self):
         """明示总分不守恒不能进入综合评审，避免错误总分传播。"""

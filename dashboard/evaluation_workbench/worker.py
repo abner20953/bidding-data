@@ -1673,6 +1673,41 @@ def _rule_candidate_richness(item: dict) -> tuple[int, int, int]:
     return (len(items), len(str(item.get("check_rule") or "")), len(str(item.get("source_text") or "")))
 
 
+def _non_score_candidates_same_fact(existing: dict, candidate: dict) -> bool:
+    """仅用可证明的同源锚点收敛非评分候选，绝不按相似标题猜测。
+
+    分段提取、补漏和 JSON 续提会让同一条原文事实出现多个副本。这里要求“同一
+    类别 + 同一对象 + 同一来源”：条款 ID 交集，或长度足够的完全相同原文。不同
+    要求即使写在同一段原文中，也因标题对象不同而不会被吞并。
+    """
+    category = str(candidate.get("category") or "")
+    if category in {"objective", "subjective"} or category != str(existing.get("category") or ""):
+        return False
+    if not storage._rule_titles_compatible(existing.get("title"), candidate.get("title"), category):
+        return False
+    left_ids = {str(value).strip() for value in existing.get("source_clause_ids") or [] if str(value).strip()}
+    right_ids = {str(value).strip() for value in candidate.get("source_clause_ids") or [] if str(value).strip()}
+    if left_ids and right_ids and left_ids & right_ids:
+        return True
+    left_source = storage._normalise_rule_source(existing.get("source_text"))
+    right_source = storage._normalise_rule_source(candidate.get("source_text"))
+    return len(left_source) >= 24 and left_source == right_source
+
+
+def _merge_duplicate_non_score_rule(existing: dict, candidate: dict) -> dict:
+    """合并确定性重复的非评分候选，只补充信息，不改写业务口径。"""
+    primary, secondary = (candidate, existing) if _rule_candidate_richness(candidate) > _rule_candidate_richness(existing) else (existing, candidate)
+    merged = dict(primary)
+    merged["source_clause_ids"] = list(dict.fromkeys([
+        *[str(value) for value in primary.get("source_clause_ids") or [] if str(value).strip()],
+        *[str(value) for value in secondary.get("source_clause_ids") or [] if str(value).strip()],
+    ]))
+    merged["ocr_required"] = bool(primary.get("ocr_required") or secondary.get("ocr_required"))
+    if not merged.get("source_page"):
+        merged["source_page"] = secondary.get("source_page")
+    return merged
+
+
 def _merge_duplicate_score_rule(existing: dict, candidate: dict) -> dict:
     """合并同一评分事实的互补字段，选择信息更全者为主体。"""
     primary, secondary = (candidate, existing) if _rule_candidate_richness(candidate) > _rule_candidate_richness(existing) else (existing, candidate)
@@ -1793,7 +1828,20 @@ def _dedupe_rule_candidates(items: list[dict]) -> list[dict]:
             final_rules.append(item)
         else:
             final_rules[target_index] = _merge_duplicate_score_rule(final_rules[target_index], item)
-    return final_rules
+    # 非评分规则也会在同一原文批次、补漏批次与本地 JSON 续提中重复出现。仅收敛
+    # 条款 ID 或完整原文均一致的副本；语义近似仍留给一次统一规范化与人工确认，
+    # 避免本地代码越界替用户判断不同审查要求是否应合并。
+    non_score_rules: list[dict] = []
+    for item in final_rules:
+        target_index = next((
+            index for index, existing in enumerate(non_score_rules)
+            if _non_score_candidates_same_fact(existing, item)
+        ), None)
+        if target_index is None:
+            non_score_rules.append(item)
+        else:
+            non_score_rules[target_index] = _merge_duplicate_non_score_rule(non_score_rules[target_index], item)
+    return non_score_rules
 
 
 def _score_label_key(value: object) -> str:
@@ -2804,16 +2852,21 @@ def _extract_rules(app, task: dict) -> dict:
     structure_issues = _score_structure_issues(rules)
     if structure_issues:
         storage.update_task(app, task["task_id"], message="正在修复评分规则结构（叶子合计与满分不一致）")
-        try:
-            supplement = _request_task_json(
-                app, task, profile, "extract_rules_scoring_structure_repair", system_prompt,
-                _score_structure_repair_prompt(app, structure_issues[:3], score_packets),
-                document_id=tender["document_id"], context_mode="score_structure_repair",
-                max_tokens=_output_token_budget(profile, 3_500), thinking_mode="disabled",
-            )
-            supplement_rules = supplement.get("rules") if isinstance(supplement, dict) else None
-            if isinstance(supplement_rules, list):
-                repaired = 0
+        # 以前只修复前 3 条异常，会让同一评分表中后续结构残缺项原样落库，造成
+        # “有时能确认、有时不能确认”的不稳定体验。每批保持小上下文，逐批独立
+        # 修复；单批失败只保留该批原始规则，不影响其余评分项。
+        for batch_index in range(0, len(structure_issues), 3):
+            issue_batch = structure_issues[batch_index:batch_index + 3]
+            try:
+                supplement = _request_task_json(
+                    app, task, profile, "extract_rules_scoring_structure_repair", system_prompt,
+                    _score_structure_repair_prompt(app, issue_batch, score_packets),
+                    document_id=tender["document_id"], context_mode=f"score_structure_repair_{batch_index // 3 + 1}",
+                    max_tokens=_output_token_budget(profile, 3_500), thinking_mode="disabled",
+                )
+                supplement_rules = supplement.get("rules") if isinstance(supplement, dict) else None
+                if not isinstance(supplement_rules, list):
+                    raise ValueError("评分结构修复未返回规则列表")
                 for candidate in supplement_rules:
                     if not isinstance(candidate, dict) or candidate.get("category") not in {"objective", "subjective"}:
                         continue
@@ -2840,12 +2893,11 @@ def _extract_rules(app, task: dict) -> dict:
                             continue
                         candidate["source_clause_ids"] = list(current_ids or candidate_ids)
                         rules[index] = candidate
-                        repaired += 1
+                        score_structure_repair_count += 1
                         break
-                score_structure_repair_count = repaired
-        except ValueError as exc:
-            score_structure_repair_failures = 1
-            storage.update_task(app, task["task_id"], message=f"评分结构修复未完成：{exc}")
+            except ValueError as exc:
+                score_structure_repair_failures += 1
+                storage.update_task(app, task["task_id"], message=f"部分评分结构修复未完成：{exc}")
     # 质量门控偶尔会遗漏“异常低价解释”等评审过程事项。它们既没有可执行分值，
     # 也不能由投标文件单独完成，不能以零分评分规则的形式进入待确认规则集。
     before_procedural_filter = len(rules)

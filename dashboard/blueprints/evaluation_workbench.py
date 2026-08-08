@@ -634,13 +634,17 @@ def tasks_api(project_id):
             failed_units = (prior.get("result") or {}).get("failed_units")
             if not isinstance(failed_units, list) or not failed_units:
                 return jsonify({"error": "该任务没有可单独重跑的失败项"}), 400
-        # force_rerun 必须随任务进入后台。仅在 API 层跳过整任务复用还不够：
-        # 综合评审内部还有按投标文件复用的增量缓存。
+        # 规则提取本身就是“生成新规则集”，不允许命中旧任务复用。force_rerun
+        # 也必须随综合评审进入后台：仅在 API 层跳过整任务复用还不够，内部还有
+        # 按投标文件复用的增量缓存。
+        force_rerun = task_type == "extract_rules" or data.get("force_rerun") is True
+        if task_type == "evaluate_all" and force_rerun and not retry_failed_task_id:
+            storage.clear_evaluation_results(current_app, project_id)
         payload = {
             "profile_id": requested_profile_id,
             "prompt_version": TASK_PROMPT_VERSION,
             "deploy_commit": _current_deploy_commit(),
-            "force_rerun": data.get("force_rerun") is True,
+            "force_rerun": force_rerun,
         }
         if retry_failed_task_id:
             payload["retry_failed_task_id"] = retry_failed_task_id
@@ -648,7 +652,7 @@ def tasks_api(project_id):
             payload["input_fingerprint"] = storage.task_input_fingerprint(
                 current_app, project_id, task_type, requested_profile_id, TASK_PROMPT_VERSION,
             )
-            if data.get("force_rerun") is not True and not retry_failed_task_id:
+            if not force_rerun and not retry_failed_task_id:
                 reusable = storage.find_reusable_task(current_app, project_id, task_type, payload["input_fingerprint"])
                 if reusable:
                     return jsonify({"task": reusable, "reused": True})

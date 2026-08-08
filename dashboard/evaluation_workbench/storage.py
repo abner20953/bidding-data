@@ -2040,6 +2040,20 @@ def delete_evaluation_unit_checkpoints(app, project_id: str, rule_set_id: str, d
             )
 
 
+def clear_evaluation_results(app, project_id: str) -> None:
+    """删除项目上一轮综合评审产物，使重新运行不展示或复用旧结论。
+
+    文件解析、页级 OCR 缓存等确定性基础数据不在这里删除；它们不是评审结论，且
+    保留可避免重新解析文件。规则、评审结果、评分结果、证据包和失败续跑快照则
+    全部清空，确保新的综合评审从规则到结论完全独立。
+    """
+    with connection(app) as conn:
+        conn.execute("DELETE FROM ew_review_runs WHERE project_id=?", (project_id,))
+        conn.execute("DELETE FROM ew_score_runs WHERE project_id=?", (project_id,))
+        conn.execute("DELETE FROM ew_evidence_packs WHERE project_id=?", (project_id,))
+        conn.execute("DELETE FROM ew_evaluation_unit_checkpoints WHERE project_id=?", (project_id,))
+
+
 def get_project_scope_checkpoint(app, project_id: str, scope_key: str) -> dict | None:
     with connection(app) as conn:
         row = conn.execute(
@@ -3206,9 +3220,10 @@ def update_rule(app, project_id: str, rule_id: str, payload: dict) -> dict:
             if rule["category"] == "objective":
                 current["kind"] = "boolean" if scoring.get("kind") == "boolean" else "manual"
             scoring_json = json.dumps(current, ensure_ascii=False)
-        # 规则内容、评分口径和图片取证策略的人工修改都属于长期维护内容；启用勾选
-        # 仅属于当前规则集，重新提取时必须重新选择，不能因为一次勾选操作把 AI
-        # 规则固化到下一版本。
+        # 规则内容与评分口径才属于“人工编辑的业务口径”。启用勾选和取证策略只是
+        # 当前一轮的执行参数：重新提取后应由新规则的证据要求重新生成，不能因为
+        # 调整过 OCR/图片策略就把整条 AI 规则永久固化为 ai_edited。后者会使历史
+        # AI 规则跨版本不断继承，是重复规则累积的根源之一。
         execution_meta_keys = (
             "execution_strategy", "evidence_requirements", "applicability", "ocr_required", "check_mode",
             "image_mode", "vision_trigger", "vision_level", "acquisition_preset", "evidence_items",
@@ -3216,7 +3231,7 @@ def update_rule(app, project_id: str, rule_id: str, payload: dict) -> dict:
         )
         execution_meta_changed = any(key in payload for key in execution_meta_keys)
         content_locked = rule.get("source_type") in {"ai", "ai_locked"} and (
-            check_rule is not None or scoring_json is not None or execution_meta_changed
+            check_rule is not None or scoring_json is not None
         )
         if check_rule is not None:
             conn.execute(
@@ -3245,20 +3260,18 @@ def update_rule(app, project_id: str, rule_id: str, payload: dict) -> dict:
 
 def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: list[dict]) -> dict:
     with connection(app) as conn:
-        # 提取管线内部保证完整性（评分条款/资格条款/硬性条款自动补漏 + 结构修复），
-        # 因此新一轮 AI 提取对纯 AI 规则采用整批替换：旧 AI 规则由新结果完整重建，
-        # 避免继承叠加产生重复；人工补充或人工修改过的规则（manual/ai_edited）
-        # 无条件保留并沿用启用状态，用户维护内容不丢失。
+        # “重新提取”就是一次全新 AI 规则生成：旧 AI 规则、AI 编辑、勾选、取证
+        # 策略和模型结论都不参与本轮。只有人工补充规则属于独立业务口径，允许
+        # 进入新草稿；历史 AI 规则保留在旧版本用于审计，但绝不混入当前草稿。
         current = conn.execute(
-            """SELECT * FROM ew_rule_sets WHERE project_id = ?
+            """SELECT rule_set_id FROM ew_rule_sets WHERE project_id=?
                AND status IN ('confirmed', 'draft') ORDER BY version DESC LIMIT 1""",
             (project_id,),
         ).fetchone()
-        preserved = []
+        manual_rules = []
         if current:
-            preserved = conn.execute(
-                """SELECT * FROM ew_rules WHERE rule_set_id = ?
-                   AND source_type IN ('manual', 'ai_edited')
+            manual_rules = conn.execute(
+                """SELECT * FROM ew_rules WHERE rule_set_id=? AND source_type='manual'
                    ORDER BY sort_order, created_at""",
                 (current["rule_set_id"],),
             ).fetchall()
@@ -3266,22 +3279,16 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
         timestamp = now_iso()
         rule_set = {"rule_set_id": str(uuid.uuid4()), "project_id": project_id, "version": prior + 1, "status": "draft", "source_task_id": task_id, "created_at": timestamp, "updated_at": timestamp}
         conn.execute("UPDATE ew_rule_sets SET status = 'superseded', updated_at = ? WHERE project_id = ? AND status != 'superseded'", (timestamp, project_id))
+        # 规则集已更换，所有综合评审产物都属于旧规则语境；不保留在页面上混看。
+        conn.execute("DELETE FROM ew_review_runs WHERE project_id=?", (project_id,))
+        conn.execute("DELETE FROM ew_score_runs WHERE project_id=?", (project_id,))
+        conn.execute("DELETE FROM ew_evidence_packs WHERE project_id=?", (project_id,))
+        conn.execute("DELETE FROM ew_evaluation_unit_checkpoints WHERE project_id=?", (project_id,))
         conn.execute("INSERT INTO ew_rule_sets(rule_set_id, project_id, version, status, source_task_id, created_at, updated_at) VALUES (:rule_set_id, :project_id, :version, :status, :source_task_id, :created_at, :updated_at)", rule_set)
         signatures = set()
-        # 编辑规则保留用户内容，但不能再把它们当作与新一轮提取无关的“孤岛”。
-        # 对任何类别均以“同类 + 标题对象 + 同源条款”重挂接：人工维护的口径不丢，
-        # 新一轮的条款锚点得以更新，也不会同时插入一条新的 AI 副本。
-        # 无法证明同源时宁可并存，绝不只凭相似标题静默吞掉人工规则。
-        preserved_edited_rules: list[dict] = []
+        next_sort_order = 0
         preserved_rule_count = 0
-        for index, row in enumerate(preserved):
-            row_value = dict(row)
-            new_rule_id = str(uuid.uuid4())
-            # 后续与本轮候选挂接时必须指向新规则集中的记录，而不是已经 superseded
-            # 的旧 rule_id。
-            row_value["rule_id"] = new_rule_id
-            if row["source_type"] == "ai_edited":
-                preserved_edited_rules.append(row_value)
+        for row in manual_rules:
             signature = (
                 row["category"], re.sub(r"\s+", "", row["title"]).casefold(),
                 re.sub(r"\s+", "", row["check_rule"] or row["title"]).casefold(),
@@ -3292,26 +3299,21 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
             conn.execute(
                 """INSERT INTO ew_rules(rule_id, rule_set_id, category, title, check_rule, source_text, source_page, check_mode,
                    source_type, source_task_id, scoring_json, execution_meta_json, enabled, sort_order, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (new_rule_id, rule_set["rule_set_id"], row["category"], row["title"], row["check_rule"] or row["title"],
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, ?, ?, ?)""",
+                (str(uuid.uuid4()), rule_set["rule_set_id"], row["category"], row["title"], row["check_rule"] or row["title"],
                  row["source_text"], row["source_page"], "ocr" if row["check_mode"] == "ocr" else "auto",
-                 row["source_type"], row["source_task_id"], row["scoring_json"], row["execution_meta_json"],
-                 int(bool(row["enabled"])), index, timestamp, timestamp),
+                 row["source_task_id"], row["scoring_json"], row["execution_meta_json"], int(bool(row["enabled"])),
+                 next_sort_order, timestamp, timestamp),
             )
+            next_sort_order += 1
             preserved_rule_count += 1
-        for index, item in enumerate(rules):
+        for item in rules:
             title = str(item.get("title", "")).strip()
             category = str(item.get("category", "")).strip()
             if not title or category not in {"qualification", "compliance", "substantive", "rejection", "other", "objective", "subjective"}:
                 continue
             check_rule = str(item.get("check_rule", "")).strip() or title
             signature = (category, re.sub(r"\s+", "", title).casefold(), re.sub(r"\s+", "", check_rule).casefold())
-            matching_edited = _matching_preserved_edited_rule(item, preserved_edited_rules)
-            if matching_edited is not None:
-                # 用户编辑的名称、检查口径、启用状态及取证策略保持不变；仅同步本轮
-                # 重新定位到的页码与条款 ID。这样“重新提取”不会产生编辑版 + AI 版。
-                _attach_extracted_rule_identity(conn, matching_edited, item)
-                continue
             if signature in signatures:
                 continue
             signatures.add(signature)
@@ -3323,13 +3325,14 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
                  "ocr" if item.get("ocr_required") or item.get("check_mode") == "ocr" else "auto",
                  task_id, json.dumps(item.get("scoring"), ensure_ascii=False) if item.get("scoring") else None, _execution_meta_json(item),
                  0 if item.get("ocr_required") or item.get("check_mode") == "ocr" else 1,
-                 preserved_rule_count + index, timestamp, timestamp),
+                 next_sort_order, timestamp, timestamp),
             )
+            next_sort_order += 1
         global_rule_count = 0
         global_rules = conn.execute(
             "SELECT * FROM ew_global_rules ORDER BY category, sort_order, created_at"
         ).fetchall()
-        for position, template in enumerate(global_rules, start=preserved_rule_count + len(rules)):
+        for template in global_rules:
             signature = (
                 template["category"], re.sub(r"\s+", "", template["title"]).casefold(),
                 re.sub(r"\s+", "", template["check_rule"]).casefold(),
@@ -3343,28 +3346,16 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
                    VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'global', NULL, NULL, ?, ?, ?, ?, ?)""",
                 (str(uuid.uuid4()), rule_set["rule_set_id"], template["category"], template["title"], template["check_rule"],
                  template["source_text"], template["check_mode"], template["execution_meta_json"],
-                 int(bool(template["enabled"])), position, timestamp, timestamp),
+                 int(bool(template["enabled"])), next_sort_order, timestamp, timestamp),
             )
             global_rule_count += 1
+            next_sort_order += 1
         rule_set["global_rule_count"] = global_rule_count
         rule_set["preserved_rule_count"] = preserved_rule_count
-    # 同一轮中可能遗留两条已编辑的历史评分规则：它们都应保留编辑内容，但若已经
-    # 能由同源原文/叶子结构证明为同一计分事实，就在草稿生成时停用次规则。这样
-    # 不必等到用户点击确认才发现总分虚高；记录仍保留，操作可逆。
+    # 当前轮内部仍可能因模型分段输出产生评分副本；只对可证明重复的规则做可逆
+    # 停用，避免同一评分事实执行两次。
     rule_set["auto_merged_score_rule_count"] = merge_draft_score_rule_duplicates(app, rule_set["rule_set_id"])
     return rule_set
-
-
-def _safe_scoring_json(rule: dict) -> dict:
-    """读取评分结构；损坏的历史 JSON 视为空结构，绝不影响重新提取。"""
-    value = rule.get("scoring") if isinstance(rule, dict) else None
-    if isinstance(value, dict):
-        return value
-    try:
-        value = json.loads((rule or {}).get("scoring_json") or "{}")
-    except (AttributeError, TypeError, json.JSONDecodeError):
-        value = {}
-    return value if isinstance(value, dict) else {}
 
 
 def _rule_title_identity(value: object, category: object = "") -> str:
@@ -3393,75 +3384,6 @@ def _rule_titles_compatible(left: object, right: object, category: object) -> bo
     return first == second or (min(len(first), len(second)) >= 6 and (first in second or second in first))
 
 
-def _rule_candidates_same_fact(existing: dict, candidate: dict) -> bool:
-    """判断编辑规则与新候选是否可证明同一招标事实。
-
-    身份由“同分类、同对象、同源锚点”共同构成。评分规则还必须同满分，避免相同
-    对象在不同评分档位被错误吸收。该逻辑服务于重新提取落库，不依赖任何项目文本。
-    """
-    category = str(candidate.get("category") or "")
-    if category != str(existing.get("category") or ""):
-        return False
-    titles_compatible = _rule_titles_compatible(existing.get("title"), candidate.get("title"), category)
-    if category in {"objective", "subjective"}:
-        existing_max = _score_rule_max_value(existing)
-        candidate_max = _score_rule_max_value(candidate)
-        if existing_max is None or candidate_max is None or abs(existing_max - candidate_max) > 0.001:
-            return False
-        # 评分提取时标题常在“评分对象”和“材料名称”间切换；同分类、同满分、同一
-        # 段原文是比标题更强的同一事实证据。非评分规则不能采用这条宽松规则。
-        left_source = _normalise_rule_source(existing.get("source_text"))
-        right_source = _normalise_rule_source(candidate.get("source_text"))
-        if len(left_source) >= 20 and left_source == right_source:
-            return True
-        existing_ids = _rule_source_clause_ids(existing)
-        candidate_ids = {str(value).strip() for value in candidate.get("source_clause_ids") or [] if str(value).strip()}
-        same_page = isinstance(existing.get("source_page"), int) and existing.get("source_page") == candidate.get("source_page")
-        same_structure = _score_scoring_structure_similar(_safe_scoring_json(existing), _safe_scoring_json(candidate))
-        # 标题可能从“相关业绩”改写为“商务业绩”，但同页同满分且逐项计分结构
-        # 一致，或稳定条款 ID 交集，仍能证明是同一事实。
-        if same_structure and (same_page or bool(existing_ids & candidate_ids)):
-            return True
-    if not titles_compatible:
-        return False
-    existing_ids = _rule_source_clause_ids(existing)
-    candidate_ids = {str(value).strip() for value in candidate.get("source_clause_ids") or [] if str(value).strip()}
-    if existing_ids and candidate_ids and existing_ids & candidate_ids:
-        return True
-    source_left, source_right = existing.get("source_text"), candidate.get("source_text")
-    return _score_sources_compatible(source_left, source_right) or _score_sources_contain(source_left, source_right)
-
-
-def _matching_preserved_edited_rule(candidate: dict, preserved: list[dict]) -> dict | None:
-    """为已编辑规则寻找可证明同源的新候选，人工补充规则不参与自动匹配。"""
-    for rule in preserved:
-        if _rule_candidates_same_fact(rule, candidate):
-            return rule
-    return None
-
-
-def _attach_extracted_rule_identity(conn, preserved: dict, candidate: dict) -> None:
-    """把新一轮提取的稳定条款身份附回已编辑规则，保留用户可见内容。"""
-    try:
-        meta = json.loads(preserved.get("execution_meta_json") or "{}")
-    except (TypeError, json.JSONDecodeError):
-        meta = {}
-    if not isinstance(meta, dict):
-        meta = {}
-    prior_ids = [str(item).strip() for item in meta.get("source_clause_ids") or [] if str(item).strip()]
-    candidate_ids = [str(item).strip() for item in candidate.get("source_clause_ids") or [] if str(item).strip()]
-    meta["source_clause_ids"] = list(dict.fromkeys([*prior_ids, *candidate_ids]))
-    source_page = preserved.get("source_page")
-    if not isinstance(source_page, int) and isinstance(candidate.get("source_page"), int):
-        source_page = candidate["source_page"]
-    conn.execute(
-        "UPDATE ew_rules SET source_page=?, execution_meta_json=?, updated_at=? WHERE rule_id=?",
-        (source_page, json.dumps(meta, ensure_ascii=False), now_iso(), preserved["rule_id"]),
-    )
-    preserved["source_page"] = source_page
-    preserved["execution_meta_json"] = json.dumps(meta, ensure_ascii=False)
-
-
 def confirm_rule_set(app, project_id: str) -> dict:
     rule_set = current_rule_set(app, project_id)
     if not rule_set:
@@ -3479,7 +3401,7 @@ def confirm_rule_set(app, project_id: str) -> dict:
     validation = rule_set_acquisition_validation(app, project_id)
     blockers = [
         item for item in validation.get("issues", [])
-        if item.get("code") in {"duplicate_score_rule", "score_source_conflict", "score_total_mismatch", "score_leaf_total_below"}
+        if item.get("code") in {"duplicate_score_rule", "score_source_conflict", "score_source_unmapped", "score_total_mismatch", "score_leaf_total_below"}
     ]
     if blockers:
         details = "；".join(str(item.get("message") or "评分规则校验失败") for item in blockers[:3])
@@ -4143,9 +4065,9 @@ def rule_set_acquisition_validation(app, project_id: str) -> dict:
             "message": f"评分原文条款 {conflict['clause_id']} 同时被多个评分规则引用：{titles}。"
                        "请合并为一个包含完整叶子项的规则，或保留唯一归属，避免重复计分。",
         })
-    # 新提取的评分规则应至少能锚定一条原文评分条款。这里先提示而非阻断：
-    # 人工补充和历史规则可能天然没有机器台账，不能因系统升级被突然拒绝确认；
-    # 但 AI 规则无来源时会失去分部对账与重复判别能力，必须显式暴露给用户。
+    # 新提取的评分规则应至少能锚定一条原文评分条款。人工补充和历史编辑规则可能
+    # 天然没有机器台账，仍只提示；纯 AI 规则若无来源则不能可靠参与分部对账，确认
+    # 后会把“同分项重复/漏项”直接带进综合评分，因此作为确认前硬阻断处理。
     for rule in rules:
         if not rule.get("enabled") or str(rule.get("category") or "") not in {"objective", "subjective"}:
             continue
@@ -4154,7 +4076,7 @@ def rule_set_acquisition_validation(app, project_id: str) -> dict:
         if rule_execution_meta(rule).get("source_clause_ids"):
             continue
         issues.append({
-            "severity": "warning", "code": "score_source_unmapped",
+            "severity": "error" if str(rule.get("source_type") or "") == "ai" else "warning", "code": "score_source_unmapped",
             "rule_id": str(rule.get("rule_id") or ""), "title": str(rule.get("title") or "评分规则"),
             "message": "该 AI 评分规则未能唯一挂接到招标评分原文条款，不能可靠参与分部对账；请核对原文依据或重新提取。",
         })
