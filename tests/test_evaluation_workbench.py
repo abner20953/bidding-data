@@ -483,6 +483,49 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("应急预案（1.5分）", progress["text"])
         self.assertEqual(sum("保障措施" in item["text"] for item in packets), 1)
 
+    def test_score_clause_packets_keep_parent_section_without_creating_parent_rule(self):
+        text = """[第33页]
+第一部分价格部分（30分）
+投标报价得分=（评标基准价/投标报价）×30，最高得30分。
+[第34页]
+第二部分商务部分（11分）
+类似业绩每提供1项得3分，最高得9分。"""
+
+        packets = worker._score_clause_packets(text)
+
+        executable = [item for item in packets if not item.get("is_section_summary")]
+        self.assertEqual(len(executable), 2)
+        self.assertEqual(executable[0]["clause_id"], "SC-33-2")
+        self.assertEqual(executable[0]["score_section"]["label"], "第一部分价格部分")
+        self.assertEqual(executable[0]["score_section"]["max_score"], 30)
+        self.assertEqual(executable[1]["score_section"]["label"], "第二部分商务部分")
+
+    def test_score_ledger_only_anchors_unique_source_match(self):
+        packets = [
+            {"clause_id": "SC-1", "text": "类似业绩每提供1项得3分，最高得9分。", "score_section": {"section_id": "SS-1", "label": "商务部分", "max_score": 11, "source_page": 33}},
+            {"clause_id": "SC-2", "text": "质量管理体系认证证书得2分。", "score_section": {"section_id": "SS-2", "label": "技术部分", "max_score": 30, "source_page": 34}},
+        ]
+        rules = worker._attach_score_ledger_metadata([{
+            "category": "objective", "title": "企业业绩评分", "check_rule": "核验类似业绩。",
+            "source_text": "类似业绩每提供1项得3分，最高得9分。", "scoring": {"max_score": 9},
+        }, {
+            "category": "objective", "title": "认证证书评分", "check_rule": "核验证书。",
+            "source_text": "认证证书", "scoring": {"max_score": 2},
+        }], packets)
+
+        self.assertEqual(rules[0]["source_clause_ids"], ["SC-1"])
+        self.assertEqual(rules[0]["score_sections"][0]["section_id"], "SS-1")
+        self.assertEqual(rules[1]["source_clause_ids"], [])
+
+    def test_score_clause_packets_keep_documents_separate(self):
+        text = "[第1页]\n第一部分价格部分（30分）\n投标报价最高得30分。"
+
+        main_packets = worker._score_clause_packets(text, source_document_key="main-tender")
+        attachment_packets = worker._score_clause_packets(text, source_document_key="tender-attachment")
+
+        self.assertNotEqual(main_packets[0]["clause_id"], attachment_packets[0]["clause_id"])
+        self.assertNotEqual(main_packets[0]["score_section"]["section_id"], attachment_packets[0]["score_section"]["section_id"])
+
     def test_numeric_boundary_equality_is_not_saved_as_high_risk_deviation(self):
         rule = {"rule_id": "rope", "title": "关键参数响应", "check_rule": "核对参数是否满足招标要求"}
         results = worker._normalise_review_results([{
@@ -1839,6 +1882,18 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         by_parent = {item["title"]: item for item in issues}
         self.assertIn("第三部分服务部分（29分）", by_parent)
         self.assertIn("差额 +18", by_parent["第三部分服务部分（29分）"]["message"])
+
+    def test_score_parent_mismatch_uses_ledger_section_not_source_page(self):
+        section = {"section_id": "SS-33-1", "label": "第一部分价格部分", "max_score": 30, "source_page": 33}
+        rules = [{
+            "enabled": True, "category": "objective", "source_page": 99, "title": "投标报价",
+            "scoring_json": json.dumps({"max_score": 30}),
+            "execution_meta_json": storage._execution_meta_json({"score_sections": [section]}),
+        }]
+
+        issues = storage._score_parent_mismatches("[第33页]\n第一部分价格部分（30分）", rules)
+
+        self.assertEqual(issues, [])
 
     def test_extract_score_from_conclusion_cases(self):
         self.assertEqual(worker._extract_score_from_conclusion("两份业绩要件齐全，建议各计3分共6分，签章需图片复核。", 9), 6)
@@ -3809,6 +3864,19 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(saved["applicability"]["package_ids"], [2])
         self.assertEqual(worker._rule_execution_strategy(saved), "section")
         self.assertFalse(worker._rule_requires_visual_verification(saved))
+
+    def test_score_section_metadata_is_persisted_for_parent_ledger(self):
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "报价评分", "check_rule": "按报价公式核验。",
+            "source_clause_ids": ["SC-abc-P1-2"],
+            "score_sections": [{"section_id": "SS-abc-P1-1", "label": "价格部分", "max_score": 30, "source_page": 1}],
+            "scoring": {"max_score": 30, "kind": "manual"},
+        })
+        _, rules = storage.list_rules(self.app, self.project["project_id"])
+        saved = next(item for item in rules if item["rule_id"] == rule["rule_id"])
+
+        self.assertEqual(saved["source_clause_ids"], ["SC-abc-P1-2"])
+        self.assertEqual(saved["score_sections"][0]["section_id"], "SS-abc-P1-1")
 
     def test_material_and_field_evidence_requirements_preserve_text_route(self):
         rule = storage.add_rule(self.app, self.project["project_id"], {

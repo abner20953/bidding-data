@@ -2856,6 +2856,27 @@ def rule_execution_meta(rule: dict) -> dict:
     if not isinstance(clause_ids, list):
         clause_ids = []
     clause_ids = [str(item).strip() for item in clause_ids if str(item).strip()]
+    sections = value.get("score_sections")
+    if not isinstance(sections, list):
+        sections = []
+    normalised_sections: list[dict] = []
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        section_id = str(section.get("section_id") or "").strip()
+        if not section_id or section_id in {item["section_id"] for item in normalised_sections}:
+            continue
+        try:
+            max_score = float(section.get("max_score"))
+        except (TypeError, ValueError):
+            max_score = None
+        page = section.get("source_page")
+        normalised_sections.append({
+            "section_id": section_id,
+            "label": str(section.get("label") or "评分分部").strip() or "评分分部",
+            "max_score": max_score if max_score is not None and max_score > 0 else None,
+            "source_page": page if isinstance(page, int) and page > 0 else None,
+        })
     return {
         "execution_strategy": strategy if strategy in _RULE_EXECUTION_STRATEGIES else "",
         "evidence_requirements": list(dict.fromkeys(requirements)),
@@ -2867,6 +2888,7 @@ def rule_execution_meta(rule: dict) -> dict:
         "baseline_ocr_mode": baseline_ocr_mode,
         "evidence_items": _normalise_evidence_items(value.get("evidence_items")),
         "source_clause_ids": list(dict.fromkeys(clause_ids)),
+        "score_sections": normalised_sections,
     }
 
 
@@ -2948,6 +2970,27 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
     if not isinstance(clause_ids, list):
         clause_ids = []
     clause_ids = [str(item).strip() for item in clause_ids if str(item).strip()]
+    sections = payload.get("score_sections", base.get("score_sections"))
+    if not isinstance(sections, list):
+        sections = []
+    normalised_sections: list[dict] = []
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        section_id = str(section.get("section_id") or "").strip()
+        if not section_id or section_id in {item["section_id"] for item in normalised_sections}:
+            continue
+        try:
+            max_score = float(section.get("max_score"))
+        except (TypeError, ValueError):
+            max_score = None
+        page = section.get("source_page")
+        normalised_sections.append({
+            "section_id": section_id,
+            "label": str(section.get("label") or "评分分部").strip() or "评分分部",
+            "max_score": max_score if max_score is not None and max_score > 0 else None,
+            "source_page": page if isinstance(page, int) and page > 0 else None,
+        })
     value = {
         "execution_strategy": strategy if strategy in _RULE_EXECUTION_STRATEGIES else "",
         "evidence_requirements": normalized,
@@ -2959,6 +3002,7 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
         "baseline_ocr_mode": baseline_ocr_mode,
         "evidence_items": _normalise_evidence_items(payload.get("evidence_items", base.get("evidence_items"))),
         "source_clause_ids": list(dict.fromkeys(clause_ids)),
+        "score_sections": normalised_sections,
     }
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
@@ -3841,7 +3885,53 @@ def _tender_score_parent_ledger(text: str) -> list[dict]:
 
 
 def _score_parent_mismatches(tender_text: str, rules: list[dict]) -> list[dict]:
-    """评分父项声明分值与下属评分规则满分合计对账。"""
+    """评分父项声明分值与下属评分规则满分合计对账。
+
+    新规则优先使用提取阶段从原文继承的 ``score_sections``。评分表常跨页，
+    用 source_page 切分会把上一分部的尾行错误归给下一分部；只有历史规则尚无
+    台账元数据时才保留页码回退，保证老项目可读而不改变既有数据。
+    """
+    anchored: dict[str, dict] = {}
+    for rule in rules:
+        if not rule.get("enabled") or str(rule.get("category") or "") not in {"objective", "subjective"}:
+            continue
+        max_score = _score_rule_max_value(rule)
+        if max_score is None:
+            continue
+        sections = rule_execution_meta(rule).get("score_sections") or []
+        for section in sections:
+            section_id = str(section.get("section_id") or "")
+            if not section_id:
+                continue
+            group = anchored.setdefault(section_id, {
+                "label": str(section.get("label") or "评分分部"),
+                "score": section.get("max_score"), "rules": [],
+            })
+            group["rules"].append((str(rule.get("rule_id") or rule.get("title") or "未命名规则"), max_score, str(rule.get("title") or "未命名规则")))
+    if anchored:
+        issues: list[dict] = []
+        for parent in anchored.values():
+            try:
+                declared = float(parent["score"])
+            except (TypeError, ValueError):
+                continue
+            members: dict[str, tuple[float, str]] = {}
+            for key, max_score, title in parent["rules"]:
+                members[key] = (max_score, title)
+            total = sum(item[0] for item in members.values())
+            if abs(total - declared) <= 0.01:
+                continue
+            titles = "、".join(item[1] for item in members.values()) or "无评分规则"
+            issues.append({
+                "severity": "warning", "code": "score_parent_mismatch",
+                "rule_id": "", "title": parent["label"],
+                "message": (
+                    f"招标评分分部“{parent['label']}”声明 {declared:g} 分，"
+                    f"但其台账锚定的启用评分规则满分合计 {total:g} 分（{titles}）。"
+                    f"差额 {declared - total:+.2g} 分，请核对是否缺项、重复或分部归属错误。"
+                ),
+            })
+        return issues
     ledger = _tender_score_parent_ledger(tender_text)
     if len(ledger) < 2:
         return []
@@ -4052,6 +4142,21 @@ def rule_set_acquisition_validation(app, project_id: str) -> dict:
             "title": str(group[0].get("title") or "评分规则"),
             "message": f"评分原文条款 {conflict['clause_id']} 同时被多个评分规则引用：{titles}。"
                        "请合并为一个包含完整叶子项的规则，或保留唯一归属，避免重复计分。",
+        })
+    # 新提取的评分规则应至少能锚定一条原文评分条款。这里先提示而非阻断：
+    # 人工补充和历史规则可能天然没有机器台账，不能因系统升级被突然拒绝确认；
+    # 但 AI 规则无来源时会失去分部对账与重复判别能力，必须显式暴露给用户。
+    for rule in rules:
+        if not rule.get("enabled") or str(rule.get("category") or "") not in {"objective", "subjective"}:
+            continue
+        if str(rule.get("source_type") or "") in {"manual", "global"}:
+            continue
+        if rule_execution_meta(rule).get("source_clause_ids"):
+            continue
+        issues.append({
+            "severity": "warning", "code": "score_source_unmapped",
+            "rule_id": str(rule.get("rule_id") or ""), "title": str(rule.get("title") or "评分规则"),
+            "message": "该 AI 评分规则未能唯一挂接到招标评分原文条款，不能可靠参与分部对账；请核对原文依据或重新提取。",
         })
     # 招标声明总分与启用评分规则满分合计交叉校验：提取可能把评分表标题分值
     # （如“商务评分标准（15分）”）误作规则满分，使合计偏离招标文件明示的

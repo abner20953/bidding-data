@@ -10,6 +10,7 @@
   let visionConfiguration = {enabled:false, default_profile_id:null};
   let ocrConfiguration = {enabled:false, services:[]};
   let hasCurrentRules = false;
+  let currentRuleSet = null;
   const defaultDocumentTitle = document.title;
   let completionTicker = null;
   let cachedHighlights = [];
@@ -471,7 +472,7 @@
       request(`/projects/${activeProject}/rules`),
       request(`/projects/${activeProject}/rules/acquisition-validation`).catch(() => ({issues:[]})),
     ]);
-    const set = data.rule_set; const isDraft = set?.status === 'draft'; const isConfirmed = set?.status === 'confirmed'; hasCurrentRules = data.rules.length > 0;
+    const set = data.rule_set; currentRuleSet = set || null; const isDraft = set?.status === 'draft'; const isConfirmed = set?.status === 'confirmed'; hasCurrentRules = data.rules.length > 0;
     const acquisitionIssuesByRule = new Map();
     for (const issue of Array.isArray(validation?.issues) ? validation.issues : []) {
       const ids = Array.isArray(issue?.rule_ids) && issue.rule_ids.length ? issue.rule_ids : (issue?.rule_id ? [issue.rule_id] : []);
@@ -654,7 +655,12 @@
     const label = labels[status];
     return label ? `<small class="result-evidence">${escapeHtml(label)}。</small>` : '';
   }
-  function partialResultNotice(run) { if (run?.task_status === 'running') return `<p class="hint">综合评审仍在运行，以下仅展示已完整完成投标人的 AI 建议。</p>`; return run?.task_status === 'error' ? `<p class="hint">本次综合评审未全部完成，以下为已成功保存的部分 AI 建议（进度 ${run.task_progress ?? 0}%）：${escapeHtml(run.task_error || '请修正模型配置后重新运行。')}</p>` : ''; }
+  function ruleSetVersionNotice(run) {
+    if (!run?.rule_set_id || !currentRuleSet?.rule_set_id || run.rule_set_id === currentRuleSet.rule_set_id) return '';
+    const version = currentRuleSet.version ? ` v${currentRuleSet.version}` : '';
+    return `<p class="hint"><strong>版本提示：</strong>以下结果基于此前已确认的规则集；当前页面已是待确认规则集${escapeHtml(version)}。确认新规则后请重新运行综合评审，避免将两版规则的结果混作比较。</p>`;
+  }
+  function partialResultNotice(run) { const versionNotice = ruleSetVersionNotice(run); if (run?.task_status === 'running') return `${versionNotice}<p class="hint">综合评审仍在运行，以下仅展示已完整完成投标人的 AI 建议。</p>`; return `${versionNotice}${run?.task_status === 'error' ? `<p class="hint">本次综合评审未全部完成，以下为已成功保存的部分 AI 建议（进度 ${run.task_progress ?? 0}%）：${escapeHtml(run.task_error || '请修正模型配置后重新运行。')}</p>` : ''}`; }
   function visibleCompletedResults(run, results) { if (run?.task_status !== 'running') return results; const completed = new Set(run.completed_document_ids || []); return results.filter((item) => completed.has(item.document_id)); }
   function renderEvaluationHighlights(summaries) {
     const values = (summaries || []).filter((summary) => Array.isArray(summary.highlights) && summary.highlights.length);

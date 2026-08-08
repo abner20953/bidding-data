@@ -615,6 +615,10 @@ _SCORE_CLAUSE_PATTERN = re.compile(
     r"(?:分值|总计|合计)\s*[:：为]?\s*\d+(?:\.\d+)?\s*分?|扣\s*\d+(?:\.\d+)?\s*分"
     r"|[（(]\s*\d+(?:\.\d+)?\s*分\s*[）)]"
 )
+_SCORE_SECTION_PARENT_PATTERN = re.compile(
+    r"^\s*((?:(?:第\s*[一二三四五六七八九十\d]+\s*部分)\s*[：:]?\s*)?"
+    r"(?:价格|商务|技术|服务|资格)(?:部分)?(?:客观|主观)?(?:评分|评审项)?)[^（(]{0,20}?[（(]\s*(\d+(?:\.\d+)?)\s*分\s*[）)]"
+)
 _SCORE_COVERAGE_IGNORED_TERMS = {"项目", "评分", "标准", "要求", "供应", "服务", "能力", "部分", "内容", "提供", "文件", "采购", "投标", "技术", "商务"}
 _QUALIFICATION_SOURCE_PATTERN = re.compile(
     r"(?:投标人|供应商|申请人|响应人|竞标人)(?:的)?(?:资格(?:条件|要求)|应具备的资格条件)|"
@@ -898,11 +902,34 @@ def _project_package_scope_instruction(app, project: dict) -> tuple[int | None, 
     )
     return package_number, instruction
 
-def _score_clause_packets(text: str, limit: int = 240) -> list[dict]:
-    """为每个明确计分行构造独立、稳定的覆盖条款，不合并相邻评分项。"""
+def _score_clause_packets(text: str, limit: int = 240, *, source_document_key: str = "") -> list[dict]:
+    """为每个明确计分行构造带分部归属的稳定评分条款台账。
+
+    评分条款不能只靠页码推断“价格/商务/服务/技术”归属：同一张评分表经常跨页，
+    页码正好落在下一分部标题前后。这里在原文层保存最近明确评分分部，后续规则
+    只从条款台账继承该身份，不再让模型或确认前校验按页码猜测。
+    """
     lines = [line.strip() for line in text.splitlines()]
     packets: list[dict] = []
+    document_key = hashlib.sha1(str(source_document_key).encode("utf-8")).hexdigest()[:8] if source_document_key else ""
+    active_section: dict | None = None
+    section_ordinal = 0
     for index, line in enumerate(lines):
+        section_match = _SCORE_SECTION_PARENT_PATTERN.match(line)
+        if section_match:
+            page_marker = next((
+                lines[position] for position in range(index, max(-1, index - 300), -1)
+                if re.fullmatch(r"\[第\d+页\]", lines[position])
+            ), "")
+            page_match = re.search(r"第\s*(\d+)\s*页", page_marker)
+            page = int(page_match.group(1)) if page_match else 0
+            section_ordinal += 1
+            active_section = {
+                "section_id": f"SS-{document_key}-P{page}-{section_ordinal}" if document_key else f"SS-{page}-{section_ordinal}",
+                "label": re.sub(r"\s+", "", section_match.group(1)),
+                "max_score": float(section_match.group(2)),
+                "source_page": page,
+            }
         if not _SCORE_CLAUSE_PATTERN.search(re.sub(r"\s+", "", line)):
             continue
         # PDF 评分表在分页处常把同一评分项拆为“标题及前两个子项”与
@@ -936,12 +963,20 @@ def _score_clause_packets(text: str, limit: int = 240) -> list[dict]:
             page_match = re.search(r"第\s*(\d+)\s*页", page_marker)
             page = int(page_match.group(1)) if page_match else 0
             seq = sum(1 for existing in packets if existing.get("source_page") == page) + 1
-            clause_id = f"SC-{page}-{seq}" if page else f"SC-{len(packets) + 1}"
+            clause_id = (
+                f"SC-{document_key}-P{page}-{seq}" if document_key and page else
+                f"SC-{document_key}-{len(packets) + 1}" if document_key else
+                f"SC-{page}-{seq}" if page else f"SC-{len(packets) + 1}"
+            )
             packets.append({
                 "clause_id": clause_id,
                 "text": value,
                 "score_line": line[:360],
                 "source_page": page,
+                "score_section": dict(active_section) if active_section else None,
+                # 保留父项包只为兼容既有分页/续行解析与审计；进入模型评分覆盖
+                # 和最终规则台账前会单独滤除，绝不把它当成可执行叶子评分项。
+                "is_section_summary": bool(section_match and not line[section_match.end():].strip()),
                 "package_numbers": sorted(_score_packet_package_numbers(lines, index)),
             })
         if len(packets) >= limit:
@@ -1099,7 +1134,9 @@ def _score_packet_prompt_text(score_packets: list[object]) -> str:
         clause_id = _score_packet_id(packet) or f"SC-{index}"
         package_numbers = packet.get("package_numbers") if isinstance(packet, dict) else None
         package_label = f"；适用采购包：{','.join(str(value) for value in package_numbers)}" if package_numbers else ""
-        values.append(f"【评分条款 {clause_id}{package_label}】\n{_score_packet_text(packet)}")
+        section = packet.get("score_section") if isinstance(packet, dict) else None
+        section_label = str((section or {}).get("label") or "未识别评分分部") if isinstance(section, dict) else "未识别评分分部"
+        values.append(f"【评分条款 {clause_id}；所属分部：{section_label}{package_label}】\n{_score_packet_text(packet)}")
     return "\n".join(values)
 
 
@@ -1243,11 +1280,25 @@ def _score_structure_issues(rules: list[dict]) -> list[dict]:
     return issues
 
 
-def _score_structure_repair_prompt(app, rules: list[dict]) -> str:
+def _score_structure_repair_prompt(app, rules: list[dict], score_packets: list[object]) -> str:
+    packet_by_id = {
+        _score_packet_id(packet): packet for packet in score_packets
+        if _score_packet_id(packet)
+    }
     payload = [
         {
             "category": item.get("category"), "title": item.get("title"),
             "check_rule": item.get("check_rule"), "source_text": item.get("source_text"),
+            "source_clause_ids": sorted(_score_rule_clause_ids(item)),
+            "score_clause_source": [
+                {
+                    "clause_id": clause_id,
+                    "text": _score_packet_text(packet_by_id[clause_id])[:900],
+                    "score_section": packet_by_id[clause_id].get("score_section"),
+                }
+                for clause_id in sorted(_score_rule_clause_ids(item))
+                if clause_id in packet_by_id
+            ],
             "scoring": item.get("scoring"),
         }
         for item in rules
@@ -1386,9 +1437,12 @@ def _rule_batch_output_tokens(text: str, compact: bool = False) -> int:
 
 def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text: str,
                         *, document_id: str, batch_label: str, review_anchor_catalog: str = "",
-                        depth: int = 0) -> tuple[list[dict], int, int]:
+                        source_document_key: str = "", depth: int = 0) -> tuple[list[dict], int, int]:
     """提取一个小批次；截断时只二分当前批次，最小批次才紧凑重试。"""
-    packets = _score_clause_packets(text, limit=24)
+    packets = [
+        packet for packet in _score_clause_packets(text, limit=24, source_document_key=source_document_key)
+        if not (isinstance(packet, dict) and packet.get("is_section_summary"))
+    ]
     # 评分表密集页在 11k 字内也可能包含大量独立计分项。与其依赖模型在固定条数
     # 上限内取舍，不如在首次调用前把这一小批次继续按页/段落二分，保证每项都能输出。
     if len(packets) > 12 and len(text) > RULE_EXTRACTION_MIN_SPLIT_CHARS and depth < 3:
@@ -1400,6 +1454,7 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
                 value, compact_count, split_count = _extract_rule_batch(
                     app, task, profile, system_prompt, piece, document_id=document_id,
                     batch_label=f"{batch_label}/评分密集拆分{index}", review_anchor_catalog=review_anchor_catalog,
+                    source_document_key=source_document_key,
                     depth=depth + 1,
                 )
                 rules.extend(value)
@@ -1469,6 +1524,7 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
                     value, compact_count, split_count = _extract_rule_batch(
                         app, task, profile, system_prompt, piece, document_id=document_id,
                         batch_label=f"{batch_label}/拆分{index}", review_anchor_catalog=review_anchor_catalog,
+                        source_document_key=source_document_key,
                         depth=depth + 1,
                     )
                     rules.extend(value)
@@ -1504,6 +1560,7 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
                     value, compact_count, split_count = _extract_rule_batch(
                         app, task, profile, system_prompt, piece, document_id=document_id,
                         batch_label=f"{batch_label}/拆分{index}", review_anchor_catalog=review_anchor_catalog,
+                        source_document_key=source_document_key,
                         depth=depth + 1,
                     )
                     rules.extend(value)
@@ -1526,7 +1583,7 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
         return [item for item in rules if isinstance(item, dict)], 1, 0
 
 
-def _extract_rule_batches(app, task: dict, profile: dict, system_prompt: str, batches: list[str], *,
+def _extract_rule_batches(app, task: dict, profile: dict, system_prompt: str, batches: list[object], *,
                           document_id: str, review_anchor_catalog: str = "") -> tuple[list[dict], int, int]:
     """在受闸门保护的至多三路工作位中映射原文，按原文顺序汇总结果。"""
     if not batches:
@@ -1539,9 +1596,11 @@ def _extract_rule_batches(app, task: dict, profile: dict, system_prompt: str, ba
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_index = {
             executor.submit(
-                _extract_rule_batch, app, task, profile, system_prompt, batch,
+                _extract_rule_batch, app, task, profile, system_prompt,
+                batch[0] if isinstance(batch, tuple) else batch,
                 document_id=document_id, batch_label=f"rule_batch_{index + 1}_of_{total}",
                 review_anchor_catalog=review_anchor_catalog,
+                source_document_key=str(batch[1]) if isinstance(batch, tuple) and len(batch) > 1 else "",
             ): index
             for index, batch in enumerate(batches)
         }
@@ -1812,6 +1871,60 @@ def _score_rule_clause_ids(rule: dict) -> set[str]:
     """返回评分规则引用的稳定原文条款 ID。"""
     values = rule.get("source_clause_ids") if isinstance(rule, dict) else None
     return {str(value).strip() for value in values if str(value).strip()} if isinstance(values, list) else set()
+
+
+def _attach_score_ledger_metadata(rules: list[dict], score_packets: list[object]) -> list[dict]:
+    """将评分规则重新锚定到完整原文台账，并继承不可由页码推断的评分分部。
+
+    分段提取、补漏和语义编译都可能改写或丢失批次内的 ``source_clause_ids``。
+    这里不靠标题相似度猜测归属：已有 ID 只接受完整台账中存在的值；没有可靠 ID
+    时仅在原文短摘录能唯一匹配一个评分条款时回挂。无法唯一证明的规则保持未锚定，
+    由确认前预检明确提示，而不是静默附会到某个评分分部。
+    """
+    packet_by_id = {
+        _score_packet_id(packet): packet for packet in score_packets
+        if _score_packet_id(packet)
+    }
+    if not packet_by_id:
+        return rules
+    result: list[dict] = []
+    for item in rules:
+        if not isinstance(item, dict) or item.get("category") not in {"objective", "subjective"}:
+            result.append(item)
+            continue
+        rule = dict(item)
+        known_ids = [
+            clause_id for clause_id in _score_rule_clause_ids(rule)
+            if clause_id in packet_by_id
+        ]
+        if not known_ids:
+            probe = dict(rule)
+            probe["source_clause_ids"] = []
+            matches = [
+                packet for packet in score_packets
+                if _score_packet_is_covered(packet, [probe])
+            ]
+            # 多个相似计分项时不能把“证书/业绩”等通用词自动扩展为多条来源，
+            # 否则会人为制造跨分部重复。只有唯一命中才允许恢复锚点。
+            if len(matches) == 1:
+                known_ids = [_score_packet_id(matches[0])]
+        rule["source_clause_ids"] = list(dict.fromkeys(known_ids))
+        sections: list[dict] = []
+        for clause_id in rule["source_clause_ids"]:
+            section = packet_by_id[clause_id].get("score_section")
+            if not isinstance(section, dict) or not str(section.get("section_id") or ""):
+                continue
+            value = {
+                "section_id": str(section["section_id"]),
+                "label": str(section.get("label") or "评分分部"),
+                "max_score": section.get("max_score"),
+                "source_page": section.get("source_page"),
+            }
+            if value["section_id"] not in {item["section_id"] for item in sections}:
+                sections.append(value)
+        rule["score_sections"] = sections
+        result.append(rule)
+    return result
 
 
 def _score_ledger_conflicts(rules: list[dict], score_packets: list[object]) -> list[dict]:
@@ -2581,26 +2694,32 @@ def _extract_rules(app, task: dict) -> dict:
     if not main_text:
         raise ValueError("主招标文件未提取到可用文本，扫描件需要先提供可检索版本")
     profile = storage.get_model_profile(app, task.get("payload", {}).get("profile_id"), "deepseek-v4-flash")
-    source_documents = [(f"主招标文件：{tender['original_name']}", main_text)]
+    source_documents = [(f"主招标文件：{tender['original_name']}", main_text, tender["document_id"])]
     attachments = [item for item in documents if item["role"] == "tender_attachment" and item.get("parse_status") == "success" and item.get("parsed_path")]
     for attachment in attachments:
         attachment_text = Path(attachment["parsed_path"]).read_text(encoding="utf-8", errors="ignore").strip()
         if attachment_text:
-            source_documents.append((f"招标附件：{attachment['original_name']}", attachment_text))
+            source_documents.append((f"招标附件：{attachment['original_name']}", attachment_text, attachment["document_id"]))
     # 规则映射按 11k 字小批次执行，无需先把全部招标文件塞进单次上下文。这里保留
     # 主文件和全部附件的完整可检索文本，避免固定关键词窗口在 AI 调用前丢掉后部评分表。
-    source_parts = [f"【{label}】\n{value}" for label, value in source_documents]
+    source_parts = [f"【{label}】\n{value}" for label, value, _ in source_documents]
     text = "\n\n".join(source_parts)
-    all_score_packets = _score_clause_packets(text, limit=400)
+    all_score_packets = []
+    for _, value, document_key in source_documents:
+        if len(all_score_packets) >= 400:
+            break
+        all_score_packets.extend(_score_clause_packets(value, limit=400 - len(all_score_packets), source_document_key=document_key))
     # 多包文件的评分公式往往相同；只把当前包或本地无法安全归属的条款送入覆盖审计，
     # 不能让包1公式“覆盖”包3评分项。未填写包号时保持原有全文件行为。
-    score_packets = _filter_score_packets_for_package(all_score_packets, package_number)
+    score_packets = _filter_score_packets_for_package(
+        [packet for packet in all_score_packets if not packet.get("is_section_summary")], package_number,
+    )
     qualification_packets = _qualification_clause_packets(text)
     review_anchor_catalog = _initial_review_anchor_catalog(main_text)
     batches = []
-    for label, value in source_documents:
+    for label, value, document_key in source_documents:
         batches.extend(
-            f"【{label}】\n{piece}"
+            (f"【{label}】\n{piece}", document_key)
             for piece in _split_rule_extraction_text(value, RULE_EXTRACTION_BATCH_CHARS)
         )
     if not batches:
@@ -2621,6 +2740,7 @@ def _extract_rules(app, task: dict) -> dict:
     raw_rules = _filter_inapplicable_template_rules(
         _filter_rules_for_package(_dedupe_rule_candidates(raw_rules), package_number), text,
     )
+    raw_rules = _attach_score_ledger_metadata(raw_rules, score_packets)
     primary_score_rules = [item for item in raw_rules if isinstance(item, dict) and item.get("category") in {"objective", "subjective"}]
     uncovered_score_packets = [
         packet for packet in score_packets
@@ -2760,6 +2880,7 @@ def _extract_rules(app, task: dict) -> dict:
     rules, scoring_reconciliation = _reconcile_scoring_rules(
         app, task, profile, system_prompt, rules, score_packets,
     )
+    rules = _attach_score_ledger_metadata(rules, score_packets)
     # 结构复核可能同时返回总分父项和其已包含的分项；在进入后续门控前先做可证明
     # 的父子重叠消除，避免同一评分事实被综合评审重复执行和重复计分。
     rules = _prune_overlapping_score_aggregates(rules)
@@ -2779,6 +2900,7 @@ def _extract_rules(app, task: dict) -> dict:
     rules, finalisation = _finalise_rule_operations(
         app, task, profile, system_prompt, rules,
     )
+    rules = _attach_score_ledger_metadata(rules, score_packets)
     # 最终规范化可能重写/合并评分候选，必须再做一次确定性同源去重；随后将
     # “某部分共 X 分”的导航标题移出可执行规则，仅保留其作为评分守恒台账。
     rules, score_ledger = _canonicalise_score_ledger(rules, score_packets)
@@ -2797,7 +2919,7 @@ def _extract_rules(app, task: dict) -> dict:
         try:
             supplement = _request_task_json(
                 app, task, profile, "extract_rules_scoring_structure_repair", system_prompt,
-                _score_structure_repair_prompt(app, structure_issues[:3]),
+                _score_structure_repair_prompt(app, structure_issues[:3], score_packets),
                 document_id=tender["document_id"], context_mode="score_structure_repair",
                 max_tokens=_output_token_budget(profile, 3_500), thinking_mode="disabled",
             )
@@ -2844,6 +2966,7 @@ def _extract_rules(app, task: dict) -> dict:
     # 评分结构修复会替换单条规则的结构化内容，因此在落库前重新执行一次
     # 台账收口。这里仍只合并可证明的同源/父子重复；剩余冲突交由确认前校验
     # 明确阻断，绝不以静默删除换取一个表面正常的总分。
+    rules = _attach_score_ledger_metadata(rules, score_packets)
     rules, final_score_ledger = _canonicalise_score_ledger(rules, score_packets)
     score_ledger["merged_count"] += final_score_ledger["merged_count"]
     score_ledger["conflict_count"] = final_score_ledger["conflict_count"]
