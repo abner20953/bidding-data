@@ -2363,22 +2363,9 @@ def _compile_rule_candidates(app, task: dict, profile: dict, system_prompt: str,
     return _compile_rule_group(app, task, profile, system_prompt, candidates, char_limit)
 
 
-RULE_QUALITY_GATE_MIN_RULES = 2
-RULE_FINALISATION_MIN_RULES = 12
-RULE_QUALITY_GATE_REASONS = {
-    "duplicate", "not_file_verifiable", "procedural", "umbrella",
-    "not_scoring_rule", "unsupported_cross_reference",
-}
-_EXPLICIT_SCORE_TEXT_PATTERN = re.compile(r"(?:满分|最高(?:得)?分|得\s*\d+(?:\.\d+)?\s*分|每.{0,20}\d+(?:\.\d+)?\s*分|扣\s*\d+(?:\.\d+)?\s*分|分值)")
-
-
-def _needs_pre_finalisation_quality_gate(rule_count: int) -> bool:
-    """小规则集没有最终规范化时，才保留旧质量门控作为唯一全局整理。"""
-    return rule_count < RULE_FINALISATION_MIN_RULES and rule_count >= RULE_QUALITY_GATE_MIN_RULES
-
-
-def _quality_gate_rule_packet(items: list[dict], *, include_ids: bool) -> str:
-    """构造小而完整的最终审计输入；限制单字段长度，但绝不截断规则数组。"""
+RULE_FINALISATION_MIN_RULES = 2
+def _rule_normalisation_packet(items: list[dict], *, include_ids: bool) -> str:
+    """构造一次规范化所需的完整规则包；不截断规则数组。"""
     values = []
     for index, item in enumerate(items, start=1):
         if not isinstance(item, dict):
@@ -2404,7 +2391,7 @@ def _quality_gate_rule_packet(items: list[dict], *, include_ids: bool) -> str:
     return json.dumps(values, ensure_ascii=False, separators=(",", ":"))
 
 
-def _protected_rules_for_quality_gate(app, project_id: str) -> list[dict]:
+def _protected_rules_for_normalisation(app, project_id: str) -> list[dict]:
     """返回不得由重新提取覆盖的用户规则，以及本轮会自动导入的通用规则。"""
     _, current_rules = storage.list_rules(app, project_id)
     protected = []
@@ -2425,99 +2412,6 @@ def _protected_rules_for_quality_gate(app, project_id: str) -> list[dict]:
     return protected
 
 
-def _recover_dropped_scoring_rules(rules: list[dict], kept_indexes: set[int],
-                                   score_packets: list[str]) -> int:
-    """质量门控只能做减法；若减法造成明确评分条款失去覆盖，恢复最匹配的原规则。"""
-    recovered = 0
-    score_categories = {"objective", "subjective"}
-    for packet in score_packets:
-        kept_scores = [
-            item for index, item in enumerate(rules)
-            if index in kept_indexes and item.get("category") in score_categories
-        ]
-        if _score_packet_is_covered(packet, kept_scores):
-            continue
-        recover_index = next((
-            index for index, item in enumerate(rules)
-            if index not in kept_indexes and item.get("category") in score_categories
-            and _score_packet_is_covered(packet, [item])
-        ), None)
-        if recover_index is not None:
-            kept_indexes.add(recover_index)
-            recovered += 1
-    return recovered
-
-
-def _has_explicit_scoring_basis(item: dict) -> bool:
-    """识别原文明确计分的规则；只用于防止最终减法误删，不据此创建或分类规则。"""
-    if item.get("category") not in {"objective", "subjective"}:
-        return False
-    if storage._valid_max_score(item.get("scoring")) is None:
-        return False
-    return bool(_EXPLICIT_SCORE_TEXT_PATTERN.search(str(item.get("source_text") or "")))
-
-
-def _final_rule_quality_gate(app, task: dict, profile: dict, system_prompt: str,
-                             rules: list[dict], score_packets: list[object]) -> tuple[list[dict], dict]:
-    """在保存前做一次全局只减不改审计；任何模型或格式异常均安全降级为保留原规则。"""
-    stats = {"applied": False, "dropped_count": 0, "failure_count": 0, "recovered_score_count": 0}
-    if len(rules) < RULE_QUALITY_GATE_MIN_RULES:
-        return rules, stats
-    protected = _protected_rules_for_quality_gate(app, task["project_id"])
-    prompt = storage.render_prompt_template(
-        app, "extract_rules_quality_gate_user",
-        candidates=_quality_gate_rule_packet(rules, include_ids=True),
-        protected_rules=_quality_gate_rule_packet(protected, include_ids=False),
-    )
-    storage.update_task(app, task["task_id"], progress=78, message="正在对完整规则集做最终质量审计")
-    try:
-        try:
-            response = _request_task_json(
-                app, task, profile, "extract_rules_quality_gate", system_prompt, prompt,
-                context_mode="rule_quality_gate", max_tokens=_output_token_budget(
-                    profile, max(1_800, min(5_000, 900 + len(rules) * 70)),
-                ), thinking_mode="disabled",
-            )
-        except InvalidJsonResponse as exc:
-            response = _repair_invalid_json(
-                app, task, profile, "extract_rules_quality_gate_json_repair", exc, "drops",
-            )
-        drops = response.get("drops") if isinstance(response, dict) else None
-        if not isinstance(drops, list):
-            raise ValueError("模型返回格式不符合规则质量审计要求")
-        drop_indexes: set[int] = set()
-        for drop in drops:
-            if not isinstance(drop, dict) or drop.get("reason") not in RULE_QUALITY_GATE_REASONS:
-                continue
-            match = re.fullmatch(r"R([1-9]\d*)", str(drop.get("rule_id") or ""))
-            if not match:
-                continue
-            index = int(match.group(1)) - 1
-            if 0 <= index < len(rules):
-                # 原文有明确分值的评分规则，只有模型同时指出具体重复对象时才允许进入
-                # 待剔除集；其余误判继续交给评分覆盖兜底，避免清理噪声时丢分。
-                if _has_explicit_scoring_basis(rules[index]) and (
-                    drop.get("reason") != "duplicate" or not str(drop.get("duplicate_of") or "").strip()
-                ):
-                    continue
-                drop_indexes.add(index)
-        if len(drop_indexes) >= len(rules):
-            raise ValueError("规则质量审计试图剔除全部候选，已安全保留原结果")
-        kept_indexes = set(range(len(rules))) - drop_indexes
-        recovered = _recover_dropped_scoring_rules(rules, kept_indexes, score_packets)
-        result = [item for index, item in enumerate(rules) if index in kept_indexes]
-        stats.update({
-            "applied": True,
-            "dropped_count": len(rules) - len(result),
-            "recovered_score_count": recovered,
-        })
-        return result, stats
-    except ValueError as exc:
-        stats["failure_count"] = 1
-        storage.update_task(app, task["task_id"], message=f"规则最终质量审计未完成，已完整保留编译结果：{exc}")
-        return rules, stats
-
-
 def _finalise_rule_operations_pass(app, task: dict, profile: dict, system_prompt: str,
                                    rules: list[dict], *, focus_key: str, focus: str) -> tuple[list[dict], dict]:
     """以可追溯操作规范化完整规则集；任何越界操作或格式异常都保留原规则。"""
@@ -2525,12 +2419,12 @@ def _finalise_rule_operations_pass(app, task: dict, profile: dict, system_prompt
         "applied": False, "dropped_count": 0, "rewritten_count": 0,
         "merged_count": 0, "failure_count": 0,
     }
-    protected = _protected_rules_for_quality_gate(app, task["project_id"])
+    protected = _protected_rules_for_normalisation(app, task["project_id"])
     prompt = storage.render_prompt_template(
         app, "extract_rules_finalise_user",
         focus=focus,
-        candidates=_quality_gate_rule_packet(rules, include_ids=True),
-        protected_rules=_quality_gate_rule_packet(protected, include_ids=False),
+        candidates=_rule_normalisation_packet(rules, include_ids=True),
+        protected_rules=_rule_normalisation_packet(protected, include_ids=False),
     )
     storage.update_task(app, task["task_id"], progress=79, message=f"正在执行规则最终规范化：{focus_key}")
     try:
@@ -2658,17 +2552,14 @@ def _finalise_rule_operations_pass(app, task: dict, profile: dict, system_prompt
 
 def _finalise_rule_operations(app, task: dict, profile: dict, system_prompt: str,
                               rules: list[dict]) -> tuple[list[dict], dict]:
-    """分两轮完成边界清理与语义归并，降低长列表多目标审计的漏判率。"""
+    """一次完成边界清理与语义归并，避免同一规则被模型连续改写。"""
     stats = {
         "applied": False, "dropped_count": 0, "rewritten_count": 0,
         "merged_count": 0, "failure_count": 0,
     }
     if len(rules) < RULE_FINALISATION_MIN_RULES:
         return rules, stats
-    passes = (
-        ("文件边界", "extract_rules_finalise_boundary_focus"),
-        ("重复归并", "extract_rules_finalise_merge_focus"),
-    )
+    passes = (("统一规范化", "extract_rules_finalise_unified_focus"),)
     result = rules
     for focus_key, focus_template_id in passes:
         result, pass_stats = _finalise_rule_operations_pass(
@@ -2844,6 +2735,12 @@ def _extract_rules(app, task: dict) -> dict:
         except ValueError as exc:
             hard_anchor_supplement_failures = 1
             storage.update_task(app, task["task_id"], message=f"部分硬性条款补充未完成：{exc}")
+    # 技术★条款的保守兜底同样必须作为候选进入统一编译、覆盖审计与最终规范化；
+    # 禁止在流程尾部直接追加规则，避免绕过同源去重并在重跑时制造副本。
+    if not _has_technical_star_requirement_rule(mapped_candidates):
+        technical_star_seed = _technical_star_requirement_seed(text, package_number)
+        if technical_star_seed:
+            mapped_candidates = _dedupe_rule_candidates([*mapped_candidates, technical_star_seed])
     compilation_failure_count = 0
     try:
         candidates, coverage_missing_rules, compilation_used = _compile_rule_candidates(
@@ -2885,18 +2782,13 @@ def _extract_rules(app, task: dict) -> dict:
     # 的父子重叠消除，避免同一评分事实被综合评审重复执行和重复计分。
     rules = _prune_overlapping_score_aggregates(rules)
     rules = _filter_inapplicable_template_rules(_filter_rules_for_package(rules, package_number), text)
-    # 大规则集后续已执行两轮、可追溯的最终规范化（文件边界与重复归并）；
-    # 不再额外叠加语义相近的质量门控，减少一次长输出模型调用。小规则集仍保留
-    # 质量门控，确保没有最终规范化时不降低原有清理能力。
-    if _needs_pre_finalisation_quality_gate(len(rules)):
-        rules, quality_gate = _final_rule_quality_gate(
-            app, task, profile, system_prompt, rules, score_packets,
-        )
-    else:
-        quality_gate = {
-            "applied": False, "dropped_count": 0, "failure_count": 0,
-            "recovered_score_count": 0, "skipped_by_finalisation": True,
-        }
+    # 不再按规则数量切换“质量门控”或“两轮规范化”两套语义路径。
+    # 所有规则集均走一次可追溯规范化：小规则集调用数不增加，大规则集减少一次
+    # 模型改写，重跑结果也更稳定。
+    quality_gate = {
+        "applied": False, "dropped_count": 0, "failure_count": 0,
+        "recovered_score_count": 0, "skipped_by_finalisation": True,
+    }
     rules, finalisation = _finalise_rule_operations(
         app, task, profile, system_prompt, rules,
     )
@@ -2906,10 +2798,6 @@ def _extract_rules(app, task: dict) -> dict:
     rules, score_ledger = _canonicalise_score_ledger(rules, score_packets)
     rules, score_summary_excluded_count = _drop_non_executable_score_section_summaries(rules)
     rules = _filter_inapplicable_template_rules(_filter_rules_for_package(rules, package_number), text)
-    # 模型分段提取和后续去重均可能把“技术★实质性指标 + 证明材料 + 明确无效后果”
-    # 错压缩进普通技术覆盖项。仅在三项原文条件同时存在、且规则集尚未承接时补一条；
-    # 不对一般技术参数、格式★或只有交叉引用的条款做任何推断。
-    rules = _ensure_technical_star_requirement_rule(rules, text, package_number)
     # 评分结构定向修复：叶子合计低于满分的评分规则自动重提修正，避免“4.5 vs 6”
     # 这类截断错误带着残缺分值进入待确认规则集。
     score_structure_repair_count = score_structure_repair_failures = 0
