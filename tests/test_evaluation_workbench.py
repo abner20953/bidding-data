@@ -2056,6 +2056,50 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIsNotNone(fallback)
         self.assertEqual(fallback.get("source"), "local_fallback")
 
+    def test_ocr_summary_does_not_override_full_text_rule_conclusion(self):
+        rule = {"rule_id": "r1", "title": "项目范围无关内容核验", "check_rule": "全文检查是否出现与本项目无关内容"}
+        working = {
+            "rule_id": "r1", "status": "not_satisfied", "risk_level": "high", "confidence": "high",
+            "evidence_quality": "sufficient", "evidence": "P10-11 施工方案", "reason": "属模板混用",
+            "conclusion_summary": "施工方案整章混用建筑工程模板",
+        }
+        payload = {"pages": [223], "service_labels": "本地 RapidOCR", "local_only": True, "failure": "", "incomplete_pages": []}
+        parsed = {
+            "summary": "已识别页与本项目范围相符", "status": "partial", "risk_level": "medium",
+            "confidence": "medium", "content_coverage": "covered", "conclusion_scope": "full",
+            "evidence_pages": [223], "evidence": "P223 与本项目相符", "reason": "已识别页相符",
+        }
+        merged = worker._apply_ocr_summary("review", rule, working, parsed, payload)
+        # 全文类规则：OCR 局部“相符”不得覆盖文字层“模板混用”结论。
+        self.assertEqual(merged["conclusion_summary"], "施工方案整章混用建筑工程模板")
+
+        point_rule = {"rule_id": "r2", "title": "投标函出具", "check_rule": "核验投标函是否出具"}
+        point_merged = worker._apply_ocr_summary("review", point_rule, working, parsed, payload)
+        self.assertEqual(point_merged["conclusion_summary"], "已识别页与本项目范围相符")
+
+    def test_scope_highlight_fallback_upgrades_existing_attention(self):
+        allowed = {
+            ("d1", "r1"): {
+                "type": "review", "rule_id": "r1", "status": "partial", "risk_level": "high",
+                "title": "项目范围无关内容核验", "reason": "属模板混用", "evidence": "P10",
+            },
+        }
+        # 模型已返回同规则但级别为 attention：原地升级为 high，不新增重复条目。
+        highlights = [{"rule_id": "r1", "level": "attention", "keyword": "模板混用", "conclusion": "待复核", "basis": "P10"}]
+        result = worker._scope_highlight_fallback_candidate("d1", highlights, allowed)
+        self.assertIsNone(result)
+        self.assertEqual(highlights[0]["level"], "high")
+        # 已是 high：跳过。
+        highlights = [{"rule_id": "r1", "level": "high", "keyword": "k", "conclusion": "c", "basis": "b"}]
+        result = worker._scope_highlight_fallback_candidate("d1", highlights, allowed)
+        self.assertIsNone(result)
+        self.assertEqual(len(highlights), 1)
+        # 未返回：注入 high 条目。
+        highlights = []
+        result = worker._scope_highlight_fallback_candidate("d1", highlights, allowed)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["level"], "high")
+
     def test_acquisition_validation_warns_when_score_total_differs_from_tender_declared(self):
         self._add_pdf("tender.pdf", "tender", "", "用于建立解析文件")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")

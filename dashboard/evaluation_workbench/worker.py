@@ -6732,7 +6732,15 @@ def _apply_ocr_summary(component: str, rule: dict, working_result: dict, parsed:
                   "requires_review": True, "automation_status": "needs_review", "review_reason": f"{service_labels} 结果已补充，需人工复核。"}
     # 采纳层有 summary 就覆盖为最新结论，没有则清空（前端回退到最新层摘要，
     # 绝不显示可能已被本轮核验推翻的文字层旧结论）。
-    merged["conclusion_summary"] = _normalise_conclusion_summary(parsed.get("summary"))
+    # 全文类规则（范围/一致性/关键要素）需要全文判断，OCR 只覆盖少量候选页，
+    # 局部“相符/待核验”不能推翻文字层的全文结论；保留文字层摘要，OCR 结论
+    # 只进入证据分层，避免把“模板混用”等高价值发现降级成模糊的“待复核”。
+    if component == "review" and (
+        _is_scope_consistency_rule(rule) or _rule_execution_strategy(rule) == "consistency"
+    ):
+        merged["conclusion_summary"] = str(working_result.get("conclusion_summary") or "")
+    else:
+        merged["conclusion_summary"] = _normalise_conclusion_summary(parsed.get("summary"))
     if component != "review" and suggested is None and max_score > 0:
         extracted = _extract_score_from_conclusion(
             f"{merged['conclusion_summary']} {reconciled_reason or ''} {parsed.get('calculation') or ''}", max_score,
@@ -8253,7 +8261,14 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
         source="图片/OCR",
     )
     # 视觉层是当前最新采纳层：有 summary 覆盖为最新结论，无则清空回退前端摘要逻辑。
-    merged["conclusion_summary"] = _normalise_conclusion_summary(parsed.get("summary"))
+    # 全文类规则（范围/一致性/关键要素）同样保留文字层摘要，视觉只看部分页外观，
+    # 不能推翻需要全文判断的结论。
+    if component == "review" and (
+        _is_scope_consistency_rule(rule) or _rule_execution_strategy(rule) == "consistency"
+    ):
+        merged["conclusion_summary"] = str(result.get("conclusion_summary") or "")
+    else:
+        merged["conclusion_summary"] = _normalise_conclusion_summary(parsed.get("summary"))
     if suggested is None and max_score > 0 and not has_conflict:
         extracted = _extract_score_from_conclusion(
             f"{merged['conclusion_summary']} {parsed.get('reason') or ''} {parsed.get('calculation') or ''}", max_score,
@@ -9490,13 +9505,17 @@ def _scope_highlight_fallback_candidate(document_id: str, highlights: list[dict]
                                         allowed: dict[tuple[str, str], dict]) -> dict | None:
     """提炼模型漏选“范围模板混用”类高价值发现时的兜底注入。
 
-    只补“审查不满足/部分满足 + 高风险 + 模板混用类范围规则”，且该投标人尚未包含
-    该规则；普通范围疑点或已在面板中的内容不重复注入，避免把展示层变成规则噪声。
+    只补“审查不满足/部分满足 + 高风险 + 模板混用类范围规则”。模型已返回同规则
+    但级别低于 high 时，把该条目升级为 high（不新增重复条目）；已是 high 则跳过。
+    普通范围疑点不注入，避免把展示层变成规则噪声。
     """
-    existing = {str(item.get("rule_id")) for item in highlights}
+    existing = {str(item.get("rule_id")): item for item in highlights}
     fallback = None
     for (doc_id, rule_id), candidate in allowed.items():
-        if doc_id != document_id or rule_id in existing:
+        if doc_id != document_id:
+            continue
+        existing_item = existing.get(rule_id)
+        if existing_item is not None and existing_item.get("level") == "high":
             continue
         if candidate.get("type") != "review":
             continue
@@ -9511,6 +9530,12 @@ def _scope_highlight_fallback_candidate(document_id: str, highlights: list[dict]
         break
     if not fallback:
         return None
+    fallback_rule_id = str(fallback.get("rule_id") or "")
+    existing_item = existing.get(fallback_rule_id)
+    if existing_item is not None:
+        # 模型已返回该规则但级别不足：原地升级，避免同规则重复条目。
+        existing_item["level"] = "high"
+        return None
     summary_text = re.sub(r"\s+", " ", _clean_model_text(fallback.get("conclusion_summary"))).strip()
     if not summary_text:
         summary_text = "存在项目范围外模板混用，需人工复核"
@@ -9521,7 +9546,7 @@ def _scope_highlight_fallback_candidate(document_id: str, highlights: list[dict]
     basis = f"{pages}；{fact}" if pages else fact
     basis = basis[:120] or "范围候选已由评审规则确认，需人工复核"
     return {
-        "rule_id": str(fallback.get("rule_id") or ""),
+        "rule_id": fallback_rule_id,
         "level": "high",
         "keyword": keyword,
         "conclusion": conclusion,
