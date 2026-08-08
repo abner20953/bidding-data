@@ -1640,6 +1640,39 @@ def _score_sources_compatible(left: object, right: object) -> bool:
     return storage._score_sources_compatible(left, right)
 
 
+def _score_candidates_same_fact(existing: dict, candidate: dict) -> bool:
+    """判断两个评分候选是否是同一计分事实，而非只比较标题。
+
+    分段提取常把“相关业绩/商务业绩”“价格得分/得分计算”写成不同标题。只有
+    同类别、同满分，且原文同源并存在相同对象或相同评分叶子结构时才合并；若两者
+    没有同源证据，则即便同分值也绝不合并。
+    """
+    category = str(candidate.get("category") or "")
+    if category not in {"objective", "subjective"} or category != str(existing.get("category") or ""):
+        return False
+    left_scoring = existing.get("scoring") if isinstance(existing.get("scoring"), dict) else {}
+    right_scoring = candidate.get("scoring") if isinstance(candidate.get("scoring"), dict) else {}
+    left_max = storage._valid_max_score(left_scoring)
+    right_max = storage._valid_max_score(right_scoring)
+    if left_max is None or right_max is None or abs(left_max - right_max) > 0.001:
+        return False
+    left_source = storage._normalise_rule_source(existing.get("source_text"))
+    right_source = storage._normalise_rule_source(candidate.get("source_text"))
+    exact_source = len(left_source) >= 12 and left_source == right_source
+    same_source = exact_source or _score_sources_compatible(existing.get("source_text"), candidate.get("source_text")) \
+        or storage._score_sources_contain(existing.get("source_text"), candidate.get("source_text"))
+    left_title = storage._score_rule_object_core(existing.get("title"))
+    right_title = storage._score_rule_object_core(candidate.get("title"))
+    same_title = storage._score_object_core_compatible(left_title, right_title)
+    same_structure = storage._score_scoring_structure_similar(left_scoring, right_scoring)
+    if same_source and (same_title or same_structure):
+        return True
+    left_ids = {str(value).strip() for value in existing.get("source_clause_ids") or [] if str(value).strip()}
+    right_ids = {str(value).strip() for value in candidate.get("source_clause_ids") or [] if str(value).strip()}
+    same_page = isinstance(existing.get("source_page"), int) and existing.get("source_page") == candidate.get("source_page")
+    return same_structure and (bool(left_ids & right_ids) or same_page)
+
+
 def _dedupe_rule_candidates(items: list[dict]) -> list[dict]:
     seen: set[tuple[str, str, str]] = set()
     score_indexes: dict[tuple[object, ...], int] = {}
@@ -1682,7 +1715,20 @@ def _dedupe_rule_candidates(items: list[dict]) -> list[dict]:
             merged[target_index] = _merge_duplicate_score_rule(merged[target_index], item)
         else:
             merged.append(item)
-    return merged
+    # 第三趟不再要求标题完全相同：只要同源条款且评分叶子结构一致，即可把
+    # “相关业绩/商务业绩”等不同叙述归并。它是对分段标题漂移的结构化修复，
+    # 不是模糊语义猜测。
+    final_rules: list[dict] = []
+    for item in merged:
+        target_index = next((
+            index for index, existing in enumerate(final_rules)
+            if _score_candidates_same_fact(existing, item)
+        ), None)
+        if target_index is None:
+            final_rules.append(item)
+        else:
+            final_rules[target_index] = _merge_duplicate_score_rule(final_rules[target_index], item)
+    return final_rules
 
 
 def _score_label_key(value: object) -> str:

@@ -6949,6 +6949,21 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         }])
         self.assertEqual(len(rules), 1)
 
+    def test_score_dedupe_merges_same_source_with_different_business_aliases(self):
+        source = "2023年起投标人独立承担的相关业绩，每项2分，满分8分；须提供合同、验收证明和发票。"
+        items = [
+            {"name": "弱电智能化业绩", "max_score": 4, "criterion": "每项2分"},
+            {"name": "机房改造业绩", "max_score": 4, "criterion": "每项2分"},
+        ]
+        rules = worker._dedupe_rule_candidates([{
+            "category": "objective", "title": "相关业绩评分（8分）",
+            "source_text": source, "source_page": 35, "scoring": {"max_score": 8, "items": items},
+        }, {
+            "category": "objective", "title": "商务业绩评分（满分8分）",
+            "source_text": source, "source_page": 35, "scoring": {"max_score": 8, "items": items},
+        }])
+        self.assertEqual(len(rules), 1)
+
     def test_score_section_summary_is_not_an_executable_rule(self):
         rules, excluded = worker._drop_non_executable_score_section_summaries([{
             "category": "subjective", "title": "服务部分评分（29分）",
@@ -6969,6 +6984,30 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             "scoring": {"max_score": 2, "items": [{"name": "认证证书", "max_score": 2, "criterion": "提供有效证书得2分"}]},
         }
         self.assertFalse(worker._is_non_executable_score_section_summary(rule))
+
+    def test_reextract_auto_disables_proven_duplicate_edited_score_rules(self):
+        source = "投标产品提供有效节能产品认证证书每项1分，环境标志产品认证证书每项1分，满分2分。"
+        storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-1", [{
+            "category": "objective", "title": "认证证书评分（2分）", "check_rule": "核验证书",
+            "source_text": source, "source_page": 34,
+            "scoring": {"max_score": 2, "items": [{"name": "节能证书", "max_score": 1}, {"name": "环境证书", "max_score": 1}]},
+        }, {
+            "category": "objective", "title": "节能/环境标志产品认证证书评分", "check_rule": "核验证书有效期",
+            "source_text": source, "source_page": 34,
+            "scoring": {"max_score": 2, "items": [{"name": "节能证书", "max_score": 1}, {"name": "环境证书", "max_score": 1}]},
+        }])
+        _, initial = storage.list_rules(self.app, self.project["project_id"])
+        for rule in initial:
+            storage.update_rule(self.app, self.project["project_id"], rule["rule_id"], {"check_rule": rule["check_rule"] + "（人工维护）"})
+            storage.update_rule(self.app, self.project["project_id"], rule["rule_id"], {"enabled": True})
+
+        rule_set = storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-2", [])
+        _, refreshed = storage.list_rules(self.app, self.project["project_id"])
+        scores = [item for item in refreshed if item["category"] == "objective"]
+        self.assertEqual(len(scores), 2)
+        self.assertEqual(sum(1 for item in scores if item["enabled"]), 1)
+        self.assertEqual(rule_set["auto_merged_score_rule_count"], 1)
+        self.assertTrue(any("人工维护" in item["check_rule"] for item in scores if item["enabled"]))
 
     def test_confirm_rule_set_blocks_declared_total_mismatch(self):
         """明示总分不守恒不能进入综合评审，避免错误总分传播。"""

@@ -3304,6 +3304,10 @@ def replace_rules_from_extraction(app, project_id: str, task_id: str, rules: lis
             global_rule_count += 1
         rule_set["global_rule_count"] = global_rule_count
         rule_set["preserved_rule_count"] = preserved_rule_count
+    # 同一轮中可能遗留两条已编辑的历史评分规则：它们都应保留编辑内容，但若已经
+    # 能由同源原文/叶子结构证明为同一计分事实，就在草稿生成时停用次规则。这样
+    # 不必等到用户点击确认才发现总分虚高；记录仍保留，操作可逆。
+    rule_set["auto_merged_score_rule_count"] = merge_draft_score_rule_duplicates(app, rule_set["rule_set_id"])
     return rule_set
 
 
@@ -3365,6 +3369,14 @@ def _rule_candidates_same_fact(existing: dict, candidate: dict) -> bool:
         left_source = _normalise_rule_source(existing.get("source_text"))
         right_source = _normalise_rule_source(candidate.get("source_text"))
         if len(left_source) >= 20 and left_source == right_source:
+            return True
+        existing_ids = _rule_source_clause_ids(existing)
+        candidate_ids = {str(value).strip() for value in candidate.get("source_clause_ids") or [] if str(value).strip()}
+        same_page = isinstance(existing.get("source_page"), int) and existing.get("source_page") == candidate.get("source_page")
+        same_structure = _score_scoring_structure_similar(_safe_scoring_json(existing), _safe_scoring_json(candidate))
+        # 标题可能从“相关业绩”改写为“商务业绩”，但同页同满分且逐项计分结构
+        # 一致，或稳定条款 ID 交集，仍能证明是同一事实。
+        if same_structure and (same_page or bool(existing_ids & candidate_ids)):
             return True
     if not titles_compatible:
         return False
@@ -3705,9 +3717,21 @@ def merge_draft_score_rule_duplicates(app, rule_set_id: str) -> int:
 
 def _merge_rule_pair(conn, primary: dict, other: dict) -> tuple[dict, dict]:
     """合并两条规则：信息更全者为主，更新主规则字段并停用次规则。"""
-    if _score_rule_richness(other) > _score_rule_richness(primary):
+    primary_edited = str(primary.get("source_type") or "") == "ai_edited"
+    other_edited = str(other.get("source_type") or "") == "ai_edited"
+    # 可证明重复时优先保留人工编辑过的规则；自动提取的较长文案只能补来源锚点，
+    # 不得反向覆盖用户已经维护的检查口径或计分结构。
+    if other_edited and not primary_edited:
         primary, other = other, primary
-    merged = _merge_rule_duplicate_fields(primary, other)
+        primary_edited, other_edited = True, False
+    elif not primary_edited and not other_edited and _score_rule_richness(other) > _score_rule_richness(primary):
+        primary, other = other, primary
+    if primary_edited:
+        merged = dict(primary)
+        if not merged.get("source_page"):
+            merged["source_page"] = other.get("source_page")
+    else:
+        merged = _merge_rule_duplicate_fields(primary, other)
     try:
         primary_meta = json.loads(primary.get("execution_meta_json") or "{}")
     except (TypeError, json.JSONDecodeError):
