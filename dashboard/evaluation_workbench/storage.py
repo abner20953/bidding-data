@@ -2877,6 +2877,19 @@ def rule_execution_meta(rule: dict) -> dict:
     if not isinstance(fact_ids, list):
         fact_ids = []
     fact_ids = [str(item).strip() for item in fact_ids if str(item).strip()]
+    source_locations = value.get("source_locations")
+    if not isinstance(source_locations, list):
+        source_locations = []
+    normalised_locations: list[dict] = []
+    for location in source_locations:
+        if not isinstance(location, dict):
+            continue
+        page = location.get("page")
+        if not isinstance(page, int) or page <= 0:
+            continue
+        value_location = {"page": page}
+        if value_location not in normalised_locations:
+            normalised_locations.append(value_location)
     sections = value.get("score_sections")
     if not isinstance(sections, list):
         sections = []
@@ -2910,6 +2923,7 @@ def rule_execution_meta(rule: dict) -> dict:
         "evidence_items": _normalise_evidence_items(value.get("evidence_items")),
         "source_clause_ids": list(dict.fromkeys(clause_ids)),
         "source_fact_ids": list(dict.fromkeys(fact_ids)),
+        "source_locations": normalised_locations,
         "score_sections": normalised_sections,
     }
 
@@ -2996,6 +3010,19 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
     if not isinstance(fact_ids, list):
         fact_ids = []
     fact_ids = [str(item).strip() for item in fact_ids if str(item).strip()]
+    source_locations = payload.get("source_locations", base.get("source_locations"))
+    if not isinstance(source_locations, list):
+        source_locations = []
+    normalised_locations: list[dict] = []
+    for location in source_locations:
+        if not isinstance(location, dict):
+            continue
+        page = location.get("page")
+        if not isinstance(page, int) or page <= 0:
+            continue
+        value_location = {"page": page}
+        if value_location not in normalised_locations:
+            normalised_locations.append(value_location)
     sections = payload.get("score_sections", base.get("score_sections"))
     if not isinstance(sections, list):
         sections = []
@@ -3029,6 +3056,7 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
         "evidence_items": _normalise_evidence_items(payload.get("evidence_items", base.get("evidence_items"))),
         "source_clause_ids": list(dict.fromkeys(clause_ids)),
         "source_fact_ids": list(dict.fromkeys(fact_ids)),
+        "source_locations": normalised_locations,
         "score_sections": normalised_sections,
     }
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))

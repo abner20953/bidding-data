@@ -861,15 +861,28 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(analysis["signals"][0]["human_disposition"], "dismissed")
 
     def test_rule_extraction_creates_a_draft_rule_set(self):
-        self._add_pdf("tender.pdf", "tender", "", "投标人应具备有效资质，技术方案满分十分。")
+        tender_text = "投标人应具备有效资质，技术方案满分十分。"
+        self._add_pdf("tender.pdf", "tender", "", tender_text)
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
         self._run_next_task()
+        tender_document = next(item for item in storage.list_documents(self.app, self.project["project_id"]) if item["role"] == "tender")
+        Path(tender_document["parsed_path"]).write_text(tender_text, encoding="utf-8")
         task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
 
-        with patch("dashboard.evaluation_workbench.worker.request_json", return_value={"rules": [
-            {"category": "qualification", "title": "具备有效资质", "check_rule": "核验是否提供有效资质材料", "source_text": "投标人应具备有效资质", "check_mode": "auto"},
-            {"category": "subjective", "title": "技术方案评分", "source_text": "技术方案满分十分", "ocr_required": True, "scoring": {"max_score": 10}},
-        ]}):
+        def response(_profile, _system, prompt, **_kwargs):
+            if "仅根据以下评分原文台账生成评分规则" in prompt:
+                clause_id = re.search(r"SC-[A-Za-z0-9-]+", prompt).group(0)
+                return {"rules": [{
+                    "category": "subjective", "title": "技术方案评分", "check_rule": "评价技术方案",
+                    "source_text": "技术方案满分十分", "source_clause_ids": [clause_id],
+                    "ocr_required": True, "scoring": {"max_score": 10},
+                }]}
+            return {"rules": [{
+                "category": "qualification", "title": "具备有效资质", "check_rule": "核验是否提供有效资质材料",
+                "source_text": "投标人应具备有效资质", "check_mode": "auto",
+            }]}
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=response):
             finished = self._run_next_task()
 
         rule_set, rules = storage.list_rules(self.app, self.project["project_id"])
@@ -883,33 +896,32 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(next(item for item in rules if item["title"] == "技术方案评分")["baseline_ocr_mode"], "auto")
 
     def test_rule_extraction_treats_objective_rules_with_score_items_as_manual(self):
-        self._add_pdf("tender.pdf", "tender", "", "管理体系认证每提供一类得1分，最高3分。")
+        tender_text = "管理体系认证每提供一类得1分，最高3分。"
+        self._add_pdf("tender.pdf", "tender", "", tender_text)
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
         self._run_next_task()
+        tender_document = next(item for item in storage.list_documents(self.app, self.project["project_id"]) if item["role"] == "tender")
+        Path(tender_document["parsed_path"]).write_text(tender_text, encoding="utf-8")
         storage.create_task(self.app, self.project["project_id"], "extract_rules")
-        response = {"rules": [
-            {
+        def response(_profile, _system, prompt, **_kwargs):
+            if "仅根据以下评分原文台账生成评分规则" not in prompt:
+                return {"rules": []}
+            clause_id = re.search(r"SC-[A-Za-z0-9-]+", prompt).group(0)
+            return {"rules": [{
                 "category": "objective", "title": "管理体系认证", "check_rule": "每提供一类认证得1分，最高3分",
-                "source_text": "管理体系认证每提供一类得1分，最高3分。",
+                "source_text": "管理体系认证每提供一类得1分，最高3分。", "source_clause_ids": [clause_id],
                 "scoring": {"max_score": 3, "kind": "boolean", "items": [
                     {"name": "管理体系认证", "max_score": 3, "criterion": "每提供一类得1分"},
                 ]},
-            },
-            {
-                "category": "objective", "title": "固定资质得分", "check_rule": "具备该资质得5分",
-                "source_text": "具备该资质得5分。", "scoring": {"max_score": 5, "kind": "boolean"},
-            },
-        ]}
+            }]}
 
-        with patch("dashboard.evaluation_workbench.worker.request_json", return_value=response):
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=response):
             finished = self._run_next_task()
 
         _, rules = storage.list_rules(self.app, self.project["project_id"])
         scoring = json.loads(next(item for item in rules if item["title"] == "管理体系认证")["scoring_json"])
-        fixed_scoring = json.loads(next(item for item in rules if item["title"] == "固定资质得分")["scoring_json"])
         self.assertEqual(finished["status"], "success")
         self.assertEqual(scoring["kind"], "manual")
-        self.assertEqual(fixed_scoring["kind"], "boolean")
 
     def test_rule_extraction_retries_with_compact_output_after_json_truncation(self):
         self._add_pdf("tender.pdf", "tender", "", "投标人应具备有效资质。")
@@ -1344,12 +1356,16 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.create_task(self.app, self.project["project_id"], "extract_rules")
 
         def response(_profile, _system, user_prompt, **_kwargs):
-            if late_clause in user_prompt:
+            if "仅根据以下评分原文台账生成评分规则" in user_prompt:
+                clause_id = re.search(r"SC-[A-Za-z0-9-]+", user_prompt).group(0)
                 return {"rules": [{
                     "category": "objective", "title": "特殊业绩计分",
                     "check_rule": "每个同类项目业绩得3分，最高9分",
-                    "source_text": late_clause, "scoring": {"kind": "manual", "max_score": 9},
+                    "source_text": late_clause, "source_clause_ids": [clause_id],
+                    "scoring": {"kind": "manual", "max_score": 9},
                 }]}
+            if late_clause in user_prompt:
+                return {"rules": []}
             return {"rules": []}
 
         with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=response) as request_json:
@@ -1371,17 +1387,30 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         tender_document = next(item for item in storage.list_documents(self.app, self.project["project_id"]) if item["role"] == "tender")
         Path(tender_document["parsed_path"]).write_text(tender_text, encoding="utf-8")
         storage.create_task(self.app, self.project["project_id"], "extract_rules")
-        primary = {"rules": [{"category": "objective", "title": "报价评分", "check_rule": "按报价公式计算", "source_text": "报价得分最高25分", "scoring": {"max_score": 25, "kind": "manual"}}]}
-        supplement = {"rules": [{"category": "objective", "title": "类似项目业绩评分", "check_rule": "每个同类型项目业绩计3分，最高9分", "source_text": "业绩每有一个得3分，最高9分", "scoring": {"max_score": 9, "kind": "manual"}}]}
+        def response(_profile, _system, prompt, **_kwargs):
+            clause_ids = list(dict.fromkeys(re.findall(r"SC-[A-Za-z0-9-]+", prompt)))
+            if "本批仅提取非评分审查事实" in prompt:
+                return {"rules": []}
+            if "仅根据以下评分原文台账生成评分规则" in prompt:
+                return {"rules": [{
+                    "category": "objective", "title": "报价评分", "check_rule": "按报价公式计算",
+                    "source_text": "报价得分最高25分", "source_clause_ids": [clause_ids[-1]],
+                    "scoring": {"max_score": 25, "kind": "manual"},
+                }]}
+            return {"rules": [{
+                "category": "objective", "title": "类似项目业绩评分", "check_rule": "每个同类型项目业绩计3分，最高9分",
+                "source_text": "业绩每有一个得3分，最高9分", "source_clause_ids": [clause_ids[0]],
+                "scoring": {"max_score": 9, "kind": "manual"},
+            }]}
 
-        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[primary, supplement, {"rules": []}, {"drops": []}]) as request_json:
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=response) as request_json:
             finished = self._run_next_task()
 
         _, rules = storage.list_rules(self.app, self.project["project_id"])
         self.assertEqual(finished["status"], "success")
         self.assertEqual(finished["result"]["score_clause_count"], 2)
         self.assertEqual(finished["result"]["scoring_supplement_count"], 1)
-        self.assertEqual(request_json.call_count, 4)
+        self.assertEqual(request_json.call_count, 3)
         self.assertEqual(next(item for item in rules if item["title"] == "类似项目业绩评分")["scoring_json"], '{"max_score": 9, "kind": "manual"}')
 
     def test_rule_extraction_checks_each_score_clause_not_only_score_rule_count(self):
@@ -1395,22 +1424,28 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         tender_document = next(item for item in storage.list_documents(self.app, self.project["project_id"]) if item["role"] == "tender")
         Path(tender_document["parsed_path"]).write_text(tender_text, encoding="utf-8")
         storage.create_task(self.app, self.project["project_id"], "extract_rules")
-        primary = {"rules": [
-            {"category": "objective", "title": "报价评分", "check_rule": "按报价公式计算", "source_text": "报价得分最高25分", "scoring": {"max_score": 25, "kind": "manual"}},
-            *[{"category": "subjective", "title": f"技术方案{i}评分", "check_rule": "评价技术方案", "source_text": "技术方案评分", "scoring": {"max_score": 5, "kind": "manual"}} for i in range(6)],
-        ]}
-        supplement = {"rules": [{"category": "objective", "title": "类似项目业绩评分", "check_rule": "每个同类型项目业绩计3分，最高9分", "source_text": "业绩每有一个得3分，最高9分", "scoring": {"max_score": 9, "kind": "manual"}}]}
+        def response(_profile, _system, prompt, **_kwargs):
+            clause_ids = list(dict.fromkeys(re.findall(r"SC-[A-Za-z0-9-]+", prompt)))
+            if "本批仅提取非评分审查事实" in prompt:
+                return {"rules": []}
+            if "仅根据以下评分原文台账生成评分规则" in prompt:
+                return {"rules": [{
+                    "category": "objective", "title": "报价评分", "check_rule": "按报价公式计算",
+                    "source_text": "报价得分最高25分", "source_clause_ids": [clause_ids[-1]],
+                    "scoring": {"max_score": 25, "kind": "manual"},
+                }]}
+            return {"rules": []}
 
-        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[primary, supplement, {"rules": []}, {"drops": []}]) as request_json:
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=response) as request_json:
             finished = self._run_next_task()
 
         _, rules = storage.list_rules(self.app, self.project["project_id"])
-        supplement_prompt = request_json.call_args_list[1].args[2]
+        supplement_prompt = request_json.call_args_list[2].args[2]
         self.assertEqual(finished["result"]["uncovered_score_clause_count"], 1)
-        self.assertEqual(request_json.call_count, 4)
+        self.assertEqual(request_json.call_count, 3)
         self.assertIn("业绩每有一个得3分", supplement_prompt)
         self.assertNotIn("报价得分最高25分", supplement_prompt)
-        self.assertIn("类似项目业绩评分", {item["title"] for item in rules})
+        self.assertNotIn("类似项目业绩评分", {item["title"] for item in rules})
 
     def test_adjacent_score_rows_remain_independent_coverage_clauses(self):
         packets = worker._score_clause_packets("\n".join([
@@ -3369,7 +3404,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_subjective_user"]["content"])
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"])
         self.assertIn("统一为 partial 或需图片核验", PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v47")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v48")
 
     def test_scope_chapter_and_text_error_guidance_present(self):
         from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
@@ -3387,7 +3422,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(text_marker, PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("必须点名最具辨识度的偏离对象", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("risk_level 应为 high", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v47")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v48")
 
     def test_ocr_visual_contracts_deduplicated_but_keep_hard_constraints(self):
         from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
@@ -5922,7 +5957,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不限定行业或采购类型", guidance)
         scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v47")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v48")
 
     def test_full_scan_does_not_reinject_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")
@@ -6414,15 +6449,29 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual({item["title"] for item in rules}, {"具备资质", "响应文件份数"})
 
     def test_rule_extraction_keeps_performance_score_with_bid_deadline_range(self):
-        self._add_pdf("tender.pdf", "tender", "", "业绩每有一个得3分，最高9分。")
+        tender_text = "业绩每有一个得3分，最高9分。"
+        self._add_pdf("tender.pdf", "tender", "", tender_text)
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
         self._run_next_task()
+        tender_document = next(item for item in storage.list_documents(self.app, self.project["project_id"]) if item["role"] == "tender")
+        Path(tender_document["parsed_path"]).write_text(tender_text, encoding="utf-8")
         storage.create_task(self.app, self.project["project_id"], "extract_rules")
 
-        with patch("dashboard.evaluation_workbench.worker.request_json", return_value={"rules": [
-            {"category": "objective", "title": "同类项目业绩", "check_rule": "核验投标截止日前三年内同类项目业绩，每个得3分，最高9分。", "source_text": "供应商提供投标截止日期三个年度内同类型项目业绩，每有一个得3分，最高9分。", "scoring": {"max_score": 9, "kind": "manual"}},
-            {"category": "compliance", "title": "响应文件份数", "check_rule": "核验是否按要求提交正副本份数", "source_text": "响应文件正本一份、副本两份"},
-        ]}):
+        def response(_profile, _system, prompt, **_kwargs):
+            if "仅根据以下评分原文台账生成评分规则" in prompt:
+                clause_id = re.search(r"SC-[A-Za-z0-9-]+", prompt).group(0)
+                return {"rules": [{
+                    "category": "objective", "title": "同类项目业绩",
+                    "check_rule": "核验投标截止日前三年内同类项目业绩，每个得3分，最高9分。",
+                    "source_text": "供应商提供投标截止日期三个年度内同类型项目业绩，每有一个得3分，最高9分。",
+                    "source_clause_ids": [clause_id], "scoring": {"max_score": 9, "kind": "manual"},
+                }]}
+            return {"rules": [{
+                "category": "compliance", "title": "响应文件份数", "check_rule": "核验是否按要求提交正副本份数",
+                "source_text": "响应文件正本一份、副本两份",
+            }]}
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=response):
             finished = self._run_next_task()
 
         _, rules = storage.list_rules(self.app, self.project["project_id"])
@@ -7063,6 +7112,63 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(stats["source_fact_count"], 1)
         self.assertEqual(stats["unanchored_rule_count"], 0)
 
+    def test_source_fact_identity_uses_content_but_preserves_multiple_page_locations(self):
+        values = worker._attach_source_fact_metadata([
+            {
+                "category": "compliance", "title": "报价唯一", "check_rule": "核验报价唯一",
+                "source_text": "投标文件只能有一个有效报价，不得提供备选报价。", "source_page": 12,
+            },
+            {
+                "category": "compliance", "title": "报价唯一", "check_rule": "核验报价唯一与备选报价",
+                "source_text": "投标文件只能有一个有效报价，不得提供备选报价。", "source_page": 25,
+            },
+        ])
+        self.assertEqual(values[0]["source_fact_ids"], values[1]["source_fact_ids"])
+        self.assertEqual(values[0]["source_locations"], [{"page": 12}])
+        self.assertEqual(values[1]["source_locations"], [{"page": 25}])
+
+    def test_merging_same_source_rule_keeps_all_source_locations(self):
+        values = worker._attach_source_fact_metadata([
+            {
+                "category": "compliance", "title": "报价唯一", "check_rule": "核验报价唯一",
+                "source_text": "投标文件只能有一个有效报价，不得提供备选报价。", "source_page": 12,
+            },
+            {
+                "category": "compliance", "title": "报价唯一", "check_rule": "核验报价唯一与备选报价",
+                "source_text": "投标文件只能有一个有效报价，不得提供备选报价。", "source_page": 25,
+            },
+        ])
+        merged = worker._merge_duplicate_non_score_rule(values[0], values[1])
+        self.assertEqual(merged["source_locations"], [{"page": 12}, {"page": 25}])
+
+    def test_non_score_rule_cannot_occupy_scoring_clause_id(self):
+        values = worker._attach_source_fact_metadata([{
+            "category": "qualification", "title": "营业执照", "check_rule": "核验营业执照",
+            "source_text": "投标人应提供营业执照。", "source_clause_ids": ["SC-1", "QF-1"],
+        }])
+        self.assertEqual(values[0]["source_clause_ids"], ["QF-1"])
+        self.assertFalse(values[0]["source_fact_ids"][0].startswith("SF-score-"))
+
+    def test_scoring_assembly_rejects_duplicate_clause_ownership(self):
+        packets = worker._score_clause_packets("业绩：每项2分，最高4分。\n报价：最高10分。")
+        rules = worker._normalise_scoring_assembly_rules([
+            {"category": "objective", "title": "业绩", "check_rule": "每项2分，最高4分", "source_text": "业绩",
+             "source_clause_ids": [packets[0]["clause_id"]], "scoring": {"max_score": 4}},
+            {"category": "objective", "title": "重复业绩", "check_rule": "重复", "source_text": "业绩",
+             "source_clause_ids": [packets[0]["clause_id"]], "scoring": {"max_score": 4}},
+            {"category": "objective", "title": "报价", "check_rule": "最高10分", "source_text": "报价",
+             "source_clause_ids": [packets[1]["clause_id"]], "scoring": {"max_score": 10}},
+        ], packets)
+        self.assertEqual([item["title"] for item in rules], ["业绩", "报价"])
+
+    def test_scoring_assembly_recovers_only_unique_exact_source_when_id_is_omitted(self):
+        packets = worker._score_clause_packets("业绩：每项2分，最高4分。\n报价：最高10分。")
+        rules = worker._normalise_scoring_assembly_rules([{
+            "category": "objective", "title": "业绩", "check_rule": "每项2分，最高4分",
+            "source_text": "业绩：每项2分，最高4分。", "scoring": {"max_score": 4},
+        }], packets)
+        self.assertEqual(rules[0]["source_clause_ids"], [packets[0]["clause_id"]])
+
     def test_source_fact_ids_survive_rule_set_storage_round_trip(self):
         storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-source", [{
             "category": "other", "title": "响应覆盖", "check_rule": "核验响应覆盖",
@@ -7113,7 +7219,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             {"rule_id": "SR2", "source_clause_ids": [packets[1]["clause_id"]]},
         ]))
 
-    def test_rule_extraction_v2_uses_source_plan_without_semantic_compile_chain(self):
+    def test_rule_extraction_v21_uses_scoring_ledger_without_semantic_compile_chain(self):
         tender_text = "业绩评分：每提供一份业绩得2分，最高4分。\n报价评分：按报价公式计算，最高10分。"
         self._add_pdf("tender.pdf", "tender", "", tender_text)
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
@@ -7123,21 +7229,18 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.create_task(self.app, self.project["project_id"], "extract_rules")
 
         def response(_profile, _system, prompt, **kwargs):
-            if "规划每条评分原文应归属" in prompt:
+            if "仅根据以下评分原文台账生成评分规则" in prompt:
                 clause_ids = list(dict.fromkeys(re.findall(r"SC-[A-Za-z0-9-]+", prompt)))
-                return {"assignments": [
-                    {"rule_id": "SR1", "source_clause_ids": [clause_ids[0]]},
-                    {"rule_id": "SR2", "source_clause_ids": [clause_ids[1]]},
-                ]}
-            if "请对完整候选规则集做一次规范化" in prompt:
-                return {"drops": [], "rewrites": [], "merges": []}
-            if "招标文件原文：" in prompt:
                 return {"rules": [
                     {"category": "objective", "title": "业绩评分", "check_rule": "每份业绩2分，最高4分",
-                     "source_text": "业绩评分：每提供一份业绩得2分，最高4分。", "scoring": {"max_score": 4, "kind": "manual"}},
+                     "source_text": "业绩评分：每提供一份业绩得2分，最高4分。", "source_clause_ids": [clause_ids[0]],
+                     "scoring": {"max_score": 4, "kind": "manual"}},
                     {"category": "objective", "title": "报价评分", "check_rule": "按报价公式计算，最高10分",
-                     "source_text": "报价评分：按报价公式计算，最高10分。", "scoring": {"max_score": 10, "kind": "manual"}},
+                     "source_text": "报价评分：按报价公式计算，最高10分。", "source_clause_ids": [clause_ids[1]],
+                     "scoring": {"max_score": 10, "kind": "manual"}},
                 ]}
+            if "本批仅提取非评分审查事实" in prompt:
+                return {"rules": []}
             self.fail("不应进入旧语义编译链")
 
         with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=response) as request_json:
@@ -7146,8 +7249,10 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         prompts = [call.args[2] for call in request_json.call_args_list]
         self.assertEqual(finished["status"], "success")
         self.assertTrue(finished["result"]["scoring_source_plan_applied"])
+        self.assertEqual(finished["result"]["scoring_assembly_mode"], "direct_assembly")
         self.assertFalse(any("统一编译并合并评审规则" in value or "审计规则覆盖范围" in value for value in prompts))
-        self.assertEqual(finished["result"]["source_ledger"]["pipeline_version"], "source-ledger-v2")
+        self.assertFalse(any("规划每条评分原文应归属" in value for value in prompts))
+        self.assertEqual(finished["result"]["source_ledger"]["pipeline_version"], "source-ledger-v2.1")
 
     def test_rule_finalisation_failure_retries_non_score_categories_only(self):
         """完整规范化异常后按类别恢复，评分规则不额外改写。"""
