@@ -7041,6 +7041,38 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         license_rule = next(item for item in merged if "营业执照" in item["title"])
         self.assertEqual(set(license_rule["source_unit_ids"]), {"SU-test-P1-1-a", "SU-test-P2-1-b"})
 
+    def test_semantic_duplicate_groups_include_same_title_with_rephrased_targets(self):
+        rules = [
+            {
+                "category": "substantive", "title": "实质性条款响应要求",
+                "verification_target": "所有星号条款逐项响应且没有负偏离",
+            },
+            {
+                "category": "substantive", "title": "实质性条款响应要求",
+                "verification_target": "商务和技术偏离表对星号条款的应答情况",
+            },
+            {
+                "category": "qualification", "title": "营业执照",
+                "verification_target": "营业执照有效性",
+            },
+        ]
+        self.assertEqual(worker._semantic_duplicate_candidate_groups(rules), [[0, 1]])
+
+    def test_scoring_ledger_boundary_keeps_ordinary_technical_requirement_but_excludes_score_source(self):
+        packets = worker._score_clause_packets("[第37页]\n技术参数中每项重要指标得0.3分，最高10分。")
+        rules, excluded = worker._filter_non_score_candidates_from_scoring_ledger([
+            {
+                "category": "other", "title": "技术响应覆盖",
+                "source_text": "技术参数中每项重要指标得0.3分，最高10分。",
+            },
+            {
+                "category": "other", "title": "服务响应覆盖",
+                "source_text": "投标文件应逐项响应网络实施服务要求。",
+            },
+        ], packets)
+        self.assertEqual([item["title"] for item in rules], ["服务响应覆盖"])
+        self.assertEqual(excluded[0]["_contract_exclusion_reason"], "评分原文台账")
+
     def test_rule_extraction_v23_uses_scoring_ledger_without_legacy_compile_chain(self):
         tender_text = "业绩评分：每提供一份业绩得2分，最高4分。\n报价评分：按报价公式计算，最高10分。"
         self._add_pdf("tender.pdf", "tender", "", tender_text)

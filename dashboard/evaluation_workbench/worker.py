@@ -1422,6 +1422,37 @@ def _enforce_non_score_candidate_contract(rules: list[dict]) -> tuple[list[dict]
     return kept, excluded
 
 
+def _filter_non_score_candidates_from_scoring_ledger(rules: list[dict], score_packets: list[dict]) -> tuple[list[dict], list[dict]]:
+    """阻止评分原文被错误包装成非评分“响应覆盖”规则。
+
+    判断只使用本地已建立的评分原文台账：候选的直接原文摘录明确属于一个评分条款
+    时，评分应由独立评分组装链处理，不能再以 ``other`` 等类别重复执行。普通技术
+    要求即使与评分表同页，只要摘录不属于评分条款，仍会保留。
+    """
+    score_sources = [
+        storage._normalise_rule_source(_score_packet_text(packet))
+        for packet in score_packets if isinstance(packet, dict) and not packet.get("is_section_summary")
+    ]
+    kept: list[dict] = []
+    excluded: list[dict] = []
+    for item in rules:
+        if not isinstance(item, dict) or str(item.get("category") or "") not in _NON_SCORE_CATEGORIES:
+            kept.append(item)
+            continue
+        source = storage._normalise_rule_source(item.get("source_text"))
+        belongs_to_score = len(source) >= 16 and any(
+            source == score_source or source in score_source
+            for score_source in score_sources if score_source
+        )
+        if not belongs_to_score:
+            kept.append(item)
+            continue
+        value = dict(item)
+        value["_contract_exclusion_reason"] = "评分原文台账"
+        excluded.append(value)
+    return kept, excluded
+
+
 def _score_packet_prompt_text(score_packets: list[object]) -> str:
     values = []
     for index, packet in enumerate(score_packets, start=1):
@@ -2304,10 +2335,6 @@ def _consolidate_same_named_non_score_rules(items: list[dict]) -> tuple[list[dic
     return result, merged_count
 
 
-def _semantic_candidate_text(value: object) -> str:
-    return re.sub(r"[\s\W_]+", "", str(value or "")).casefold()
-
-
 def _semantic_duplicate_candidate_groups(items: list[dict], *, max_group_size: int = 6) -> list[list[int]]:
     """从已完成确定性去重的候选中找出少量“可能同义”的规则组。
 
@@ -2323,24 +2350,22 @@ def _semantic_duplicate_candidate_groups(items: list[dict], *, max_group_size: i
         left = items[left_index]
         left_category = str(left.get("category") or "")
         left_title = storage._rule_title_identity(left.get("title"), left_category)
-        left_target = _semantic_candidate_text(left.get("verification_target") or left.get("check_rule"))
         for right_index in candidates[left_offset + 1:]:
             right = items[right_index]
             if str(right.get("category") or "") != left_category:
                 continue
             right_title = storage._rule_title_identity(right.get("title"), left_category)
-            right_target = _semantic_candidate_text(right.get("verification_target") or right.get("check_rule"))
             title_related = bool(left_title and right_title and (
                 left_title == right_title
                 or storage._rule_titles_compatible(left.get("title"), right.get("title"), left_category)
             ))
             if not title_related:
                 continue
-            target_similarity = (
-                difflib.SequenceMatcher(None, left_target, right_target).ratio()
-                if left_target and right_target else 0.0
-            )
-            if left_target == right_target or target_similarity >= 0.62:
+            # 此处仅决定“是否交给 AI 裁决”，不触发本地合并。同类别且标题身份
+            # 一致的跨章节候选，即使模型将核验对象改写成不同句式，也必须进入小组；
+            # 否则会漏掉最常见的“同一偏离表/实质性条款被不同章节重复描述”。
+            # 最终是否合并仍由模型依据完整来源判断，裁决失败则全部保留。
+            if title_related:
                 linked[left_index].add(right_index)
                 linked[right_index].add(left_index)
     groups: list[list[int]] = []
@@ -3133,10 +3158,11 @@ def _extract_rules(app, task: dict) -> dict:
     storage.update_task(app, task["task_id"], progress=68, message="正在按来源事实台账整理评审规则")
     # 是否可由投标文件核验交给完整提示词与人工确认判断；不以词表硬过滤，避免误删业绩有效期等规则。
     rules = _normalise_non_score_candidate_contract(candidates, source_unit_catalog)
+    rules, scoring_source_excluded_rules = _filter_non_score_candidates_from_scoring_ledger(rules, score_packets)
     rules = _filter_non_file_verifiable_candidates(_filter_inapplicable_template_rules(_filter_rules_for_package(rules, package_number), text))
     rules, contract_excluded_rules = _enforce_non_score_candidate_contract(rules)
     rules = _attach_source_fact_metadata(rules)
-    excluded_rule_count = len(contract_excluded_rules)
+    excluded_rule_count = len(contract_excluded_rules) + len(scoring_source_excluded_rules)
     for item in rules:
         if item.get("category") not in {"objective", "subjective"}:
             continue
@@ -3317,6 +3343,7 @@ def _extract_rules(app, task: dict) -> dict:
             "finalisation_failure_count": finalisation["failure_count"],
             "same_name_rule_merged_count": same_name_pre_merged_count + same_name_post_merged_count,
             "source_contract_excluded_count": len(contract_excluded_rules),
+            "score_source_excluded_count": len(scoring_source_excluded_rules),
             "semantic_dedupe_group_count": semantic_dedupe["group_count"],
             "semantic_dedupe_merged_count": semantic_dedupe["merged_count"],
             "semantic_dedupe_failure_count": semantic_dedupe["failure_count"],
