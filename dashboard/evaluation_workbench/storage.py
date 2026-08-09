@@ -71,22 +71,47 @@ _RUNTIME_RELEASE_CACHE: str | None = None
 _RUNTIME_CODE_CACHE: str | None = None
 
 
+def _runtime_project_root() -> Path:
+    """返回运行代码根目录，便于测试与版本事实读取保持同一入口。"""
+    return Path(__file__).resolve().parents[2]
+
+
+def _read_release_marker(path: Path) -> tuple[bool, str]:
+    """读取镜像构建标记，区分“文件缺失”和“文件存在但不可用”。"""
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return False, ""
+    value = raw[:40]
+    return True, value if re.fullmatch(r"[0-9a-fA-F]{7,40}", value) else ""
+
+
 def runtime_release_fingerprint() -> str:
     """返回当前运行代码的可公开版本标识，用于任务复现与缓存隔离。
 
-    部署脚本会写入 ``.deploy-commit``；本地开发则优先读取 Git HEAD。两者都不可用
-    时返回 ``unknown``。不调用 git 子进程，也不读取任何凭据。
+    镜像内 ``.build-commit`` 是运行代码的唯一生产事实。镜像已带该文件但内容无效时，
+    不能退回宿主机部署记录或挂载目录 Git HEAD 冒充运行版本，只能明确返回 ``unknown``；
+    本地开发没有镜像标记时才读取 Git HEAD。不会调用 git 子进程，也不读取任何凭据。
     """
     global _RUNTIME_RELEASE_CACHE
     if _RUNTIME_RELEASE_CACHE is not None:
         return _RUNTIME_RELEASE_CACHE
+    root = _runtime_project_root()
+    image_marker_exists, image_commit = _read_release_marker(root / ".build-commit")
+    if image_marker_exists:
+        _RUNTIME_RELEASE_CACHE = image_commit or "unknown"
+        return _RUNTIME_RELEASE_CACHE
+
     value = str(os.environ.get("DEPLOY_COMMIT") or "").strip()[:40]
-    root = Path(__file__).resolve().parents[2]
+    if not re.fullmatch(r"[0-9a-fA-F]{7,40}", value):
+        value = ""
     if not value:
         try:
             value = (root / ".deploy-commit").read_text(encoding="utf-8").strip()[:40]
         except OSError:
             pass
+    if not re.fullmatch(r"[0-9a-fA-F]{7,40}", value):
+        value = ""
     if not value:
         git_dir = root / ".git"
         try:

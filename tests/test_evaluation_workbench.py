@@ -1261,9 +1261,12 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         _, rules = storage.list_rules(self.app, self.project["project_id"])
         supplement_prompt = request_json.call_args_list[2].args[2]
+        strict_retry_prompt = request_json.call_args_list[3].args[2]
         self.assertEqual(finished["result"]["uncovered_score_clause_count"], 1)
-        self.assertEqual(request_json.call_count, 3)
+        self.assertEqual(finished["result"]["scoring_assembly_strict_retry_count"], 1)
+        self.assertEqual(request_json.call_count, 4)
         self.assertIn("业绩每有一个得3分", supplement_prompt)
+        self.assertIn("业绩每有一个得3分", strict_retry_prompt)
         self.assertNotIn("报价得分最高25分", supplement_prompt)
         self.assertNotIn("类似项目业绩评分", {item["title"] for item in rules})
 
@@ -6241,6 +6244,38 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertTrue(info["deploy_recorded_at"])
         self.assertFalse(info["version_consistent"])
 
+    def test_deployment_version_info_marks_invalid_image_marker_unverified(self):
+        """镜像标记损坏时不能用挂载目录的旧记录冒充运行版本。"""
+        root = self.temp_dir / "invalid-build-version"
+        (root / "tools").mkdir(parents=True)
+        (root / ".build-commit").write_text("unknown\n", encoding="utf-8")
+        (root / "tools" / ".deploy-commit").write_text("def5678\n", encoding="utf-8")
+        with patch.object(evaluation_workbench_module, "_PROJECT_ROOT", root), \
+             patch.object(storage, "runtime_release_fingerprint", return_value="unknown"):
+            info = evaluation_workbench_module._deployment_version_info()
+
+        self.assertEqual(info["commit"], "unknown")
+        self.assertEqual(info["code_source"], "image_unverified")
+        self.assertFalse(info["version_consistent"])
+
+    def test_runtime_release_uses_image_marker_without_stale_fallback(self):
+        root = self.temp_dir / "runtime-build-version"
+        root.mkdir()
+        (root / ".build-commit").write_text("unknown\n", encoding="utf-8")
+        (root / ".deploy-commit").write_text("def5678\n", encoding="utf-8")
+        original_cache = storage._RUNTIME_RELEASE_CACHE
+        try:
+            storage._RUNTIME_RELEASE_CACHE = None
+            with patch.object(storage, "_runtime_project_root", return_value=root), \
+                 patch.dict(os.environ, {"DEPLOY_COMMIT": "abc1234"}):
+                self.assertEqual(storage.runtime_release_fingerprint(), "unknown")
+            storage._RUNTIME_RELEASE_CACHE = None
+            (root / ".build-commit").write_text("cafe1234\n", encoding="utf-8")
+            with patch.object(storage, "_runtime_project_root", return_value=root):
+                self.assertEqual(storage.runtime_release_fingerprint(), "cafe1234")
+        finally:
+            storage._RUNTIME_RELEASE_CACHE = original_cache
+
     def test_task_version_uses_same_runtime_release_source_as_blue_dot(self):
         with patch.object(storage, "runtime_release_fingerprint", return_value="run-version"):
             self.assertEqual(evaluation_workbench_module._current_deploy_commit(), "run-version")
@@ -7250,7 +7285,11 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             {"category": "objective", "title": "业绩", "source_clause_ids": ["SC-1"], "scoring": {"max_score": 15}},
             {"category": "objective", "title": "认证", "source_clause_ids": ["SC-2"], "scoring": {"max_score": 15}},
         ]
-        self.assertFalse(worker._score_contract_candidate_preserves_anchors(changed, original))
+        packets = [
+            {"clause_id": "SC-1", "text": "业绩得10分。"},
+            {"clause_id": "SC-2", "text": "认证得20分。"},
+        ]
+        self.assertFalse(worker._score_contract_candidate_preserves_anchors(changed, original, packets))
 
     def test_score_section_header_never_treats_specific_item_as_section(self):
         self.assertIsNone(worker._SCORE_SECTION_PARENT_PATTERN.match(
@@ -7332,6 +7371,60 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         )
         self.assertFalse(stats["attempted"])
         self.assertEqual(repaired, rules)
+
+    def test_scoring_contract_repair_recovers_missing_clause_across_multiple_groups(self):
+        packets = [
+            {"clause_id": "SC-doc-P8-1", "source_document_key": "doc", "source_page": 8,
+             "text": "资质满足得4分。", "score_section": {}},
+            {"clause_id": "SC-doc-P12-1", "source_document_key": "doc", "source_page": 12,
+             "text": "业绩满足得6分。", "score_section": {}},
+        ]
+        existing = [{"category": "objective", "title": "资质", "check_rule": "资质得4分",
+                     "source_text": "资质满足得4分", "source_clause_ids": ["SC-doc-P8-1"],
+                     "scoring": {"max_score": 4, "kind": "manual"}}]
+        candidate = [*existing, {"category": "objective", "title": "业绩", "check_rule": "业绩得6分",
+                                 "source_text": "业绩满足得6分", "source_clause_ids": ["SC-doc-P12-1"],
+                                 "scoring": {"max_score": 6, "kind": "manual"}}]
+        with patch("dashboard.evaluation_workbench.worker._request_task_json", return_value={"rules": candidate}):
+            repaired, stats = worker._repair_scoring_contract(
+                self.app, {"task_id": "task-score-multi"}, {"profile_id": "profile-1"}, "system",
+                existing, packets, [[packets[0]], [packets[1]]], declared_total=10, document_id="doc-1",
+            )
+        self.assertTrue(stats["attempted"])
+        self.assertTrue(stats["applied"])
+        self.assertEqual(worker._score_rules_total(repaired), 10)
+
+    def test_score_contract_attention_covers_omission_duplicate_and_total(self):
+        self.assertTrue(worker._score_contract_requires_attention({"missing_clause_ids": ["x"]}))
+        self.assertTrue(worker._score_contract_requires_attention({"duplicate_clause_ids": ["x"]}))
+        self.assertTrue(worker._score_contract_requires_attention({"total_mismatch": True}))
+        self.assertFalse(worker._score_contract_requires_attention({}))
+
+    def test_scoring_supplement_failure_keeps_successful_primary_rules(self):
+        packets = [
+            {"clause_id": "SC-doc-P8-1", "source_document_key": "doc", "source_page": 8,
+             "text": "资质满足得4分。", "score_section": {}},
+            {"clause_id": "SC-doc-P8-2", "source_document_key": "doc", "source_page": 8,
+             "text": "业绩满足得6分。", "score_section": {}},
+        ]
+        primary = {"category": "objective", "title": "资质", "check_rule": "资质得4分",
+                   "source_text": "资质满足得4分", "source_clause_ids": ["SC-doc-P8-1"],
+                   "scoring": {"max_score": 4, "kind": "manual"}}
+        no_fragment = {"candidate_group_count": 0, "merged_count": 0, "failure_count": 0, "guarded_count": 0}
+        no_contract = {"attempted": False, "applied": False, "failure_count": 0,
+                       "contract": worker._score_contract_issues([primary], packets, 10)}
+        with patch("dashboard.evaluation_workbench.worker._request_task_json", side_effect=[
+            {"rules": [primary]}, ValueError("补漏请求失败"), {"rules": []},
+        ]), patch("dashboard.evaluation_workbench.worker._repair_scoring_fragments", return_value=([primary], no_fragment)), patch(
+            "dashboard.evaluation_workbench.worker._repair_scoring_contract", return_value=([primary], no_contract),
+        ):
+            rules, stats = worker._extract_scoring_rules_from_ledger(
+                self.app, {"task_id": "task-score-retain"}, {"profile_id": "profile-1"}, "system",
+                packets, document_id="doc-1", declared_total=10,
+            )
+        self.assertEqual([item["title"] for item in rules], ["资质"])
+        self.assertEqual(stats["uncovered_clause_ids"], ["SC-doc-P8-2"])
+        self.assertGreaterEqual(stats["failure_count"], 1)
 
     def test_source_fact_ids_survive_rule_set_storage_round_trip(self):
         storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-source", [{
@@ -7542,6 +7635,27 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertFalse(stats["applied"])
         self.assertEqual(stats["failure_count"], 1)
         self.assertEqual(compiled, rules)
+
+    def test_obligation_compilation_retries_invalid_response_once(self):
+        rules = [
+            {"category": "qualification", "title": "营业执照", "check_rule": "核验营业执照", "source_text": "提供营业执照。"},
+            {"category": "compliance", "title": "投标函", "check_rule": "核验投标函", "source_text": "提交投标函。"},
+        ]
+        with patch("dashboard.evaluation_workbench.worker._request_task_json", side_effect=[
+            {"groups": "非法"},
+            {"groups": [
+                {"candidate_ids": ["O-1"], "action": "keep_separate"},
+                {"candidate_ids": ["O-2"], "action": "keep_separate"},
+            ]},
+        ]) as request:
+            compiled, stats = worker._compile_non_score_obligations(
+                self.app, {"task_id": "task-compile-retry"}, {"profile_id": "profile-1"}, "system", rules,
+                document_id="doc-1",
+            )
+        self.assertTrue(stats["applied"])
+        self.assertEqual(stats["strict_retry_count"], 1)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(len(compiled), 2)
 
     def test_template_filter_removes_only_explicitly_inapplicable_current_project_condition(self):
         inactive = {

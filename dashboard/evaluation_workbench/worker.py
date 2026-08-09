@@ -2030,6 +2030,15 @@ def _score_contract_issues(rules: list[dict], score_packets: list[dict],
     }
 
 
+def _score_contract_requires_attention(contract: dict) -> bool:
+    """返回评分原文契约是否仍有不能静默完成的异常。"""
+    return bool(
+        contract.get("missing_clause_ids")
+        or contract.get("duplicate_clause_ids")
+        or contract.get("total_mismatch")
+    )
+
+
 def _score_contract_repair_prompt(app, score_packets: list[dict], rules: list[dict],
                                   contract: dict) -> str:
     """把已经发现结构异常的连续评分表交给一次受约束重组。"""
@@ -2061,11 +2070,11 @@ def _repair_scoring_contract(app, task: dict, profile: dict, system_prompt: str,
     守恒校验；否则保留原结果，让确认前检查显式报告问题而不是静默替换。
     """
     contract = _score_contract_issues(rules, score_packets, declared_total)
-    # 只有招标原文给出了可信总分且当前合计不守恒时才增加一次模型调用。条款遗漏
-    # 已有原定向补漏流程处理；没有总分锚点时也不能把“疑似重复”当成自动重组依据。
-    abnormal = declared_total is not None and bool(contract["total_mismatch"])
+    # 只在招标原文存在可信总分、且本地契约确证异常时才增加一次调用。评分台账
+    # 即使被分成多个连续组，仍是同一份招标评分事实，不能因此放弃最后的全表修复。
+    abnormal = declared_total is not None and _score_contract_requires_attention(contract)
     stats = {"attempted": False, "applied": False, "failure_count": 0, "contract": contract}
-    if not abnormal or len(groups) != 1 or not score_packets:
+    if not abnormal or not score_packets:
         return rules, stats
     stats["attempted"] = True
     try:
@@ -2084,7 +2093,7 @@ def _repair_scoring_contract(app, task: dict, profile: dict, system_prompt: str,
             candidate_contract["missing_clause_ids"]
             or candidate_contract["duplicate_clause_ids"]
             or candidate_contract["total_mismatch"]
-        ) and _score_contract_candidate_preserves_anchors(candidate, rules):
+        ) and _score_contract_candidate_preserves_anchors(candidate, rules, score_packets):
             stats["applied"] = True
             stats["contract"] = candidate_contract
             return candidate, stats
@@ -2094,7 +2103,8 @@ def _repair_scoring_contract(app, task: dict, profile: dict, system_prompt: str,
     return rules, stats
 
 
-def _score_contract_candidate_preserves_anchors(candidate: list[dict], existing: list[dict]) -> bool:
+def _score_contract_candidate_preserves_anchors(candidate: list[dict], existing: list[dict],
+                                                score_packets: list[dict]) -> bool:
     """阻止“总分凑对了、单项却被改错”的评分表重组。
 
     评分结构修复可把同一条评分事实的跨页片段并回一条，但不得把已存在的满分改成
@@ -2107,13 +2117,19 @@ def _score_contract_candidate_preserves_anchors(candidate: list[dict], existing:
             continue
         for clause_id in _score_rule_clause_ids(rule):
             by_clause.setdefault(clause_id, []).append(rule)
+    known_ids = {_score_packet_id(packet) for packet in score_packets if _score_packet_id(packet)}
+    existing_ids = set(by_clause)
     for rule in candidate:
         if not isinstance(rule, dict):
             return False
         clause_ids = _score_rule_clause_ids(rule)
         anchors = [anchor for clause_id in clause_ids for anchor in by_clause.get(clause_id, [])]
         if not anchors:
-            return False
+            # 定向重组可恢复此前完全漏失、但能在原始评分台账中明确定位的条款；其余
+            # 无来源锚点的新增规则仍拒绝，避免模型为凑总分臆造评分项。
+            if not clause_ids or not clause_ids.issubset(known_ids - existing_ids):
+                return False
+            continue
         max_score = storage._valid_max_score(rule.get("scoring") if isinstance(rule.get("scoring"), dict) else {})
         anchor_scores = {
             storage._valid_max_score(anchor.get("scoring") if isinstance(anchor.get("scoring"), dict) else {})
@@ -2133,6 +2149,7 @@ def _extract_scoring_rules_from_ledger(app, task: dict, profile: dict, system_pr
                                        declared_total: float | None = None) -> tuple[list[dict], dict]:
     """V2.2 的唯一评分生成链路：评分表不再混入正文分批映射。"""
     stats = {"applied": bool(score_packets), "failure_count": 0, "supplement_count": 0,
+             "strict_retry_count": 0,
              "uncovered_clause_ids": [], "group_count": 0, "mode": "direct_assembly"}
     rules: list[dict] = []
     groups = _score_packet_assembly_groups(score_packets)
@@ -2150,9 +2167,14 @@ def _extract_scoring_rules_from_ledger(app, task: dict, profile: dict, system_pr
             current = _normalise_scoring_assembly_rules(
                 response.get("rules") if isinstance(response, dict) else None, group,
             )
-            covered = {clause_id for item in current for clause_id in _score_rule_clause_ids(item)}
-            missing = [packet for packet in group if _score_packet_id(packet) not in covered]
-            if missing:
+        except ValueError as exc:
+            stats["failure_count"] += 1
+            storage.update_task(app, task["task_id"], message=f"评分原文第{index}组未完成：{exc}")
+            continue
+        covered = {clause_id for item in current for clause_id in _score_rule_clause_ids(item)}
+        missing = [packet for packet in group if _score_packet_id(packet) not in covered]
+        if missing:
+            try:
                 supplement = _request_task_json(
                     app, task, profile, "extract_rules_scoring_supplement", system_prompt,
                     _score_rule_supplement_prompt(app, missing, current), document_id=document_id,
@@ -2165,10 +2187,33 @@ def _extract_scoring_rules_from_ledger(app, task: dict, profile: dict, system_pr
                 )
                 current.extend(extra)
                 stats["supplement_count"] += len(extra)
-            rules.extend(current)
-        except ValueError as exc:
-            stats["failure_count"] += 1
-            storage.update_task(app, task["task_id"], message=f"评分原文第{index}组未完成：{exc}")
+                covered = {clause_id for item in current for clause_id in _score_rule_clause_ids(item)}
+                missing = [packet for packet in group if _score_packet_id(packet) not in covered]
+            except ValueError as exc:
+                # 补漏失败不能撤销同组已经成功的主组装结果；最终契约会把遗漏明确
+                # 标记为部分完成，用户可重跑而不会丢失可用评分规则。
+                stats["failure_count"] += 1
+                storage.update_task(app, task["task_id"], message=f"评分原文第{index}组补漏未完成：{exc}")
+        if missing:
+            # 首次补漏仍未覆盖时，仅对确实漏失的原文条款作一次严格重试。复用可见
+            # 的补漏模板，不另设隐藏指令；正常完整的评分表零额外调用。
+            try:
+                strict_retry = _request_task_json(
+                    app, task, profile, "extract_rules_scoring_supplement", system_prompt,
+                    _score_rule_supplement_prompt(app, missing, current), document_id=document_id,
+                    context_mode=f"score_source_group_{index}_strict_retry",
+                    max_tokens=_output_token_budget(profile, max(2_500, min(4_500, 900 + len(missing) * 420))),
+                    thinking_mode="disabled",
+                )
+                extra = _normalise_scoring_assembly_rules(
+                    strict_retry.get("rules") if isinstance(strict_retry, dict) else None, missing,
+                )
+                current.extend(extra)
+                stats["strict_retry_count"] += 1
+            except ValueError as exc:
+                stats["failure_count"] += 1
+                storage.update_task(app, task["task_id"], message=f"评分原文第{index}组严格补漏未完成：{exc}")
+        rules.extend(current)
     rules = _attach_score_ledger_metadata(_dedupe_rule_candidates(rules), score_packets)
     rules, fragment_repair = _repair_scoring_fragments(
         app, task, profile, system_prompt, rules, score_packets, document_id=document_id,
@@ -2191,6 +2236,9 @@ def _extract_scoring_rules_from_ledger(app, task: dict, profile: dict, system_pr
     stats["uncovered_clause_ids"] = [
         _score_packet_id(packet) for packet in score_packets if _score_packet_id(packet) not in covered
     ]
+    stats["unresolved_contract"] = _score_contract_requires_attention(
+        _score_contract_issues(rules, score_packets, declared_total)
+    )
     return rules, stats
 
 
@@ -3291,7 +3339,7 @@ def _compile_non_score_obligations(app, task: dict, profile: dict, system_prompt
     不会因汇总失败把未经编译的 AI 输出静默删掉。
     """
     stats = {"applied": False, "merged_count": 0, "failure_count": 0, "candidate_count": len(rules),
-             "recovered_candidate_count": 0}
+             "recovered_candidate_count": 0, "strict_retry_count": 0}
     if len(rules) < 2:
         return rules, stats
     if len(rules) > _OBLIGATION_COMPILATION_MAX_CANDIDATES:
@@ -3300,16 +3348,29 @@ def _compile_non_score_obligations(app, task: dict, profile: dict, system_prompt
     prompt = storage.render_prompt_template(
         app, "extract_rules_obligation_compile_user", candidates=_obligation_compilation_payload(rules),
     )
+    request_kwargs = {
+        "document_id": document_id,
+        "max_tokens": _output_token_budget(profile, min(8_000, 1_400 + len(rules) * 90)),
+        "thinking_mode": "disabled",
+    }
     try:
         response = _request_task_json(
             app, task, profile, "extract_rules_obligation_compile", system_prompt, prompt,
-            document_id=document_id, context_mode="obligation_compilation",
-            max_tokens=_output_token_budget(profile, min(8_000, 1_400 + len(rules) * 90)), thinking_mode="disabled",
+            context_mode="obligation_compilation", **request_kwargs,
         )
+        normalised = _normalise_obligation_compilation_groups(response, len(rules))
+        if normalised is None:
+            # 格式不合格时只用原模板严格重试一次，避免后续再把未经契约约束的原始候选
+            # 交给语义去重模型处理。提示词仍由右上角配置统一管理。
+            stats["strict_retry_count"] = 1
+            response = _request_task_json(
+                app, task, profile, "extract_rules_obligation_compile", system_prompt, prompt,
+                context_mode="obligation_compilation_strict_retry", **request_kwargs,
+            )
+            normalised = _normalise_obligation_compilation_groups(response, len(rules))
     except ValueError:
         stats["failure_count"] = 1
         return rules, stats
-    normalised = _normalise_obligation_compilation_groups(response, len(rules))
     if normalised is None:
         stats["failure_count"] = 1
         return rules, stats
@@ -4076,8 +4137,8 @@ def _extract_rules(app, task: dict) -> dict:
     # 后续模型操作再次碰触评分类别、满分或条款归属。
     non_score_rules = [item for item in rules if item.get("category") not in {"objective", "subjective"}]
     assembled_score_rules = [item for item in rules if item.get("category") in {"objective", "subjective"}]
-    # 先收敛同源副本，再在全局范围编译同一审查义务。编译失败时保留原候选，并回退
-    # 到旧的小范围裁决；这样远端格式异常不会让提取任务退化为失败或静默丢规则。
+    # 先收敛同源副本，再在全局范围编译同一审查义务。编译失败时只保留确定性的
+    # 同源收口，绝不把未经分组契约约束的原始候选再送入语义模型猜测去重。
     non_score_rules, local_finalisation_merged = _consolidate_same_named_non_score_rules(non_score_rules)
     non_score_rules, obligation_compilation = _compile_non_score_obligations(
         app, task, profile, system_prompt, non_score_rules, document_id=tender["document_id"],
@@ -4091,9 +4152,11 @@ def _extract_rules(app, task: dict) -> dict:
             context_mode="material_detail_duplicate_adjudication",
         )
     else:
-        non_score_rules, semantic_dedupe = _adjudicate_semantic_duplicate_groups(
-            app, task, profile, system_prompt, non_score_rules, document_id=tender["document_id"],
-        )
+        non_score_rules, fallback_merged_count = _consolidate_same_named_non_score_rules(non_score_rules)
+        semantic_dedupe = {
+            "group_count": 0, "merged_count": fallback_merged_count, "failure_count": 0,
+            "fallback_deterministic": True,
+        }
     non_score_rules = _normalise_compiled_coverage_rule_titles(non_score_rules)
     finalisation = {
         "applied": bool(local_finalisation_merged or obligation_compilation["merged_count"] or semantic_dedupe["merged_count"]), "dropped_count": 0,
@@ -4179,13 +4242,24 @@ def _extract_rules(app, task: dict) -> dict:
     score_ledger["conflicts"] = final_score_ledger["conflicts"]
     rules = _normalise_visual_rule_policies(rules)
     rules = _attach_source_fact_metadata(rules)
+    final_score_contract = _score_contract_issues(
+        rules, score_packets, _declared_total_score_from_text(main_text),
+    )
+    scoring_contract_unresolved = _score_contract_requires_attention(final_score_contract)
+    # 任务摘要必须基于落库前的最终规则，而不是早期组装阶段的中间覆盖情况。
+    uncovered_score_packets = [
+        packet for packet in score_packets
+        if _score_packet_id(packet) in set(final_score_contract["missing_clause_ids"])
+    ]
+    scoring_assembly["uncovered_clause_ids"] = list(final_score_contract["missing_clause_ids"])
+    scoring_assembly_status["applied"] = bool(score_packets) and not scoring_contract_unresolved
     source_ledger = _source_ledger_stats(rules)
     if not rules:
         raise ValueError("模型未提取到可确认的有效规则，请检查招标文件文本或更换模型")
     storage.update_task(app, task["task_id"], progress=80, message="正在保存待确认规则")
     rule_set = storage.replace_rules_from_extraction(app, task["project_id"], task["task_id"], rules)
     global_rule_count = rule_set.get("global_rule_count", 0)
-    return {"rule_set_id": rule_set["rule_set_id"], "version": rule_set["version"], "rule_count": len(rules) + global_rule_count,
+    result = {"rule_set_id": rule_set["rule_set_id"], "version": rule_set["version"], "rule_count": len(rules) + global_rule_count,
             "ai_rule_count": len(rules), "global_rule_count": global_rule_count,
             "excluded_rule_count": excluded_rule_count, "profile": profile["display_name"],
             "compact_retry_count": compact_retry_count, "score_clause_count": len(score_packets),
@@ -4199,6 +4273,7 @@ def _extract_rules(app, task: dict) -> dict:
             "obligation_compilation_candidate_count": obligation_compilation["candidate_count"],
             "obligation_compilation_merged_count": obligation_compilation["merged_count"],
             "obligation_compilation_recovered_candidate_count": obligation_compilation["recovered_candidate_count"],
+            "obligation_compilation_strict_retry_count": obligation_compilation.get("strict_retry_count", 0),
             # 保留旧字段，供页面和历史统计兼容；其语义为评分原文台账组装。
             # 旧字段仅供历史任务页面及外部调用方读取；新链路的真实语义为评分原文
             # 台账组装，不能据此重新启用旧的评分来源规划流程。
@@ -4215,8 +4290,12 @@ def _extract_rules(app, task: dict) -> dict:
             "scoring_contract_repair_attempted": bool(scoring_assembly.get("contract_repair_attempted")),
             "scoring_contract_repair_applied": bool(scoring_assembly.get("contract_repair_applied")),
             "scoring_contract_repair_failure_count": scoring_assembly.get("contract_repair_failure_count", 0),
-            "scoring_contract_total_expected": scoring_assembly.get("contract_total_expected"),
-            "scoring_contract_total_actual": scoring_assembly.get("contract_total_actual"),
+            "scoring_contract_total_expected": final_score_contract["declared_total"],
+            "scoring_contract_total_actual": final_score_contract["actual_total"],
+            "scoring_contract_unresolved": scoring_contract_unresolved,
+            "scoring_contract_missing_clause_ids": final_score_contract["missing_clause_ids"],
+            "scoring_contract_duplicate_clause_ids": final_score_contract["duplicate_clause_ids"],
+            "scoring_assembly_strict_retry_count": scoring_assembly.get("strict_retry_count", 0),
             "quality_gate_applied": quality_gate["applied"],
             "quality_gate_dropped_count": quality_gate["dropped_count"],
             "quality_gate_failure_count": quality_gate["failure_count"],
@@ -4243,6 +4322,12 @@ def _extract_rules(app, task: dict) -> dict:
             "source_ledger": source_ledger,
             "preserved_rule_count": rule_set.get("preserved_rule_count", 0), "split_retry_count": split_retry_count,
             "execution_metadata": _task_execution_metadata(app, task, profile)}
+    if scoring_contract_unresolved:
+        result["completion_state"] = "partial_success"
+        result["completion_message"] = (
+            "规则已生成，但评分原文覆盖或总分校验未通过；当前规则集不能确认，请仅重试规则提取或人工核对评分项。"
+        )
+    return result
 
 
 def _review_documents(app, task: dict) -> dict:
@@ -11855,7 +11940,7 @@ def run_task(app, task: dict) -> None:
         partial = isinstance(result, dict) and result.get("completion_state") == "partial_success"
         storage.update_task(
             app, task["task_id"], progress=100,
-            message="任务部分完成，可仅重跑失败项" if partial else "任务完成",
+            message=(result.get("completion_message") or "任务部分完成，可仅重跑失败项") if partial else "任务完成",
             status="success", result=result,
         )
     except (ComparisonLimitError, ValueError) as exc:

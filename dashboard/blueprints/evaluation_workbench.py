@@ -72,6 +72,15 @@ def _read_short_commit_file(path: Path) -> str:
     return value if re.fullmatch(r"[0-9a-fA-F]{7}", value) else ""
 
 
+def _read_image_commit_marker(path: Path) -> tuple[bool, str]:
+    """镜像标记存在但无效时，不能用宿主机 Git 或部署记录冒充运行代码。"""
+    try:
+        raw = path.read_text(encoding="utf-8").strip()[:7]
+    except OSError:
+        return False, ""
+    return True, raw if re.fullmatch(r"[0-9a-fA-F]{7}", raw) else ""
+
+
 def _deploy_record_info(path: Path) -> tuple[str, str]:
     """读取部署记录及其更新时间；不缓存，便于人工部署后立即反映。"""
     commit = _read_short_commit_file(path)
@@ -92,9 +101,9 @@ def _deployment_version_info() -> dict[str, object]:
     交叉核验；二者不一致时必须显式暴露，而不能继续显示一个看似正常的旧版本。
     本地开发没有镜像标记时，再读取实际 Git HEAD。
     """
-    code_commit = _read_short_commit_file(_PROJECT_ROOT / ".build-commit")
-    code_source = "image"
-    if not code_commit:
+    image_marker_exists, code_commit = _read_image_commit_marker(_PROJECT_ROOT / ".build-commit")
+    code_source = "image" if code_commit else ("image_unverified" if image_marker_exists else "")
+    if not image_marker_exists:
         for base in (_PROJECT_ROOT, _PROJECT_ROOT / "tools"):
             code_commit = _read_git_head_commit(base)
             if code_commit:
@@ -117,12 +126,16 @@ def _deployment_version_info() -> dict[str, object]:
             break
 
     # 兼容非 Docker 运行：只有部署记录时仍可显示版本，但明确标注来源。
-    if not code_commit:
+    if not code_commit and code_source != "image_unverified":
         code_commit = deploy_record_commit
         code_source = "deploy_record" if code_commit else "unknown"
+    elif not code_commit:
+        code_commit = "unknown"
     consistent = None
-    if code_commit and deploy_record_commit:
+    if code_commit and code_commit != "unknown" and deploy_record_commit:
         consistent = code_commit == deploy_record_commit
+    elif code_source == "image_unverified" and deploy_record_commit:
+        consistent = False
     value = {
         "commit": code_commit,
         "code_source": code_source,
