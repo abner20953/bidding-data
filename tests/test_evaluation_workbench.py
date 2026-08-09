@@ -3224,7 +3224,9 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("条件未触发，无需提供", PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
         self.assertIn("条件未触发，无需提供", PROMPT_TEMPLATES["review_documents_user"]["content"])
         self.assertIn("表格字段、填写格式", PROMPT_TEMPLATES["extract_rules_obligation_compile_user"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v51")
+        self.assertIn("系统仅能核验已上传文件", PROMPT_TEMPLATES["extract_rules_guidance"]["content"])
+        self.assertIn("当一条候选仅概述同一表单、附件或材料的格式", PROMPT_TEMPLATES["extract_rules_dedupe_adjudication_user"]["content"])
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v53")
 
     def test_scope_chapter_and_text_error_guidance_present(self):
         from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
@@ -3242,7 +3244,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(text_marker, PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("必须点名最具辨识度的偏离对象", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("risk_level 应为 high", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v51")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v53")
 
     def test_ocr_visual_contracts_deduplicated_but_keep_hard_constraints(self):
         from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
@@ -4681,6 +4683,53 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         )
         self.assertEqual(kept, [active_restriction, internal_restriction])
 
+    def test_pure_unobservable_submission_operation_is_excluded_but_mixed_file_fact_is_kept(self):
+        virus = {
+            "category": "rejection", "title": "平台文件安全检查",
+            "check_rule": "核验投标文件不含计算机病毒且文件完整。",
+            "source_text": "通过采购平台提交的文件含计算机病毒或非完整文件的，投标无效。",
+            "verifiability": "single_bid",
+        }
+        mixed_signature = {
+            "category": "rejection", "title": "签署与解密要求",
+            "check_rule": "核验投标文件已签署、加密并成功解密。",
+            "source_text": "投标文件应按要求签署并加密、成功解密。",
+            "verifiability": "single_bid",
+        }
+        package_scope = {
+            "category": "rejection", "title": "标包内容范围",
+            "check_rule": "核验上传文件的内容与当前标包范围一致。",
+            "source_text": "上传文件实际包含多个标包或内容与当前标包范围不一致的无效。",
+            "verifiability": "single_bid",
+        }
+        self.assertTrue(worker._is_pure_unobservable_submission_operation(virus))
+        self.assertFalse(worker._is_pure_unobservable_submission_operation(mixed_signature))
+        self.assertFalse(worker._is_pure_unobservable_submission_operation(package_scope))
+        self.assertEqual(
+            worker._filter_non_file_verifiable_candidates([virus, mixed_signature, package_scope]),
+            [mixed_signature, package_scope],
+        )
+
+    def test_material_detail_groups_are_only_candidates_for_model_adjudication(self):
+        summary = {
+            "category": "compliance", "title": "正在实施和新承接项目合同情况",
+            "verification_target": "正在实施和新承接项目合同复印件是否提供",
+            "check_rule": "如有正在实施项目，应附合同协议书复印件。",
+            "source_text": "正在实施和新承接的类似项目合同情况应附合同协议书复印件。",
+        }
+        detail = {
+            "category": "other", "title": "正在实施和新承接的类似项目合同情况表",
+            "verification_target": "正在实施和新承接项目合同情况表及合同扫描件",
+            "check_rule": "核验表格字段填写并附合同协议书扫描件。",
+            "source_text": "项目合同情况表应填写相关字段，合同协议书扫描件附后。",
+        }
+        unrelated = {
+            "category": "other", "title": "项目管理机构配备情况表",
+            "verification_target": "项目管理机构配备表",
+            "check_rule": "核验人员配备表填写。", "source_text": "项目管理机构配备情况表。",
+        }
+        self.assertEqual(worker._material_detail_candidate_groups([summary, detail, unrelated]), [[0, 1]])
+
     def test_technical_star_material_rule_is_recovered_only_with_complete_formal_chain(self):
         tender = """[第99页]
 指标按重要性分为“★”、“#”和“△”。★代表实质性指标，不满足该指标项将导致投标被拒绝。
@@ -5799,7 +5848,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不限定行业或采购类型", guidance)
         scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v51")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v53")
 
     def test_full_scan_does_not_reinject_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")
@@ -6106,6 +6155,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         info = response.get_json()
         self.assertIn("commit", info)
         self.assertIn("deployed_at", info)
+        self.assertIn("deploy_recorded_at", info)
         self.assertIn("prompt_version", info)
 
     def test_deployment_version_info_prefers_image_code_and_exposes_mismatch(self):
@@ -6116,13 +6166,12 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         (root / "tools" / ".deploy-commit").write_text("def5678\n", encoding="utf-8")
         with patch.object(evaluation_workbench_module, "_PROJECT_ROOT", root), \
              patch.dict(os.environ, {"DEPLOY_COMMIT": "def5678"}):
-            evaluation_workbench_module._DEPLOY_VERSION_CACHE.clear()
             info = evaluation_workbench_module._deployment_version_info()
-        evaluation_workbench_module._DEPLOY_VERSION_CACHE.clear()
 
         self.assertEqual(info["commit"], "abc1234")
         self.assertEqual(info["code_source"], "image")
         self.assertEqual(info["deploy_record_commit"], "def5678")
+        self.assertTrue(info["deploy_recorded_at"])
         self.assertFalse(info["version_consistent"])
 
     def test_token_usage_endpoint_includes_latest_evaluation_run(self):

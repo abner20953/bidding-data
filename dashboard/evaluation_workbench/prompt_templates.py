@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 PROMPT_TEMPLATE_SETTING = "evaluation_workbench_prompt_templates"
-EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v51"
+EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v53"
 
 
 def _template(name: str, description: str, content: str, *placeholders: str) -> dict:
@@ -221,6 +221,16 @@ _APPLICABILITY_AND_RESULT_CONSISTENCY_GUIDANCE = (
 )
 _extend_prompt("extract_rules_guidance", "适用范围与结论一致性", "\n\n" + _APPLICABILITY_AND_RESULT_CONSISTENCY_GUIDANCE)
 _extend_prompt("evaluate_all_guidance", "适用范围与结论一致性", "\n\n" + _APPLICABILITY_AND_RESULT_CONSISTENCY_GUIDANCE)
+_RULE_EVIDENCE_CAPABILITY_GUIDANCE = (
+    "系统仅能核验已上传文件的文字、表格、页面内容、OCR 和图片事实；不能核验采购平台上传/"
+    "递交状态、提交时点、加密或解密是否成功、密码学签名、计算机病毒、文件系统完整性或其他"
+    "平台后台结果。原文同时包含文件内事实与上述流程事实时，只提取可直接核验的文件内部分，"
+    "例如签字盖章、文件内容与当前采购包范围；不得把它们与上传、解密等流程混为一条规则。"
+    "规则标题、核验对象和检查指令必须由所附 source_text 直接支持；来源只说明表格、证书或"
+    "材料格式时，不得改写成另一种材料或业务对象。"
+)
+_extend_prompt("extract_rules_guidance", "系统可核验证据边界", "\n\n" + _RULE_EVIDENCE_CAPABILITY_GUIDANCE)
+_extend_prompt("extract_rules_source_ledger_contract", "系统可核验证据边界", "\n\n" + _RULE_EVIDENCE_CAPABILITY_GUIDANCE)
 _CONDITIONAL_RULE_REVIEW_GUIDANCE = (
     "若规则原文或检查指令含“如有”“若存在”“当……时”“如适用”等前提，必须先根据当前"
     "投标文件和规则所附原文确认前提是否触发。明确未触发时，返回 satisfied、low 风险，"
@@ -236,6 +246,11 @@ _OBLIGATION_MATERIAL_DETAIL_MERGE_GUIDANCE = (
     "不得另留格式卡；字段本身有独立适用条件、独立证明材料或可单独改变结论时才 keep_separate。"
 )
 _extend_prompt("extract_rules_obligation_compile_user", "材料格式附属项合并", " " + _OBLIGATION_MATERIAL_DETAIL_MERGE_GUIDANCE)
+_extend_prompt("extract_rules_dedupe_adjudication_user", "材料格式附属项裁决", (
+    " 当一条候选仅概述同一表单、附件或材料的格式、字段、填写方式，另一条已明确该材料的"
+    "提交条件、证明要件或后果时，应 action=merge；合并后系统保留双方全部来源和子检查。"
+    "不同材料、不同适用条件、不同独立证明或可单独改变结论的字段必须 keep_separate。"
+))
 PROMPT_TEMPLATES["evaluate_all_visual_user"] = _template(
     "综合评审 · 图片识别补充",
     "仅对已启用图片识别的单条规则和候选页面进行补充判断。",

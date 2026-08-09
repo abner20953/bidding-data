@@ -9,7 +9,7 @@
 <body>
     <main class="shell">
         <header class="topbar">
-            <div><h1>工作台<span id="deploy-version" class="version-badge" title="正在加载部署信息…"></span></h1><p>单人、低并发的文件对比与评标辅助</p></div>
+            <div><h1>工作台<span id="deploy-version-wrap" class="deploy-version-wrap"><button id="deploy-version" class="version-badge" type="button" aria-label="查看部署信息" aria-expanded="false" title="正在加载部署信息…"></button><span id="deploy-version-popover" class="deploy-version-popover hidden" role="status"><strong>部署信息</strong><span id="deploy-version-details">正在加载…</span></span></span></h1><p>单人、低并发的文件对比与评标辅助</p></div>
             <div class="actions"><button id="manage-models">模型配置</button><button id="manage-prompts">提示词配置</button><button id="manage-global-rules">通用规则库</button><button id="create-project" class="primary">新建评标项目</button></div>
         </header>
         <div id="models-panel" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="models-title">

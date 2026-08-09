@@ -25,7 +25,6 @@ MODEL_CONFIGURATION_PASSWORD = "108"
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _PROCESS_STARTED_AT = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-_DEPLOY_VERSION_CACHE: dict[str, object] = {}
 
 
 def _read_git_head_commit(base: Path) -> str:
@@ -73,6 +72,18 @@ def _read_short_commit_file(path: Path) -> str:
     return value if re.fullmatch(r"[0-9a-fA-F]{7}", value) else ""
 
 
+def _deploy_record_info(path: Path) -> tuple[str, str]:
+    """读取部署记录及其更新时间；不缓存，便于人工部署后立即反映。"""
+    commit = _read_short_commit_file(path)
+    if not commit:
+        return "", ""
+    try:
+        recorded_at = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    except OSError:
+        recorded_at = ""
+    return commit, recorded_at
+
+
 def _deployment_version_info() -> dict[str, object]:
     """分别返回镜像代码版本与部署记录，禁止用旧环境变量冒充运行代码。
 
@@ -81,8 +92,6 @@ def _deployment_version_info() -> dict[str, object]:
     交叉核验；二者不一致时必须显式暴露，而不能继续显示一个看似正常的旧版本。
     本地开发没有镜像标记时，再读取实际 Git HEAD。
     """
-    if _DEPLOY_VERSION_CACHE:
-        return dict(_DEPLOY_VERSION_CACHE)
     code_commit = _read_short_commit_file(_PROJECT_ROOT / ".build-commit")
     code_source = "image"
     if not code_commit:
@@ -95,11 +104,17 @@ def _deployment_version_info() -> dict[str, object]:
     deploy_record_commit = os.environ.get("DEPLOY_COMMIT", "").strip()[:7]
     if not re.fullmatch(r"[0-9a-fA-F]{7}", deploy_record_commit):
         deploy_record_commit = ""
-    if not deploy_record_commit:
-        for base in (_PROJECT_ROOT / "tools", _PROJECT_ROOT):
-            deploy_record_commit = _read_short_commit_file(base / ".deploy-commit")
-            if deploy_record_commit:
-                break
+    deploy_recorded_at = ""
+    for base in (_PROJECT_ROOT / "tools", _PROJECT_ROOT):
+        file_commit, file_recorded_at = _deploy_record_info(base / ".deploy-commit")
+        if not deploy_record_commit and file_commit:
+            deploy_record_commit, deploy_recorded_at = file_commit, file_recorded_at
+            break
+        # 容器环境变量是提交号的优先来源，但宿主机挂载的部署记录仍能提供实际
+        # 写入时间，便于页面确认本轮部署是否已经生效。
+        if file_commit and file_commit == deploy_record_commit:
+            deploy_recorded_at = file_recorded_at
+            break
 
     # 兼容非 Docker 运行：只有部署记录时仍可显示版本，但明确标注来源。
     if not code_commit:
@@ -112,10 +127,10 @@ def _deployment_version_info() -> dict[str, object]:
         "commit": code_commit,
         "code_source": code_source,
         "deploy_record_commit": deploy_record_commit,
+        "deploy_recorded_at": deploy_recorded_at,
         "version_consistent": consistent,
     }
-    _DEPLOY_VERSION_CACHE.update(value)
-    return dict(value)
+    return value
 
 
 def _current_deploy_commit() -> str:

@@ -69,19 +69,40 @@
     wrap.addEventListener('mouseleave', scheduleHide);
     document.addEventListener('click', (event) => { if (!wrap.contains(event.target)) { popover.classList.add('hidden'); trigger.setAttribute('aria-expanded', 'false'); } });
   }
+  function initDeploymentPopover() {
+    const wrap = $('deploy-version-wrap');
+    const trigger = $('deploy-version');
+    const popover = $('deploy-version-popover');
+    if (!wrap || !trigger || !popover) return;
+    const hide = () => { popover.classList.add('hidden'); trigger.setAttribute('aria-expanded', 'false'); };
+    trigger.addEventListener('click', (event) => {
+      event.stopPropagation();
+      const hidden = popover.classList.toggle('hidden');
+      trigger.setAttribute('aria-expanded', hidden ? 'false' : 'true');
+      if (!hidden) loadBuildInfo().catch(() => {});
+    });
+    document.addEventListener('click', (event) => { if (!wrap.contains(event.target)) hide(); });
+    document.addEventListener('keydown', (event) => { if (event.key === 'Escape') hide(); });
+  }
   async function loadBuildInfo() {
     try {
       const info = await request('/build-info');
-      const lines = [`当前运行版本：${info.commit || '未知'}`, `部署时间：${info.deployed_at || '未知'}`];
+      const lines = [`当前运行版本：${info.commit || '未知'}`, `运行进程启动：${info.deployed_at || '未知'}`];
       if (info.deploy_record_commit && info.deploy_record_commit !== info.commit) {
         lines.push(`部署记录版本：${info.deploy_record_commit}（与运行代码不一致，请重新部署）`);
-      } else if (info.version_consistent === true) {
+      } else {
+        if (info.deploy_record_commit) lines.push(`部署记录版本：${info.deploy_record_commit}`);
+        if (info.deploy_recorded_at) lines.push(`部署记录更新：${info.deploy_recorded_at}`);
+      }
+      if (info.version_consistent === true) {
         lines.push('版本核验：一致');
       }
       if (info.prompt_version) lines.push(`提示词版本：${info.prompt_version}`);
       $('deploy-version').title = lines.join('\n');
+      $('deploy-version-details').textContent = lines.join('\n');
     } catch (_) {
       $('deploy-version').title = '部署信息不可用';
+      $('deploy-version-details').textContent = '部署信息不可用';
     }
   }
   function renderLatestRunUsage(run) {
@@ -530,7 +551,7 @@
     ));
     const enabledCount = data.rules.filter((r) => Boolean(r.enabled)).length; $('rule-set-meta').textContent = set ? `版本 ${set.version} · ${set.status === 'confirmed' ? '已确认' : set.status === 'draft' ? '待确认' : '已替换'} · 已启用 ${enabledCount}/${data.rules.length} 条${set.source_task_id ? ' · AI 提取结果' : ''}` : '尚未提取或添加规则。'; $('confirm-rules').disabled = !isDraft;
     const acquisitionCounts = displayRules.reduce((counts, rule) => { const key = simpleAcquisitionMode(rule); counts[key] = (counts[key] || 0) + 1; return counts; }, {recommended:0, adaptive:0, text_only:0, local_ocr:0, smart:0, always:0, custom:0});
-    const toolbar = isDraft && displayRules.length ? `<div class="rule-acquisition-toolbar"><div><strong>核验方式</strong><span class="muted"> 默认按 AI 对证据类型的判断执行；也可明确限定为纯文字、本地 OCR，或追加腾讯 OCR／多模态增强。</span><small>当前：AI 建议 ${acquisitionCounts.recommended || 0} 条 · 文字优先 ${acquisitionCounts.adaptive || 0} 条 · 纯文字 ${acquisitionCounts.text_only || 0} 条 · 本地 OCR ${acquisitionCounts.local_ocr || 0} 条 · 智能增强 ${acquisitionCounts.smart || 0} 条 · 强制增强 ${acquisitionCounts.always || 0} 条${acquisitionCounts.custom ? ` · 专家自定义 ${acquisitionCounts.custom} 条` : ''}</small><small>${escapeHtml(acquisitionCapabilityNote())}</small></div><div class="rule-acquisition-toolbar-actions"><button class="restore-acquisition-recommendations" type="button">已启用规则采用 AI 建议</button><details class="rule-acquisition-help"><summary>如何选择？</summary><div class="rule-acquisition-help-popover"><p><strong>按 AI 建议：</strong>系统按每条规则的证据类型自动选择（推荐）。<strong>纯文字核验：</strong>只审已解析全文，最快。<strong>文字优先：</strong>先审全文，不足才补本地 OCR（免费）。<strong>本地 OCR 核验：</strong>全文之外固定补扫关键页（免费）。<strong>智能增强核验：</strong>本地 OCR 不够时才调腾讯 OCR／多模态（按量计费）。<strong>强制增强核验：</strong>无论文字是否充分都调腾讯 OCR／多模态（按量计费）。</p><p>快速／标准／充分只控制增强核验的页数上限；本地 OCR 仍按有限候选页和缓存执行。</p></div></details></div></div>` : '';
+    const toolbar = isDraft && displayRules.length ? `<div class="rule-acquisition-toolbar"><div><strong>核验方式</strong><span class="muted"> 默认按 AI 对证据类型的判断执行；也可明确限定为纯文字、本地 OCR，或追加腾讯 OCR／多模态增强。</span><small>当前：AI 建议 ${acquisitionCounts.recommended || 0} 条 · 文字优先 ${acquisitionCounts.adaptive || 0} 条 · 纯文字 ${acquisitionCounts.text_only || 0} 条 · 本地 OCR ${acquisitionCounts.local_ocr || 0} 条 · 智能增强 ${acquisitionCounts.smart || 0} 条 · 强制增强 ${acquisitionCounts.always || 0} 条${acquisitionCounts.custom ? ` · 专家自定义 ${acquisitionCounts.custom} 条` : ''}</small><small>${escapeHtml(acquisitionCapabilityNote())}</small></div><div class="rule-acquisition-toolbar-actions"><button class="restore-acquisition-recommendations" type="button">采用 AI 建议（高计费）</button><button class="restore-low-cost-acquisition" type="button">恢复默认（低成本）</button><details class="rule-acquisition-help"><summary>如何选择？</summary><div class="rule-acquisition-help-popover"><p><strong>恢复默认（低成本）：</strong>恢复为规则刚提取后的基础路径，只审全文；证据不足时最多补本地 OCR，不调用腾讯 OCR 或多模态。<strong>采用 AI 建议（高计费）：</strong>按每条规则的证据类型自动启用必要的腾讯 OCR／多模态增强，可能产生按量费用。<strong>纯文字核验：</strong>只审已解析全文，最快。<strong>文字优先：</strong>先审全文，不足才补本地 OCR（免费）。<strong>本地 OCR 核验：</strong>全文之外固定补扫关键页（免费）。</p><p>快速／标准／充分只控制增强核验的页数上限；本地 OCR 仍按有限候选页和缓存执行。</p></div></details></div></div>` : '';
     $('rules').innerHTML = displayRules.length ? `${toolbar}<div class="rule-card-list">${displayRules.map((r) => {
       const checkContent = compiledRuleTextContent(r, 'check_rule', isDraft);
       const sourceContent = compiledRuleTextContent(r, 'source_text', false);
@@ -571,6 +592,7 @@
     $('rules').querySelectorAll('.open-rule-expert').forEach((button) => button.onclick = () => { const advanced = button.closest('.rule-vision-controls')?.querySelector('.rule-image-advanced'); if (advanced) { advanced.open = true; advanced.scrollIntoView({block:'nearest', behavior:'smooth'}); } });
     $('rules').querySelectorAll('.restore-rule-acquisition').forEach((button) => button.onclick = async () => { try { const rule = ruleById.get(button.dataset.rule); await saveAcquisition(button.dataset.rule, acquisitionRecommendationPayload(rule)); await refreshRules(); } catch (error) { alert(error.message); await refreshRules(); } });
     $('rules').querySelectorAll('.restore-acquisition-recommendations').forEach((button) => button.onclick = async () => { const candidates = displayRules.filter((rule) => rule.enabled && rule.acquisition_recommendation); if (!candidates.length || !confirm(`将为 ${candidates.length} 条已启用规则恢复 AI 建议；已有自定义取证设置会被替换。是否继续？`)) return; button.disabled = true; try { for (const rule of candidates) await saveAcquisition(rule.rule_id, acquisitionRecommendationPayload(rule)); await refreshRules(); } catch (error) { alert(error.message); await refreshRules(); } finally { button.disabled = false; } });
+    $('rules').querySelectorAll('.restore-low-cost-acquisition').forEach((button) => button.onclick = async () => { const candidates = displayRules.filter((rule) => rule.enabled); if (!candidates.length || !confirm(`将为 ${candidates.length} 条已启用规则恢复低成本默认设置：只审全文，必要时最多补本地 OCR；不会调用腾讯 OCR 或多模态。是否继续？`)) return; button.disabled = true; try { for (const rule of candidates) await saveAcquisition(rule.rule_id, simpleAcquisitionPayload('adaptive', 'standard', rule)); await refreshRules(); } catch (error) { alert(error.message); await refreshRules(); } finally { button.disabled = false; } });
     $('rules').querySelectorAll('.save-check-rule').forEach((button) => button.onclick = async () => { try { const input = $('rules').querySelector(`.rule-check-rule[data-rule="${button.dataset.rule}"]`); await request(`/projects/${activeProject}/rules/${button.dataset.rule}`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({check_rule:input.value})}); await refreshRules(); } catch (error) { alert(error.message); } });
     $('rules').querySelectorAll('.keep-rule-only').forEach((button) => button.onclick = async (event) => {
       event.stopPropagation();
@@ -856,5 +878,6 @@
   window.addEventListener('focus', () => refreshFocusedProject().catch(() => {}));
   document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshFocusedProject().catch(() => {}); });
   initUsagePopover();
+  initDeploymentPopover();
   Promise.all([loadProjects(), loadProfiles(), loadBuildInfo()]).catch((error) => { $('projects').textContent = error.message; });
 })();

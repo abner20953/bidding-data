@@ -935,8 +935,35 @@ def _filter_non_file_verifiable_candidates(rules: list[dict]) -> list[dict]:
         # 已明确声明为横向比较或外部/程序事项的则立即排除。
         if category not in {"objective", "subjective"} and scope in {"cross_bid", "external_procedure"}:
             continue
+        if category not in {"objective", "subjective"} and _is_pure_unobservable_submission_operation(item):
+            continue
         kept.append(item)
     return kept
+
+
+_UNOBSERVABLE_SUBMISSION_OPERATION_PATTERN = re.compile(
+    r"(?:加密|解密|上传|递交|提交(?:状态|时间)|计算机病毒|病毒检测|文件完整性(?:检测|校验)|平台(?:操作|状态)?)"
+)
+_DIRECT_DOCUMENT_FACT_PATTERN = re.compile(
+    r"(?:签字|签署|签章|盖章|电子印章|内容|范围|报价|金额|参数|型号|数量|期限|"
+    r"声明|承诺|合同|证书|许可证|营业执照|授权|偏离|响应表|技术方案|服务方案)"
+)
+
+
+def _is_pure_unobservable_submission_operation(rule: dict) -> bool:
+    """仅剔除系统当前没有证据能力、且未夹带文件内事实的流程候选。
+
+    平台上传、密码学加解密、提交状态、病毒扫描等不能从解析文本、OCR 或图片中确认；
+    但同一条原文若还包含签章、标包内容范围等文件内事实，必须保留交给提取提示词
+    拆分，不能因出现一个流程词而删掉可核验的部分。
+    """
+    text = " ".join(str(rule.get(key) or "") for key in (
+        "title", "verification_target", "check_rule", "source_text",
+    ))
+    return bool(
+        _UNOBSERVABLE_SUBMISSION_OPERATION_PATTERN.search(text)
+        and not _DIRECT_DOCUMENT_FACT_PATTERN.search(text)
+    )
 
 
 _NON_FILE_SCORING_PROCESS_PATTERN = re.compile(
@@ -2434,6 +2461,85 @@ def _semantic_duplicate_candidate_groups(items: list[dict], *, max_group_size: i
                 continue
             visited.add(current)
             component.append(current)
+            stack.extend(sorted(linked[current] - visited, reverse=True))
+        component.sort()
+        for start in range(0, len(component), max_group_size):
+            group = sorted(component[start:start + max_group_size])
+            if len(group) >= 2:
+                groups.append(group)
+    return groups
+
+
+_MATERIAL_DETAIL_MARKER_PATTERN = re.compile(r"(?:表|格式|填写|附件|附后|明细|清单)")
+_MATERIAL_IDENTITY_NOISE_PATTERN = re.compile(
+    r"(?:投标文件|响应文件|投标人|供应商|采购|项目|服务|产品|材料|内容|情况|要求|"
+    r"核验|审查|响应|提供|是否|完整|符合|的)"
+)
+
+
+def _material_identity_text(rule: dict) -> str:
+    """生成候选材料身份的保守比较文本，不用行业或项目词表。"""
+    text = "".join(str(rule.get(key) or "") for key in ("title", "verification_target"))
+    text = _MATERIAL_IDENTITY_NOISE_PATTERN.sub("", re.sub(r"\s+", "", text))
+    return text[:240]
+
+
+def _material_identity_shingles(text: str, *, size: int = 8) -> set[str]:
+    """返回材料身份的连续片段，用于低成本召回可能相同的材料。
+
+    共享一个连续八字片段已足以作为“交给 AI 复核”的保守候选信号。这里不计算所有
+    文本对的动态规划最长公共子串，避免规则较多时在 2 核机器上出现二次方 CPU 峰值。
+    """
+    if len(text) < size:
+        return set()
+    return {text[index:index + size] for index in range(len(text) - size + 1)}
+
+
+def _material_detail_candidate_groups(items: list[dict], *, max_group_size: int = 4) -> list[list[int]]:
+    """定位可能是“材料主义务 + 表单/附件说明”的残余候选组。
+
+    仅以足够长的共享材料身份和通用格式标记缩小范围，绝不在本地直接合并；最终仍由
+    受约束 AI 根据完整来源裁决，避免把不同材料、不同条件或不同结论误并。
+    """
+    candidates = [
+        index for index, item in enumerate(items)
+        if isinstance(item, dict) and str(item.get("category") or "") in _NON_SCORE_CATEGORIES
+    ]
+    identities = {index: _material_identity_text(items[index]) for index in candidates}
+    details = {
+        index for index in candidates
+        if _MATERIAL_DETAIL_MARKER_PATTERN.search(" ".join(str(items[index].get(key) or "") for key in (
+            "title", "verification_target", "check_rule", "source_text",
+        )))
+    }
+    linked: dict[int, set[int]] = {index: set() for index in candidates}
+    # 先按八字连续片段建立倒排索引；只比较至少一侧是格式/附件说明的条目。候选
+    # 数量通常很小，仍限制每个片段的桶大小，防止通用短语把整批规则串成一个大组。
+    shingle_index: dict[str, list[int]] = {}
+    for index in candidates:
+        for shingle in _material_identity_shingles(identities[index]):
+            shingle_index.setdefault(shingle, []).append(index)
+    for indexes in shingle_index.values():
+        if len(indexes) < 2 or len(indexes) > max_group_size * 2:
+            continue
+        for offset, left_index in enumerate(indexes):
+            for right_index in indexes[offset + 1:]:
+                if left_index not in details and right_index not in details:
+                    continue
+                linked[left_index].add(right_index)
+                linked[right_index].add(left_index)
+    groups: list[list[int]] = []
+    visited: set[int] = set()
+    for index in candidates:
+        if index in visited or not linked[index]:
+            continue
+        stack, component = [index], []
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            component.append(current)
             stack.extend(linked[current] - visited)
         for start in range(0, len(component), max_group_size):
             group = sorted(component[start:start + max_group_size])
@@ -2462,6 +2568,27 @@ def _merge_semantic_non_score_group(items: list[dict]) -> dict:
                 evidence_items.append(evidence)
     if evidence_items:
         merged["evidence_items"] = evidence_items
+    categories = list(dict.fromkeys(
+        str(item.get("category") or "") for item in items if str(item.get("category") or "")
+    ))
+    if categories:
+        merged["category"] = max(categories, key=lambda value: _RULE_CATEGORY_PRIORITY.get(value, 0))
+        merged["compiled_categories"] = categories
+    children: list[dict] = []
+    child_signatures: set[str] = set()
+    for item in items:
+        source_children = item.get("compiled_child_requirements")
+        if not isinstance(source_children, list) or not source_children:
+            source_children = [_compiled_child_requirement(item)]
+        for child in source_children:
+            if not isinstance(child, dict):
+                continue
+            signature = json.dumps(child, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            if signature not in child_signatures:
+                child_signatures.add(signature)
+                children.append(child)
+    if children:
+        merged["compiled_child_requirements"] = children
     return merged
 
 
@@ -2485,9 +2612,10 @@ def _semantic_dedupe_prompt(app, groups: list[list[int]], rules: list[dict]) -> 
 
 
 def _adjudicate_semantic_duplicate_groups(app, task: dict, profile: dict, system_prompt: str, rules: list[dict], *,
-                                           document_id: str) -> tuple[list[dict], dict]:
+                                           document_id: str, groups: list[list[int]] | None = None,
+                                           context_mode: str = "semantic_duplicate_adjudication") -> tuple[list[dict], dict]:
     """仅让模型裁决小范围疑似重复组；失败时原样保留，绝不影响整轮提取。"""
-    groups = _semantic_duplicate_candidate_groups(rules)
+    groups = _semantic_duplicate_candidate_groups(rules) if groups is None else groups
     stats = {"group_count": len(groups), "merged_count": 0, "failure_count": 0}
     if not groups:
         return rules, stats
@@ -2495,7 +2623,7 @@ def _adjudicate_semantic_duplicate_groups(app, task: dict, profile: dict, system
         response = _request_task_json(
             app, task, profile, "extract_rules_dedupe_adjudication", system_prompt,
             _semantic_dedupe_prompt(app, groups, rules), document_id=document_id,
-            context_mode="semantic_duplicate_adjudication",
+            context_mode=context_mode,
             max_tokens=_output_token_budget(profile, min(3_000, 800 + len(groups) * 450)),
             thinking_mode="disabled",
         )
@@ -3449,7 +3577,11 @@ def _extract_rules(app, task: dict) -> dict:
     compilation_used = obligation_compilation["applied"]
     compilation_failure_count = obligation_compilation["failure_count"]
     if obligation_compilation["applied"]:
-        semantic_dedupe = {"group_count": 0, "merged_count": 0, "failure_count": 0}
+        non_score_rules, semantic_dedupe = _adjudicate_semantic_duplicate_groups(
+            app, task, profile, system_prompt, non_score_rules, document_id=tender["document_id"],
+            groups=_material_detail_candidate_groups(non_score_rules),
+            context_mode="material_detail_duplicate_adjudication",
+        )
     else:
         non_score_rules, semantic_dedupe = _adjudicate_semantic_duplicate_groups(
             app, task, profile, system_prompt, non_score_rules, document_id=tender["document_id"],
