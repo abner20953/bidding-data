@@ -2553,8 +2553,13 @@ def _obligation_compilation_payload(rules: list[dict]) -> str:
     return json.dumps(values, ensure_ascii=False, separators=(",", ":"))
 
 
-def _normalise_obligation_compilation_groups(response: object, candidate_count: int) -> list[list[int]] | None:
-    """校验 AI 分组是严格分区，防止遗漏、重复引用或越界 ID 静默改变规则集。"""
+def _normalise_obligation_compilation_groups(response: object, candidate_count: int) -> tuple[list[list[int]], list[int]] | None:
+    """校验 AI 分组，并安全回收遗漏 ID。
+
+    AI 的合法 JSON 可能因输出收尾、长度控制等原因漏掉尾部若干候选。重复引用、越界
+    或非法 action 仍整体拒绝；但仅遗漏时，已返回的分组可安全使用，遗漏候选由代码
+    以单条规则保留。这不会删除规则，也不会把模型未明确要求合并的事实擅自合并。
+    """
     groups = response.get("groups") if isinstance(response, dict) else None
     if not isinstance(groups, list):
         return None
@@ -2579,7 +2584,8 @@ def _normalise_obligation_compilation_groups(response: object, candidate_count: 
             return None
         seen.update(ids)
         result.append([int(value.removeprefix("O-")) - 1 for value in ids])
-    return result if seen == expected else None
+    missing = [index - 1 for index in range(1, candidate_count + 1) if f"O-{index}" not in seen]
+    return result, missing
 
 
 _RULE_CATEGORY_PRIORITY = {
@@ -2640,10 +2646,12 @@ def _compile_non_score_obligations(app, task: dict, profile: dict, system_prompt
                                    document_id: str) -> tuple[list[dict], dict]:
     """全局汇总非评分候选：AI 只给 ID 分组，代码负责合并与来源保护。
 
-    候选过多或模型返回不满足严格分区契约时，原样返回并由旧的小范围裁决兜底；不会
-    因汇总失败把未经编译的 AI 输出静默删掉。
+    候选过多、模型返回非法/交叉/越界分组时，原样返回并由旧的小范围裁决兜底；合法
+    结果仅遗漏部分候选时，已确认分组照常使用，遗漏项安全地按单条保留。两种路径都
+    不会因汇总失败把未经编译的 AI 输出静默删掉。
     """
-    stats = {"applied": False, "merged_count": 0, "failure_count": 0, "candidate_count": len(rules)}
+    stats = {"applied": False, "merged_count": 0, "failure_count": 0, "candidate_count": len(rules),
+             "recovered_candidate_count": 0}
     if len(rules) < 2:
         return rules, stats
     if len(rules) > _OBLIGATION_COMPILATION_MAX_CANDIDATES:
@@ -2661,10 +2669,15 @@ def _compile_non_score_obligations(app, task: dict, profile: dict, system_prompt
     except ValueError:
         stats["failure_count"] = 1
         return rules, stats
-    groups = _normalise_obligation_compilation_groups(response, len(rules))
-    if groups is None:
+    normalised = _normalise_obligation_compilation_groups(response, len(rules))
+    if normalised is None:
         stats["failure_count"] = 1
         return rules, stats
+    groups, missing_indexes = normalised
+    if missing_indexes:
+        # 仅回收模型未列出的候选；不补造 merge 关系，保证“缺失时宁可多留、不误并”。
+        groups.extend([[index] for index in missing_indexes])
+        stats["recovered_candidate_count"] = len(missing_indexes)
     compiled = [_merge_obligation_compilation_group(
         [rules[index] for index in indexes], group_number=group_number,
     ) for group_number, indexes in enumerate(groups, start=1)]
@@ -3519,6 +3532,7 @@ def _extract_rules(app, task: dict) -> dict:
             "semantic_compilation_failure_count": compilation_failure_count,
             "obligation_compilation_candidate_count": obligation_compilation["candidate_count"],
             "obligation_compilation_merged_count": obligation_compilation["merged_count"],
+            "obligation_compilation_recovered_candidate_count": obligation_compilation["recovered_candidate_count"],
             # 保留旧字段，供页面和历史统计兼容；其语义为评分原文台账组装。
             # 旧字段仅供历史任务页面及外部调用方读取；新链路的真实语义为评分原文
             # 台账组装，不能据此重新启用旧的评分来源规划流程。

@@ -7169,13 +7169,39 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(len(quote["compiled_child_requirements"]), 2)
         self.assertEqual(set(quote["source_unit_ids"]), {"SU-test-P12-1-a", "SU-test-P24-2-b"})
 
-    def test_obligation_compilation_rejects_incomplete_partition_without_losing_candidates(self):
+    def test_obligation_compilation_recovers_missing_candidates_without_losing_valid_groups(self):
+        rules = [
+            {"category": "qualification", "title": "营业执照", "check_rule": "核验营业执照", "source_text": "提供营业执照。"},
+            {"category": "compliance", "title": "投标函", "check_rule": "核验投标函", "source_text": "提交投标函。"},
+            {"category": "qualification", "title": "法定代表人身份证明", "check_rule": "核验身份证明", "source_text": "提供法定代表人身份证明。"},
+        ]
+        with patch("dashboard.evaluation_workbench.worker._request_task_json", return_value={
+            "groups": [
+                {"candidate_ids": ["O-1", "O-2"], "action": "merge"},
+            ],
+        }):
+            compiled, stats = worker._compile_non_score_obligations(
+                self.app, {"task_id": "task-compile"}, {"profile_id": "profile-1"}, "system", rules,
+                document_id="doc-1",
+            )
+        self.assertTrue(stats["applied"])
+        self.assertEqual(stats["failure_count"], 0)
+        self.assertEqual(stats["recovered_candidate_count"], 1)
+        self.assertEqual(stats["merged_count"], 1)
+        self.assertEqual(len(compiled), 2)
+        self.assertEqual(len(compiled[0]["compiled_child_requirements"]), 2)
+        self.assertEqual(compiled[1]["title"], "法定代表人身份证明")
+
+    def test_obligation_compilation_rejects_duplicate_candidate_ids(self):
         rules = [
             {"category": "qualification", "title": "营业执照", "check_rule": "核验营业执照", "source_text": "提供营业执照。"},
             {"category": "compliance", "title": "投标函", "check_rule": "核验投标函", "source_text": "提交投标函。"},
         ]
         with patch("dashboard.evaluation_workbench.worker._request_task_json", return_value={
-            "groups": [{"candidate_ids": ["O-1"], "action": "keep_separate"}],
+            "groups": [
+                {"candidate_ids": ["O-1"], "action": "keep_separate"},
+                {"candidate_ids": ["O-1", "O-2"], "action": "merge"},
+            ],
         }):
             compiled, stats = worker._compile_non_score_obligations(
                 self.app, {"task_id": "task-compile"}, {"profile_id": "profile-1"}, "system", rules,
