@@ -51,6 +51,11 @@ ENV EVALUATION_WORKBENCH_OCR_BATCH=1
 # 这样每次改代码发布时，上面所有步骤都会被跳过，只有这一步会重做
 COPY --chown=1000:1000 . .
 
+# 构建提交号与镜像内代码处于同一不可变层，是页面显示“实际运行版本”的唯一
+# 生产事实来源。环境变量和宿主机 .deploy-commit 只用于部署后交叉核验。
+ARG BUILD_COMMIT=unknown
+RUN printf '%s\n' "$BUILD_COMMIT" > /app/.build-commit
+
 # RapidOCR 仅由短生命周期子进程按需加载；这里提前下载并校验 PP-OCRv5 mobile
 # 模型，避免用户发起评审时才联网下载。仅对 warmup 命令设置 HOME，不能污染容器内
 # 其他库（例如 HuggingFace）的缓存目录；运行时子进程会使用同一目录。

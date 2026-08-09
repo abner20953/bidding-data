@@ -1708,6 +1708,103 @@ def _merge_duplicate_non_score_rule(existing: dict, candidate: dict) -> dict:
     return merged
 
 
+def _merge_distinct_rule_texts(values: list[object], *, separator: str, limit: int) -> str:
+    """合并同一规则的互补文字；包含关系只留完整版本，避免机械重复。"""
+    kept: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        normalised = re.sub(r"[\s\W_]+", "", text).casefold()
+        if not normalised:
+            continue
+        replaced = False
+        for index, existing in enumerate(kept):
+            existing_normalised = re.sub(r"[\s\W_]+", "", existing).casefold()
+            if normalised == existing_normalised or normalised in existing_normalised:
+                replaced = True
+                break
+            if existing_normalised in normalised:
+                kept[index] = text
+                replaced = True
+                break
+        if not replaced:
+            kept.append(text)
+    return separator.join(kept)[:limit]
+
+
+def _consolidate_same_named_non_score_rules(items: list[dict]) -> tuple[list[dict], int]:
+    """收敛最终规则集中同类别、同对象的同名非评分规则。
+
+    统一规范化模型偶尔会整体失败；若此时直接保存候选，同一规则在不同原文章节
+    的支撑内容就会以多张卡片出现。这里使用编译后的稳定结构身份（类别 + 规范化
+    标题）合并，且把所有互补检查指令、原文、条款 ID 和证据项一并保留。不同
+    类别或不同对象绝不合并，因此不会靠标题相似度吞掉独立审查事实。
+    """
+    result: list[dict] = []
+    indexes: dict[tuple[str, str], int] = {}
+    merged_count = 0
+    for item in items:
+        category = str(item.get("category") or "")
+        title_identity = storage._rule_title_identity(item.get("title"), category)
+        if category in {"objective", "subjective"} or len(title_identity) < 4:
+            result.append(item)
+            continue
+        key = (category, title_identity)
+        if key not in indexes:
+            indexes[key] = len(result)
+            result.append(item)
+            continue
+        index = indexes[key]
+        existing = result[index]
+        primary, secondary = (
+            (item, existing)
+            if _rule_candidate_richness(item) > _rule_candidate_richness(existing)
+            else (existing, item)
+        )
+        merged = dict(primary)
+        merged["check_rule"] = _merge_distinct_rule_texts(
+            [existing.get("check_rule") or existing.get("title"), item.get("check_rule") or item.get("title")],
+            separator="；", limit=1_500,
+        ) or str(primary.get("title") or "")
+        distinct_pages = {
+            value for value in (existing.get("source_page"), item.get("source_page"))
+            if isinstance(value, int) and value > 0
+        }
+        source_values = []
+        for value in (existing, item):
+            source_text = str(value.get("source_text") or "").strip()
+            source_page = value.get("source_page")
+            if source_text and len(distinct_pages) > 1 and isinstance(source_page, int) and source_page > 0:
+                source_text = f"第{source_page}页：{source_text}"
+            source_values.append(source_text)
+        merged["source_text"] = _merge_distinct_rule_texts(
+            source_values, separator=" / ", limit=3_000,
+        )
+        merged["source_clause_ids"] = list(dict.fromkeys([
+            *[str(value) for value in existing.get("source_clause_ids") or [] if str(value).strip()],
+            *[str(value) for value in item.get("source_clause_ids") or [] if str(value).strip()],
+        ]))
+        evidence_items = []
+        evidence_signatures = set()
+        for value in [*(existing.get("evidence_items") or []), *(item.get("evidence_items") or [])]:
+            if not isinstance(value, dict):
+                continue
+            signature = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            if signature in evidence_signatures:
+                continue
+            evidence_signatures.add(signature)
+            evidence_items.append(value)
+        if evidence_items:
+            merged["evidence_items"] = evidence_items
+        merged["ocr_required"] = bool(existing.get("ocr_required") or item.get("ocr_required"))
+        if not merged.get("source_page"):
+            merged["source_page"] = secondary.get("source_page")
+        result[index] = merged
+        merged_count += 1
+    return result, merged_count
+
+
 def _merge_duplicate_score_rule(existing: dict, candidate: dict) -> dict:
     """合并同一评分事实的互补字段，选择信息更全者为主体。"""
     primary, secondary = (candidate, existing) if _rule_candidate_richness(candidate) > _rule_candidate_richness(existing) else (existing, candidate)
@@ -2440,11 +2537,11 @@ def _rule_normalisation_packet(items: list[dict], *, include_ids: bool) -> str:
 
 
 def _protected_rules_for_normalisation(app, project_id: str) -> list[dict]:
-    """返回不得由重新提取覆盖的用户规则，以及本轮会自动导入的通用规则。"""
+    """返回独立人工规则与本轮通用规则；历史 AI 编辑不得影响新一轮提取。"""
     _, current_rules = storage.list_rules(app, project_id)
     protected = []
     for item in current_rules:
-        if item.get("source_type") not in {"manual", "ai_edited"}:
+        if item.get("source_type") != "manual":
             continue
         value = dict(item)
         if item.get("scoring_json"):
@@ -2536,8 +2633,7 @@ def _finalise_rule_operations_pass(app, task: dict, profile: dict, system_prompt
             # 评分规则只允许合并可由本地结构证明的重复项：同一类别、同一归一化
             # 评分锚点（同一条款ID/来源、对象与满分）。不同子项绝不因模型建议合并。
             if score_merge and (
-                len({rules[index].get("category") for index in indexes}) != 1
-                or any(_score_rule_dedupe_key(rules[index]) is None for index in indexes)
+                any(_score_rule_dedupe_key(rules[index]) is None for index in indexes)
                 or len({_score_rule_dedupe_key(rules[index]) for index in indexes}) != 1
             ):
                 continue
@@ -2607,17 +2703,42 @@ def _finalise_rule_operations(app, task: dict, profile: dict, system_prompt: str
     }
     if len(rules) < RULE_FINALISATION_MIN_RULES:
         return rules, stats
-    passes = (("统一规范化", "extract_rules_finalise_unified_focus"),)
-    result = rules
-    for focus_key, focus_template_id in passes:
-        result, pass_stats = _finalise_rule_operations_pass(
-            app, task, profile, system_prompt, result, focus_key=focus_key,
-            focus=storage.render_prompt_template(app, focus_template_id),
+    focus = storage.render_prompt_template(app, "extract_rules_finalise_unified_focus")
+    result, pass_stats = _finalise_rule_operations_pass(
+        app, task, profile, system_prompt, rules, focus_key="统一规范化", focus=focus,
+    )
+    stats["applied"] = pass_stats["applied"]
+    for key in ("dropped_count", "rewritten_count", "merged_count", "failure_count"):
+        stats[key] = pass_stats[key]
+    if not pass_stats["failure_count"]:
+        return result, stats
+
+    # 完整规则包格式异常时，只按类别定向重试。回退路径有意不再尝试跨类别语义
+    # 合并：宁可保留少量需人工确认的跨类别关系，也不能因失去完整上下文误并；
+    # 同类别同对象副本随后仍由确定性收口处理。这样既降低单次上下文，也避免一次
+    # JSON 异常让整套规则完全跳过规范化。评分规则已有独立台账收口，不在这里
+    # 增加额外模型调用。
+    storage.update_task(app, task["task_id"], message="规则最终规范化异常，正在按类别定向重试")
+    category_order = list(dict.fromkeys(str(item.get("category") or "") for item in rules))
+    recovered: list[dict] = []
+    for category in category_order:
+        group = [item for item in rules if str(item.get("category") or "") == category]
+        if category in {"objective", "subjective"} or len(group) < RULE_FINALISATION_MIN_RULES:
+            recovered.extend(group)
+            continue
+        group_result, group_stats = _finalise_rule_operations_pass(
+            app, task, profile, system_prompt, group,
+            focus_key=f"统一规范化回退_{category}",
+            focus=f"{focus}\n\n本次只审计 category={category} 的规则；不得引用或补造其他类别规则。",
         )
-        stats["applied"] = stats["applied"] or pass_stats["applied"]
-        for key in ("dropped_count", "rewritten_count", "merged_count", "failure_count"):
-            stats[key] += pass_stats[key]
-    return result, stats
+        recovered.extend(group_result)
+        stats["applied"] = stats["applied"] or group_stats["applied"]
+        for key in ("dropped_count", "rewritten_count", "merged_count"):
+            stats[key] += group_stats[key]
+        # 对外保持“本轮最终规范化是否出现过失败”的布尔计数语义；定向重试
+        # 次数由模型调用台账记录，不能把一次根因重复累计成多次业务失败。
+        stats["failure_count"] = max(stats["failure_count"], group_stats["failure_count"])
+    return recovered, stats
 
 
 def _extract_rules(app, task: dict) -> dict:
@@ -2830,6 +2951,9 @@ def _extract_rules(app, task: dict) -> dict:
     # 的父子重叠消除，避免同一评分事实被综合评审重复执行和重复计分。
     rules = _prune_overlapping_score_aggregates(rules)
     rules = _filter_inapplicable_template_rules(_filter_rules_for_package(rules, package_number), text)
+    # 编译结果已经形成稳定标题和类别；先收敛跨章节产生的同名同对象规则，既减少
+    # 最终规范化上下文，也保证模型规范化偶发失败时不会原样落下明显副本。
+    rules, same_name_pre_merged_count = _consolidate_same_named_non_score_rules(rules)
     # 不再按规则数量切换“质量门控”或“两轮规范化”两套语义路径。
     # 所有规则集均走一次可追溯规范化：小规则集调用数不增加，大规则集减少一次
     # 模型改写，重跑结果也更稳定。
@@ -2840,6 +2964,10 @@ def _extract_rules(app, task: dict) -> dict:
     rules, finalisation = _finalise_rule_operations(
         app, task, profile, system_prompt, rules,
     )
+    # 模型规范化可能改写标题，也可能因格式异常只完成部分类别。再次执行同一套
+    # 确定性收口，且补做同源候选去重；不依赖模型是否成功返回操作列表。
+    rules = _dedupe_rule_candidates(rules)
+    rules, same_name_post_merged_count = _consolidate_same_named_non_score_rules(rules)
     rules = _attach_score_ledger_metadata(rules, score_packets)
     # 最终规范化可能重写/合并评分候选，必须再做一次确定性同源去重；随后将
     # “某部分共 X 分”的导航标题移出可执行规则，仅保留其作为评分守恒台账。
@@ -2947,6 +3075,7 @@ def _extract_rules(app, task: dict) -> dict:
             "finalisation_rewritten_count": finalisation["rewritten_count"],
             "finalisation_merged_count": finalisation["merged_count"],
             "finalisation_failure_count": finalisation["failure_count"],
+            "same_name_rule_merged_count": same_name_pre_merged_count + same_name_post_merged_count,
             "preserved_rule_count": rule_set.get("preserved_rule_count", 0), "split_retry_count": split_retry_count,
             "execution_metadata": _task_execution_metadata(app, task, profile)}
 

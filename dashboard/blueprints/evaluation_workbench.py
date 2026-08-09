@@ -25,7 +25,7 @@ MODEL_CONFIGURATION_PASSWORD = "108"
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _PROCESS_STARTED_AT = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-_DEPLOY_COMMIT_CACHE: dict[str, str] = {}
+_DEPLOY_VERSION_CACHE: dict[str, object] = {}
 
 
 def _read_git_head_commit(base: Path) -> str:
@@ -65,26 +65,62 @@ def _read_git_head_commit(base: Path) -> str:
     return head[:7]
 
 
+def _read_short_commit_file(path: Path) -> str:
+    try:
+        value = path.read_text(encoding="utf-8").strip()[:7]
+    except OSError:
+        return ""
+    return value if re.fullmatch(r"[0-9a-fA-F]{7}", value) else ""
+
+
+def _deployment_version_info() -> dict[str, object]:
+    """分别返回镜像代码版本与部署记录，禁止用旧环境变量冒充运行代码。
+
+    ``/app/.build-commit`` 在 Docker 构建时写入，和镜像内代码属于同一不可变层，
+    因而是生产环境的首选事实来源。``DEPLOY_COMMIT`` 与宿主机部署文件只用于
+    交叉核验；二者不一致时必须显式暴露，而不能继续显示一个看似正常的旧版本。
+    本地开发没有镜像标记时，再读取实际 Git HEAD。
+    """
+    if _DEPLOY_VERSION_CACHE:
+        return dict(_DEPLOY_VERSION_CACHE)
+    code_commit = _read_short_commit_file(_PROJECT_ROOT / ".build-commit")
+    code_source = "image"
+    if not code_commit:
+        for base in (_PROJECT_ROOT, _PROJECT_ROOT / "tools"):
+            code_commit = _read_git_head_commit(base)
+            if code_commit:
+                code_source = "git"
+                break
+
+    deploy_record_commit = os.environ.get("DEPLOY_COMMIT", "").strip()[:7]
+    if not re.fullmatch(r"[0-9a-fA-F]{7}", deploy_record_commit):
+        deploy_record_commit = ""
+    if not deploy_record_commit:
+        for base in (_PROJECT_ROOT / "tools", _PROJECT_ROOT):
+            deploy_record_commit = _read_short_commit_file(base / ".deploy-commit")
+            if deploy_record_commit:
+                break
+
+    # 兼容非 Docker 运行：只有部署记录时仍可显示版本，但明确标注来源。
+    if not code_commit:
+        code_commit = deploy_record_commit
+        code_source = "deploy_record" if code_commit else "unknown"
+    consistent = None
+    if code_commit and deploy_record_commit:
+        consistent = code_commit == deploy_record_commit
+    value = {
+        "commit": code_commit,
+        "code_source": code_source,
+        "deploy_record_commit": deploy_record_commit,
+        "version_consistent": consistent,
+    }
+    _DEPLOY_VERSION_CACHE.update(value)
+    return dict(value)
+
+
 def _current_deploy_commit() -> str:
-    """返回当前运行代码的 Git 短提交号；优先环境变量，其次部署文件，最后直接读 .git。"""
-    if "value" in _DEPLOY_COMMIT_CACHE:
-        return _DEPLOY_COMMIT_CACHE["value"]
-    value = os.environ.get("DEPLOY_COMMIT", "").strip()[:7]
-    if not value:
-        for base in [_PROJECT_ROOT, _PROJECT_ROOT / "tools"]:
-            try:
-                value = (base / ".deploy-commit").read_text(encoding="utf-8").strip()[:7]
-            except OSError:
-                continue
-            if value:
-                break
-    if not value:
-        for base in [_PROJECT_ROOT, _PROJECT_ROOT / "tools"]:
-            value = _read_git_head_commit(base)
-            if value:
-                break
-    _DEPLOY_COMMIT_CACHE["value"] = value
-    return value
+    """兼容旧调用方：返回实际运行代码版本，而不是未经核验的部署记录。"""
+    return str(_deployment_version_info().get("commit") or "")
 
 
 _REPORT_ROLE_LABELS = {"tender": "主招标文件", "tender_attachment": "招标附件", "bid": "投标文件"}
@@ -679,7 +715,7 @@ def token_usage_api(project_id):
 def build_info_api():
     _init()
     return jsonify({
-        "commit": _current_deploy_commit(),
+        **_deployment_version_info(),
         "deployed_at": _PROCESS_STARTED_AT,
         "prompt_version": TASK_PROMPT_VERSION,
     })

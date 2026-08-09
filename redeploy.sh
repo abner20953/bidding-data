@@ -36,7 +36,7 @@ if docker image inspect bidding-app:latest >/dev/null 2>&1; then
 fi
 
 # 优先复用当前和最近旧版镜像层，避免重新下载 PyTorch、OCR 模型等大依赖。
-docker build "${CACHE_FROM_ARGS[@]}" -f Dockerfile.tencent -t bidding-app:latest .
+docker build "${CACHE_FROM_ARGS[@]}" --build-arg "BUILD_COMMIT=$DEPLOY_COMMIT_VALUE" -f Dockerfile.tencent -t bidding-app:latest .
 if [ $? -ne 0 ]; then
     echo "❌ 镜像构建失败！"
     exit 1
@@ -101,7 +101,16 @@ docker run -d \
   bidding-app:latest
 
 if [ $? -eq 0 ]; then
-    echo "✅ 部署成功！"
+    # 部署成功必须同时满足：宿主机 Git、镜像内实际代码标记、容器部署记录一致。
+    # 任何一项不一致都停止报告“成功”，避免页面版本与真实代码再次漂移。
+    IMAGE_COMMIT_VALUE="$(docker exec bidding-app sh -c 'cat /app/.build-commit 2>/dev/null' | tr -d '\r\n')"
+    CONTAINER_COMMIT_VALUE="$(docker exec bidding-app printenv DEPLOY_COMMIT 2>/dev/null | tr -d '\r\n')"
+    if [ "$IMAGE_COMMIT_VALUE" != "$DEPLOY_COMMIT_VALUE" ] || [ "$CONTAINER_COMMIT_VALUE" != "$DEPLOY_COMMIT_VALUE" ]; then
+        echo "❌ 部署版本核验失败：Git=$DEPLOY_COMMIT_VALUE，镜像=$IMAGE_COMMIT_VALUE，容器=$CONTAINER_COMMIT_VALUE"
+        echo "   新容器仍在运行，请先检查部署命令和镜像来源，不要将本次操作视为成功。"
+        exit 1
+    fi
+    echo "✅ 部署成功！运行版本：$DEPLOY_COMMIT_VALUE"
     
     # 仅保留 bidding-app:latest 与 bidding-app:previous，移除本项目的其他历史标签。
     # 不使用 --force：如有其他容器仍引用旧镜像，Docker 会拒绝删除并保留它。

@@ -6231,6 +6231,23 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("deployed_at", info)
         self.assertIn("prompt_version", info)
 
+    def test_deployment_version_info_prefers_image_code_and_exposes_mismatch(self):
+        """运行代码标记优先于旧部署记录，并显式报告不一致。"""
+        root = self.temp_dir / "build-version"
+        (root / "tools").mkdir(parents=True)
+        (root / ".build-commit").write_text("abc1234\n", encoding="utf-8")
+        (root / "tools" / ".deploy-commit").write_text("def5678\n", encoding="utf-8")
+        with patch.object(evaluation_workbench_module, "_PROJECT_ROOT", root), \
+             patch.dict(os.environ, {"DEPLOY_COMMIT": "def5678"}):
+            evaluation_workbench_module._DEPLOY_VERSION_CACHE.clear()
+            info = evaluation_workbench_module._deployment_version_info()
+        evaluation_workbench_module._DEPLOY_VERSION_CACHE.clear()
+
+        self.assertEqual(info["commit"], "abc1234")
+        self.assertEqual(info["code_source"], "image")
+        self.assertEqual(info["deploy_record_commit"], "def5678")
+        self.assertFalse(info["version_consistent"])
+
     def test_token_usage_endpoint_includes_latest_evaluation_run(self):
         task = storage.create_task(
             self.app, self.project["project_id"], "evaluate_all",
@@ -7004,6 +7021,83 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         self.assertEqual(len(rules), 2)
         self.assertEqual(sum(item["title"] == "法定代表人身份证明" for item in rules), 1)
+
+    def test_same_named_non_score_rules_merge_all_sources_without_cross_category_merge(self):
+        """同类别同对象的跨章节副本合并，但资格门槛与符合性结论保持独立。"""
+        rules, merged_count = worker._consolidate_same_named_non_score_rules([
+            {
+                "category": "other", "title": "中小企业声明函审查",
+                "check_rule": "核验声明函是否填写所属行业。", "source_text": "声明函应填写所属行业。",
+                "source_page": 10, "source_clause_ids": ["Q-1"],
+            },
+            {
+                "category": "other", "title": "中小企业声明函审查",
+                "check_rule": "核验企业类型是否完整。", "source_text": "声明函应填写企业类型。",
+                "source_page": 18, "source_clause_ids": ["Q-2"], "ocr_required": True,
+            },
+            {
+                "category": "qualification", "title": "中小企业声明函审查",
+                "check_rule": "核验资格条件。", "source_text": "本项目专门面向中小企业。",
+            },
+        ])
+
+        self.assertEqual(len(rules), 2)
+        self.assertEqual(merged_count, 1)
+        combined = next(item for item in rules if item["category"] == "other")
+        self.assertIn("所属行业", combined["check_rule"])
+        self.assertIn("企业类型", combined["check_rule"])
+        self.assertIn("声明函应填写所属行业", combined["source_text"])
+        self.assertIn("声明函应填写企业类型", combined["source_text"])
+        self.assertIn("第10页", combined["source_text"])
+        self.assertIn("第18页", combined["source_text"])
+        self.assertEqual(set(combined["source_clause_ids"]), {"Q-1", "Q-2"})
+        self.assertTrue(combined["ocr_required"])
+
+    def test_rule_finalisation_failure_retries_non_score_categories_only(self):
+        """完整规范化异常后按类别恢复，评分规则不额外改写。"""
+        rules = [
+            {"category": "qualification", "title": "资格A", "check_rule": "A"},
+            {"category": "qualification", "title": "资格B", "check_rule": "B"},
+            {"category": "other", "title": "响应A", "check_rule": "A"},
+            {"category": "other", "title": "响应B", "check_rule": "B"},
+            {"category": "objective", "title": "报价评分", "check_rule": "评分", "scoring": {"max_score": 10}},
+        ]
+        calls = []
+
+        def finalise_pass(_app, _task, _profile, _system_prompt, values, *, focus_key, focus):
+            calls.append((focus_key, [item["category"] for item in values]))
+            if focus_key == "统一规范化":
+                return values, {"applied": False, "dropped_count": 0, "rewritten_count": 0,
+                                "merged_count": 0, "failure_count": 1}
+            return values, {"applied": True, "dropped_count": 0, "rewritten_count": 0,
+                            "merged_count": 0, "failure_count": 0}
+
+        with patch.object(worker, "_finalise_rule_operations_pass", side_effect=finalise_pass):
+            result, stats = worker._finalise_rule_operations(
+                self.app, {"task_id": "task", "project_id": self.project["project_id"]},
+                {"profile_id": "model"}, "系统提示", rules,
+            )
+
+        self.assertEqual(len(result), len(rules))
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(any(key.endswith("qualification") for key, _ in calls))
+        self.assertTrue(any(key.endswith("other") for key, _ in calls))
+        self.assertFalse(any(categories == ["objective"] for _, categories in calls[1:]))
+        self.assertEqual(stats["failure_count"], 1)
+
+    def test_rule_finalisation_protects_manual_and_global_but_not_old_ai_edits(self):
+        """重新提取提示词也不得受历史 AI 编辑规则影响。"""
+        current = [
+            {"source_type": "manual", "title": "人工规则", "category": "other"},
+            {"source_type": "ai_edited", "title": "旧 AI 编辑", "category": "other"},
+            {"source_type": "ai", "title": "旧 AI", "category": "other"},
+        ]
+        global_rules = [{"source_type": "global", "title": "通用规则", "category": "other"}]
+        with patch.object(storage, "list_rules", return_value=({}, current)), \
+             patch.object(storage, "list_global_rules", return_value=global_rules):
+            protected = worker._protected_rules_for_normalisation(self.app, self.project["project_id"])
+
+        self.assertEqual([item["title"] for item in protected], ["人工规则", "通用规则"])
 
     def test_unmapped_ai_score_rule_blocks_confirmation(self):
         """没有原文评分台账锚点的纯 AI 评分规则不能进入已确认规则集。"""

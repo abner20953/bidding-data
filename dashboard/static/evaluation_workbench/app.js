@@ -14,6 +14,7 @@
   const defaultDocumentTitle = document.title;
   let completionTicker = null;
   let cachedHighlights = [];
+  let focusRefreshInFlight = false;
   const $ = (id) => document.getElementById(id);
   const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
   // 展示层统一清洗：去掉内部编号（SI-1/SI-2）、JSON 字段名记法（status=、suggested_score=）、
@@ -71,7 +72,12 @@
   async function loadBuildInfo() {
     try {
       const info = await request('/build-info');
-      const lines = [`当前部署版本：${info.commit || '未知'}`, `部署时间：${info.deployed_at || '未知'}`];
+      const lines = [`当前运行版本：${info.commit || '未知'}`, `部署时间：${info.deployed_at || '未知'}`];
+      if (info.deploy_record_commit && info.deploy_record_commit !== info.commit) {
+        lines.push(`部署记录版本：${info.deploy_record_commit}（与运行代码不一致，请重新部署）`);
+      } else if (info.version_consistent === true) {
+        lines.push('版本核验：一致');
+      }
       if (info.prompt_version) lines.push(`提示词版本：${info.prompt_version}`);
       $('deploy-version').title = lines.join('\n');
     } catch (_) {
@@ -799,7 +805,22 @@
   $('test-ocr-configuration').onclick = async () => { try { const data = await request('/tencent-ocr-configuration/test', {method:'POST'}); alert(data.message); } catch (error) { alert(error.message); } };
   $('open-report').onclick = () => window.open(`/pingbiao/projects/${activeProject}/report`, '_blank', 'noopener');
   $('export-score-csv').onclick = async () => { try { const [objective, subjective] = await Promise.all(['objective', 'subjective'].map((type) => request(`/projects/${activeProject}/score-results/${type}`))); const rows = [['评分类型','投标人','规则名称','检查规则','结论','AI建议得分','满分','置信度','证据','理由']]; for (const [type, data] of [['客观分', objective], ['主观分', subjective]]) for (const item of data.results) { const compactOcr = type === '客观分'; rows.push([type, item.bidder_name || item.original_name, ruleTitle(item), item.check_rule || '', cleanDisplayText(item.conclusion_summary), item.suggested_score ?? '', item.max_score ?? '', confidenceLabel(item.confidence), compactOcr ? cleanDisplayText(compactObjectiveOcrText(item.evidence)) : cleanDisplayText(item.evidence), compactOcr ? cleanDisplayText(compactObjectiveOcrText(item.reason)) : cleanDisplayText(item.reason)]); } const csv = '\ufeff' + rows.map((row) => row.map((cell) => `"${String(cell).replaceAll('"', '""')}"`).join(',')).join('\r\n'); const link = document.createElement('a'); link.href = URL.createObjectURL(new Blob([csv], {type:'text/csv;charset=utf-8'})); link.download = '评标评分汇总.csv'; link.click(); URL.revokeObjectURL(link.href); } catch (error) { alert(error.message); } };
-  document.querySelectorAll('[data-tab]').forEach((button) => button.onclick = () => { if (button.disabled) return; document.querySelectorAll('[data-tab]').forEach((item) => item.classList.toggle('active', item === button)); document.querySelectorAll('[data-pane]').forEach((item) => item.classList.toggle('active', item.dataset.pane === button.dataset.tab)); });
+  document.querySelectorAll('[data-tab]').forEach((button) => button.onclick = async () => { if (button.disabled) return; document.querySelectorAll('[data-tab]').forEach((item) => item.classList.toggle('active', item === button)); document.querySelectorAll('[data-pane]').forEach((item) => item.classList.toggle('active', item.dataset.pane === button.dataset.tab)); if (button.dataset.tab === 'rules' && activeProject) { try { await refreshRules(); } catch (error) { $('task-status').textContent = error.message; } } });
+  // 任务可能由另一个浏览器标签或会话发起。空闲时不轮询；用户返回页面时只做
+  // 一次按需同步，避免继续显示旧规则集，又不增加 2 核 2 GB 服务器的常驻负担。
+  async function refreshFocusedProject() {
+    if (!activeProject || document.hidden || focusRefreshInFlight) return;
+    focusRefreshInFlight = true;
+    try {
+      await refreshProject();
+      const activePane = document.querySelector('[data-pane].active')?.dataset.pane;
+      if (activePane === 'rules') await refreshRules();
+    } finally {
+      focusRefreshInFlight = false;
+    }
+  }
+  window.addEventListener('focus', () => refreshFocusedProject().catch(() => {}));
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshFocusedProject().catch(() => {}); });
   initUsagePopover();
   Promise.all([loadProjects(), loadProfiles(), loadBuildInfo()]).catch((error) => { $('projects').textContent = error.message; });
 })();
