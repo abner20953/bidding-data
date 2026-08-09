@@ -1991,17 +1991,19 @@ def _rule_signature(item: dict) -> tuple[str, str, str]:
     )
 
 
-RULE_EXTRACTION_PIPELINE_VERSION = "source-ledger-v2.3"
-# 规则提取只保留来源台账 V2.3：评分表与普通规则分别生成，再由同一份原文
-# 台账收口；少量跨来源疑似重复仅接受受约束的 AI 裁决，不再恢复全局自由改写。
+RULE_EXTRACTION_PIPELINE_VERSION = "obligation-compiler-v3.0"
+# 评分表与普通规则分别生成。普通规则先保留全部可追溯的原子候选，再由受约束的
+# “义务编译器”生成最终规则卡；模型只能返回候选 ID 分组，不能改写原文、评分或
+# 业务字段。这样既避免长文件按批次做并集而膨胀，也不恢复旧版全局自由改写。
+_OBLIGATION_COMPILATION_MAX_CANDIDATES = 160
 
 
 def _source_fact_fingerprint(item: dict) -> str:
     """为任意候选规则生成稳定的原文事实键。
 
     规则标题和检查语句都可能在模型的后续整理中变化，不能作为来源身份。评分规则
-    优先使用评分条款 ID；其他规则只使用类别、页码和直接原文摘录。该键只表示“直接
-    来源事实”，不擅自判断两个相近事实应否合并。
+    优先使用评分条款 ID；其他规则优先使用类别和直接原文内容，物理页码/原文单元
+    只保留为审计位置。该键只表示“直接来源事实”，不擅自判断两个相近事实应否合并。
     """
     category = str(item.get("category") or "").strip()
     # 评分条款 ID 只属于评分规则。模型偶尔会把 SC-* 误带到资格/符合性规则；
@@ -2009,19 +2011,24 @@ def _source_fact_fingerprint(item: dict) -> str:
     clause_ids = sorted(_score_rule_clause_ids(item)) if category in {"objective", "subjective"} else []
     if clause_ids:
         return "SF-score-" + hashlib.sha1("|".join(clause_ids).encode("utf-8")).hexdigest()[:16]
+    source = storage._normalise_rule_source(item.get("source_text"))
+    # 直接原文足够长时，内容才是事实身份，页码和 SU-* 只保留为审计位置。同一
+    # 评审表被多处复述时，不能因物理页不同制造多个“来源事实”。
+    if source and len(source) >= 16:
+        payload = f"{category}|{source}".encode("utf-8")
+        return "SF-rule-" + hashlib.sha1(payload).hexdigest()[:16]
     unit_ids = sorted({str(value).strip() for value in item.get("source_unit_ids") or [] if str(value).strip()})
     if unit_ids:
         payload = f"{category}|{'|'.join(unit_ids)}".encode("utf-8")
         return "SF-unit-" + hashlib.sha1(payload).hexdigest()[:16]
     page = item.get("source_page") if isinstance(item.get("source_page"), int) else 0
-    source = storage._normalise_rule_source(item.get("source_text"))
     if not source:
         # 没有直接原文时不能伪装成稳定来源；保留空值并由提取台账显式计数。
         return ""
     # 页码是来源位置而不是事实身份：同一原文在评审表、前附表或附件中重复出现时，
     # 不能因页码不同自动生成多张规则卡。极短摘录缺少足够语境时才保留页码，避免
     # “符合要求”一类短语跨章节误合并。
-    source_identity = source if len(source) >= 16 else f"P{page}|{source}"
+    source_identity = f"P{page}|{source}"
     payload = f"{category}|{source_identity}".encode("utf-8")
     return "SF-rule-" + hashlib.sha1(payload).hexdigest()[:16]
 
@@ -2431,7 +2438,7 @@ def _semantic_dedupe_prompt(app, groups: list[list[int]], rules: list[dict]) -> 
 
 
 def _adjudicate_semantic_duplicate_groups(app, task: dict, profile: dict, system_prompt: str, rules: list[dict], *,
-                                          document_id: str) -> tuple[list[dict], dict]:
+                                           document_id: str) -> tuple[list[dict], dict]:
     """仅让模型裁决小范围疑似重复组；失败时原样保留，绝不影响整轮提取。"""
     groups = _semantic_duplicate_candidate_groups(rules)
     stats = {"group_count": len(groups), "merged_count": 0, "failure_count": 0}
@@ -2498,6 +2505,150 @@ def _adjudicate_semantic_duplicate_groups(app, task: dict, profile: dict, system
         result.append(_merge_semantic_non_score_group([rules[item_index] for item_index in sorted(component)]))
         stats["merged_count"] += len(component) - 1
     return result, stats
+
+
+def _obligation_compilation_payload(rules: list[dict]) -> str:
+    """将非评分原子候选压缩成稳定清单，供 AI 只返回分组映射。
+
+    这里故意不发送整份招标文件，也不让模型生成新规则文字。候选本身已经通过来源、
+    单文件核验和分包门控；编译步骤只解决“哪些候选应成为同一张最终规则卡”。
+    """
+    values: list[dict] = []
+    for index, item in enumerate(rules, start=1):
+        source_units = [str(value) for value in item.get("source_unit_ids") or [] if str(value).strip()]
+        values.append({
+            "candidate_id": f"O-{index}",
+            "category": item.get("category"),
+            "title": str(item.get("title") or "")[:80],
+            "verification_target": str(item.get("verification_target") or "")[:180],
+            "check_rule": str(item.get("check_rule") or "")[:420],
+            "source_text": str(item.get("source_text") or "")[:280],
+            "source_page": item.get("source_page"),
+            "source_unit_ids": source_units[:12],
+            "evidence_requirements": list(item.get("evidence_requirements") or [])[:5],
+            "ocr_required": bool(item.get("ocr_required")),
+        })
+    return json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+
+
+def _normalise_obligation_compilation_groups(response: object, candidate_count: int) -> list[list[int]] | None:
+    """校验 AI 分组是严格分区，防止遗漏、重复引用或越界 ID 静默改变规则集。"""
+    groups = response.get("groups") if isinstance(response, dict) else None
+    if not isinstance(groups, list):
+        return None
+    expected = {f"O-{index}" for index in range(1, candidate_count + 1)}
+    seen: set[str] = set()
+    result: list[list[int]] = []
+    for group in groups:
+        if not isinstance(group, dict):
+            return None
+        candidate_ids = group.get("candidate_ids")
+        action = str(group.get("action") or "").strip()
+        if action not in {"merge", "keep_separate"} or not isinstance(candidate_ids, list):
+            return None
+        ids = [str(value).strip() for value in candidate_ids if str(value).strip()]
+        if not ids or len(ids) != len(set(ids)) or any(value not in expected for value in ids):
+            return None
+        if action == "merge" and len(ids) < 2:
+            return None
+        if action == "keep_separate" and len(ids) != 1:
+            return None
+        if seen.intersection(ids):
+            return None
+        seen.update(ids)
+        result.append([int(value.removeprefix("O-")) - 1 for value in ids])
+    return result if seen == expected else None
+
+
+_RULE_CATEGORY_PRIORITY = {
+    "rejection": 5,
+    "substantive": 4,
+    "qualification": 3,
+    "compliance": 2,
+    "other": 1,
+}
+
+
+def _compiled_child_requirement(item: dict) -> dict:
+    """保留被汇总候选的最小可执行信息，供综合评审继续逐项核验。"""
+    return {
+        "category": str(item.get("category") or ""),
+        "title": str(item.get("title") or "")[:120],
+        "verification_target": str(item.get("verification_target") or "")[:240],
+        "check_rule": str(item.get("check_rule") or item.get("title") or "")[:520],
+        "source_page": item.get("source_page") if isinstance(item.get("source_page"), int) else None,
+        "source_unit_ids": [str(value) for value in item.get("source_unit_ids") or [] if str(value).strip()][:24],
+    }
+
+
+def _merge_obligation_compilation_group(items: list[dict], *, group_number: int) -> dict:
+    """把 AI 确认的同一义务编译成一条规则，同时保留全部来源与子检查项。"""
+    if len(items) == 1:
+        value = dict(items[0])
+        value["compiled_group_id"] = f"OC-{group_number}"
+        value["compiled_child_requirements"] = [_compiled_child_requirement(items[0])]
+        value["compiled_categories"] = [str(items[0].get("category") or "")]
+        return value
+    merged = _merge_semantic_non_score_group(items)
+    categories = list(dict.fromkeys(str(item.get("category") or "") for item in items if str(item.get("category") or "")))
+    merged["category"] = max(categories, key=lambda value: _RULE_CATEGORY_PRIORITY.get(value, 0))
+    merged["check_rule"] = _merge_distinct_rule_texts(
+        [item.get("check_rule") or item.get("title") for item in items], separator="；", limit=2_600,
+    ) or str(merged.get("title") or "")
+    merged["source_text"] = _merge_distinct_rule_texts(
+        [item.get("source_text") for item in items], separator=" / ", limit=3_500,
+    )
+    targets = _merge_distinct_rule_texts(
+        [item.get("verification_target") for item in items], separator="；", limit=900,
+    )
+    if targets:
+        merged["verification_target"] = targets
+    requirements: list[str] = []
+    for item in items:
+        requirements.extend(str(value) for value in item.get("evidence_requirements") or [] if str(value).strip())
+    if requirements:
+        merged["evidence_requirements"] = list(dict.fromkeys(requirements))
+    merged["compiled_group_id"] = f"OC-{group_number}"
+    merged["compiled_child_requirements"] = [_compiled_child_requirement(item) for item in items]
+    merged["compiled_categories"] = categories
+    return merged
+
+
+def _compile_non_score_obligations(app, task: dict, profile: dict, system_prompt: str, rules: list[dict], *,
+                                   document_id: str) -> tuple[list[dict], dict]:
+    """全局汇总非评分候选：AI 只给 ID 分组，代码负责合并与来源保护。
+
+    候选过多或模型返回不满足严格分区契约时，原样返回并由旧的小范围裁决兜底；不会
+    因汇总失败把未经编译的 AI 输出静默删掉。
+    """
+    stats = {"applied": False, "merged_count": 0, "failure_count": 0, "candidate_count": len(rules)}
+    if len(rules) < 2:
+        return rules, stats
+    if len(rules) > _OBLIGATION_COMPILATION_MAX_CANDIDATES:
+        stats["failure_count"] = 1
+        return rules, stats
+    prompt = storage.render_prompt_template(
+        app, "extract_rules_obligation_compile_user", candidates=_obligation_compilation_payload(rules),
+    )
+    try:
+        response = _request_task_json(
+            app, task, profile, "extract_rules_obligation_compile", system_prompt, prompt,
+            document_id=document_id, context_mode="obligation_compilation",
+            max_tokens=_output_token_budget(profile, min(8_000, 1_400 + len(rules) * 90)), thinking_mode="disabled",
+        )
+    except ValueError:
+        stats["failure_count"] = 1
+        return rules, stats
+    groups = _normalise_obligation_compilation_groups(response, len(rules))
+    if groups is None:
+        stats["failure_count"] = 1
+        return rules, stats
+    compiled = [_merge_obligation_compilation_group(
+        [rules[index] for index in indexes], group_number=group_number,
+    ) for group_number, indexes in enumerate(groups, start=1)]
+    stats["applied"] = True
+    stats["merged_count"] = len(rules) - len(compiled)
+    return compiled, stats
 
 
 def _merge_duplicate_score_rule(existing: dict, candidate: dict) -> dict:
@@ -3150,12 +3301,13 @@ def _extract_rules(app, task: dict) -> dict:
                 *mapped_candidates,
                 *_normalise_non_score_candidate_contract([technical_star_seed], source_unit_catalog),
             ])
-    # 来源事实台账 V2.3：分段映射已经完成“从原文到候选事实”的唯一生成。后续只
-    # 做本地、可追溯的收口，不能再由多轮全局模型改写反复
-    # 改写标题、类别和来源。评分/资格/硬性条款的定向补漏均已在此前进入同一候选集。
-    candidates, coverage_missing_rules, compilation_used = _dedupe_rule_candidates(mapped_candidates), [], False
+    # 所有批次、资格补漏和硬性条款补漏先进入同一候选池；评分仍只由评分台账组装。
+    # 随后使用全局义务编译器收敛为最终卡片。模型只能返回候选 ID 分组，不能自由
+    # 改写标题、类别、来源或评分，避免旧版全局改写的截断与漂移问题。
+    candidates, coverage_missing_rules = _dedupe_rule_candidates(mapped_candidates), []
+    compilation_used = False
     compilation_failure_count = 0
-    storage.update_task(app, task["task_id"], progress=68, message="正在按来源事实台账整理评审规则")
+    storage.update_task(app, task["task_id"], progress=68, message="正在按原子要求汇总并去重评审规则")
     # 是否可由投标文件核验交给完整提示词与人工确认判断；不以词表硬过滤，避免误删业绩有效期等规则。
     rules = _normalise_non_score_candidate_contract(candidates, source_unit_catalog)
     rules, scoring_source_excluded_rules = _filter_non_score_candidates_from_scoring_ledger(rules, score_packets)
@@ -3207,17 +3359,25 @@ def _extract_rules(app, task: dict) -> dict:
     # 后续模型操作再次碰触评分类别、满分或条款归属。
     non_score_rules = [item for item in rules if item.get("category") not in {"objective", "subjective"}]
     assembled_score_rules = [item for item in rules if item.get("category") in {"objective", "subjective"}]
-    # 来源单元已经在映射阶段提供稳定身份；不能恢复旧的全量“最终整理”，否则会
-    # 重新引入长度截断和标题漂移。确定性收口后，仅将少量跨来源的疑似重复组交给
-    # 模型做合并/保留裁决，模型不拥有改写规则内容、类别或评分的权限。
+    # 先收敛同源副本，再在全局范围编译同一审查义务。编译失败时保留原候选，并回退
+    # 到旧的小范围裁决；这样远端格式异常不会让提取任务退化为失败或静默丢规则。
     non_score_rules, local_finalisation_merged = _consolidate_same_named_non_score_rules(non_score_rules)
-    non_score_rules, semantic_dedupe = _adjudicate_semantic_duplicate_groups(
+    non_score_rules, obligation_compilation = _compile_non_score_obligations(
         app, task, profile, system_prompt, non_score_rules, document_id=tender["document_id"],
     )
+    compilation_used = obligation_compilation["applied"]
+    compilation_failure_count = obligation_compilation["failure_count"]
+    if obligation_compilation["applied"]:
+        semantic_dedupe = {"group_count": 0, "merged_count": 0, "failure_count": 0}
+    else:
+        non_score_rules, semantic_dedupe = _adjudicate_semantic_duplicate_groups(
+            app, task, profile, system_prompt, non_score_rules, document_id=tender["document_id"],
+        )
     finalisation = {
-        "applied": bool(local_finalisation_merged or semantic_dedupe["merged_count"]), "dropped_count": 0,
-        "rewritten_count": 0, "merged_count": local_finalisation_merged + semantic_dedupe["merged_count"],
-        "failure_count": semantic_dedupe["failure_count"],
+        "applied": bool(local_finalisation_merged or obligation_compilation["merged_count"] or semantic_dedupe["merged_count"]), "dropped_count": 0,
+        "rewritten_count": 0,
+        "merged_count": local_finalisation_merged + obligation_compilation["merged_count"] + semantic_dedupe["merged_count"],
+        "failure_count": compilation_failure_count + semantic_dedupe["failure_count"],
     }
     rules = [*non_score_rules, *assembled_score_rules]
     # 前序定向补漏可能带来同源候选；再次执行同一套确定性收口，且补做同源候选去重。
@@ -3314,6 +3474,8 @@ def _extract_rules(app, task: dict) -> dict:
             "qualification_supplement_failure_count": qualification_supplement_failures,
             "semantic_compilation_used": compilation_used, "coverage_missing_rule_count": len(coverage_missing_rules),
             "semantic_compilation_failure_count": compilation_failure_count,
+            "obligation_compilation_candidate_count": obligation_compilation["candidate_count"],
+            "obligation_compilation_merged_count": obligation_compilation["merged_count"],
             # 保留旧字段，供页面和历史统计兼容；其语义为评分原文台账组装。
             # 旧字段仅供历史任务页面及外部调用方读取；新链路的真实语义为评分原文
             # 台账组装，不能据此重新启用旧的评分来源规划流程。
@@ -3367,7 +3529,8 @@ def _review_documents(app, task: dict) -> dict:
     review_run = storage.create_review_run(app, task["project_id"], task["task_id"], profile["profile_id"])
     rule_prompt = [{"rule_id": item["rule_id"], "category": item["category"], "title": item["title"],
                     "check_rule": item.get("check_rule") or item["title"], "source_text": item["source_text"],
-                    "ocr_required": _rule_requires_visual_verification(item)} for item in rules]
+                    "ocr_required": _rule_requires_visual_verification(item),
+                    "sub_requirements": _compiled_child_requirements(item)} for item in rules]
     for index, document in enumerate(documents, start=1):
         storage.update_task(app, task["task_id"], progress=int((index - 1) * 100 / len(documents)), message=f"正在审查 {index}/{len(documents)}：{document['bidder_name'] or document['original_name']}")
         text = Path(document["parsed_path"]).read_text(encoding="utf-8", errors="ignore")
@@ -4786,7 +4949,8 @@ def _combined_batch_payload(component: str, rules: list[dict]) -> list[dict]:
                  "ocr_required": _rule_requires_visual_verification(item),
                  "execution_strategy": _rule_execution_strategy(item),
                  "evidence_requirements": item.get("evidence_requirements") or [],
-                 "evidence_items": _rule_evidence_items(item)} for item in rules]
+                 "evidence_items": _rule_evidence_items(item),
+                 "sub_requirements": _compiled_child_requirements(item)} for item in rules]
     return _score_payload(rules)
 
 
@@ -4795,6 +4959,14 @@ def _full_scan_catalog(rules: list[dict]) -> list[dict]:
     catalog = []
     for rule in rules:
         query = re.sub(r"\s+", " ", f"{rule.get('title') or ''}；{rule.get('check_rule') or rule.get('title') or ''}").strip()
+        compiled_children = _compiled_child_requirements(rule)
+        if compiled_children:
+            child_text = "；".join(
+                _clean_model_text(child.get("verification_target") or child.get("check_rule") or child.get("title"))[:180]
+                for child in compiled_children[:24]
+            )
+            if child_text:
+                query = f"{query}；子检查项：{child_text}"
         evidence_items = _rule_evidence_items(rule)
         if evidence_items:
             item_text = "；".join(
@@ -6802,6 +6974,15 @@ def _rule_evidence_items(rule: dict) -> list[dict]:
         dict(item) for item in values
         if isinstance(item, dict) and str(item.get("name") or item.get("requirement") or "").strip()
     ]
+
+
+def _compiled_child_requirements(rule: dict, *, limit: int = 120) -> list[dict]:
+    """读取义务编译器保留的子检查项；存量规则保持空列表。"""
+    try:
+        values = storage.rule_execution_meta(rule).get("compiled_child_requirements") or []
+    except (TypeError, ValueError):
+        values = rule.get("compiled_child_requirements") or []
+    return [dict(value) for value in values[:limit] if isinstance(value, dict)]
 
 
 def _evidence_item_rule(rule: dict, item: dict) -> dict:
@@ -8874,6 +9055,7 @@ def _visual_rule_packet(rule: dict) -> dict:
         "rule_id": rule["rule_id"], "category": rule.get("category"), "title": rule.get("title"),
         "check_rule": rule.get("check_rule") or rule.get("title"), "source_text": rule.get("source_text"),
         "evidence_items": _rule_evidence_items(rule),
+        "sub_requirements": _compiled_child_requirements(rule),
         "scoring": scoring if scoring else None,
     }
 

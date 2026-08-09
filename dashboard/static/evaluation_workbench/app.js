@@ -469,6 +469,38 @@
     if (choice === 'local_ocr') return {...presetPayload('off', 'off', rule), baseline_ocr_mode:'local_ocr'};
     return {...presetPayload(choice === 'always' ? 'always' : 'smart', ['low', 'standard', 'high'].includes(level) ? level : 'standard', rule), baseline_ocr_mode:'auto'};
   }
+  function compiledSubRequirements(rule = {}) {
+    return Array.isArray(rule?.compiled_child_requirements)
+      ? rule.compiled_child_requirements.filter((item) => item && typeof item === 'object')
+      : [];
+  }
+  function compiledRuleSummary(rule = {}) {
+    const children = compiledSubRequirements(rule);
+    if (children.length < 2) return '';
+    const visible = children.slice(0, 24);
+    const items = visible.map((item, index) => {
+      const title = String(item.title || item.verification_target || item.check_rule || `子检查项 ${index + 1}`).trim();
+      const detail = String(item.check_rule || item.verification_target || '').trim();
+      const page = Number(item.source_page) > 0 ? `（第 ${Number(item.source_page)} 页）` : '';
+      return `<li><strong>${escapeHtml(title)}</strong>${page}${detail && detail !== title ? `<span>${escapeHtml(detail)}</span>` : ''}</li>`;
+    }).join('');
+    const remaining = children.length - visible.length;
+    return `<div class="rule-compiled-summary"><div><strong>已汇总 ${children.length} 项子检查</strong><span>页面合并展示；综合评审仍逐项核验。</span></div><details><summary>查看子检查项</summary><ol>${items}</ol>${remaining > 0 ? `<p class="muted">另有 ${remaining} 项，完整要求可在下方“合并后的完整检查规则”中查看。</p>` : ''}</details></div>`;
+  }
+  function compiledRuleTextContent(rule, field, isDraft) {
+    const value = String(rule?.[field] || (field === 'check_rule' ? rule?.title || '' : '未提供')).trim();
+    const children = compiledSubRequirements(rule);
+    if (children.length < 2) {
+      return isDraft && field === 'check_rule'
+        ? `<textarea class="rule-check-rule" data-rule="${rule.rule_id}" rows="4">${escapeHtml(value)}</textarea>`
+        : `<div class="rule-text">${escapeHtml(value || '未提供')}</div>`;
+    }
+    const label = field === 'check_rule' ? '合并后的完整检查规则' : '合并后的完整招标原文依据';
+    const body = isDraft && field === 'check_rule'
+      ? `<textarea class="rule-check-rule" data-rule="${rule.rule_id}" rows="6">${escapeHtml(value)}</textarea>`
+      : `<div class="rule-text">${escapeHtml(value || '未提供')}</div>`;
+    return `<details class="rule-compiled-fulltext"><summary>${label}</summary>${body}</details>`;
+  }
   async function refreshRules() {
     if (!activeProject) return;
     const expandedRuleIds = new Set([...$('rules').querySelectorAll('details.rule-card[open]')]
@@ -500,7 +532,9 @@
     const acquisitionCounts = displayRules.reduce((counts, rule) => { const key = simpleAcquisitionMode(rule); counts[key] = (counts[key] || 0) + 1; return counts; }, {recommended:0, adaptive:0, text_only:0, local_ocr:0, smart:0, always:0, custom:0});
     const toolbar = isDraft && displayRules.length ? `<div class="rule-acquisition-toolbar"><div><strong>核验方式</strong><span class="muted"> 默认按 AI 对证据类型的判断执行；也可明确限定为纯文字、本地 OCR，或追加腾讯 OCR／多模态增强。</span><small>当前：AI 建议 ${acquisitionCounts.recommended || 0} 条 · 文字优先 ${acquisitionCounts.adaptive || 0} 条 · 纯文字 ${acquisitionCounts.text_only || 0} 条 · 本地 OCR ${acquisitionCounts.local_ocr || 0} 条 · 智能增强 ${acquisitionCounts.smart || 0} 条 · 强制增强 ${acquisitionCounts.always || 0} 条${acquisitionCounts.custom ? ` · 专家自定义 ${acquisitionCounts.custom} 条` : ''}</small><small>${escapeHtml(acquisitionCapabilityNote())}</small></div><div class="rule-acquisition-toolbar-actions"><button class="restore-acquisition-recommendations" type="button">已启用规则采用 AI 建议</button><details class="rule-acquisition-help"><summary>如何选择？</summary><div class="rule-acquisition-help-popover"><p><strong>按 AI 建议：</strong>系统按每条规则的证据类型自动选择（推荐）。<strong>纯文字核验：</strong>只审已解析全文，最快。<strong>文字优先：</strong>先审全文，不足才补本地 OCR（免费）。<strong>本地 OCR 核验：</strong>全文之外固定补扫关键页（免费）。<strong>智能增强核验：</strong>本地 OCR 不够时才调腾讯 OCR／多模态（按量计费）。<strong>强制增强核验：</strong>无论文字是否充分都调腾讯 OCR／多模态（按量计费）。</p><p>快速／标准／充分只控制增强核验的页数上限；本地 OCR 仍按有限候选页和缓存执行。</p></div></details></div></div>` : '';
     $('rules').innerHTML = displayRules.length ? `${toolbar}<div class="rule-card-list">${displayRules.map((r) => {
-      const checkContent = isDraft ? `<textarea class="rule-check-rule" data-rule="${r.rule_id}" rows="4">${escapeHtml(r.check_rule || r.title)}</textarea>` : `<div class="rule-text">${escapeHtml(r.check_rule || r.title)}</div>`;
+      const checkContent = compiledRuleTextContent(r, 'check_rule', isDraft);
+      const sourceContent = compiledRuleTextContent(r, 'source_text', false);
+      const compilationSummary = compiledRuleSummary(r);
       const summary = acquisitionSummary(r);
       const sourceLabel = r.source_type === 'ai' ? 'AI 提取' : r.source_type === 'global' ? '通用规则库' : ['ai_edited', 'ai_locked'].includes(r.source_type) ? 'AI 提取 · 人工修改' : '人工补充';
       const enabledControl = (isDraft || isConfirmed) ? `<label class="rule-enabled-control" title="停用只影响后续评审执行，历史结果保留；启停状态会随下次重新提取继承"><input class="rule-enabled" data-rule="${r.rule_id}" type="checkbox" ${r.enabled ? 'checked' : ''}><span>启用</span></label>` : (r.enabled ? '' : '<span class="tag rule-disabled">未启用</span>');
@@ -521,7 +555,7 @@
       const visionReadonly = isDraft ? '' : `<div class="rule-vision-readonly"><span class="rule-field-label">核验方式</span><span>${escapeHtml(acquisitionSummary(r).label)}</span>${matchesRecommendation ? '<small class="ai-rec ai-rec-match">（与 AI 建议一致）</small>' : `<span class="ai-rec-current">AI 建议：${escapeHtml(recommendationLabel)}</span>`}</div>`;
       const recCell = matchesRecommendation ? `<span class="ai-rec-head ai-rec-head-match" title="当前核验方式与 AI 建议一致">${escapeHtml(recommendationLabel)}（当前）</span>` : `<span class="ai-rec-head" title="AI 建议的核验方式（当前未采用）">AI 建议：${escapeHtml(recommendationLabel)}</span><span class="ai-rec-current">当前：${escapeHtml(summary.label)}</span>`;
       const visionControl = isDraft ? `<div class="rule-vision-controls"><div class="rule-vision-heading"><strong>核验方式</strong><small>默认按 AI 建议；纯文字与本地 OCR 是基础路径，智能／强制增强才会追加腾讯 OCR 或多模态。</small></div>${choiceControl}${strengthControl}${basePath}<div class="rule-acquisition-preview"><strong>执行预览</strong><span>${escapeHtml(acquisitionPreview(r))}</span></div>${acquisitionWarning}<div class="rule-acquisition-actions"><button class="restore-rule-acquisition" data-rule="${r.rule_id}" type="button" ${matchesRecommendation ? 'disabled title="当前已采用 AI 建议"' : ''}>采用 AI 建议</button><small class="${matchesRecommendation ? 'ai-rec ai-rec-match' : 'ai-rec'}">AI 建议：${escapeHtml(baseVerificationSummary({...r, baseline_ocr_mode:recommendation.baseline_ocr_mode || 'auto'}).label)}${recommendation.acquisition_preset !== 'off' ? ` · ${escapeHtml(acquisitionPresetLabels[recommendation.acquisition_preset] || '智能增强')} · ${escapeHtml(acquisitionLevelLabels[recommendation.vision_level] || '标准')}强度` : ''}${matchesRecommendation ? '（当前）' : ''}</small>${matchesRecommendation ? '' : `<span class="ai-rec-current">当前：${escapeHtml(acquisitionSummary(r).label)}</span>`}</div><details class="rule-image-advanced"><summary>专家模式：增强通道与启动方式</summary><p class="hint">一般无需修改。基础核验方式请在上方选择；这里只限定腾讯精确复核、多模态外观核验或双通道。</p><div class="rule-image-advanced-grid"><label>增强通道<select class="rule-image-mode" data-rule="${r.rule_id}"><option value="auto" ${r.image_mode === 'auto' ? 'selected' : ''}>系统自动选择（推荐）</option><option value="ocr_only" ${r.image_mode === 'ocr_only' ? 'selected' : ''}>腾讯 OCR：精确字段复核</option><option value="vision_only" ${r.image_mode === 'vision_only' ? 'selected' : ''}>多模态：签章、外观等</option><option value="combined" ${r.image_mode === 'combined' ? 'selected' : ''}>腾讯 OCR＋多模态：双重复核</option><option value="off" ${r.image_mode === 'off' ? 'selected' : ''}>不作增强核验</option></select></label><label>启动方式<select class="rule-vision-trigger" data-rule="${r.rule_id}"><option value="off" ${r.vision_trigger === 'off' ? 'selected' : ''}>不追加增强</option><option value="text_fallback" ${r.vision_trigger === 'text_fallback' ? 'selected' : ''}>基础证据不足时追加增强</option><option value="required" ${r.vision_trigger === 'required' ? 'selected' : ''}>强制追加增强（无论基础证据是否充分）</option></select></label></div></details></div>` : '';
-      return `<details class="rule-card${duplicateIssue ? ' rule-card-duplicate' : ''}"><summary><span class="rule-card-summary">${enabledControl}<span class="tag">${categoryLabel(r.category)}</span><strong class="rule-card-title">${escapeHtml(r.title)}</strong><span class="tag">${sourceLabel}</span>${recCell}</span></summary><div class="rule-card-body">${duplicateWarning}<div class="rule-card-grid"><label>检查规则${checkContent}</label><div class="rule-field"><span class="rule-field-label">招标原文依据</span><div class="rule-text">${escapeHtml(r.source_text || '未提供')}</div></div></div>${visionControl}${visionReadonly}${isDraft ? `<div class="actions rule-card-actions"><button class="save-check-rule primary" data-rule="${r.rule_id}">保存检查规则</button></div>` : ''}</div></details>`;
+      return `<details class="rule-card${duplicateIssue ? ' rule-card-duplicate' : ''}"><summary><span class="rule-card-summary">${enabledControl}<span class="tag">${categoryLabel(r.category)}</span><strong class="rule-card-title">${escapeHtml(r.title)}</strong><span class="tag">${sourceLabel}</span>${recCell}</span></summary><div class="rule-card-body">${duplicateWarning}${compilationSummary}<div class="rule-card-grid"><label>检查规则${checkContent}</label><div class="rule-field"><span class="rule-field-label">招标原文依据</span>${sourceContent}</div></div>${visionControl}${visionReadonly}${isDraft ? `<div class="actions rule-card-actions"><button class="save-check-rule primary" data-rule="${r.rule_id}">保存检查规则</button></div>` : ''}</div></details>`;
     }).join('')}</div>` : '<p class="muted">暂无规则。</p>';
     $('rules').querySelectorAll('details.rule-card').forEach((card, index) => {
       const ruleId = displayRules[index]?.rule_id;

@@ -205,6 +205,8 @@ def task_prompt_template_fingerprint(app, task_type: str) -> str | None:
             "extract_rules_supplement_user",
             "extract_rules_qualification_supplement_user",
             "extract_rules_hard_anchor_supplement_user",
+            "extract_rules_dedupe_adjudication_user",
+            "extract_rules_obligation_compile_user",
             "extract_rules_scoring_structure_repair_user",
             "json_repair", "json_repair_user",
         },
@@ -2917,6 +2919,37 @@ def rule_execution_meta(rule: dict) -> dict:
             "max_score": max_score if max_score is not None and max_score > 0 else None,
             "source_page": page if isinstance(page, int) and page > 0 else None,
         })
+    compiled_group_id = str(value.get("compiled_group_id") or "").strip()[:80]
+    compiled_categories = value.get("compiled_categories")
+    if not isinstance(compiled_categories, list):
+        compiled_categories = []
+    compiled_categories = [
+        str(item) for item in compiled_categories
+        if str(item) in {"qualification", "compliance", "substantive", "rejection", "other"}
+    ]
+    compiled_children = value.get("compiled_child_requirements")
+    if not isinstance(compiled_children, list):
+        compiled_children = []
+    normalised_children: list[dict] = []
+    for child in compiled_children[:120]:
+        if not isinstance(child, dict):
+            continue
+        title = str(child.get("title") or "").strip()[:120]
+        check_rule = str(child.get("check_rule") or title).strip()[:520]
+        if not title and not check_rule:
+            continue
+        source_units = child.get("source_unit_ids")
+        if not isinstance(source_units, list):
+            source_units = []
+        page = child.get("source_page")
+        normalised_children.append({
+            "category": str(child.get("category") or "") if str(child.get("category") or "") in {"qualification", "compliance", "substantive", "rejection", "other"} else "",
+            "title": title or check_rule[:120],
+            "verification_target": str(child.get("verification_target") or "").strip()[:240],
+            "check_rule": check_rule,
+            "source_page": page if isinstance(page, int) and page > 0 else None,
+            "source_unit_ids": list(dict.fromkeys(str(item).strip() for item in source_units if str(item).strip()))[:24],
+        })
     return {
         "execution_strategy": strategy if strategy in _RULE_EXECUTION_STRATEGIES else "",
         "evidence_requirements": list(dict.fromkeys(requirements)),
@@ -2934,6 +2967,9 @@ def rule_execution_meta(rule: dict) -> dict:
         "verifiability": verifiability,
         "source_locations": normalised_locations,
         "score_sections": normalised_sections,
+        "compiled_group_id": compiled_group_id,
+        "compiled_categories": list(dict.fromkeys(compiled_categories)),
+        "compiled_child_requirements": normalised_children,
     }
 
 
@@ -3061,6 +3097,37 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
             "max_score": max_score if max_score is not None and max_score > 0 else None,
             "source_page": page if isinstance(page, int) and page > 0 else None,
         })
+    compiled_group_id = str(payload.get("compiled_group_id", base.get("compiled_group_id")) or "").strip()[:80]
+    compiled_categories = payload.get("compiled_categories", base.get("compiled_categories"))
+    if not isinstance(compiled_categories, list):
+        compiled_categories = []
+    compiled_categories = [
+        str(item) for item in compiled_categories
+        if str(item) in {"qualification", "compliance", "substantive", "rejection", "other"}
+    ]
+    compiled_children = payload.get("compiled_child_requirements", base.get("compiled_child_requirements"))
+    if not isinstance(compiled_children, list):
+        compiled_children = []
+    normalised_children: list[dict] = []
+    for child in compiled_children[:120]:
+        if not isinstance(child, dict):
+            continue
+        title = str(child.get("title") or "").strip()[:120]
+        check_rule = str(child.get("check_rule") or title).strip()[:520]
+        if not title and not check_rule:
+            continue
+        source_units = child.get("source_unit_ids")
+        if not isinstance(source_units, list):
+            source_units = []
+        page = child.get("source_page")
+        normalised_children.append({
+            "category": str(child.get("category") or "") if str(child.get("category") or "") in {"qualification", "compliance", "substantive", "rejection", "other"} else "",
+            "title": title or check_rule[:120],
+            "verification_target": str(child.get("verification_target") or "").strip()[:240],
+            "check_rule": check_rule,
+            "source_page": page if isinstance(page, int) and page > 0 else None,
+            "source_unit_ids": list(dict.fromkeys(str(item).strip() for item in source_units if str(item).strip()))[:24],
+        })
     value = {
         "execution_strategy": strategy if strategy in _RULE_EXECUTION_STRATEGIES else "",
         "evidence_requirements": normalized,
@@ -3078,6 +3145,9 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
         "verifiability": verifiability,
         "source_locations": normalised_locations,
         "score_sections": normalised_sections,
+        "compiled_group_id": compiled_group_id,
+        "compiled_categories": list(dict.fromkeys(compiled_categories)),
+        "compiled_child_requirements": normalised_children,
     }
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 

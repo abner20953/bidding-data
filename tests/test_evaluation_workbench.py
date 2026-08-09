@@ -3010,6 +3010,16 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(storage.task_prompt_template_fingerprint(self.app, "evaluate_all"), before_evaluation)
         self.assertNotEqual(storage.task_prompt_template_fingerprint(self.app, "extract_rules"), before_extraction)
 
+    def test_obligation_compilation_template_participates_in_extraction_fingerprint(self):
+        client = self.app.test_client()
+        before = storage.task_prompt_template_fingerprint(self.app, "extract_rules")
+        response = client.patch(
+            "/api/evaluation-workbench/prompt-templates/extract_rules_obligation_compile_user",
+            json={"content": "仅返回候选 ID 分组：{{candidates}}", "password": "108"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertNotEqual(storage.task_prompt_template_fingerprint(self.app, "extract_rules"), before)
+
     def test_global_rules_require_password_and_are_all_imported_with_default_selection(self):
         client = self.app.test_client()
         self.assertEqual(client.get("/api/evaluation-workbench/global-rules").status_code, 200)
@@ -6933,6 +6943,21 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(values[0]["source_locations"], [{"page": 12}])
         self.assertEqual(values[1]["source_locations"], [{"page": 25}])
 
+    def test_source_fact_identity_prefers_repeated_source_content_over_physical_unit(self):
+        values = worker._attach_source_fact_metadata([
+            {
+                "category": "compliance", "title": "报价唯一", "check_rule": "核验报价唯一",
+                "source_text": "投标文件只能有一个有效报价，不得提供备选报价。", "source_page": 12,
+                "source_unit_ids": ["SU-test-P12-1-same-content"],
+            },
+            {
+                "category": "compliance", "title": "报价唯一", "check_rule": "核验报价唯一",
+                "source_text": "投标文件只能有一个有效报价，不得提供备选报价。", "source_page": 25,
+                "source_unit_ids": ["SU-test-P25-4-same-content"],
+            },
+        ])
+        self.assertEqual(values[0]["source_fact_ids"], values[1]["source_fact_ids"])
+
     def test_merging_same_source_rule_keeps_all_source_locations(self):
         values = worker._attach_source_fact_metadata([
             {
@@ -7106,7 +7131,74 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(finished["result"]["scoring_assembly_mode"], "direct_assembly")
         self.assertFalse(any("统一编译并合并评审规则" in value or "审计规则覆盖范围" in value for value in prompts))
         self.assertFalse(any("规划每条评分原文应归属" in value for value in prompts))
-        self.assertEqual(finished["result"]["source_ledger"]["pipeline_version"], "source-ledger-v2.3")
+        self.assertEqual(finished["result"]["source_ledger"]["pipeline_version"], "obligation-compiler-v3.0")
+
+    def test_obligation_compilation_merges_cross_category_restatements_and_keeps_children(self):
+        rules = [
+            {
+                "category": "compliance", "title": "报价未超预算", "check_rule": "核验报价不超过最高限价。",
+                "verification_target": "投标报价是否超过最高限价", "source_text": "报价不得超过最高限价。",
+                "source_page": 12, "source_unit_ids": ["SU-test-P12-1-a"], "verifiability": "single_bid",
+            },
+            {
+                "category": "rejection", "title": "报价超限无效", "check_rule": "报价超过最高限价的投标无效。",
+                "verification_target": "投标报价是否超过最高限价", "source_text": "报价超过最高限价的投标无效。",
+                "source_page": 24, "source_unit_ids": ["SU-test-P24-2-b"], "verifiability": "single_bid",
+            },
+            {
+                "category": "qualification", "title": "营业执照", "check_rule": "核验营业执照有效。",
+                "verification_target": "营业执照有效性", "source_text": "提供有效营业执照。",
+                "source_page": 8, "source_unit_ids": ["SU-test-P8-1-c"], "verifiability": "single_bid",
+            },
+        ]
+        with patch("dashboard.evaluation_workbench.worker._request_task_json", return_value={
+            "groups": [
+                {"candidate_ids": ["O-1", "O-2"], "action": "merge"},
+                {"candidate_ids": ["O-3"], "action": "keep_separate"},
+            ],
+        }):
+            compiled, stats = worker._compile_non_score_obligations(
+                self.app, {"task_id": "task-compile"}, {"profile_id": "profile-1"}, "system", rules,
+                document_id="doc-1",
+            )
+        self.assertTrue(stats["applied"])
+        self.assertEqual(stats["merged_count"], 1)
+        self.assertEqual(len(compiled), 2)
+        quote = next(item for item in compiled if "报价" in item["title"])
+        self.assertEqual(quote["category"], "rejection")
+        self.assertEqual(len(quote["compiled_child_requirements"]), 2)
+        self.assertEqual(set(quote["source_unit_ids"]), {"SU-test-P12-1-a", "SU-test-P24-2-b"})
+
+    def test_obligation_compilation_rejects_incomplete_partition_without_losing_candidates(self):
+        rules = [
+            {"category": "qualification", "title": "营业执照", "check_rule": "核验营业执照", "source_text": "提供营业执照。"},
+            {"category": "compliance", "title": "投标函", "check_rule": "核验投标函", "source_text": "提交投标函。"},
+        ]
+        with patch("dashboard.evaluation_workbench.worker._request_task_json", return_value={
+            "groups": [{"candidate_ids": ["O-1"], "action": "keep_separate"}],
+        }):
+            compiled, stats = worker._compile_non_score_obligations(
+                self.app, {"task_id": "task-compile"}, {"profile_id": "profile-1"}, "system", rules,
+                document_id="doc-1",
+            )
+        self.assertFalse(stats["applied"])
+        self.assertEqual(stats["failure_count"], 1)
+        self.assertEqual(compiled, rules)
+
+    def test_compiled_child_requirements_survive_rule_storage_round_trip(self):
+        storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-compiled", [{
+            "category": "other", "title": "技术要求响应", "check_rule": "核验技术要求逐项响应。",
+            "source_text": "技术要求应逐项响应。", "verification_target": "技术参数响应",
+            "verifiability": "single_bid", "compiled_group_id": "OC-9", "compiled_categories": ["other", "substantive"],
+            "compiled_child_requirements": [{
+                "category": "other", "title": "参数组一", "verification_target": "参数组一响应",
+                "check_rule": "核验参数组一逐项响应。", "source_page": 16, "source_unit_ids": ["SU-test-P16-1-a"],
+            }],
+        }])
+        _, rules = storage.list_rules(self.app, self.project["project_id"])
+        self.assertEqual(rules[0]["compiled_group_id"], "OC-9")
+        self.assertEqual(rules[0]["compiled_categories"], ["other", "substantive"])
+        self.assertEqual(rules[0]["compiled_child_requirements"][0]["title"], "参数组一")
 
     def test_unmapped_ai_score_rule_blocks_confirmation(self):
         """没有原文评分台账锚点的纯 AI 评分规则不能进入已确认规则集。"""
