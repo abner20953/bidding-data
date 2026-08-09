@@ -3221,7 +3221,10 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_subjective_user"]["content"])
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"])
         self.assertIn("统一为 partial 或需图片核验", PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v50")
+        self.assertIn("条件未触发，无需提供", PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
+        self.assertIn("条件未触发，无需提供", PROMPT_TEMPLATES["review_documents_user"]["content"])
+        self.assertIn("表格字段、填写格式", PROMPT_TEMPLATES["extract_rules_obligation_compile_user"]["content"])
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v51")
 
     def test_scope_chapter_and_text_error_guidance_present(self):
         from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
@@ -3239,7 +3242,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(text_marker, PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("必须点名最具辨识度的偏离对象", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("risk_level 应为 high", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v50")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v51")
 
     def test_ocr_visual_contracts_deduplicated_but_keep_hard_constraints(self):
         from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
@@ -4655,6 +4658,29 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         titles = [item["title"] for item in worker._filter_inapplicable_template_rules(rules[:2], active_tender)]
         self.assertEqual(titles, ["★号条款响应", "进口产品限制"])
 
+    def test_joint_agreement_templates_are_removed_only_when_project_rejects_joint_bids(self):
+        agreement = {
+            "title": "联合体投标协议及资格条件", "verification_target": "联合体协议及各方资格材料",
+            "check_rule": "若投标人为联合体，核验是否提供联合体投标协议。",
+            "source_text": "联合体各方应签订联合投标协议，并随投标文件提交。",
+        }
+        active_restriction = {
+            "title": "联合体投标限制", "verification_target": "不得以联合体形式投标",
+            "check_rule": "核验投标文件未以联合体形式投标。",
+            "source_text": "本项目不允许联合体投标。",
+        }
+        internal_restriction = {
+            "title": "联合体成员投标限制", "verification_target": "联合体成员不得另行投标",
+            "check_rule": "核验联合体成员未单独参加同一采购活动。",
+            "source_text": "联合体各方不得再单独参加同一采购活动。",
+        }
+        tender = "本项目是否接受联合体：不允许联合体投标。"
+        self.assertTrue(worker._has_explicit_joint_bid_restriction(tender))
+        kept = worker._filter_inapplicable_template_rules(
+            [agreement, active_restriction, internal_restriction], tender,
+        )
+        self.assertEqual(kept, [active_restriction, internal_restriction])
+
     def test_technical_star_material_rule_is_recovered_only_with_complete_formal_chain(self):
         tender = """[第99页]
 指标按重要性分为“★”、“#”和“△”。★代表实质性指标，不满足该指标项将导致投标被拒绝。
@@ -5773,7 +5799,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不限定行业或采购类型", guidance)
         scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v50")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v51")
 
     def test_full_scan_does_not_reinject_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")

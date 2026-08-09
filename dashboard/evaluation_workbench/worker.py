@@ -853,6 +853,28 @@ def _has_explicit_import_restriction(tender_text: str) -> bool:
     ))
 
 
+def _has_explicit_joint_bid_restriction(tender_text: str) -> bool:
+    """仅识别当前项目明确不接受联合体这一采购方式前提。
+
+    这是项目级适用范围事实，不把“联合体成员不得另行投标”等仍需遵守的限制误作
+    不适用。后续只据此过滤以联合体协议为核验对象的条件模板。
+    """
+    compact = re.sub(r"\s+", "", tender_text or "")
+    return bool(re.search(
+        r"(?:本项目|本包|本次采购|当前采购包|项目).{0,36}?(?:不接受|不允许|禁止)"
+        r".{0,16}?(?:联合体(?:投标|参与)?|以联合体形式)",
+        compact,
+    ))
+
+
+def _is_joint_bid_agreement_template(rule: dict) -> bool:
+    """判断候选是否只核验联合体协议及其随附资格材料。"""
+    combined = " ".join(str(rule.get(key) or "") for key in (
+        "title", "verification_target", "check_rule", "source_text",
+    ))
+    return "联合体" in combined and "协议" in combined
+
+
 _EXPLICIT_INAPPLICABLE_CONDITION_PATTERN = re.compile(
     r"(?:本项目|本包|本次采购|当前采购包).{0,48}?(?:产品|货物|服务|事项|材料|资格|认证|许可)"
     r".{0,28}?(?:名称|范围|内容)?\s*(?:为|是|：|:)\s*(?:无|不涉及|不适用)"
@@ -877,12 +899,15 @@ def _filter_inapplicable_template_rules(rules: list[dict], tender_text: str) -> 
     """剔除没有实际触发条件的模板规则，保守地保留其他候选。"""
     has_star = _has_concrete_star_requirement(tender_text)
     has_import_restriction = _has_explicit_import_restriction(tender_text)
+    has_joint_bid_restriction = _has_explicit_joint_bid_restriction(tender_text)
     kept: list[dict] = []
     for rule in rules:
         if not isinstance(rule, dict):
             continue
         combined = " ".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text"))
         if _has_explicitly_inapplicable_source(rule):
+            continue
+        if has_joint_bid_restriction and _is_joint_bid_agreement_template(rule):
             continue
         if re.search(r"★\s*号|星号条款", combined) and not has_star:
             continue

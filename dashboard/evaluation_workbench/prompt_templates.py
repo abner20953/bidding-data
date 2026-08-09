@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 PROMPT_TEMPLATE_SETTING = "evaluation_workbench_prompt_templates"
-EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v50"
+EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v51"
 
 
 def _template(name: str, description: str, content: str, *placeholders: str) -> dict:
@@ -221,6 +221,21 @@ _APPLICABILITY_AND_RESULT_CONSISTENCY_GUIDANCE = (
 )
 _extend_prompt("extract_rules_guidance", "适用范围与结论一致性", "\n\n" + _APPLICABILITY_AND_RESULT_CONSISTENCY_GUIDANCE)
 _extend_prompt("evaluate_all_guidance", "适用范围与结论一致性", "\n\n" + _APPLICABILITY_AND_RESULT_CONSISTENCY_GUIDANCE)
+_CONDITIONAL_RULE_REVIEW_GUIDANCE = (
+    "若规则原文或检查指令含“如有”“若存在”“当……时”“如适用”等前提，必须先根据当前"
+    "投标文件和规则所附原文确认前提是否触发。明确未触发时，返回 satisfied、low 风险，"
+    "reason 与 summary 写“条件未触发，无需提供”，不得把材料未出现判为缺失；前提无法判断时"
+    "返回 manual 或 partial、low 风险，并说明待核验的触发事实。只有前提已触发后，才可把"
+    "相应材料缺失或不一致作为负面结论。"
+)
+_extend_prompt("evaluate_all_review_user", "条件性规则审查", " " + _CONDITIONAL_RULE_REVIEW_GUIDANCE)
+_extend_prompt("review_documents_user", "条件性规则审查", " " + _CONDITIONAL_RULE_REVIEW_GUIDANCE)
+_OBLIGATION_MATERIAL_DETAIL_MERGE_GUIDANCE = (
+    "仅描述同一材料的表格字段、填写格式、附件位置或“证书附后”等执行细节，且已有候选"
+    "明确该材料的提供条件、证明要求或不响应后果时，必须 merge 为该材料规则的子检查，"
+    "不得另留格式卡；字段本身有独立适用条件、独立证明材料或可单独改变结论时才 keep_separate。"
+)
+_extend_prompt("extract_rules_obligation_compile_user", "材料格式附属项合并", " " + _OBLIGATION_MATERIAL_DETAIL_MERGE_GUIDANCE)
 PROMPT_TEMPLATES["evaluate_all_visual_user"] = _template(
     "综合评审 · 图片识别补充",
     "仅对已启用图片识别的单条规则和候选页面进行补充判断。",
