@@ -618,9 +618,12 @@ _SCORE_CLAUSE_PATTERN = re.compile(
     rf"|[（(]\s*{_SCORE_VALUE_PATTERN}\s*分\s*[）)]"
 )
 _SCORE_SECTION_PARENT_PATTERN = re.compile(
+    # 分部标题必须在“价格/商务/技术/服务/资格”之后明确出现“部分/评审/评分”。
+    # 不能只因“技术参数……扣完（24分）”同时出现“技术”和分值就把一个具体
+    # 评分项误判为新的评分分部。
     r"^\s*((?:(?:第\s*[一二三四五六七八九十\d]+\s*部分)\s*[：:]?\s*)?"
-    r"(?:价格|商务|技术|服务|资格)(?:部分)?(?:客观|主观)?(?:评分|评审项)?)"
-    r"(?:[^（(:：]{0,20}?[（(]\s*(\d+(?:\.\d+)?)\s*分\s*[）)]|\s*[：:]\s*(\d+(?:\.\d+)?)\s*分)"
+    r"(?:价格|商务|技术|服务|资格)[^（(:：]{0,16}?(?:部分|评审|评分)[^（(:：]{0,8}?)"
+    r"(?:[（(]\s*(\d+(?:\.\d+)?)\s*分\s*[）)]|\s*[：:]\s*(\d+(?:\.\d+)?)\s*分)\s*$"
 )
 _SCORE_TABLE_BOUNDARY_PATTERN = re.compile(r"条款号|评审因素|评分因素|评审标准|评分标准|分值构成|总分\s*\d+\s*分")
 _SCORE_GRADE_FRAGMENT_PATTERN = re.compile(r"^[A-HＡ-Ｈ甲乙丙丁戊己庚辛][、.．:：]")
@@ -919,7 +922,7 @@ def _filter_inapplicable_template_rules(rules: list[dict], tender_text: str) -> 
     return kept
 
 
-def _filter_non_file_verifiable_candidates(rules: list[dict]) -> list[dict]:
+def _filter_non_file_verifiable_candidates(rules: list[dict], tender_text: str = "") -> list[dict]:
     """只采信可由单份投标文件核验的非评分候选。
 
     新链路要求模型明确给出核验范围；兼容旧输出时由候选规范化阶段补齐最保守的
@@ -939,7 +942,7 @@ def _filter_non_file_verifiable_candidates(rules: list[dict]) -> list[dict]:
             continue
         if category not in {"objective", "subjective"} and _is_non_executable_review_method_summary(item):
             continue
-        if category not in {"objective", "subjective"} and _is_external_payment_without_file_evidence(item):
+        if category not in {"objective", "subjective"} and _is_external_payment_without_file_evidence(item, tender_text):
             continue
         kept.append(item)
     return kept
@@ -987,18 +990,52 @@ def _is_non_executable_review_method_summary(rule: dict) -> bool:
     )
 
 
-def _is_external_payment_without_file_evidence(rule: dict) -> bool:
+def _external_payment_subjects(value: object) -> set[str]:
+    """抽取外部缴费动作中的材料主体，仅用于在同一招标原文内找文件证据。"""
+    compact = re.sub(r"\s+", "", str(value or ""))
+    return {
+        match.group(0) for match in re.finditer(
+            r"(?:投标|响应|履约)?(?:保证金|押金|费用|款项)", compact,
+        )
+    }
+
+
+def _tender_has_file_evidence_for_external_payment(rule: dict, tender_text: str) -> bool:
+    """判断同一材料是否在招标原文其他位置被明确列为投标文件内材料。
+
+    外部动作与文件组成常分散在前附表、投标文件组成和否决条款三处。仅凭候选的
+    短摘录会误删已明确要求附随文件的材料；这里要求“同一材料主体 + 投标/响应
+    文件语境 + 凭证/保函等证据词”同时出现，不会因普通缴费说明而放行。
+    """
+    compact = re.sub(r"\s+", "", tender_text or "")
+    if not compact:
+        return False
+    combined = " ".join(str(rule.get(key) or "") for key in (
+        "title", "verification_target", "check_rule", "source_text",
+    ))
+    evidence = r"(?:凭证|回单|保函|证明材料|复印件|扫描件)"
+    for subject in _external_payment_subjects(combined):
+        escaped = re.escape(subject)
+        if re.search(rf"(?:投标|响应)文件.{{0,240}}?{escaped}.{{0,56}}?{evidence}", compact):
+            return True
+        if re.search(rf"{escaped}.{{0,56}}?(?:随|附于|装入|作为).{{0,40}}?(?:投标|响应)文件", compact):
+            return True
+    return False
+
+
+def _is_external_payment_without_file_evidence(rule: dict, tender_text: str = "") -> bool:
     """文件外缴费/保证金动作不能被改写成“文件内存在凭证”。
 
     只有直接原文明确要求投标/响应文件附凭证、保函、回单或证明时才保留。这样既
     排除平台或银行侧事实，也不会误删确实要求随文件提交证明材料的规则。
     """
     source = re.sub(r"\s+", "", str(rule.get("source_text") or ""))
-    return bool(
+    is_external_only = bool(
         source
         and _EXTERNAL_PAYMENT_OPERATION_PATTERN.search(source)
         and not _FILE_EVIDENCE_REQUIREMENT_PATTERN.search(source)
     )
+    return is_external_only and not _tender_has_file_evidence_for_external_payment(rule, tender_text)
 
 
 def _is_pure_unobservable_submission_operation(rule: dict) -> bool:
@@ -1185,6 +1222,7 @@ def _score_clause_packets(text: str, limit: int = 240, *, source_document_key: s
             )
             packets.append({
                 "clause_id": clause_id,
+                "source_document_key": source_document_key,
                 "text": value,
                 "score_line": line[:360],
                 "source_page": page,
@@ -1666,35 +1704,38 @@ def _score_rule_supplement_prompt(app, score_packets: list[object], existing_rul
 
 
 def _score_packet_assembly_groups(score_packets: list[dict], max_chars: int = 24_000) -> list[list[dict]]:
-    """按评分分部聚合原文台账；分部过长时才按完整条款继续拆分。
+    """按同一文件的连续评分表页面聚合原文台账。
 
-    这是评分规则的唯一入口。按分部而非正文切片分组，避免一张评分表被多个正文批次
-    重复生成；max_chars 只控制单次模型上下文，不改变“每条款仅归属一次”的语义。
+    PDF 表格常在页边把同一评分项拆为“上一页的标题/A、B档”与“下一页的 C、D
+    档”。未能可靠识别分部时若按页面拆组，模型只能把续行虚构成独立评分项。这里
+    以同一文件、连续页面作为更基础的边界；明确的 ``score_section`` 仍作为元数据
+    保存给后续对账，不能再作为组装时的硬切分条件。页面不连续、来源文件变化或超过
+    上下文上限时才切组，因此正常评分表不会增加调用次数。
     """
-    sections: dict[str, list[dict]] = {}
-    order: list[str] = []
+    groups: list[list[dict]] = []
+    current: list[dict] = []
+    size = 0
+    current_document = ""
+    last_page = 0
     for packet in score_packets:
         if not isinstance(packet, dict) or not _score_packet_id(packet):
             continue
-        section = packet.get("score_section") if isinstance(packet.get("score_section"), dict) else {}
-        key = str(section.get("section_id") or f"page-{packet.get('source_page') or 0}")
-        if key not in sections:
-            sections[key] = []
-            order.append(key)
-        sections[key].append(packet)
-    groups: list[list[dict]] = []
-    for key in order:
-        current: list[dict] = []
-        size = 0
-        for packet in sections[key]:
-            packet_size = len(_score_packet_prompt_text([packet]))
-            if current and size + packet_size > max_chars:
-                groups.append(current)
-                current, size = [], 0
-            current.append(packet)
-            size += packet_size
-        if current:
+        document = str(packet.get("source_document_key") or "")
+        page = int(packet.get("source_page") or 0)
+        page_gap = bool(current and page and last_page and page > last_page + 1)
+        document_changed = bool(current and document != current_document)
+        packet_size = len(_score_packet_prompt_text([packet]))
+        if current and (document_changed or page_gap or size + packet_size > max_chars):
             groups.append(current)
+            current, size, current_document, last_page = [], 0, "", 0
+        if not current:
+            current_document = document
+        current.append(packet)
+        size += packet_size
+        if page:
+            last_page = page
+    if current:
+        groups.append(current)
     return groups
 
 
@@ -1919,13 +1960,126 @@ def _repair_scoring_fragments(app, task: dict, profile: dict, system_prompt: str
     return [replacements.get(index, rule) for index, rule in enumerate(rules) if index not in removed], stats
 
 
+def _declared_total_score_from_text(text: str) -> float | None:
+    """从原文读取唯一且可信的总分声明；无法确定时不启用总分重组。"""
+    votes: dict[float, int] = {}
+    for pattern in storage._TENDER_TOTAL_SCORE_PATTERNS:
+        for match in pattern.finditer(text or ""):
+            try:
+                value = float(match.group(1))
+            except (IndexError, TypeError, ValueError):
+                continue
+            if 50 <= value <= 1_000:
+                votes[value] = votes.get(value, 0) + 1
+    return max(sorted(votes), key=lambda value: votes[value]) if votes else None
+
+
+def _score_rules_total(rules: list[dict]) -> float:
+    """仅用于提取质量契约，统计本轮 AI 评分规则的满分合计。"""
+    total = 0.0
+    for rule in rules:
+        if not isinstance(rule, dict) or rule.get("category") not in {"objective", "subjective"}:
+            continue
+        scoring = rule.get("scoring") if isinstance(rule.get("scoring"), dict) else {}
+        value = storage._valid_max_score(scoring)
+        if value is not None:
+            total += float(value)
+    return total
+
+
+def _score_contract_issues(rules: list[dict], score_packets: list[dict],
+                           declared_total: float | None) -> dict:
+    """评分原文唯一归属和总分守恒的本地契约，不按标题或语义猜测。"""
+    known_ids = {_score_packet_id(packet) for packet in score_packets if _score_packet_id(packet)}
+    owners: dict[str, int] = {}
+    for rule in rules:
+        for clause_id in _score_rule_clause_ids(rule) & known_ids:
+            owners[clause_id] = owners.get(clause_id, 0) + 1
+    actual_total = _score_rules_total(rules)
+    return {
+        "missing_clause_ids": sorted(known_ids - set(owners)),
+        "duplicate_clause_ids": sorted(clause_id for clause_id, count in owners.items() if count > 1),
+        "declared_total": declared_total,
+        "actual_total": actual_total,
+        "total_mismatch": bool(
+            declared_total is not None and abs(actual_total - float(declared_total)) > 0.01
+        ),
+    }
+
+
+def _score_contract_repair_prompt(app, score_packets: list[dict], rules: list[dict],
+                                  contract: dict) -> str:
+    """把已经发现结构异常的连续评分表交给一次受约束重组。"""
+    existing = [
+        {
+            "category": item.get("category"), "title": item.get("title"),
+            "check_rule": item.get("check_rule"), "source_clause_ids": sorted(_score_rule_clause_ids(item)),
+            "scoring": item.get("scoring"),
+        }
+        for item in rules if isinstance(item, dict) and item.get("category") in {"objective", "subjective"}
+    ]
+    return storage.render_prompt_template(
+        app, "extract_rules_scoring_contract_repair_user",
+        declared_total=(f"{float(contract['declared_total']):g}" if contract.get("declared_total") is not None else "未明确"),
+        actual_total=f"{float(contract.get('actual_total') or 0):g}",
+        missing_clause_ids=json.dumps(contract.get("missing_clause_ids") or [], ensure_ascii=False),
+        duplicate_clause_ids=json.dumps(contract.get("duplicate_clause_ids") or [], ensure_ascii=False),
+        existing_rules=json.dumps(existing, ensure_ascii=False, separators=(",", ":")),
+        score_packets=_score_packet_prompt_text(score_packets),
+    )
+
+
+def _repair_scoring_contract(app, task: dict, profile: dict, system_prompt: str, rules: list[dict],
+                             score_packets: list[dict], groups: list[list[dict]], *,
+                             declared_total: float | None, document_id: str) -> tuple[list[dict], dict]:
+    """仅在单个连续评分表已被本地证明异常时，执行一次全表定向重组。
+
+    正常项目不进入此分支。重组输出必须同时通过条款唯一归属、全量覆盖与明确总分
+    守恒校验；否则保留原结果，让确认前检查显式报告问题而不是静默替换。
+    """
+    contract = _score_contract_issues(rules, score_packets, declared_total)
+    # 只有招标原文给出了可信总分且当前合计不守恒时才增加一次模型调用。条款遗漏
+    # 已有原定向补漏流程处理；没有总分锚点时也不能把“疑似重复”当成自动重组依据。
+    abnormal = declared_total is not None and bool(contract["total_mismatch"])
+    stats = {"attempted": False, "applied": False, "failure_count": 0, "contract": contract}
+    if not abnormal or len(groups) != 1 or not score_packets:
+        return rules, stats
+    stats["attempted"] = True
+    try:
+        response = _request_task_json(
+            app, task, profile, "extract_rules_scoring_contract_repair", system_prompt,
+            _score_contract_repair_prompt(app, score_packets, rules, contract),
+            document_id=document_id, context_mode="score_contract_repair",
+            max_tokens=_output_token_budget(profile, max(4_000, min(8_000, 1_200 + len(score_packets) * 440))),
+            thinking_mode="disabled",
+        )
+        candidate = _normalise_scoring_assembly_rules(
+            response.get("rules") if isinstance(response, dict) else None, score_packets,
+        )
+        candidate_contract = _score_contract_issues(candidate, score_packets, declared_total)
+        if candidate and not (
+            candidate_contract["missing_clause_ids"]
+            or candidate_contract["duplicate_clause_ids"]
+            or candidate_contract["total_mismatch"]
+        ):
+            stats["applied"] = True
+            stats["contract"] = candidate_contract
+            return candidate, stats
+        stats["failure_count"] = 1
+    except ValueError:
+        stats["failure_count"] = 1
+    return rules, stats
+
+
 def _extract_scoring_rules_from_ledger(app, task: dict, profile: dict, system_prompt: str,
-                                       score_packets: list[dict], *, document_id: str) -> tuple[list[dict], dict]:
+                                       score_packets: list[dict], *, document_id: str,
+                                       declared_total: float | None = None) -> tuple[list[dict], dict]:
     """V2.2 的唯一评分生成链路：评分表不再混入正文分批映射。"""
     stats = {"applied": bool(score_packets), "failure_count": 0, "supplement_count": 0,
              "uncovered_clause_ids": [], "group_count": 0, "mode": "direct_assembly"}
     rules: list[dict] = []
-    for index, group in enumerate(_score_packet_assembly_groups(score_packets), start=1):
+    groups = _score_packet_assembly_groups(score_packets)
+    for index, group in enumerate(groups, start=1):
         stats["group_count"] += 1
         try:
             response = _request_task_json(
@@ -1965,6 +2119,15 @@ def _extract_scoring_rules_from_ledger(app, task: dict, profile: dict, system_pr
     stats["fragment_repair_candidate_group_count"] = fragment_repair["candidate_group_count"]
     stats["fragment_repair_merged_count"] = fragment_repair["merged_count"]
     stats["fragment_repair_failure_count"] = fragment_repair["failure_count"]
+    rules, contract_repair = _repair_scoring_contract(
+        app, task, profile, system_prompt, rules, score_packets, groups,
+        declared_total=declared_total, document_id=document_id,
+    )
+    stats["contract_repair_attempted"] = contract_repair["attempted"]
+    stats["contract_repair_applied"] = contract_repair["applied"]
+    stats["contract_repair_failure_count"] = contract_repair["failure_count"]
+    stats["contract_total_expected"] = contract_repair["contract"].get("declared_total")
+    stats["contract_total_actual"] = contract_repair["contract"].get("actual_total")
     covered = {clause_id for item in rules for clause_id in _score_rule_clause_ids(item)}
     stats["uncovered_clause_ids"] = [
         _score_packet_id(packet) for packet in score_packets if _score_packet_id(packet) not in covered
@@ -3670,13 +3833,14 @@ def _extract_rules(app, task: dict) -> dict:
     raw_rules = _normalise_non_score_candidate_contract(raw_rules, source_unit_catalog)
     raw_rules = _filter_non_file_verifiable_candidates(_filter_inapplicable_template_rules(
         _filter_rules_for_package(_dedupe_rule_candidates(raw_rules), package_number), text,
-    ))
+    ), text)
     raw_rules = _attach_source_fact_metadata(raw_rules)
     # V2.2：评分规则不再从每个正文批次重复生成，也不再以“补漏”方式追加到旧候选。
     # 评分原文台账是唯一输入，按评分分部独立组装；未覆盖条款会被显式记录。
     storage.update_task(app, task["task_id"], progress=60, message="正在按评分原文台账组装评分规则")
     score_rules, scoring_assembly = _extract_scoring_rules_from_ledger(
         app, task, profile, system_prompt, score_packets, document_id=tender["document_id"],
+        declared_total=_declared_total_score_from_text(main_text),
     )
     raw_rules.extend(score_rules)
     uncovered_score_packets = [
@@ -3727,7 +3891,9 @@ def _extract_rules(app, task: dict) -> dict:
     ]
     mapped_candidates = _normalise_non_score_candidate_contract(mapped_candidates, source_unit_catalog)
     boundary_excluded_rule_count = len(mapped_candidates)
-    mapped_candidates = _filter_non_file_verifiable_candidates(_filter_rules_for_package(mapped_candidates, package_number))
+    mapped_candidates = _filter_non_file_verifiable_candidates(
+        _filter_rules_for_package(mapped_candidates, package_number), text,
+    )
     boundary_excluded_rule_count -= len(mapped_candidates)
     mapped_candidates = _attach_source_fact_metadata(mapped_candidates)
     # 硬性条款补漏属于候选生成，不属于最终结果补丁。必须在来源台账收口前加入，
@@ -3779,7 +3945,9 @@ def _extract_rules(app, task: dict) -> dict:
     rules = _normalise_non_score_candidate_contract(candidates, source_unit_catalog)
     rules, scoring_source_excluded_rules = _filter_non_score_candidates_from_scoring_ledger(rules, score_packets)
     before_boundary_filter = len(rules)
-    rules = _filter_non_file_verifiable_candidates(_filter_inapplicable_template_rules(_filter_rules_for_package(rules, package_number), text))
+    rules = _filter_non_file_verifiable_candidates(
+        _filter_inapplicable_template_rules(_filter_rules_for_package(rules, package_number), text), text,
+    )
     boundary_excluded_rule_count += before_boundary_filter - len(rules)
     rules, contract_excluded_rules = _enforce_non_score_candidate_contract(rules)
     rules = _attach_source_fact_metadata(rules)
@@ -3964,6 +4132,11 @@ def _extract_rules(app, task: dict) -> dict:
             "scoring_fragment_candidate_group_count": scoring_assembly.get("fragment_repair_candidate_group_count", 0),
             "scoring_fragment_merged_count": scoring_assembly.get("fragment_repair_merged_count", 0),
             "scoring_fragment_failure_count": scoring_assembly.get("fragment_repair_failure_count", 0),
+            "scoring_contract_repair_attempted": bool(scoring_assembly.get("contract_repair_attempted")),
+            "scoring_contract_repair_applied": bool(scoring_assembly.get("contract_repair_applied")),
+            "scoring_contract_repair_failure_count": scoring_assembly.get("contract_repair_failure_count", 0),
+            "scoring_contract_total_expected": scoring_assembly.get("contract_total_expected"),
+            "scoring_contract_total_actual": scoring_assembly.get("contract_total_actual"),
             "quality_gate_applied": quality_gate["applied"],
             "quality_gate_dropped_count": quality_gate["dropped_count"],
             "quality_gate_failure_count": quality_gate["failure_count"],

@@ -126,6 +126,9 @@ def _deployment_version_info() -> dict[str, object]:
     value = {
         "commit": code_commit,
         "code_source": code_source,
+        # 与任务 payload 的 deploy_commit 使用同一运行时版本来源。页面展示必须与
+        # “模型用量 · 最后一次运行”一致；镜像构建标记和部署记录继续保留为诊断信息。
+        "runtime_release_commit": storage.runtime_release_fingerprint(),
         "deploy_record_commit": deploy_record_commit,
         "deploy_recorded_at": deploy_recorded_at,
         "version_consistent": consistent,
@@ -134,8 +137,8 @@ def _deployment_version_info() -> dict[str, object]:
 
 
 def _current_deploy_commit() -> str:
-    """兼容旧调用方：返回实际运行代码版本，而不是未经核验的部署记录。"""
-    return str(_deployment_version_info().get("commit") or "")
+    """任务版本与用量记录的唯一来源，供页面和任务历史一致展示。"""
+    return storage.runtime_release_fingerprint()
 
 
 _REPORT_ROLE_LABELS = {"tender": "主招标文件", "tender_attachment": "招标附件", "bid": "投标文件"}

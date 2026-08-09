@@ -87,16 +87,10 @@
   async function loadBuildInfo() {
     try {
       const info = await request('/build-info');
-      const lines = [`当前运行版本：${info.commit || '未知'}`, `运行进程启动：${info.deployed_at || '未知'}`];
-      if (info.deploy_record_commit && info.deploy_record_commit !== info.commit) {
-        lines.push(`部署记录版本：${info.deploy_record_commit}（与运行代码不一致，请重新部署）`);
-      } else {
-        if (info.deploy_record_commit) lines.push(`部署记录版本：${info.deploy_record_commit}`);
-        if (info.deploy_recorded_at) lines.push(`部署记录更新：${info.deploy_recorded_at}`);
-      }
-      if (info.version_consistent === true) {
-        lines.push('版本核验：一致');
-      }
+      // 与“模型用量 · 最后一次运行”的 deploy_commit 共用后端运行时版本来源。
+      // 镜像构建标记和宿主机部署记录仅用于接口诊断，不能再干扰用户看到的版本号。
+      const runtimeVersion = info.runtime_release_commit || info.commit || '未知';
+      const lines = [`运行版本：${runtimeVersion}`, `运行进程启动：${info.deployed_at || '未知'}`];
       if (info.prompt_version) lines.push(`提示词版本：${info.prompt_version}`);
       $('deploy-version').title = lines.join('\n');
       $('deploy-version-details').textContent = lines.join('\n');

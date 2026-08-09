@@ -3226,7 +3226,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("表格字段、填写格式", PROMPT_TEMPLATES["extract_rules_obligation_compile_user"]["content"])
         self.assertIn("系统仅能核验已上传文件", PROMPT_TEMPLATES["extract_rules_guidance"]["content"])
         self.assertIn("当一条候选仅概述同一表单、附件或材料的格式", PROMPT_TEMPLATES["extract_rules_dedupe_adjudication_user"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v54")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v55")
 
     def test_scope_chapter_and_text_error_guidance_present(self):
         from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
@@ -3244,7 +3244,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(text_marker, PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("必须点名最具辨识度的偏离对象", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("risk_level 应为 high", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v54")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v55")
 
     def test_ocr_visual_contracts_deduplicated_but_keep_hard_constraints(self):
         from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
@@ -4746,6 +4746,10 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertTrue(worker._is_external_payment_without_file_evidence(payment_only))
         self.assertFalse(worker._is_external_payment_without_file_evidence(payment_evidence))
         self.assertFalse(worker._is_external_payment_without_file_evidence(reverse_payment_evidence))
+        self.assertFalse(worker._is_external_payment_without_file_evidence(
+            payment_only,
+            "投标文件应包括：投标保证金凭证。投标人不按要求提交投标保证金的，否决其响应。",
+        ))
         self.assertEqual(
             worker._filter_non_file_verifiable_candidates([
                 method_summary, concrete, payment_only, payment_evidence, reverse_payment_evidence,
@@ -5891,7 +5895,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不限定行业或采购类型", guidance)
         scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v54")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v55")
 
     def test_full_scan_does_not_reinject_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")
@@ -6197,6 +6201,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         info = response.get_json()
         self.assertIn("commit", info)
+        self.assertIn("runtime_release_commit", info)
         self.assertIn("deployed_at", info)
         self.assertIn("deploy_recorded_at", info)
         self.assertIn("prompt_version", info)
@@ -6208,14 +6213,22 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         (root / ".build-commit").write_text("abc1234\n", encoding="utf-8")
         (root / "tools" / ".deploy-commit").write_text("def5678\n", encoding="utf-8")
         with patch.object(evaluation_workbench_module, "_PROJECT_ROOT", root), \
+             patch.object(storage, "runtime_release_fingerprint", return_value="def5678"), \
              patch.dict(os.environ, {"DEPLOY_COMMIT": "def5678"}):
             info = evaluation_workbench_module._deployment_version_info()
 
         self.assertEqual(info["commit"], "abc1234")
         self.assertEqual(info["code_source"], "image")
+        self.assertEqual(info["runtime_release_commit"], "def5678")
         self.assertEqual(info["deploy_record_commit"], "def5678")
         self.assertTrue(info["deploy_recorded_at"])
         self.assertFalse(info["version_consistent"])
+
+    def test_task_version_uses_same_runtime_release_source_as_blue_dot(self):
+        with patch.object(storage, "runtime_release_fingerprint", return_value="run-version"):
+            self.assertEqual(evaluation_workbench_module._current_deploy_commit(), "run-version")
+            info = evaluation_workbench_module._deployment_version_info()
+        self.assertEqual(info["runtime_release_commit"], "run-version")
 
     def test_token_usage_endpoint_includes_latest_evaluation_run(self):
         task = storage.create_task(
@@ -7178,6 +7191,87 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             )
         self.assertEqual(repaired, rules)
         self.assertEqual(stats["failure_count"], 1)
+
+    def test_score_section_header_never_treats_specific_item_as_section(self):
+        self.assertIsNone(worker._SCORE_SECTION_PARENT_PATTERN.match(
+            "技术参数每有一项负偏离扣0.5分，扣完（24分）为止。"
+        ))
+        self.assertIsNotNone(worker._SCORE_SECTION_PARENT_PATTERN.match("技术评审：44分"))
+        self.assertIsNotNone(worker._SCORE_SECTION_PARENT_PATTERN.match("商务资信评审（46分）"))
+
+    def test_scoring_assembly_groups_keep_continuous_pages_together(self):
+        packets = [
+            {"clause_id": "SC-doc-P30-1", "source_document_key": "doc", "source_page": 30,
+             "text": "实施方案得10分。", "score_section": {"section_id": "SS-1"}},
+            {"clause_id": "SC-doc-P31-1", "source_document_key": "doc", "source_page": 31,
+             "text": "C档得5分，D档不得分。", "score_section": {}},
+            {"clause_id": "SC-doc-P31-2", "source_document_key": "doc", "source_page": 31,
+             "text": "技术指标满足得24分。", "score_section": {"section_id": "SS-2"}},
+            {"clause_id": "SC-other-P1-1", "source_document_key": "other", "source_page": 1,
+             "text": "报价得10分。", "score_section": {}},
+        ]
+        groups = worker._score_packet_assembly_groups(packets)
+        self.assertEqual(
+            [[packet["clause_id"] for packet in group] for group in groups],
+            [["SC-doc-P30-1", "SC-doc-P31-1", "SC-doc-P31-2"], ["SC-other-P1-1"]],
+        )
+
+    def test_score_packets_keep_cross_page_grade_tail_in_same_assembly_group(self):
+        text = "\n".join([
+            "[第30页]", "技术评审：20分", "1、售后服务方案", "A、方案完整每项得2分。",
+            "B、方案较完整每项得1.5分。", "[第31页]", "C、方案一般每项得1分。",
+            "D、不提供者不得分。", "2、技术指标响应（10分）", "满足全部指标得10分。",
+            "每有一项负偏离扣1分，扣完为止。",
+        ])
+        packets = worker._score_clause_packets(text, source_document_key="doc")
+        groups = worker._score_packet_assembly_groups(packets)
+        self.assertGreaterEqual(len(packets), 3)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual({item["source_page"] for item in groups[0]}, {30, 31})
+
+    def test_scoring_contract_repair_only_replaces_valid_total_conserving_result(self):
+        packets = [
+            {"clause_id": "SC-doc-P8-1", "source_document_key": "doc", "source_page": 8,
+             "text": "技术指标全部满足得10分。", "score_section": {}},
+            {"clause_id": "SC-doc-P8-2", "source_document_key": "doc", "source_page": 8,
+             "text": "每有一项负偏离扣1分，扣完为止。", "score_section": {}},
+        ]
+        broken = [
+            {"category": "objective", "title": "技术指标", "check_rule": "满足得10分",
+             "source_text": "技术指标全部满足得10分", "source_clause_ids": ["SC-doc-P8-1"],
+             "scoring": {"max_score": 10, "kind": "manual"}},
+            {"category": "subjective", "title": "技术参数扣分", "check_rule": "每项扣1分",
+             "source_text": "每项负偏离扣1分", "source_clause_ids": ["SC-doc-P8-2"],
+             "scoring": {"max_score": 10, "kind": "manual"}},
+        ]
+        repaired_rule = {
+            "category": "objective", "title": "技术指标响应", "check_rule": "满足得10分；每项负偏离扣1分。",
+            "source_text": "技术指标全部满足得10分；每有一项负偏离扣1分。",
+            "source_clause_ids": ["SC-doc-P8-1", "SC-doc-P8-2"],
+            "scoring": {"max_score": 10, "kind": "manual"},
+        }
+        with patch("dashboard.evaluation_workbench.worker._request_task_json", return_value={"rules": [repaired_rule]}):
+            repaired, stats = worker._repair_scoring_contract(
+                self.app, {"task_id": "task-score-contract"}, {"profile_id": "profile-1"}, "system",
+                broken, packets, [packets], declared_total=10, document_id="doc-1",
+            )
+        self.assertTrue(stats["attempted"])
+        self.assertTrue(stats["applied"])
+        self.assertEqual([item["title"] for item in repaired], ["技术指标响应"])
+        self.assertEqual(worker._score_rules_total(repaired), 10)
+
+    def test_scoring_contract_repair_does_not_run_for_valid_result(self):
+        packets = [{"clause_id": "SC-doc-P8-1", "source_document_key": "doc", "source_page": 8,
+                    "text": "报价得10分。", "score_section": {}}]
+        rules = [{"category": "objective", "title": "报价", "check_rule": "报价得10分",
+                  "source_text": "报价得10分", "source_clause_ids": ["SC-doc-P8-1"],
+                  "scoring": {"max_score": 10}}]
+        repaired, stats = worker._repair_scoring_contract(
+            self.app, {"task_id": "task-score-contract-ok"}, {"profile_id": "profile-1"}, "system",
+            rules, packets, [packets], declared_total=10, document_id="doc-1",
+        )
+        self.assertFalse(stats["attempted"])
+        self.assertEqual(repaired, rules)
 
     def test_source_fact_ids_survive_rule_set_storage_round_trip(self):
         storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-source", [{
