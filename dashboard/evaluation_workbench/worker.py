@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import itertools
 import hashlib
 import json
@@ -618,8 +619,12 @@ _SCORE_CLAUSE_PATTERN = re.compile(
 )
 _SCORE_SECTION_PARENT_PATTERN = re.compile(
     r"^\s*((?:(?:第\s*[一二三四五六七八九十\d]+\s*部分)\s*[：:]?\s*)?"
-    r"(?:价格|商务|技术|服务|资格)(?:部分)?(?:客观|主观)?(?:评分|评审项)?)[^（(]{0,20}?[（(]\s*(\d+(?:\.\d+)?)\s*分\s*[）)]"
+    r"(?:价格|商务|技术|服务|资格)(?:部分)?(?:客观|主观)?(?:评分|评审项)?)"
+    r"(?:[^（(:：]{0,20}?[（(]\s*(\d+(?:\.\d+)?)\s*分\s*[）)]|\s*[：:]\s*(\d+(?:\.\d+)?)\s*分)"
 )
+_SCORE_TABLE_BOUNDARY_PATTERN = re.compile(r"条款号|评审因素|评分因素|评审标准|评分标准|分值构成|总分\s*\d+\s*分")
+_SCORE_GRADE_FRAGMENT_PATTERN = re.compile(r"^[A-HＡ-Ｈ甲乙丙丁戊己庚辛][、.．:：]")
+_SCORE_NEGATIVE_FRAGMENT_PATTERN = re.compile(r"^[^。；;]{0,40}(?:未提供|不提供|未附|未按|有(?:保留|否定)|无法表示|缺失|不满足|不符合|未响应).{0,90}(?:得\s*0\s*分|不得分)")
 _SCORE_COVERAGE_IGNORED_TERMS = {"项目", "评分", "标准", "要求", "供应", "服务", "能力", "部分", "内容", "提供", "文件", "采购", "投标", "技术", "商务"}
 _QUALIFICATION_SOURCE_PATTERN = re.compile(
     r"(?:投标人|供应商|申请人|响应人|竞标人)(?:的)?(?:资格(?:条件|要求)|应具备的资格条件)|"
@@ -867,6 +872,24 @@ def _filter_inapplicable_template_rules(rules: list[dict], tender_text: str) -> 
     return kept
 
 
+def _filter_non_file_verifiable_candidates(rules: list[dict]) -> list[dict]:
+    """只采信模型显式标记为可由单份投标文件核验的非评分候选。
+
+    缺少新字段的历史模型输出保持兼容，仍交由既有提示词和人工确认；不会凭关键词
+    静默删除规则。新输出若明确承认依赖横向比较或评审程序，则在来源映射阶段剔除。
+    """
+    kept: list[dict] = []
+    for item in rules:
+        if not isinstance(item, dict):
+            continue
+        category = str(item.get("category") or "")
+        scope = str(item.get("verifiability") or "").strip()
+        if category not in {"objective", "subjective"} and scope in {"cross_bid", "external_procedure"}:
+            continue
+        kept.append(item)
+    return kept
+
+
 _NON_FILE_SCORING_PROCESS_PATTERN = re.compile(
     r"异常低价|澄清(?:说明)?|补正|谈判|投诉|算术(?:更正|修正)|评审现场"
 )
@@ -903,6 +926,66 @@ def _project_package_scope_instruction(app, project: dict) -> tuple[int | None, 
     )
     return package_number, instruction
 
+
+def _score_context_start(lines: list[str], index: int) -> int:
+    """定位评分行的近邻表格上下文，不把上一评分项、页脚或分部汇总带入。"""
+    page_start = 0
+    for position in range(index, -1, -1):
+        if re.fullmatch(r"\[第\d+页\]", str(lines[position] or "").strip()):
+            page_start = position + 1
+            break
+    start = max(page_start, index - 16)
+    compact_current = re.sub(r"\s+", "", str(lines[index] or ""))
+    # 新页第一个计分行以“每/最高/得/扣”开头时，常是上一页标题、材料清单或
+    # 叶子项的续行。只接回“上一评分行之后”的有限上下文，不把整张上一页带入。
+    page_has_score = any(
+        _SCORE_CLAUSE_PATTERN.search(re.sub(r"\s+", "", str(lines[position] or "")))
+        for position in range(page_start, index)
+    )
+    page_prefix_content = any(
+        str(lines[position] or "").strip()
+        and not re.fullmatch(r"\d{1,4}", str(lines[position] or "").strip())
+        for position in range(page_start, index)
+    )
+    continuation_opening = bool(re.match(r"^(?:每|最高|得|扣|[（(]\d)", compact_current))
+    if page_start and not page_has_score and not page_prefix_content and continuation_opening:
+        cross_page_start = max(0, page_start - 12)
+        for previous in range(page_start - 1, cross_page_start - 1, -1):
+            compact = re.sub(r"\s+", "", str(lines[previous] or ""))
+            if _SCORE_CLAUSE_PATTERN.search(compact):
+                start = previous + 1
+                break
+    for previous in range(index - 1, page_start - 1, -1):
+        compact = re.sub(r"\s+", "", str(lines[previous] or ""))
+        if _SCORE_GRADE_FRAGMENT_PATTERN.match(compact) and "不得分" in compact:
+            start = previous + 1
+            break
+        if _SCORE_TABLE_BOUNDARY_PATTERN.search(compact):
+            start = previous + 1
+            break
+        if _SCORE_CLAUSE_PATTERN.search(compact):
+            start = previous + 1
+            break
+    return start
+
+
+def _score_packet_page(lines: list[str], index: int) -> int:
+    marker = next((
+        lines[position] for position in range(index, max(-1, index - 300), -1)
+        if re.fullmatch(r"\[第\d+页\]", str(lines[position] or "").strip())
+    ), "")
+    match = re.search(r"第\s*(\d+)\s*页", str(marker))
+    return int(match.group(1)) if match else 0
+
+
+def _score_packet_is_label_only(packet: dict) -> bool:
+    """表格中“项目名称（X分）”随后另起行写计分条件时，前者只是该项标题。"""
+    line = re.sub(r"\s+", "", str(packet.get("score_line") or ""))
+    if not re.search(r"[（(]\d+(?:\.\d+)?分[）)]", line):
+        return False
+    return not bool(re.search(r"(?:得|每项|每个|每人|每处|最高|满分|扣)\s*\d", line))
+
+
 def _score_clause_packets(text: str, limit: int = 240, *, source_document_key: str = "") -> list[dict]:
     """为每个明确计分行构造带分部归属的稳定评分条款台账。
 
@@ -918,21 +1001,15 @@ def _score_clause_packets(text: str, limit: int = 240, *, source_document_key: s
     for index, line in enumerate(lines):
         section_match = _SCORE_SECTION_PARENT_PATTERN.match(line)
         if section_match:
-            page_marker = next((
-                lines[position] for position in range(index, max(-1, index - 300), -1)
-                if re.fullmatch(r"\[第\d+页\]", lines[position])
-            ), "")
-            page_match = re.search(r"第\s*(\d+)\s*页", page_marker)
-            page = int(page_match.group(1)) if page_match else 0
+            page = _score_packet_page(lines, index)
             section_ordinal += 1
+            section_score = section_match.group(2) or section_match.group(3)
             active_section = {
                 "section_id": f"SS-{document_key}-P{page}-{section_ordinal}" if document_key else f"SS-{page}-{section_ordinal}",
                 "label": re.sub(r"\s+", "", section_match.group(1)),
-                "max_score": float(section_match.group(2)),
+                "max_score": float(section_score),
                 "source_page": page,
             }
-        if not _SCORE_CLAUSE_PATTERN.search(re.sub(r"\s+", "", line)):
-            continue
         # PDF 评分表在分页处常把同一评分项拆为“标题及前两个子项”与
         # “（1.5分）、其余子项”。后者不是新的计分事实，应续接到前一个完整
         # 评分包，防止模型生成错误标题的重复评分规则。
@@ -941,28 +1018,38 @@ def _score_clause_packets(text: str, limit: int = 240, *, source_document_key: s
             if continuation and continuation not in packets[-1]["text"]:
                 packets[-1]["text"] = (packets[-1]["text"] + "\n" + continuation)[:1_400]
                 packets[-1]["score_line"] = (packets[-1]["score_line"] + " " + continuation)[:520]
+                page = _score_packet_page(lines, index)
+                pages = packets[-1].setdefault("source_pages", [packets[-1].get("source_page")])
+                if page and page not in pages:
+                    pages.append(page)
+            continue
+        if packets and not packets[-1].get("is_section_summary") and _SCORE_CLAUSE_PATTERN.search(re.sub(r"\s+", "", line)) and _score_packet_is_label_only(packets[-1]) and not _score_packet_is_label_only({"score_line": line}):
+            continuation = str(line or "").strip()
+            if continuation and continuation not in packets[-1]["text"]:
+                packets[-1]["text"] = (packets[-1]["text"] + "\n" + continuation)[:1_400]
+                packets[-1]["score_line"] = (packets[-1]["score_line"] + " " + continuation)[:520]
+                page = _score_packet_page(lines, index)
+                pages = packets[-1].setdefault("source_pages", [packets[-1].get("source_page")])
+                if page and page not in pages:
+                    pages.append(page)
+            continue
+        if not _SCORE_CLAUSE_PATTERN.search(re.sub(r"\s+", "", line)):
             continue
         # 评分表经 PDF 文本抽取后，项目名称、证明材料和计分行可能被分页符和大量空行
         # 分开。不能把分页符当作新评分项边界；最近一条明确计分行才是可靠边界。
         # 仍限制回看窗口，避免把整张长表误并为一个条款。
-        start = max(0, index - 48)
-        for previous in range(index - 1, start - 1, -1):
-            compact_previous = re.sub(r"\s+", "", lines[previous])
-            if _SCORE_CLAUSE_PATTERN.search(compact_previous):
-                start = previous + 1
-                break
-        value = "\n".join(item for item in lines[start:index + 1] if item)[:900]
+        start = _score_context_start(lines, index)
+        value = "\n".join(
+            item for item in lines[start:index + 1]
+            if item and not re.fullmatch(r"\[第\d+页\]", str(item).strip())
+            and not re.fullmatch(r"\d{1,4}", str(item).strip())
+        )[:900]
         if value:
             compact = re.sub(r"\s+", "", value)
-            page_marker = next((
-                lines[position] for position in range(index, max(-1, index - 300), -1)
-                if re.fullmatch(r"\[第\d+页\]", lines[position])
-            ), "")
             # 稳定条款 ID：按“页码 + 该页内条款顺序”生成，不依赖内容哈希。
             # 招标文件与解析顺序稳定时，同一评分条款跨版本 ID 相同，继承/覆盖
             # 审计/补漏都用它做确定性锚；打包逻辑调整只影响“同代确定、跨代尽力”。
-            page_match = re.search(r"第\s*(\d+)\s*页", page_marker)
-            page = int(page_match.group(1)) if page_match else 0
+            page = _score_packet_page(lines, index)
             seq = sum(1 for existing in packets if existing.get("source_page") == page) + 1
             clause_id = (
                 f"SC-{document_key}-P{page}-{seq}" if document_key and page else
@@ -974,6 +1061,7 @@ def _score_clause_packets(text: str, limit: int = 240, *, source_document_key: s
                 "text": value,
                 "score_line": line[:360],
                 "source_page": page,
+                "source_pages": [page] if page else [],
                 "score_section": dict(active_section) if active_section else None,
                 # 保留父项包只为兼容既有分页/续行解析与审计；进入模型评分覆盖
                 # 和最终规则台账前会单独滤除，绝不把它当成可执行叶子评分项。
@@ -1129,6 +1217,126 @@ def _split_rule_extraction_text(text: str, max_chars: int) -> list[str]:
     return chunks or [value[:max_chars]]
 
 
+def _source_units_for_text(text: str, *, source_document_key: str) -> list[dict]:
+    """将非评分提取依据预先切成稳定原文单元。
+
+    单元身份来自“文件 + PDF 页 + 单元顺序 + 原文”，而非模型回传的摘录。
+    页面内优先按空行保留自然段；对 PDF 将整页压成一段的情况再按有限行数组块，
+    既避免一个单元过大，也不按业务关键词切分。
+    """
+    document_key = hashlib.sha1(str(source_document_key).encode("utf-8")).hexdigest()[:8]
+    pages = [value.strip() for value in re.split(r"(?=\[第\d+页\])", str(text or "")) if value.strip()]
+    if not pages:
+        pages = [str(text or "").strip()] if str(text or "").strip() else []
+    units: list[dict] = []
+    for page_index, page_text in enumerate(pages, start=1):
+        marker = re.match(r"\[第(\d+)页\]\s*", page_text)
+        page = int(marker.group(1)) if marker else page_index
+        body = page_text[marker.end():].strip() if marker else page_text.strip()
+        paragraphs = [part.strip() for part in re.split(r"\n\s*\n+", body) if part.strip()]
+        if not paragraphs:
+            continue
+        ordinal = 0
+        for paragraph in paragraphs:
+            lines = [line.strip() for line in paragraph.splitlines() if line.strip()]
+            pieces: list[str] = []
+            current: list[str] = []
+            size = 0
+            for line in lines:
+                if current and (size + len(line) + 1 > 900 or len(current) >= 8):
+                    pieces.append("\n".join(current))
+                    current, size = [], 0
+                current.append(line)
+                size += len(line) + 1
+            if current:
+                pieces.append("\n".join(current))
+            for piece in pieces or [paragraph]:
+                value = piece.strip()
+                if not value:
+                    continue
+                ordinal += 1
+                digest = hashlib.sha1(re.sub(r"\s+", "", value).encode("utf-8")).hexdigest()[:8]
+                units.append({
+                    "unit_id": f"SU-{document_key}-P{page}-{ordinal}-{digest}",
+                    "page": page,
+                    "text": value,
+                })
+    return units
+
+
+def _source_unit_batches(units: list[dict], max_chars: int) -> list[tuple[str, dict[str, dict]]]:
+    """按完整原文单元分批，绝不把单元截半后再要求模型定位来源。"""
+    batches: list[tuple[str, dict[str, dict]]] = []
+    current: list[str] = []
+    catalog: dict[str, dict] = {}
+    size = 0
+    for unit in units:
+        unit_id = str(unit.get("unit_id") or "")
+        value = str(unit.get("text") or "").strip()
+        if not unit_id or not value:
+            continue
+        rendered = f"【原文单元 {unit_id} / 第{unit.get('page') or '?'}页】\n{value}"
+        if current and size + len(rendered) + 2 > max_chars:
+            batches.append(("\n\n".join(current), catalog))
+            current, catalog, size = [], {}, 0
+        current.append(rendered)
+        catalog[unit_id] = {"page": unit.get("page"), "text": value}
+        size += len(rendered) + 2
+    if current:
+        batches.append(("\n\n".join(current), catalog))
+    return batches
+
+
+def _normalise_source_unit_ids(value: object, catalog: dict[str, dict] | None = None) -> list[str]:
+    values = value if isinstance(value, list) else []
+    known = set(catalog or {})
+    return list(dict.fromkeys(
+        item for raw in values
+        if (item := str(raw or "").strip()) and (not known or item in known)
+    ))
+
+
+def _attach_rule_source_units(rules: list[dict], catalog: dict[str, dict] | None) -> list[dict]:
+    """校验模型引用的原文单元；缺字段时仅以唯一直接摘录回填。"""
+    if not catalog:
+        return rules
+    result: list[dict] = []
+    for item in rules:
+        if not isinstance(item, dict):
+            continue
+        value = dict(item)
+        if value.get("category") in {"objective", "subjective"}:
+            result.append(value)
+            continue
+        unit_ids = _normalise_source_unit_ids(value.get("source_unit_ids"), catalog)
+        if not unit_ids:
+            source = storage._normalise_rule_source(value.get("source_text"))
+            matches = [
+                unit_id for unit_id, unit in catalog.items()
+                if len(source) >= 12 and (
+                    source in storage._normalise_rule_source(unit.get("text"))
+                    or storage._normalise_rule_source(unit.get("text")) in source
+                )
+            ]
+            if len(matches) == 1:
+                unit_ids = matches
+            elif matches and all(
+                len(storage._normalise_rule_source(catalog[unit_id].get("text"))) >= 20
+                and storage._normalise_rule_source(catalog[unit_id].get("text")) in source
+                for unit_id in matches
+            ):
+                # 模型未回传 ID、但摘录明确覆盖多个相邻原文单元时，保留全部直接
+                # 支撑单元；这不是按标题或语义猜测，仍可稳定追溯和去重。
+                unit_ids = matches
+        value["source_unit_ids"] = unit_ids
+        if len(unit_ids) == 1 and not isinstance(value.get("source_page"), int):
+            page = catalog[unit_ids[0]].get("page")
+            if isinstance(page, int) and page > 0:
+                value["source_page"] = page
+        result.append(value)
+    return result
+
+
 def _score_packet_prompt_text(score_packets: list[object]) -> str:
     values = []
     for index, packet in enumerate(score_packets, start=1):
@@ -1197,10 +1405,13 @@ def _rule_extraction_prompt(app, text: str, *, compact: bool, score_packets: lis
         if include_scoring and score_audit else
         "本批仅提取非评分审查事实；不得输出 objective 或 subjective，也不要把评分表、评分公式、分值或评委评分动作改写为非评分规则。"
     )
-    return storage.render_prompt_template(
+    prompt = storage.render_prompt_template(
         app, "extract_rules_user", limits=limits, score_requirement=score_requirement,
         score_audit=score_audit or "无", review_anchor_catalog=review_anchor_catalog, text=text,
     )
+    if not include_scoring:
+        prompt = f"{prompt}\n\n【原文台账约束】\n{storage.render_prompt_template(app, 'extract_rules_source_ledger_contract')}"
+    return prompt
 
 
 def _score_rule_supplement_prompt(app, score_packets: list[object], existing_rules: list[dict]) -> str:
@@ -1288,7 +1499,7 @@ def _normalise_scoring_assembly_rules(value: object, score_packets: list[dict]) 
 
 def _extract_scoring_rules_from_ledger(app, task: dict, profile: dict, system_prompt: str,
                                        score_packets: list[dict], *, document_id: str) -> tuple[list[dict], dict]:
-    """V2.1 的唯一评分生成链路：评分表不再混入正文分批映射。"""
+    """V2.2 的唯一评分生成链路：评分表不再混入正文分批映射。"""
     stats = {"applied": bool(score_packets), "failure_count": 0, "supplement_count": 0,
              "uncovered_clause_ids": [], "group_count": 0, "mode": "direct_assembly"}
     rules: list[dict] = []
@@ -1432,236 +1643,6 @@ def _score_structure_repair_prompt(app, rules: list[dict], score_packets: list[o
     )
 
 
-def _scoring_reconciliation_packet(score_packets: list[object], char_limit: int) -> str | None:
-    """以完整条款为单位压缩评分表，不能把半条 JSON 送给结构复核。"""
-    values, size = [], 2
-    for index, packet in enumerate(score_packets, start=1):
-        value = {
-            "clause_id": _score_packet_id(packet) or f"SC-{index}",
-            # 评分行及其最近上下文优先，保留父项标题、计分对象和分值。
-            "text": _score_packet_text(packet)[:900],
-        }
-        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-        if values and size + len(encoded) + 1 > char_limit:
-            return None
-        values.append(value)
-        size += len(encoded) + 1
-    return json.dumps(values, ensure_ascii=False, separators=(",", ":"))
-
-
-def _normalise_reconciled_scoring_rules(value: object, score_packets: list[object]) -> list[dict] | None:
-    """仅接受可完整覆盖原评分条款的结构复核结果，异常时仍使用上一阶段结果。"""
-    if not isinstance(value, list) or not value:
-        return None
-    known_clause_ids = {_score_packet_id(packet) for packet in score_packets if _score_packet_id(packet)}
-    rules = _dedupe_rule_candidates([item for item in value if isinstance(item, dict)])
-    if not rules:
-        return None
-    for rule in rules:
-        if rule.get("category") not in {"objective", "subjective"}:
-            return None
-        if not str(rule.get("title") or "").strip() or not str(rule.get("check_rule") or "").strip():
-            return None
-        scoring = rule.get("scoring") if isinstance(rule.get("scoring"), dict) else {}
-        if storage._valid_max_score(scoring) is None:
-            return None
-        scoring = dict(scoring)
-        scoring["kind"] = "manual" if rule["category"] == "subjective" else (
-            "boolean" if scoring.get("kind") == "boolean" and not scoring.get("items") else "manual"
-        )
-        rule["scoring"] = scoring
-        clause_ids = rule.get("source_clause_ids")
-        if not isinstance(clause_ids, list) or not clause_ids:
-            return None
-        if any(str(clause_id) not in known_clause_ids for clause_id in clause_ids):
-            return None
-    # 不以“分数相加恰好 100”代替结构完整性；各项目总分可能不是 100。
-    # 每个原始评分条款均须明确映射，防止模型为删重而静默丢掉叶子项。
-    if any(not _score_packet_is_covered(packet, rules) for packet in score_packets):
-        return None
-    # 结构复核的输出必须满足“一个原文评分条款只有一个最终归属”。可由父项
-    # 叶子结构证明的重叠在本地收敛；其余冲突不能交给后续页面或综合评审猜测，
-    # 直接拒绝本次模型改写并回退到上游候选，避免用不完整的复核结果覆盖原始证据。
-    rules, ledger = _canonicalise_score_ledger(rules, score_packets)
-    if ledger["conflict_count"]:
-        return None
-    return rules
-
-
-def _reconcile_scoring_rules(app, task: dict, profile: dict, system_prompt: str,
-                             rules: list[dict], score_packets: list[object]) -> tuple[list[dict], dict]:
-    """对评分表做一次独立结构复核，修正类别/归属而不触碰非评分规则。"""
-    stats = {"applied": False, "failure_count": 0}
-    scoring_rules = [item for item in rules if item.get("category") in {"objective", "subjective"}]
-    if not score_packets or not scoring_rules:
-        return rules, stats
-    input_limit = min(_prompt_char_limit(profile, 90_000, 140_000), 140_000)
-    packets = _scoring_reconciliation_packet(score_packets, input_limit)
-    score_rules_packet = _rule_compilation_packet(scoring_rules, input_limit)
-    try:
-        if packets is None:
-            raise ValueError("评分条款过长，未执行结构复核")
-        parsed_score_rules = json.loads(score_rules_packet)
-        if not isinstance(parsed_score_rules, list) or len(parsed_score_rules) != len(scoring_rules):
-            raise ValueError("当前评分规则过长，未执行结构复核")
-        storage.update_task(app, task["task_id"], progress=76, message="正在复核评分表的分部、类别与重复项")
-        try:
-            response = _request_task_json(
-                app, task, profile, "extract_rules_scoring_reconcile", system_prompt,
-                storage.render_prompt_template(
-                    app, "extract_rules_scoring_reconcile_user", score_packets=packets,
-                    score_rules=score_rules_packet,
-                ),
-                context_mode="rule_scoring_structure_reconcile",
-                max_tokens=_output_token_budget(profile, max(4_500, min(10_000, 1_200 + len(scoring_rules) * 460))),
-                thinking_mode="disabled",
-            )
-        except InvalidJsonResponse as exc:
-            response = _repair_invalid_json(
-                app, task, profile, "extract_rules_scoring_reconcile_json_repair", exc, "rules",
-            )
-        reconciled = _normalise_reconciled_scoring_rules(
-            response.get("rules") if isinstance(response, dict) else None, score_packets,
-        )
-        if reconciled is None:
-            raise ValueError("评分结构复核未返回完整、可追溯的评分规则")
-        non_scoring_rules = [item for item in rules if item.get("category") not in {"objective", "subjective"}]
-        stats["applied"] = True
-        return _dedupe_rule_candidates(non_scoring_rules + reconciled), stats
-    except ValueError as exc:
-        stats["failure_count"] = 1
-        storage.update_task(app, task["task_id"], message=f"评分结构复核未完成，已保留原评分规则：{exc}")
-        return rules, stats
-
-
-def _scoring_plan_rule_packet(rules: list[dict], char_limit: int) -> str | None:
-    """构造轻量评分来源分组输入，不再要求模型重写整套评分规则。"""
-    values = []
-    size = 2
-    for index, item in enumerate(rules, start=1):
-        scoring = item.get("scoring") if isinstance(item.get("scoring"), dict) else {}
-        value = {
-            "rule_id": f"SR{index}",
-            "category": item.get("category"),
-            "title": str(item.get("title") or "")[:100],
-            "source_text": str(item.get("source_text") or "")[:520],
-            "source_clause_ids": sorted(_score_rule_clause_ids(item)),
-            "max_score": storage._valid_max_score(scoring),
-            "scoring_items": scoring.get("items") if isinstance(scoring.get("items"), list) else [],
-        }
-        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-        if values and size + len(encoded) + 1 > char_limit:
-            return None
-        values.append(value)
-        size += len(encoded) + 1
-    return json.dumps(values, ensure_ascii=False, separators=(",", ":"))
-
-
-def _apply_scoring_source_plan(rules: list[dict], score_packets: list[object], assignments: object) -> list[dict] | None:
-    """按模型返回的来源分组确定性收口评分候选。
-
-    此处不接收模型重写的标题、分值或规则文字，只允许其为现有候选分配原文条款
-    ID。这样评分表的业务文本只在原始提取阶段生成一次，后续不会被“结构复核”再次
-    改写。无法证明的候选保持原样，宁可交给人工确认，也不静默删除。
-    """
-    if not isinstance(assignments, list):
-        return None
-    score_indexes = [index for index, item in enumerate(rules) if item.get("category") in {"objective", "subjective"}]
-    if not score_indexes:
-        return rules
-    known_ids = {_score_packet_id(packet) for packet in score_packets if _score_packet_id(packet)}
-    id_to_index = {f"SR{position + 1}": index for position, index in enumerate(score_indexes)}
-    owners: dict[str, int] = {}
-    for assignment in assignments:
-        if not isinstance(assignment, dict):
-            return None
-        rule_index = id_to_index.get(str(assignment.get("rule_id") or ""))
-        clause_ids = assignment.get("source_clause_ids")
-        if rule_index is None or not isinstance(clause_ids, list) or not clause_ids:
-            return None
-        for clause_id in clause_ids:
-            clause_id = str(clause_id).strip()
-            if clause_id not in known_ids or clause_id in owners:
-                return None
-            owners[clause_id] = rule_index
-    # 只有完整覆盖才启用新计划，避免模型在压缩输出时静默遗漏评分条款。
-    if owners.keys() != known_ids:
-        return None
-
-    result = [dict(item) if isinstance(item, dict) else item for item in rules]
-    assigned_by_rule: dict[int, list[str]] = {}
-    for clause_id, rule_index in owners.items():
-        assigned_by_rule.setdefault(rule_index, []).append(clause_id)
-    for rule_index, clause_ids in assigned_by_rule.items():
-        result[rule_index]["source_clause_ids"] = sorted(clause_ids)
-
-    # 仅删除“来源已完整由另一规则承接”的重复评分副本。无锚点且无法由原文确定
-    # 判断的候选一律保留，保证 V2 不会因模型计划失误损失既有评分能力。
-    removable: set[int] = set()
-    for index in score_indexes:
-        if index in assigned_by_rule:
-            continue
-        candidate = result[index]
-        candidate_matches = {
-            _score_packet_id(packet) for packet in score_packets
-            if _score_packet_is_covered(packet, [candidate])
-        }
-        if not candidate_matches:
-            continue
-        owners_for_candidate = {owners.get(clause_id) for clause_id in candidate_matches}
-        if None in owners_for_candidate or len(owners_for_candidate) != 1:
-            continue
-        owner_index = next(iter(owners_for_candidate))
-        owner = result[owner_index]
-        # 仅当候选原文与已选规则可证明同源，或候选自身明确挂接的条款已被完全承接
-        # 时才移除；这条门槛避免“同分同类但不同项目”的误合并。
-        own_ids = _score_rule_clause_ids(candidate)
-        same_source = _score_sources_compatible(candidate.get("source_text"), owner.get("source_text")) \
-            or storage._score_sources_contain(candidate.get("source_text"), owner.get("source_text"))
-        if own_ids and own_ids.issubset(set(assigned_by_rule[owner_index])):
-            removable.add(index)
-        elif same_source:
-            removable.add(index)
-
-    return [item for index, item in enumerate(result) if index not in removable]
-
-
-def _plan_scoring_rule_sources(app, task: dict, profile: dict, system_prompt: str,
-                               rules: list[dict], score_packets: list[object]) -> tuple[list[dict], dict]:
-    """V2：让模型只做评分来源分组，再由本地完成确定性落库。"""
-    stats = {"applied": False, "failure_count": 0, "mode": "source_plan"}
-    scoring_rules = [item for item in rules if item.get("category") in {"objective", "subjective"}]
-    if not score_packets or not scoring_rules:
-        return rules, stats
-    input_limit = min(_prompt_char_limit(profile, 90_000, 140_000), 140_000)
-    packets = _scoring_reconciliation_packet(score_packets, input_limit)
-    candidates = _scoring_plan_rule_packet(scoring_rules, input_limit)
-    try:
-        if packets is None or candidates is None:
-            raise ValueError("评分来源台账过长，未执行来源分组")
-        storage.update_task(app, task["task_id"], progress=76, message="正在按评分原文台账归并评分规则")
-        response = _request_task_json(
-            app, task, profile, "extract_rules_scoring_source_plan", system_prompt,
-            storage.render_prompt_template(
-                app, "extract_rules_scoring_plan_user", score_packets=packets, score_rules=candidates,
-            ),
-            context_mode="rule_scoring_source_plan",
-            max_tokens=_output_token_budget(profile, max(2_500, min(5_000, 800 + len(scoring_rules) * 120))),
-            thinking_mode="disabled",
-        )
-        planned = _apply_scoring_source_plan(
-            rules, score_packets, response.get("assignments") if isinstance(response, dict) else None,
-        )
-        if planned is None:
-            raise ValueError("评分来源分组未返回完整且唯一的条款归属")
-        stats["applied"] = True
-        return planned, stats
-    except ValueError as exc:
-        stats["failure_count"] = 1
-        storage.update_task(app, task["task_id"], message=f"评分来源分组未完成，已保留原评分规则：{exc}")
-        return rules, stats
-
-
 def _rule_recovery_continue_prompt(app, text: str, recovered_rules: list[dict], review_anchor_catalog: str) -> str:
     """仅把已完整解析的必要字段交给续提，避免截断正文或重复输出放大上下文。"""
     recovered = [
@@ -1689,7 +1670,8 @@ def _rule_batch_output_tokens(text: str, compact: bool = False) -> int:
 def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text: str,
                         *, document_id: str, batch_label: str, review_anchor_catalog: str = "",
                         source_document_key: str = "", depth: int = 0,
-                        include_scoring: bool = True) -> tuple[list[dict], int, int]:
+                        include_scoring: bool = True,
+                        source_unit_catalog: dict[str, dict] | None = None) -> tuple[list[dict], int, int]:
     """提取一个小批次；截断时只二分当前批次，最小批次才紧凑重试。"""
     packets = [
         packet for packet in _score_clause_packets(text, limit=24, source_document_key=source_document_key)
@@ -1707,7 +1689,7 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
                     app, task, profile, system_prompt, piece, document_id=document_id,
                     batch_label=f"{batch_label}/评分密集拆分{index}", review_anchor_catalog=review_anchor_catalog,
                     source_document_key=source_document_key,
-                    depth=depth + 1, include_scoring=include_scoring,
+                    depth=depth + 1, include_scoring=include_scoring, source_unit_catalog=source_unit_catalog,
                 )
                 rules.extend(value)
                 compact_retries += compact_count
@@ -1727,7 +1709,7 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
         rules = parsed.get("rules") if isinstance(parsed, dict) else None
         if not isinstance(rules, list):
             raise ValueError("模型返回格式不符合规则提取要求")
-        return [item for item in rules if isinstance(item, dict)], 0, 0
+        return _attach_rule_source_units([item for item in rules if isinstance(item, dict)], source_unit_catalog), 0, 0
     except InvalidJsonResponse as exc:
         # 响应已到达但尾部截断时，先回收每个边界完整、能独立 json.loads 的规则对象。
         # 这一步绝不补全半截条款；随后仅请求模型补足遗漏项，避免把已成功的长输出整段重发。
@@ -1749,9 +1731,9 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
                 missing_rules = continued.get("rules") if isinstance(continued, dict) else None
                 if not isinstance(missing_rules, list):
                     raise ValueError("模型返回格式不符合规则续提要求")
-                return _dedupe_rule_candidates(
+                return _attach_rule_source_units(_dedupe_rule_candidates(
                     [item for item in recovered_rules + missing_rules if isinstance(item, dict)]
-                ), 0, 0
+                ), source_unit_catalog), 0, 0
             except ValueError:
                 # 续提只是节省重发的优先路径；它异常时仍完整回到原有拆分/紧凑重试，
                 # 不能以局部恢复替代全量提取而遗漏规则。
@@ -1764,7 +1746,7 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
                 repaired_rules = repaired.get("rules") if isinstance(repaired, dict) else None
                 if not isinstance(repaired_rules, list):
                     raise ValueError("模型返回格式不符合规则提取要求")
-                return [item for item in repaired_rules if isinstance(item, dict)], 0, 0
+                return _attach_rule_source_units([item for item in repaired_rules if isinstance(item, dict)], source_unit_catalog), 0, 0
             except ValueError:
                 storage.update_task(app, task["task_id"], message=f"{batch_label} 本地修复未完成，正在按完整策略重试")
         if len(text) > RULE_EXTRACTION_MIN_SPLIT_CHARS and depth < 3:
@@ -1778,7 +1760,7 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
                         app, task, profile, system_prompt, piece, document_id=document_id,
                         batch_label=f"{batch_label}/拆分{index}", review_anchor_catalog=review_anchor_catalog,
                         source_document_key=source_document_key,
-                        depth=depth + 1, include_scoring=include_scoring,
+                        depth=depth + 1, include_scoring=include_scoring, source_unit_catalog=source_unit_catalog,
                     )
                     rules.extend(value)
                     compact_retries += compact_count
@@ -1797,7 +1779,7 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
         rules = parsed.get("rules") if isinstance(parsed, dict) else None
         if not isinstance(rules, list):
             raise ValueError("模型返回格式不符合规则提取要求")
-        return [item for item in rules if isinstance(item, dict)], 1, 0
+        return _attach_rule_source_units([item for item in rules if isinstance(item, dict)], source_unit_catalog), 1, 0
     except ValueError as exc:
         # 暂时性 HTTP 200 错误包在网关已完成局部退避后，仍可走紧凑/拆分恢复；
         # 鉴权、余额、参数等不可重试错误仍会立即清晰报出。
@@ -1814,7 +1796,7 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
                         app, task, profile, system_prompt, piece, document_id=document_id,
                         batch_label=f"{batch_label}/拆分{index}", review_anchor_catalog=review_anchor_catalog,
                         source_document_key=source_document_key,
-                        depth=depth + 1, include_scoring=include_scoring,
+                        depth=depth + 1, include_scoring=include_scoring, source_unit_catalog=source_unit_catalog,
                     )
                     rules.extend(value)
                     compact_retries += compact_count
@@ -1833,7 +1815,7 @@ def _extract_rule_batch(app, task: dict, profile: dict, system_prompt: str, text
         rules = parsed.get("rules") if isinstance(parsed, dict) else None
         if not isinstance(rules, list):
             raise ValueError("模型返回格式不符合规则提取要求")
-        return [item for item in rules if isinstance(item, dict)], 1, 0
+        return _attach_rule_source_units([item for item in rules if isinstance(item, dict)], source_unit_catalog), 1, 0
 
 
 def _extract_rule_batches(app, task: dict, profile: dict, system_prompt: str, batches: list[object], *,
@@ -1856,6 +1838,7 @@ def _extract_rule_batches(app, task: dict, profile: dict, system_prompt: str, ba
                 review_anchor_catalog=review_anchor_catalog,
                 source_document_key=str(batch[1]) if isinstance(batch, tuple) and len(batch) > 1 else "",
                 include_scoring=include_scoring,
+                source_unit_catalog=batch[2] if isinstance(batch, tuple) and len(batch) > 2 and isinstance(batch[2], dict) else None,
             ): index
             for index, batch in enumerate(batches)
         }
@@ -1892,10 +1875,9 @@ def _rule_signature(item: dict) -> tuple[str, str, str]:
     )
 
 
-RULE_EXTRACTION_PIPELINE_VERSION = "source-ledger-v2.1"
-# V2.1 继续保留“来源事实优先”的单一生产路径：评分表与普通规则分别生成，
-# 再由同一份原文台账收口。不会维持 V1/V2 两套运行语义。
-USE_SOURCE_LEDGER_RULE_PIPELINE = True
+RULE_EXTRACTION_PIPELINE_VERSION = "source-ledger-v2.2"
+# 规则提取只保留来源台账 V2.2：评分表与普通规则分别生成，再由同一份原文
+# 台账收口。规则提取只保留来源单元映射、评分原文台账与本地确定性收口。
 
 
 def _source_fact_fingerprint(item: dict) -> str:
@@ -1911,6 +1893,10 @@ def _source_fact_fingerprint(item: dict) -> str:
     clause_ids = sorted(_score_rule_clause_ids(item)) if category in {"objective", "subjective"} else []
     if clause_ids:
         return "SF-score-" + hashlib.sha1("|".join(clause_ids).encode("utf-8")).hexdigest()[:16]
+    unit_ids = sorted({str(value).strip() for value in item.get("source_unit_ids") or [] if str(value).strip()})
+    if unit_ids:
+        payload = f"{category}|{'|'.join(unit_ids)}".encode("utf-8")
+        return "SF-unit-" + hashlib.sha1(payload).hexdigest()[:16]
     page = item.get("source_page") if isinstance(item.get("source_page"), int) else 0
     source = storage._normalise_rule_source(item.get("source_text"))
     if not source:
@@ -1926,6 +1912,13 @@ def _source_fact_fingerprint(item: dict) -> str:
 
 def _rule_source_fact_ids(item: dict) -> set[str]:
     values = item.get("source_fact_ids") if isinstance(item, dict) else None
+    if not isinstance(values, list):
+        return set()
+    return {str(value).strip() for value in values if str(value).strip()}
+
+
+def _rule_source_unit_ids(item: dict) -> set[str]:
+    values = item.get("source_unit_ids") if isinstance(item, dict) else None
     if not isinstance(values, list):
         return set()
     return {str(value).strip() for value in values if str(value).strip()}
@@ -1968,6 +1961,10 @@ def _attach_source_fact_metadata(rules: list[dict]) -> list[dict]:
                 str(clause_id) for clause_id in value.get("source_clause_ids") or []
                 if str(clause_id).strip() and not str(clause_id).strip().startswith("SC-")
             ]
+            value["source_unit_ids"] = list(dict.fromkeys(
+                str(unit_id).strip() for unit_id in value.get("source_unit_ids") or []
+                if str(unit_id).strip()
+            ))
         fact_ids = list(dict.fromkeys([
             *[str(fact_id) for fact_id in value.get("source_fact_ids") or [] if str(fact_id).strip()],
             *([_source_fact_fingerprint(value)] if _source_fact_fingerprint(value) else []),
@@ -1987,6 +1984,7 @@ def _source_ledger_stats(rules: list[dict]) -> dict:
         "pipeline_version": RULE_EXTRACTION_PIPELINE_VERSION,
         "rule_count": len(ai_rules),
         "source_fact_count": len({fact_id for item in anchored for fact_id in _rule_source_fact_ids(item)}),
+        "source_unit_count": len({unit_id for item in ai_rules for unit_id in _rule_source_unit_ids(item)}),
         "unanchored_rule_count": len(unanchored),
         "unanchored_score_rule_count": sum(
             1 for item in unanchored
@@ -2044,8 +2042,19 @@ def _non_score_candidates_same_fact(existing: dict, candidate: dict) -> bool:
     category = str(candidate.get("category") or "")
     if category in {"objective", "subjective"} or category != str(existing.get("category") or ""):
         return False
-    if not storage._rule_titles_compatible(existing.get("title"), candidate.get("title"), category):
+    same_title = storage._rule_titles_compatible(existing.get("title"), candidate.get("title"), category)
+    left_check = re.sub(r"[\s\W_]+", "", str(existing.get("check_rule") or existing.get("title") or ""))
+    right_check = re.sub(r"[\s\W_]+", "", str(candidate.get("check_rule") or candidate.get("title") or ""))
+    check_similarity = difflib.SequenceMatcher(None, left_check, right_check).ratio() if left_check and right_check else 0.0
+    compatible_intent = same_title or check_similarity >= 0.78 or (
+        min(len(left_check), len(right_check)) >= 16 and (left_check in right_check or right_check in left_check)
+    )
+    if not compatible_intent:
         return False
+    left_units = _rule_source_unit_ids(existing)
+    right_units = _rule_source_unit_ids(candidate)
+    if left_units and right_units and left_units & right_units:
+        return True
     left_facts = _rule_source_fact_ids(existing)
     right_facts = _rule_source_fact_ids(candidate)
     if left_facts and right_facts and left_facts & right_facts:
@@ -2070,6 +2079,10 @@ def _merge_duplicate_non_score_rule(existing: dict, candidate: dict) -> dict:
     merged["source_fact_ids"] = list(dict.fromkeys([
         *[str(value) for value in primary.get("source_fact_ids") or [] if str(value).strip()],
         *[str(value) for value in secondary.get("source_fact_ids") or [] if str(value).strip()],
+    ]))
+    merged["source_unit_ids"] = list(dict.fromkeys([
+        *[str(value) for value in primary.get("source_unit_ids") or [] if str(value).strip()],
+        *[str(value) for value in secondary.get("source_unit_ids") or [] if str(value).strip()],
     ]))
     merged["source_locations"] = _merge_source_locations(primary, secondary)
     merged["ocr_required"] = bool(primary.get("ocr_required") or secondary.get("ocr_required"))
@@ -2113,6 +2126,7 @@ def _consolidate_same_named_non_score_rules(items: list[dict]) -> tuple[list[dic
     """
     result: list[dict] = []
     indexes: dict[tuple[str, str], list[int]] = {}
+    source_indexes: dict[tuple[str, str], list[int]] = {}
     merged_count = 0
     for item in items:
         category = str(item.get("category") or "")
@@ -2121,20 +2135,24 @@ def _consolidate_same_named_non_score_rules(items: list[dict]) -> tuple[list[dic
             result.append(item)
             continue
         key = (category, title_identity)
-        if key not in indexes:
-            indexes[key] = [len(result)]
-            result.append(item)
-            continue
+        unit_keys = [(category, unit_id) for unit_id in _rule_source_unit_ids(item)]
+        candidate_indexes = list(indexes.get(key, []))
+        for unit_key in unit_keys:
+            candidate_indexes.extend(source_indexes.get(unit_key, []))
+        candidate_indexes = list(dict.fromkeys(candidate_indexes))
         # 标题相同只是候选对象相同的线索，不是同一审查事实的证明。过去这里会把
         # 不同章节、不同条件但碰巧同名的规则直接拼接，是税务/山大项目规则错配的
         # 结构性来源之一。只有来源事实 ID 相交、稳定条款 ID 相交或完整原文一致时
-        # 才允许本地收口；其余同名候选交由一次最终规范化和人工确认。
+        # 才允许本地收口；其余同名候选保留给人工确认。
         index = next((
-            candidate_index for candidate_index in indexes[key]
+            candidate_index for candidate_index in candidate_indexes
             if _non_score_candidates_same_fact(result[candidate_index], item)
         ), None)
         if index is None:
-            indexes[key].append(len(result))
+            new_index = len(result)
+            indexes.setdefault(key, []).append(new_index)
+            for unit_key in unit_keys:
+                source_indexes.setdefault(unit_key, []).append(new_index)
             result.append(item)
             continue
         existing = result[index]
@@ -2170,6 +2188,10 @@ def _consolidate_same_named_non_score_rules(items: list[dict]) -> tuple[list[dic
             *[str(value) for value in existing.get("source_fact_ids") or [] if str(value).strip()],
             *[str(value) for value in item.get("source_fact_ids") or [] if str(value).strip()],
         ]))
+        merged["source_unit_ids"] = list(dict.fromkeys([
+            *[str(value) for value in existing.get("source_unit_ids") or [] if str(value).strip()],
+            *[str(value) for value in item.get("source_unit_ids") or [] if str(value).strip()],
+        ]))
         merged["source_locations"] = _merge_source_locations(existing, item)
         evidence_items = []
         evidence_signatures = set()
@@ -2187,6 +2209,9 @@ def _consolidate_same_named_non_score_rules(items: list[dict]) -> tuple[list[dic
         if not merged.get("source_page"):
             merged["source_page"] = secondary.get("source_page")
         result[index] = merged
+        # 合并后可能保留了两侧的来源单元，补齐索引，使后续同源副本仍能收敛。
+        for unit_id in _rule_source_unit_ids(merged):
+            source_indexes.setdefault((category, unit_id), []).append(index)
         merged_count += 1
     return result, merged_count
 
@@ -2672,480 +2697,6 @@ def _normalise_visual_rule_policies(rules: list[dict]) -> list[dict]:
     return result
 
 
-def _rule_compilation_packet(items: list[dict], char_limit: int) -> str:
-    """为规则编译阶段准备紧凑且可追溯的原始条款包。"""
-    values = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        values.append({
-            "category": item.get("category"), "title": item.get("title"),
-            "check_rule": item.get("check_rule") or item.get("title"),
-            "source_text": item.get("source_text"), "source_page": item.get("source_page"),
-            "ocr_required": bool(item.get("ocr_required") or item.get("check_mode") == "ocr"),
-            "execution_strategy": item.get("execution_strategy"),
-            "evidence_requirements": item.get("evidence_requirements"),
-            "evidence_items": item.get("evidence_items"),
-            "applicability": item.get("applicability"),
-            "source_clause_ids": item.get("source_clause_ids") if isinstance(item.get("source_clause_ids"), list) else [],
-            "source_fact_ids": item.get("source_fact_ids") if isinstance(item.get("source_fact_ids"), list) else [],
-            "scoring": item.get("scoring"),
-        })
-    packet = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
-    # 不截断 JSON 数组，防止模型误把残缺条款当成完整依据；超量时以完整条款为单位收缩。
-    if len(packet) <= char_limit:
-        return packet
-    compact = []
-    size = 2
-    for item in values:
-        encoded = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
-        if compact and size + len(encoded) + 1 > char_limit:
-            break
-        compact.append(item)
-        size += len(encoded) + 1
-    return json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
-
-
-RULE_COMPILATION_INPUT_CHARS = 48_000
-
-
-def _split_rule_compilation_groups(items: list[dict], max_chars: int) -> list[list[dict]]:
-    """按完整规则切分编译输入，绝不截断 JSON 或静默丢弃尾部规则。"""
-    groups: list[list[dict]] = []
-    current: list[dict] = []
-    size = 2
-    for item in items:
-        encoded = _rule_compilation_packet([item], max_chars)
-        item_size = len(encoded) - 2
-        if current and size + item_size + 1 > max_chars:
-            groups.append(current)
-            current, size = [], 2
-        current.append(item)
-        size += item_size + 1
-    if current:
-        groups.append(current)
-    return groups
-
-
-def _rule_compilation_output_tokens(item_count: int) -> int:
-    """规则编译必须容纳完整规范规则；不足时由递归分组处理，而不是回退原始条款。"""
-    return max(4_500, min(10_000, 1_200 + max(1, item_count) * 420))
-
-
-def _merge_compiled_rule_groups(app, task: dict, profile: dict, system_prompt: str,
-                                rules: list[dict], char_limit: int) -> list[dict]:
-    """对拆分后的规范规则做一次全局轻量语义合并；失败时完整保留子组结果。"""
-    values = _dedupe_rule_candidates(rules)
-    if len(values) <= 1:
-        return values
-    input_limit = min(char_limit, 140_000)
-    packet = _rule_compilation_packet(values, input_limit)
-    try:
-        packet_values = json.loads(packet)
-    except json.JSONDecodeError:
-        return values
-    # 不能把不完整数组送去做“全局”合并，否则尾部规则会被无提示遗漏。
-    if not isinstance(packet_values, list) or len(packet_values) != len(values):
-        return values
-    storage.update_task(app, task["task_id"], message="正在全局合并拆分后的评审规则")
-    try:
-        response = _request_task_json(
-            app, task, profile, "extract_rules_global_compile", system_prompt,
-            storage.render_prompt_template(app, "extract_rules_compile_user", candidates=packet),
-            context_mode="rule_global_semantic_compile",
-            max_tokens=_output_token_budget(profile, _rule_compilation_output_tokens(len(values))),
-            thinking_mode="disabled",
-        )
-        merged = response.get("rules") if isinstance(response, dict) else None
-        if not isinstance(merged, list):
-            raise ValueError("全局规则编译未返回有效规则")
-        merged = _dedupe_rule_candidates([item for item in merged if isinstance(item, dict)])
-        if not merged:
-            raise ValueError("全局规则编译返回空规则集")
-        # 全局合并允许减少重复规则，但明确计分条款不能因此失去覆盖。
-        for original in values:
-            if original.get("category") not in {"objective", "subjective"}:
-                continue
-            packet_like = {
-                "clause_id": next(iter(original.get("source_clause_ids") or []), ""),
-                "text": str(original.get("source_text") or original.get("check_rule") or ""),
-            }
-            if not _score_packet_is_covered(packet_like, merged):
-                merged.append(original)
-        return _dedupe_rule_candidates(merged)
-    except ValueError as exc:
-        storage.update_task(app, task["task_id"], message=f"全局规则合并未完成，已完整保留分组结果：{exc}")
-        return values
-
-
-def _compile_rule_group(app, task: dict, profile: dict, system_prompt: str,
-                        candidates: list[dict], char_limit: int, *, depth: int = 0) -> tuple[list[dict], list[dict], bool]:
-    """编译一个完整规则组；长度或格式异常时仅二分该组，保留每个子组的覆盖审计。"""
-    if len(candidates) <= 1:
-        return candidates, [], False
-    input_limit = min(char_limit, RULE_COMPILATION_INPUT_CHARS)
-    groups = _split_rule_compilation_groups(candidates, input_limit)
-    if len(groups) > 1:
-        compiled, missing, used = [], [], False
-        # 原始映射完成后，多个大规则组之间互不依赖。只在顶层动态至多三路，子组内
-        # 保持串行，最终仍由全局合并统一消重和保留评分覆盖，避免嵌套并发打满接口。
-        parallel_groups = depth == 0 and task.get("_evaluation_request_gate") is not None
-        if parallel_groups:
-            storage.update_task(app, task["task_id"], message=f"正在分组编译评审规则（{len(groups)} 组，按模型档案动态并发）")
-            group_results: list[tuple[list[dict], list[dict], bool] | None] = [None] * len(groups)
-            gate = task.get("_evaluation_request_gate")
-            with ThreadPoolExecutor(max_workers=min(gate.max_limit if gate else 2, len(groups))) as executor:
-                future_to_index = {
-                    executor.submit(
-                        _compile_rule_group, app, task, profile, system_prompt, group, char_limit, depth=depth + 1,
-                    ): index
-                    for index, group in enumerate(groups)
-                }
-                for future in as_completed(future_to_index):
-                    group_results[future_to_index[future]] = future.result()
-            for result in group_results:
-                if result is None:
-                    continue
-                values, uncovered, group_used = result
-                compiled.extend(values)
-                missing.extend(uncovered)
-                used = used or group_used
-        else:
-            for index, group in enumerate(groups, start=1):
-                storage.update_task(app, task["task_id"], message=f"正在分组编译评审规则（{index}/{len(groups)}）")
-                values, uncovered, group_used = _compile_rule_group(
-                    app, task, profile, system_prompt, group, char_limit, depth=depth + 1,
-                )
-                compiled.extend(values)
-                missing.extend(uncovered)
-                used = used or group_used
-        return _merge_compiled_rule_groups(
-            app, task, profile, system_prompt, compiled, char_limit,
-        ), _dedupe_rule_candidates(missing), used
-
-    packet = _rule_compilation_packet(candidates, input_limit)
-    try:
-        compiled_response = _request_task_json(
-            app, task, profile, "extract_rules_compile", system_prompt,
-            storage.render_prompt_template(app, "extract_rules_compile_user", candidates=packet),
-            context_mode=f"rule_semantic_compile_d{depth}",
-            max_tokens=_output_token_budget(profile, _rule_compilation_output_tokens(len(candidates))), thinking_mode="disabled",
-        )
-        compiled = compiled_response.get("rules") if isinstance(compiled_response, dict) else None
-        if not isinstance(compiled, list):
-            raise ValueError("模型返回格式不符合规则编译要求")
-        compiled = _dedupe_rule_candidates([item for item in compiled if isinstance(item, dict)])
-        if not compiled:
-            raise ValueError("规则编译未返回有效规则")
-    except ValueError as exc:
-        # 输出截断或 JSON 偶发异常只影响当前规则组。二分后每一半仍会走语义合并和覆盖审计，
-        # 不能再把整套规则退回未经编译的原始候选。
-        if _is_invalid_json_model_response(exc) or str(exc).startswith("模型返回格式不符合规则编译要求") or str(exc).startswith("规则编译未返回有效规则"):
-            if len(candidates) > 1 and depth < 6:
-                midpoint = len(candidates) // 2
-                storage.update_task(app, task["task_id"], message="规则编译输出异常，正在仅拆分该规则组重试")
-                left = _compile_rule_group(app, task, profile, system_prompt, candidates[:midpoint], char_limit, depth=depth + 1)
-                right = _compile_rule_group(app, task, profile, system_prompt, candidates[midpoint:], char_limit, depth=depth + 1)
-                return (
-                    _merge_compiled_rule_groups(app, task, profile, system_prompt, left[0] + right[0], char_limit),
-                    _dedupe_rule_candidates(left[1] + right[1]),
-                    left[2] or right[2],
-                )
-        raise
-
-    try:
-        storage.update_task(app, task["task_id"], message="正在审计规则覆盖范围")
-        coverage_response = _request_task_json(
-            app, task, profile, "extract_rules_coverage_audit", system_prompt,
-            storage.render_prompt_template(
-                app, "extract_rules_coverage_user", candidates=packet,
-                compiled_rules=_rule_compilation_packet(compiled, input_limit),
-            ),
-            context_mode=f"rule_coverage_audit_d{depth}",
-            max_tokens=_output_token_budget(profile, 4_500), thinking_mode="disabled",
-        )
-        missing = coverage_response.get("missing_rules") if isinstance(coverage_response, dict) else None
-        if missing is None and isinstance(coverage_response, dict):
-            missing = coverage_response.get("rules")  # 兼容少数模型的确定字段偏差。
-        if not isinstance(missing, list):
-            raise ValueError("模型返回格式不符合规则覆盖审计要求")
-        missing = [item for item in missing if isinstance(item, dict)]
-    except ValueError as exc:
-        # 编译结果本身已经是规范规则集；覆盖审计单独失败时保留它，并将失败上抛给调用方的
-        # 非格式降级路径处理。格式问题则把当前组拆小，争取完成审计而非静默遗漏。
-        if (_is_invalid_json_model_response(exc) or str(exc).startswith("模型返回格式不符合规则覆盖审计要求")) and len(candidates) > 1 and depth < 6:
-            midpoint = len(candidates) // 2
-            storage.update_task(app, task["task_id"], message="规则覆盖审计输出异常，正在仅拆分该规则组重试")
-            left = _compile_rule_group(app, task, profile, system_prompt, candidates[:midpoint], char_limit, depth=depth + 1)
-            right = _compile_rule_group(app, task, profile, system_prompt, candidates[midpoint:], char_limit, depth=depth + 1)
-            return (
-                _merge_compiled_rule_groups(app, task, profile, system_prompt, left[0] + right[0], char_limit),
-                _dedupe_rule_candidates(left[1] + right[1]),
-                left[2] or right[2],
-            )
-        raise
-    return _dedupe_rule_candidates(compiled + missing), _dedupe_rule_candidates(missing), True
-
-
-def _compile_rule_candidates(app, task: dict, profile: dict, system_prompt: str,
-                             raw_rules: list[dict], char_limit: int) -> tuple[list[dict], list[dict], bool]:
-    """用 AI 做语义归并和覆盖审计，取代跨批次的字符串去重。
-
-    小文件只有极少条规则时，直接保留映射结果，避免为了无收益的归并增加一次模型调用。
-    """
-    candidates = _dedupe_rule_candidates(raw_rules)
-    if len(candidates) < 12:
-        return candidates, [], False
-    storage.update_task(app, task["task_id"], progress=68, message="正在统一编译并合并评审规则")
-    return _compile_rule_group(app, task, profile, system_prompt, candidates, char_limit)
-
-
-RULE_FINALISATION_MIN_RULES = 2
-def _rule_normalisation_packet(items: list[dict], *, include_ids: bool) -> str:
-    """构造一次规范化所需的完整规则包；不截断规则数组。"""
-    values = []
-    for index, item in enumerate(items, start=1):
-        if not isinstance(item, dict):
-            continue
-        value = {
-            "category": item.get("category"),
-            "title": str(item.get("title") or "")[:120],
-            "check_rule": str(item.get("check_rule") or item.get("title") or "")[:700],
-            "source_text": str(item.get("source_text") or "")[:260],
-            "source_page": item.get("source_page"),
-            "ocr_required": bool(item.get("ocr_required") or item.get("check_mode") == "ocr"),
-            "source_clause_ids": item.get("source_clause_ids") if isinstance(item.get("source_clause_ids"), list) else [],
-            "source_fact_ids": item.get("source_fact_ids") if isinstance(item.get("source_fact_ids"), list) else [],
-            "scoring": item.get("scoring"),
-        }
-        if include_ids:
-            value = {"rule_id": f"R{index}", **value}
-        else:
-            value.update({
-                "source_type": item.get("source_type"),
-                "enabled": bool(item.get("enabled", True)),
-            })
-        values.append(value)
-    return json.dumps(values, ensure_ascii=False, separators=(",", ":"))
-
-
-def _protected_rules_for_normalisation(app, project_id: str) -> list[dict]:
-    """返回独立人工规则与本轮通用规则；历史 AI 编辑不得影响新一轮提取。"""
-    _, current_rules = storage.list_rules(app, project_id)
-    protected = []
-    for item in current_rules:
-        if item.get("source_type") != "manual":
-            continue
-        value = dict(item)
-        if item.get("scoring_json"):
-            try:
-                value["scoring"] = json.loads(item["scoring_json"])
-            except (TypeError, json.JSONDecodeError):
-                value["scoring"] = None
-        protected.append(value)
-    protected.extend(
-        {**item, "source_type": "global"}
-        for item in storage.list_global_rules(app)
-    )
-    return protected
-
-
-def _finalise_rule_operations_pass(app, task: dict, profile: dict, system_prompt: str,
-                                   rules: list[dict], *, focus_key: str, focus: str) -> tuple[list[dict], dict]:
-    """以可追溯操作规范化完整规则集；任何越界操作或格式异常都保留原规则。"""
-    stats = {
-        "applied": False, "dropped_count": 0, "rewritten_count": 0,
-        "merged_count": 0, "failure_count": 0,
-    }
-    protected = _protected_rules_for_normalisation(app, task["project_id"])
-    prompt = storage.render_prompt_template(
-        app, "extract_rules_finalise_user",
-        focus=focus,
-        candidates=_rule_normalisation_packet(rules, include_ids=True),
-        protected_rules=_rule_normalisation_packet(protected, include_ids=False),
-    )
-    storage.update_task(app, task["task_id"], progress=79, message=f"正在执行规则最终规范化：{focus_key}")
-    try:
-        try:
-            response = _request_task_json(
-                app, task, profile, f"extract_rules_finalise_{focus_key}", system_prompt, prompt,
-                context_mode=f"rule_finalise_{focus_key}",
-                max_tokens=_output_token_budget(profile, max(2_500, min(6_000, 1_200 + len(rules) * 85))),
-                thinking_mode="disabled",
-            )
-        except InvalidJsonResponse as exc:
-            response = _repair_invalid_json(
-                app, task, profile, f"extract_rules_finalise_{focus_key}_json_repair", exc, "drops",
-            )
-        if not isinstance(response, dict):
-            raise ValueError("模型返回格式不符合规则最终规范化要求")
-        operations = {key: response.get(key, []) for key in ("drops", "rewrites", "merges")}
-        if any(not isinstance(value, list) for value in operations.values()):
-            raise ValueError("模型返回格式不符合规则最终规范化要求")
-
-        id_to_index = {f"R{index + 1}": index for index in range(len(rules))}
-        working = [dict(item) for item in rules]
-        removed: set[int] = set()
-        merged_removed: set[int] = set()
-        rewritten: set[int] = set()
-        merged_groups = 0
-        allowed_drop_reasons = {"duplicate", "not_file_verifiable", "procedural", "umbrella"}
-
-        for operation in operations["rewrites"]:
-            if not isinstance(operation, dict) or not isinstance(operation.get("reason"), str) or operation.get("reason") not in {"partial_boundary", "umbrella"}:
-                continue
-            index = id_to_index.get(str(operation.get("rule_id") or ""))
-            if index is None or rules[index].get("category") in {"objective", "subjective"}:
-                continue
-            title = str(operation.get("title") or "").strip()
-            check_rule = str(operation.get("check_rule") or "").strip()
-            if not title or not check_rule or len(title) > 120 or len(check_rule) > 1_200:
-                continue
-            working[index]["title"] = title
-            working[index]["check_rule"] = check_rule
-            if operation.get("ocr_required") is True:
-                working[index]["ocr_required"] = True
-            rewritten.add(index)
-
-        used_merge_indexes: set[int] = set()
-        for operation in operations["merges"]:
-            if not isinstance(operation, dict) or operation.get("reason") != "duplicate":
-                continue
-            raw_ids = operation.get("rule_ids")
-            if not isinstance(raw_ids, list):
-                continue
-            indexes = []
-            for rule_id in raw_ids:
-                index = id_to_index.get(str(rule_id or ""))
-                if index is not None and index not in indexes:
-                    indexes.append(index)
-            keep_index = id_to_index.get(str(operation.get("keep_rule_id") or ""))
-            if len(indexes) < 2 or keep_index not in indexes or used_merge_indexes.intersection(indexes):
-                continue
-            score_merge = any(rules[index].get("category") in {"objective", "subjective"} for index in indexes)
-            # 评分规则只允许合并可由本地结构证明的重复项：同一类别、同一归一化
-            # 评分锚点（同一条款ID/来源、对象与满分）。不同子项绝不因模型建议合并。
-            if score_merge and (
-                any(_score_rule_dedupe_key(rules[index]) is None for index in indexes)
-                or len({_score_rule_dedupe_key(rules[index]) for index in indexes}) != 1
-            ):
-                continue
-            title = str(operation.get("title") or "").strip()
-            check_rule = str(operation.get("check_rule") or "").strip()
-            if not title or not check_rule or len(title) > 120 or len(check_rule) > 1_500:
-                continue
-            source_texts = []
-            clause_ids = []
-            source_fact_ids = []
-            for index in indexes:
-                source_text = str(rules[index].get("source_text") or "").strip()
-                if source_text and source_text not in source_texts:
-                    source_texts.append(source_text)
-                for clause_id in rules[index].get("source_clause_ids") or []:
-                    if clause_id not in clause_ids:
-                        clause_ids.append(clause_id)
-                for fact_id in rules[index].get("source_fact_ids") or []:
-                    if fact_id and fact_id not in source_fact_ids:
-                        source_fact_ids.append(fact_id)
-            if score_merge:
-                merged_score = dict(working[keep_index])
-                for index in indexes:
-                    if index != keep_index:
-                        merged_score = _merge_duplicate_score_rule(merged_score, working[index])
-                working[keep_index] = merged_score
-            working[keep_index]["title"] = title
-            working[keep_index]["check_rule"] = check_rule
-            working[keep_index]["source_text"] = " / ".join(source_texts)[:1_500]
-            working[keep_index]["source_clause_ids"] = clause_ids
-            working[keep_index]["source_fact_ids"] = source_fact_ids
-            if operation.get("ocr_required") is True or any(_rule_requires_visual_verification(rules[index]) for index in indexes):
-                working[keep_index]["ocr_required"] = True
-            group_removed = {index for index in indexes if index != keep_index}
-            removed.update(group_removed)
-            merged_removed.update(group_removed)
-            used_merge_indexes.update(indexes)
-            rewritten.difference_update(indexes)
-            merged_groups += 1
-
-        for operation in operations["drops"]:
-            if not isinstance(operation, dict) or not isinstance(operation.get("reason"), str) or operation.get("reason") not in allowed_drop_reasons:
-                continue
-            index = id_to_index.get(str(operation.get("rule_id") or ""))
-            if index is None or index in used_merge_indexes or rules[index].get("category") in {"objective", "subjective"}:
-                continue
-            removed.add(index)
-            rewritten.discard(index)
-
-        # 模型偶尔会把大量“可选删除”一并返回。不能让这些不安全的删除拖累已被
-        # 结构证明的合并、边界改写：先撤销普通删除，保留可追溯的合并；只有合并
-        # 本身也会使规则集减半时才整批回退，避免少数异常操作毁掉整个规范化阶段。
-        minimum_remaining = max(1, len(rules) // 2)
-        if len(removed) >= len(rules) or len(rules) - len(removed) < minimum_remaining:
-            safe_removed = set(merged_removed)
-            if len(safe_removed) >= len(rules) or len(rules) - len(safe_removed) < minimum_remaining:
-                raise ValueError("规则最终规范化合并比例异常，已安全保留原结果")
-            removed = safe_removed
-        result = [item for index, item in enumerate(working) if index not in removed]
-        stats.update({
-            "applied": bool(removed or rewritten or merged_groups),
-            "dropped_count": len(removed - merged_removed),
-            "rewritten_count": len(rewritten),
-            "merged_count": merged_groups,
-        })
-        return result, stats
-    except ValueError as exc:
-        stats["failure_count"] = 1
-        storage.update_task(app, task["task_id"], message=f"规则最终规范化未完成，已完整保留质量审计结果：{exc}")
-        return rules, stats
-
-
-def _finalise_rule_operations(app, task: dict, profile: dict, system_prompt: str,
-                              rules: list[dict]) -> tuple[list[dict], dict]:
-    """一次完成边界清理与语义归并，避免同一规则被模型连续改写。"""
-    stats = {
-        "applied": False, "dropped_count": 0, "rewritten_count": 0,
-        "merged_count": 0, "failure_count": 0,
-    }
-    if len(rules) < RULE_FINALISATION_MIN_RULES:
-        return rules, stats
-    focus = storage.render_prompt_template(app, "extract_rules_finalise_unified_focus")
-    result, pass_stats = _finalise_rule_operations_pass(
-        app, task, profile, system_prompt, rules, focus_key="统一规范化", focus=focus,
-    )
-    stats["applied"] = pass_stats["applied"]
-    for key in ("dropped_count", "rewritten_count", "merged_count", "failure_count"):
-        stats[key] = pass_stats[key]
-    if not pass_stats["failure_count"]:
-        return result, stats
-
-    # 完整规则包格式异常时，只按类别定向重试。回退路径有意不再尝试跨类别语义
-    # 合并：宁可保留少量需人工确认的跨类别关系，也不能因失去完整上下文误并；
-    # 同类别同对象副本随后仍由确定性收口处理。这样既降低单次上下文，也避免一次
-    # JSON 异常让整套规则完全跳过规范化。评分规则已有独立台账收口，不在这里
-    # 增加额外模型调用。
-    storage.update_task(app, task["task_id"], message="规则最终规范化异常，正在按类别定向重试")
-    category_order = list(dict.fromkeys(str(item.get("category") or "") for item in rules))
-    recovered: list[dict] = []
-    for category in category_order:
-        group = [item for item in rules if str(item.get("category") or "") == category]
-        if category in {"objective", "subjective"} or len(group) < RULE_FINALISATION_MIN_RULES:
-            recovered.extend(group)
-            continue
-        group_result, group_stats = _finalise_rule_operations_pass(
-            app, task, profile, system_prompt, group,
-            focus_key=f"统一规范化回退_{category}",
-            focus=f"{focus}\n\n本次只审计 category={category} 的规则；不得引用或补造其他类别规则。",
-        )
-        recovered.extend(group_result)
-        stats["applied"] = stats["applied"] or group_stats["applied"]
-        for key in ("dropped_count", "rewritten_count", "merged_count"):
-            stats[key] += group_stats[key]
-        # 对外保持“本轮最终规范化是否出现过失败”的布尔计数语义；定向重试
-        # 次数由模型调用台账记录，不能把一次根因重复累计成多次业务失败。
-        stats["failure_count"] = max(stats["failure_count"], group_stats["failure_count"])
-    return recovered, stats
-
-
 def _extract_rules(app, task: dict) -> dict:
     project = storage.get_project(app, task["project_id"])
     if not project:
@@ -3174,7 +2725,7 @@ def _extract_rules(app, task: dict) -> dict:
         if len(all_score_packets) >= 400:
             break
         all_score_packets.extend(_score_clause_packets(value, limit=400 - len(all_score_packets), source_document_key=document_key))
-    # 多包文件的评分公式往往相同；只把当前包或本地无法安全归属的条款送入覆盖审计，
+    # 多包文件的评分公式往往相同；只把当前包或本地无法安全归属的条款送入定向补提取，
     # 不能让包1公式“覆盖”包3评分项。未填写包号时保持原有全文件行为。
     score_packets = _filter_score_packets_for_package(
         [packet for packet in all_score_packets if not packet.get("is_section_summary")], package_number,
@@ -3183,9 +2734,18 @@ def _extract_rules(app, task: dict) -> dict:
     review_anchor_catalog = _initial_review_anchor_catalog(main_text)
     batches = []
     for label, value, document_key in source_documents:
+        units = _source_units_for_text(value, source_document_key=document_key)
+        unit_batches = _source_unit_batches(units, RULE_EXTRACTION_BATCH_CHARS)
+        # 极端解析文本没有可分单元时保留旧分段入口，避免因来源台账增强而拒绝文件。
+        if not unit_batches:
+            batches.extend(
+                (f"【{label}】\n{piece}", document_key, {})
+                for piece in _split_rule_extraction_text(value, RULE_EXTRACTION_BATCH_CHARS)
+            )
+            continue
         batches.extend(
-            (f"【{label}】\n{piece}", document_key)
-            for piece in _split_rule_extraction_text(value, RULE_EXTRACTION_BATCH_CHARS)
+            (f"【{label}】\n{piece}", document_key, catalog)
+            for piece, catalog in unit_batches
         )
     if not batches:
         raise ValueError("招标文件未提取到可供规则识别的正文")
@@ -3202,11 +2762,11 @@ def _extract_rules(app, task: dict) -> dict:
         app, task, profile, system_prompt, batches, document_id=tender["document_id"],
         review_anchor_catalog=review_anchor_catalog, include_scoring=False,
     )
-    raw_rules = _filter_inapplicable_template_rules(
+    raw_rules = _filter_non_file_verifiable_candidates(_filter_inapplicable_template_rules(
         _filter_rules_for_package(_dedupe_rule_candidates(raw_rules), package_number), text,
-    )
+    ))
     raw_rules = _attach_source_fact_metadata(raw_rules)
-    # V2.1：评分规则不再从每个正文批次重复生成，也不再以“补漏”方式追加到旧候选。
+    # V2.2：评分规则不再从每个正文批次重复生成，也不再以“补漏”方式追加到旧候选。
     # 评分原文台账是唯一输入，按评分分部独立组装；未覆盖条款会被显式记录。
     storage.update_task(app, task["task_id"], progress=60, message="正在按评分原文台账组装评分规则")
     score_rules, scoring_assembly = _extract_scoring_rules_from_ledger(
@@ -3256,10 +2816,10 @@ def _extract_rules(app, task: dict) -> dict:
         and isinstance(item.get("category"), str)
         and item.get("category") in {"qualification", "compliance", "substantive", "rejection", "objective", "subjective", "other"}
     ]
-    mapped_candidates = _filter_rules_for_package(mapped_candidates, package_number)
+    mapped_candidates = _filter_non_file_verifiable_candidates(_filter_rules_for_package(mapped_candidates, package_number))
     mapped_candidates = _attach_source_fact_metadata(mapped_candidates)
-    # 硬性条款补漏属于候选生成，不属于最终结果补丁。必须在统一编译前加入，
-    # 让它经历同一套语义去重、覆盖审计和最终边界整理，避免同一事实在尾部绕过治理。
+    # 硬性条款补漏属于候选生成，不属于最终结果补丁。必须在来源台账收口前加入，
+    # 让它经历同一套同源去重与文件边界校验，避免同一事实在尾部绕过治理。
     hard_anchor_supplement_count = hard_anchor_supplement_failures = 0
     hard_gaps = _hard_tender_anchor_gaps(mapped_candidates, text)
     if hard_gaps:
@@ -3285,35 +2845,20 @@ def _extract_rules(app, task: dict) -> dict:
         except ValueError as exc:
             hard_anchor_supplement_failures = 1
             storage.update_task(app, task["task_id"], message=f"部分硬性条款补充未完成：{exc}")
-    # 技术★条款的保守兜底同样必须作为候选进入统一编译、覆盖审计与最终规范化；
-    # 禁止在流程尾部直接追加规则，避免绕过同源去重并在重跑时制造副本。
+    # 技术★条款的保守兜底同样必须作为候选进入来源台账收口；禁止在流程尾部
+    # 直接追加规则，避免绕过同源去重并在重跑时制造副本。
     if not _has_technical_star_requirement_rule(mapped_candidates):
         technical_star_seed = _technical_star_requirement_seed(text, package_number)
         if technical_star_seed:
             mapped_candidates = _dedupe_rule_candidates([*mapped_candidates, technical_star_seed])
+    # 来源事实台账 V2.2：分段映射已经完成“从原文到候选事实”的唯一生成。后续只
+    # 做本地、可追溯的收口，不能再由多轮全局模型改写反复
+    # 改写标题、类别和来源。评分/资格/硬性条款的定向补漏均已在此前进入同一候选集。
+    candidates, coverage_missing_rules, compilation_used = _dedupe_rule_candidates(mapped_candidates), [], False
     compilation_failure_count = 0
-    if USE_SOURCE_LEDGER_RULE_PIPELINE:
-        # 来源事实台账 V2：分段映射已经完成“从原文到候选事实”的唯一生成。后续只
-        # 做一次可追溯规范化，不能再由编译、覆盖审计、全局合并三轮模型调用反复
-        # 改写标题、类别和来源。评分/资格/硬性条款的定向补漏均已在此前进入同一候选
-        # 集，因此这里不需要任何项目特例的尾部补丁。
-        candidates, coverage_missing_rules, compilation_used = (
-            _dedupe_rule_candidates(mapped_candidates), [], False
-        )
-        storage.update_task(app, task["task_id"], progress=68, message="正在按来源事实台账整理评审规则")
-    else:
-        # 仅保留兼容分支，方便历史单元测试和紧急回滚验证；正常任务不再进入此链路。
-        try:
-            candidates, coverage_missing_rules, compilation_used = _compile_rule_candidates(
-                app, task, profile, system_prompt, mapped_candidates,
-                _prompt_char_limit(profile, 100_000, 180_000),
-            )
-        except ValueError as exc:
-            candidates, coverage_missing_rules, compilation_used = _dedupe_rule_candidates(mapped_candidates), [], False
-            compilation_failure_count = 1
-            storage.update_task(app, task["task_id"], progress=76, message=f"规则编译未完成，已保留原始提取结果：{exc}")
+    storage.update_task(app, task["task_id"], progress=68, message="正在按来源事实台账整理评审规则")
     # 是否可由投标文件核验交给完整提示词与人工确认判断；不以词表硬过滤，避免误删业绩有效期等规则。
-    rules = _filter_inapplicable_template_rules(_filter_rules_for_package(candidates, package_number), text)
+    rules = _filter_non_file_verifiable_candidates(_filter_inapplicable_template_rules(_filter_rules_for_package(candidates, package_number), text))
     rules = _attach_source_fact_metadata(rules)
     excluded_rule_count = 0
     for item in rules:
@@ -3336,7 +2881,7 @@ def _extract_rules(app, task: dict) -> dict:
             item["scoring"] = scoring
     # 评分已由独立原文台账组装，不能再将它与正文批次候选重新混编。保留旧字段
     # 仅为任务历史/API 兼容；其语义现在是“评分台账组装是否完整”。
-    scoring_source_plan = {
+    scoring_assembly_status = {
         "applied": bool(score_packets) and not scoring_assembly["uncovered_clause_ids"],
         "failure_count": int(scoring_assembly["failure_count"]),
         "mode": "direct_assembly",
@@ -3346,8 +2891,8 @@ def _extract_rules(app, task: dict) -> dict:
     # 的父子重叠消除，避免同一评分事实被综合评审重复执行和重复计分。
     rules = _prune_overlapping_score_aggregates(rules)
     rules = _filter_inapplicable_template_rules(_filter_rules_for_package(rules, package_number), text)
-    # 编译结果已经形成稳定标题和类别；先收敛跨章节产生的同名同对象规则，既减少
-    # 最终规范化上下文，也保证模型规范化偶发失败时不会原样落下明显副本。
+    # 来源映射可能在跨章节生成同名同对象规则；先按来源与检查意图做确定性收口，
+    # 避免相同事实在后续落库时形成副本。
     rules, same_name_pre_merged_count = _consolidate_same_named_non_score_rules(rules)
     # 不再按规则数量切换“质量门控”或“两轮规范化”两套语义路径。
     # 所有规则集均走一次可追溯规范化：小规则集调用数不增加，大规则集减少一次
@@ -3356,21 +2901,25 @@ def _extract_rules(app, task: dict) -> dict:
         "applied": False, "dropped_count": 0, "failure_count": 0,
         "recovered_score_count": 0, "skipped_by_finalisation": True,
     }
-    # 评分规则已经由独立评分台账完成唯一组装；最终规范化只处理非评分候选，避免
-    # 模型操作再次碰触评分类别、满分或条款归属。
+    # 评分规则已经由独立评分台账完成唯一组装；非评分候选只走本地来源收口，避免
+    # 后续模型操作再次碰触评分类别、满分或条款归属。
     non_score_rules = [item for item in rules if item.get("category") not in {"objective", "subjective"}]
     assembled_score_rules = [item for item in rules if item.get("category") in {"objective", "subjective"}]
-    non_score_rules, finalisation = _finalise_rule_operations(
-        app, task, profile, system_prompt, non_score_rules,
-    )
+    # V2.2 的来源单元已经在映射阶段提供稳定身份；再把全部规则交给一次全局模型
+    # “最终整理”会重新引入长度截断和标题漂移。这里仅做同源、同意图的确定性收口；
+    # 不能证明重复的候选保留给人工确认，绝不以静默删除换取表面整洁。
+    non_score_rules, local_finalisation_merged = _consolidate_same_named_non_score_rules(non_score_rules)
+    finalisation = {
+        "applied": bool(local_finalisation_merged), "dropped_count": 0,
+        "rewritten_count": 0, "merged_count": local_finalisation_merged, "failure_count": 0,
+    }
     rules = [*non_score_rules, *assembled_score_rules]
-    # 模型规范化可能改写标题，也可能因格式异常只完成部分类别。再次执行同一套
-    # 确定性收口，且补做同源候选去重；不依赖模型是否成功返回操作列表。
+    # 前序定向补漏可能带来同源候选；再次执行同一套确定性收口，且补做同源候选去重。
     rules = _dedupe_rule_candidates(rules)
     rules, same_name_post_merged_count = _consolidate_same_named_non_score_rules(rules)
     rules = _attach_source_fact_metadata(rules)
     rules = _attach_score_ledger_metadata(rules, score_packets)
-    # 最终规范化可能重写/合并评分候选，必须再做一次确定性同源去重；随后将
+    # 评分结构修复或定向补漏可能补充评分候选，必须再做一次确定性同源去重；随后将
     # “某部分共 X 分”的导航标题移出可执行规则，仅保留其作为评分守恒台账。
     rules, score_ledger = _canonicalise_score_ledger(rules, score_packets)
     rules, score_summary_excluded_count = _drop_non_executable_score_section_summaries(rules)
@@ -3459,12 +3008,14 @@ def _extract_rules(app, task: dict) -> dict:
             "qualification_supplement_failure_count": qualification_supplement_failures,
             "semantic_compilation_used": compilation_used, "coverage_missing_rule_count": len(coverage_missing_rules),
             "semantic_compilation_failure_count": compilation_failure_count,
-            # 保留旧字段，供页面和历史统计兼容；其语义升级为“评分来源分组”。
-            "scoring_reconciliation_applied": scoring_source_plan["applied"],
-            "scoring_reconciliation_failure_count": scoring_source_plan["failure_count"],
-            "scoring_source_plan_applied": scoring_source_plan["applied"],
-            "scoring_source_plan_failure_count": scoring_source_plan["failure_count"],
-            "scoring_assembly_mode": scoring_source_plan["mode"],
+            # 保留旧字段，供页面和历史统计兼容；其语义为评分原文台账组装。
+            # 旧字段仅供历史任务页面及外部调用方读取；新链路的真实语义为评分原文
+            # 台账组装，不能据此重新启用旧的评分来源规划流程。
+            "scoring_reconciliation_applied": scoring_assembly_status["applied"],
+            "scoring_reconciliation_failure_count": scoring_assembly_status["failure_count"],
+            "scoring_source_plan_applied": scoring_assembly_status["applied"],
+            "scoring_source_plan_failure_count": scoring_assembly_status["failure_count"],
+            "scoring_assembly_mode": scoring_assembly_status["mode"],
             "scoring_assembly_group_count": scoring_assembly["group_count"],
             "scoring_assembly_uncovered_clause_ids": scoring_assembly["uncovered_clause_ids"],
             "quality_gate_applied": quality_gate["applied"],
@@ -4172,9 +3723,14 @@ def _is_score_fragment_continuation(lines: list[str], index: int) -> bool:
     """
     line = str(lines[index] or "").strip()
     compact = re.sub(r"\s+", "", line)
-    if not re.match(r"^[（(]?\d+(?:\.\d+)?分[）)]?[、，,；;]", compact):
+    numeric_fragment = bool(re.match(r"^[（(]?\d+(?:\.\d+)?分[）)]?[、，,；;]", compact))
+    grade_fragment = bool(_SCORE_GRADE_FRAGMENT_PATTERN.match(compact) and (
+        _SCORE_CLAUSE_PATTERN.search(compact) or "不得分" in compact
+    ))
+    negative_fragment = bool(_SCORE_NEGATIVE_FRAGMENT_PATTERN.match(compact))
+    if not (numeric_fragment or grade_fragment or negative_fragment):
         return False
-    if re.match(r"^(?:\d+|[一二三四五六七八九十]+)[.、．]", compact):
+    if numeric_fragment and re.match(r"^(?:\d+|[一二三四五六七八九十]+)[.、．]", compact):
         return False
     previous = ""
     for value in reversed(lines[max(0, index - 8):index]):
@@ -4185,7 +3741,11 @@ def _is_score_fragment_continuation(lines: list[str], index: int) -> bool:
         if clean and not re.fullmatch(r"\[第\d+页\]", clean) and not re.fullmatch(r"\d{1,4}", clean):
             previous = re.sub(r"\s+", "", clean)
             break
-    return bool(previous and ("分" in previous or "计划" in previous or "方案" in previous))
+    if not previous:
+        return False
+    # A/B/C/D 档次与“未提供不得分”都必须有一个刚出现的评分语境，不能把普通
+    # 列表中的字母编号误接入上一评分项。
+    return bool("分" in previous or "计划" in previous or "方案" in previous or "评分" in previous)
 _DIRECTORY_LEADER_PATTERN = re.compile(r"[.．·…]{2,}|\s{3,}")
 _DIRECTORY_CONTINUATION_MAX_PAGES = 8
 _MATERIAL_ROLE_TERMS = {

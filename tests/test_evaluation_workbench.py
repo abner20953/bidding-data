@@ -993,136 +993,6 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual([item["title"] for item in rules], ["第一批", "第二批", "第三批"])
         self.assertEqual((compact_retries, split_retries), (0, 0))
 
-    def test_rule_compilation_splits_only_the_overflowing_group_and_keeps_all_rules(self):
-        task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
-        profile = storage.get_model_profile(self.app, None)
-        candidates = [
-            {"category": "qualification", "title": f"资格条件{index}", "check_rule": f"核验资格条件{index}",
-             "source_text": f"投标人应满足资格条件{index}", "source_page": index}
-            for index in range(12)
-        ]
-        left_rules, right_rules = candidates[:6], candidates[6:]
-        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[
-            worker.InvalidJsonResponse('{"rules":[', "length"),
-            {"rules": left_rules}, {"missing_rules": []},
-            {"rules": right_rules}, {"missing_rules": []},
-            {"rules": candidates},
-        ]) as request_json:
-            compiled, missing, used = worker._compile_rule_candidates(
-                self.app, task, profile, "规则编译系统提示", candidates, 40_000,
-            )
-
-        self.assertTrue(used)
-        self.assertEqual(missing, [])
-        self.assertEqual({item["title"] for item in compiled}, {item["title"] for item in candidates})
-        self.assertEqual(request_json.call_count, 6)
-        self.assertEqual(request_json.call_args_list[0].kwargs["max_tokens"], 6240)
-
-    def test_global_rule_compile_semantically_merges_results_from_different_groups(self):
-        task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
-        profile = storage.get_model_profile(self.app, None)
-        split_results = [
-            {"category": "qualification", "title": "营业执照要求", "check_rule": "核验有效营业执照", "source_text": "提供有效营业执照"},
-            {"category": "compliance", "title": "营业执照缺失后果", "check_rule": "未提供营业执照则无效", "source_text": "未提供则响应无效"},
-        ]
-        merged_response = {"rules": [{
-            "category": "qualification", "title": "营业执照",
-            "check_rule": "核验有效营业执照；未提供则响应无效",
-            "source_text": "提供有效营业执照，未提供则响应无效",
-        }]}
-
-        with patch("dashboard.evaluation_workbench.worker.request_json", return_value=merged_response) as request_json:
-            merged = worker._merge_compiled_rule_groups(
-                self.app, task, profile, "规则编译系统提示", split_results, 40_000,
-            )
-
-        self.assertEqual(len(merged), 1)
-        self.assertIn("未提供则响应无效", merged[0]["check_rule"])
-        self.assertEqual(request_json.call_count, 1)
-
-    def test_rule_normalisation_uses_one_shared_stage_for_all_nontrivial_rule_sets(self):
-        self.assertEqual(worker.RULE_FINALISATION_MIN_RULES, 2)
-        rules = [
-            {"category": "qualification", "title": "营业执照", "check_rule": "核验营业执照"},
-            {"category": "compliance", "title": "响应有效期", "check_rule": "核验响应有效期"},
-        ]
-        packet = worker._rule_normalisation_packet(rules, include_ids=True)
-        self.assertIn('"rule_id":"R1"', packet)
-        task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
-        profile = storage.get_model_profile(self.app, None)
-        with patch("dashboard.evaluation_workbench.worker.request_json", return_value={"drops": [], "rewrites": [], "merges": []}) as request_json:
-            kept, stats = worker._finalise_rule_operations(self.app, task, profile, "规则提取系统提示", rules)
-        self.assertEqual(kept, rules)
-        self.assertFalse(stats["applied"])
-        self.assertEqual(request_json.call_count, 1)
-
-    def test_final_rule_operations_rewrite_merge_and_drop_without_touching_scores(self):
-        task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
-        profile = storage.get_model_profile(self.app, None)
-        rules = [
-            {"category": "qualification", "title": "代理资格", "check_rule": "核验代理条件", "source_text": "代理商须满足资格条件"},
-            {"category": "compliance", "title": "制造商授权书", "check_rule": "核验制造商授权书", "source_text": "代理商须提供制造商授权书", "ocr_required": True},
-            {"category": "rejection", "title": "保证金平台状态", "check_rule": "核验平台子账号到账状态", "source_text": "投标保证金金额为五万元"},
-            {"category": "compliance", "title": "签章及在线提交", "check_rule": "核验签章并确认在线提交", "source_text": "投标文件应按要求签字盖章并在线提交"},
-            {"category": "objective", "title": "业绩评分", "check_rule": "每项3分，最高9分", "source_text": "每项3分，最高9分", "scoring": {"max_score": 9, "kind": "manual"}},
-        ]
-        rules.extend(
-            {"category": "substantive", "title": f"有效规则{index}", "check_rule": f"核验有效规则{index}", "source_text": f"应满足有效规则{index}"}
-            for index in range(6, 13)
-        )
-        normalisation_response = {
-            "drops": [
-                {"rule_id": "R3", "reason": "not_file_verifiable"},
-                {"rule_id": "R5", "reason": "duplicate"},
-            ],
-            "rewrites": [
-                {"rule_id": "R4", "reason": "partial_boundary", "title": "电子签章与签字形式", "check_rule": "核验电子签章、扫描签字及涂改确认。", "ocr_required": True},
-                {"rule_id": "R5", "reason": "partial_boundary", "title": "错误评分改写", "check_rule": "不得生效", "ocr_required": False},
-            ],
-            "merges": [{
-                "rule_ids": ["R1", "R2"], "keep_rule_id": "R1", "reason": "duplicate",
-                "title": "生产或代理资格与授权材料", "check_rule": "核验代理资格条件及制造商授权书。", "ocr_required": True,
-            }],
-        }
-
-        with patch("dashboard.evaluation_workbench.worker.request_json", return_value=normalisation_response) as request_json:
-            kept, stats = worker._finalise_rule_operations(
-                self.app, task, profile, "规则提取系统提示", rules,
-            )
-
-        self.assertEqual(len(kept), 10)
-        self.assertNotIn("保证金平台状态", {item["title"] for item in kept})
-        merged = next(item for item in kept if item["title"] == "生产或代理资格与授权材料")
-        self.assertIn("代理商须满足资格条件", merged["source_text"])
-        self.assertIn("代理商须提供制造商授权书", merged["source_text"])
-        self.assertTrue(merged["ocr_required"])
-        rewritten = next(item for item in kept if item["title"] == "电子签章与签字形式")
-        self.assertNotIn("在线提交", rewritten["check_rule"])
-        score = next(item for item in kept if item["category"] == "objective")
-        self.assertEqual(score["title"], "业绩评分")
-        self.assertEqual(score["scoring"]["max_score"], 9)
-        self.assertEqual(stats, {
-            "applied": True, "dropped_count": 1, "rewritten_count": 1,
-            "merged_count": 1, "failure_count": 0,
-        })
-        self.assertEqual(request_json.call_count, 1)
-        self.assertIn("一次处理三类问题", request_json.call_args.args[2])
-
-    def test_final_rule_operations_failure_keeps_all_rules(self):
-        task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
-        profile = storage.get_model_profile(self.app, None)
-        rules = [
-            {"category": "qualification", "title": f"规则{index}", "check_rule": f"核验规则{index}"}
-            for index in range(12)
-        ]
-        with patch("dashboard.evaluation_workbench.worker.request_json", return_value={"drops": "invalid"}):
-            kept, stats = worker._finalise_rule_operations(
-                self.app, task, profile, "规则提取系统提示", rules,
-            )
-        self.assertEqual(kept, rules)
-        self.assertEqual(stats["failure_count"], 1)
-        self.assertFalse(stats["applied"])
-
     def test_explicit_non_ocr_is_overridden_only_by_decisive_visual_evidence(self):
         self.assertTrue(worker._rule_requires_visual_verification({
             "ocr_required": False,
@@ -1274,56 +1144,6 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(len(packets), 2)
         self.assertIn("提供主体资格证明", combined)
         self.assertIn("核验项目负责人资格", combined)
-
-    def test_scoring_reconciliation_preserves_all_clauses_and_corrects_discretionary_category(self):
-        packets = worker._score_clause_packets("\n".join([
-            "商务部分（9分）", "同类业绩：每提供一个得3分，最高6分。", "管理体系证书：每项1分，最高1分。",
-            "技术部分（46分）", "设备选型（5分）：按优劣横向比较、酌情评分。", "技术方案（41分）：按完整性和合理性评分。",
-            "投标报价（45分）：按报价公式计算。", "总分（100分）。",
-        ]))
-        current_rules = [
-            {"category": "objective", "title": "同类业绩", "check_rule": "每项3分，最高6分", "source_text": "每提供一个得3分，最高6分", "scoring": {"max_score": 6, "kind": "manual"}},
-            {"category": "objective", "title": "设备选型", "check_rule": "按横向比较评分", "source_text": "设备选型（5分）", "scoring": {"max_score": 5, "kind": "manual"}},
-            {"category": "subjective", "title": "技术方案", "check_rule": "按完整性评分", "source_text": "技术方案（41分）", "scoring": {"max_score": 41, "kind": "manual"}},
-        ]
-        clause_ids = [packet["clause_id"] for packet in packets]
-        reconciled = {
-            "rules": [
-                {"category": "objective", "title": "同类业绩", "check_rule": "每提供一个得3分，最高6分。", "source_text": "同类业绩：每提供一个得3分，最高6分。", "source_clause_ids": clause_ids[:2], "scoring": {"max_score": 6, "kind": "manual"}},
-                {"category": "objective", "title": "管理体系证书", "check_rule": "每项1分，最高1分。", "source_text": "管理体系证书：每项1分，最高1分。", "source_clause_ids": [clause_ids[2]], "scoring": {"max_score": 1, "kind": "manual"}},
-                {"category": "subjective", "title": "设备选型", "check_rule": "按优劣横向比较、酌情评分，满分5分。", "source_text": "设备选型（5分）：按优劣横向比较、酌情评分。", "source_clause_ids": clause_ids[3:5], "scoring": {"max_score": 5, "kind": "manual"}},
-                {"category": "subjective", "title": "技术方案", "check_rule": "按完整性和合理性评分，满分41分。", "source_text": "技术方案（41分）：按完整性和合理性评分。", "source_clause_ids": [clause_ids[5]], "scoring": {"max_score": 41, "kind": "manual"}},
-                {"category": "objective", "title": "投标报价", "check_rule": "按报价公式计算，满分45分。", "source_text": "投标报价（45分）：按报价公式计算。", "source_clause_ids": clause_ids[6:], "scoring": {"max_score": 45, "kind": "manual"}},
-            ],
-        }
-        task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
-        profile = storage.get_model_profile(self.app, None)
-
-        with patch("dashboard.evaluation_workbench.worker.request_json", return_value=reconciled) as request_json:
-            rules, stats = worker._reconcile_scoring_rules(
-                self.app, task, profile, "规则提取系统提示", current_rules, packets,
-            )
-
-        self.assertTrue(stats["applied"])
-        self.assertEqual(stats["failure_count"], 0)
-        self.assertEqual(next(item for item in rules if item["title"] == "设备选型")["category"], "subjective")
-        self.assertTrue(all(worker._score_packet_is_covered(packet, rules) for packet in packets))
-        self.assertIn("完整评分条款", request_json.call_args.args[2])
-
-    def test_scoring_reconciliation_keeps_original_rules_when_model_omits_clause_mapping(self):
-        packets = worker._score_clause_packets("业绩：每提供一个得3分，最高6分。\n报价：最高得45分。")
-        original = [{"category": "objective", "title": "业绩评分", "check_rule": "每个业绩3分，最高6分", "source_text": "每提供一个得3分，最高6分", "scoring": {"max_score": 6, "kind": "manual"}}]
-        task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
-        profile = storage.get_model_profile(self.app, None)
-
-        with patch("dashboard.evaluation_workbench.worker.request_json", return_value={"rules": original}):
-            rules, stats = worker._reconcile_scoring_rules(
-                self.app, task, profile, "规则提取系统提示", original, packets,
-            )
-
-        self.assertEqual(rules, original)
-        self.assertFalse(stats["applied"])
-        self.assertEqual(stats["failure_count"], 1)
 
     def test_rule_extraction_splits_long_source_into_bounded_batches(self):
         self._add_pdf("tender.pdf", "tender", "", "用于建立解析文件")
@@ -3049,9 +2869,12 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertTrue(all(item["section"] and item["change_level"] for item in templates))
         extraction_template = next(item for item in templates if item["template_id"] == "extract_rules_user")
         self.assertIn("不得逐条复述招标原文", extraction_template["content"])
-        internal_template = next(item for item in templates if item["template_id"] == "extract_rules_compile_user")
-        self.assertEqual(internal_template["configuration_group"], "system")
-        self.assertEqual(internal_template["section"], "评审规则内部处理")
+        removed_ids = {
+            "extract_rules_compile_user", "extract_rules_coverage_user",
+            "extract_rules_finalise_user", "extract_rules_scoring_reconcile_user",
+        }
+        self.assertTrue(removed_ids.isdisjoint({item["template_id"] for item in templates}))
+        self.assertTrue(removed_ids.isdisjoint(PROMPT_TEMPLATES))
         compare_guidance = next(item for item in templates if item["template_id"] == "compare_ai_assessment")
         self.assertEqual(compare_guidance["name"], "文件查重 · 通用业务指令")
         original = next(item for item in templates if item["template_id"] == "evaluate_all")
@@ -3127,29 +2950,13 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         self.assertIn("相邻非资格内容", qualification_template)
         extraction_validation = PROMPT_TEMPLATES["extract_rules_validation_guidance"]["content"]
-        compile_template = PROMPT_TEMPLATES["extract_rules_compile_user"]["content"]
-        coverage_template = PROMPT_TEMPLATES["extract_rules_coverage_user"]["content"]
-        finalise_template = PROMPT_TEMPLATES["extract_rules_finalise_user"]["content"]
-        finalise_focus = PROMPT_TEMPLATES["extract_rules_finalise_unified_focus"]["content"]
-        for value in (extraction_guidance, compile_template, coverage_template):
-            self.assertIn("履约", value)
-            self.assertIn("电子投标文件", value)
-            self.assertIn("串通、行贿、弄虚作假", value)
-        self.assertIn("同一响应字段的期限、地点、标准、金额", compile_template)
-        self.assertIn("source_clause_ids", compile_template)
-        self.assertIn("scoring.items", compile_template)
-        self.assertIn("逐项响应覆盖候选", compile_template)
-        for value in (extraction_user, extraction_continue, compile_template, coverage_template):
+        self.assertIn("履约", extraction_guidance)
+        self.assertIn("电子投标文件", extraction_guidance)
+        self.assertIn("串通、行贿、弄虚作假", extraction_guidance)
+        for value in (extraction_user, extraction_continue):
             self.assertIn('"evidence_requirements"', value)
             self.assertIn("每条输出都必须保留该字段", value)
-        self.assertIn("不得因材料名称或可能存在扫描页而把整条规则强制 OCR", compile_template)
-        self.assertIn("category=other 的逐项响应覆盖规则", coverage_template)
         self.assertIn("对象名称、编号、列表层级、分组标题、位置描述或表格行", extraction_guidance)
-        self.assertIn('"rewrites"', finalise_template)
-        self.assertIn('"merges"', finalise_template)
-        self.assertIn("objective/subjective", finalise_template)
-        self.assertIn("一次处理三类问题", finalise_focus)
-        self.assertIn("对象名称、编号、列表层级、分组标题、位置描述或表格行", compile_template)
         self.assertIn("不接受联合体", extraction_validation)
         self.assertIn("平台子账号", extraction_validation)
         self.assertIn("必须为 manual", extraction_validation)
@@ -3404,7 +3211,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_subjective_user"]["content"])
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"])
         self.assertIn("统一为 partial 或需图片核验", PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v48")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v49")
 
     def test_scope_chapter_and_text_error_guidance_present(self):
         from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
@@ -3422,7 +3229,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(text_marker, PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("必须点名最具辨识度的偏离对象", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("risk_level 应为 high", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v48")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v49")
 
     def test_ocr_visual_contracts_deduplicated_but_keep_hard_constraints(self):
         from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
@@ -5846,7 +5653,6 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         ]
         _, ledger = worker._canonicalise_score_ledger(rules, packets)
         self.assertEqual(ledger["conflict_count"], 1)
-        self.assertIsNone(worker._normalise_reconciled_scoring_rules(rules, packets))
 
     def test_score_ledger_never_prunes_children_when_parent_loses_clause_coverage(self):
         packets = [
@@ -5957,7 +5763,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不限定行业或采购类型", guidance)
         scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v48")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v49")
 
     def test_full_scan_does_not_reinject_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")
@@ -7173,53 +6979,14 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-source", [{
             "category": "other", "title": "响应覆盖", "check_rule": "核验响应覆盖",
             "source_text": "投标文件应逐项响应。", "source_fact_ids": ["SF-rule-test"],
+            "source_unit_ids": ["SU-test-P1-1-abc"],
         }])
         _, rules = storage.list_rules(self.app, self.project["project_id"])
         meta = storage.rule_execution_meta(rules[0])
         self.assertEqual(meta["source_fact_ids"], ["SF-rule-test"])
+        self.assertEqual(meta["source_unit_ids"], ["SU-test-P1-1-abc"])
 
-    def test_scoring_source_plan_only_removes_proven_duplicate(self):
-        packets = worker._score_clause_packets("业绩A：每项2分，最高4分。\n业绩B：每项2分，最高4分。")
-        clause_ids = [packet["clause_id"] for packet in packets]
-        rules = [
-            {
-                "category": "objective", "title": "相关业绩评分", "check_rule": "A、B各2分，共8分",
-                "source_text": "业绩A：每项2分，最高4分。业绩B：每项2分，最高4分。",
-                "scoring": {"max_score": 8, "kind": "manual"},
-            },
-            {
-                "category": "objective", "title": "业绩A评分", "check_rule": "A每项2分，最高4分",
-                "source_text": "业绩A：每项2分，最高4分。",
-                "source_clause_ids": [clause_ids[0]], "scoring": {"max_score": 4, "kind": "manual"},
-            },
-            {
-                "category": "objective", "title": "业绩B评分", "check_rule": "B每项2分，最高4分",
-                "source_text": "业绩B：每项2分，最高4分。",
-                "source_clause_ids": [clause_ids[1]], "scoring": {"max_score": 4, "kind": "manual"},
-            },
-        ]
-        planned = worker._apply_scoring_source_plan(rules, packets, [
-            {"rule_id": "SR1", "source_clause_ids": clause_ids},
-        ])
-        self.assertIsNotNone(planned)
-        self.assertEqual([item["title"] for item in planned], ["相关业绩评分"])
-        self.assertEqual(set(planned[0]["source_clause_ids"]), set(clause_ids))
-
-    def test_scoring_source_plan_rejects_incomplete_or_overlapping_assignment(self):
-        packets = worker._score_clause_packets("业绩：每项2分，最高4分。\n报价：最高10分。")
-        rules = [
-            {"category": "objective", "title": "业绩", "check_rule": "业绩", "source_text": "业绩：每项2分，最高4分。", "scoring": {"max_score": 4}},
-            {"category": "objective", "title": "报价", "check_rule": "报价", "source_text": "报价：最高10分。", "scoring": {"max_score": 10}},
-        ]
-        self.assertIsNone(worker._apply_scoring_source_plan(rules, packets, [
-            {"rule_id": "SR1", "source_clause_ids": [packets[0]["clause_id"]]},
-        ]))
-        self.assertIsNone(worker._apply_scoring_source_plan(rules, packets, [
-            {"rule_id": "SR1", "source_clause_ids": [packets[0]["clause_id"], packets[1]["clause_id"]]},
-            {"rule_id": "SR2", "source_clause_ids": [packets[1]["clause_id"]]},
-        ]))
-
-    def test_rule_extraction_v21_uses_scoring_ledger_without_semantic_compile_chain(self):
+    def test_rule_extraction_v22_uses_scoring_ledger_without_legacy_compile_chain(self):
         tender_text = "业绩评分：每提供一份业绩得2分，最高4分。\n报价评分：按报价公式计算，最高10分。"
         self._add_pdf("tender.pdf", "tender", "", tender_text)
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
@@ -7252,53 +7019,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(finished["result"]["scoring_assembly_mode"], "direct_assembly")
         self.assertFalse(any("统一编译并合并评审规则" in value or "审计规则覆盖范围" in value for value in prompts))
         self.assertFalse(any("规划每条评分原文应归属" in value for value in prompts))
-        self.assertEqual(finished["result"]["source_ledger"]["pipeline_version"], "source-ledger-v2.1")
-
-    def test_rule_finalisation_failure_retries_non_score_categories_only(self):
-        """完整规范化异常后按类别恢复，评分规则不额外改写。"""
-        rules = [
-            {"category": "qualification", "title": "资格A", "check_rule": "A"},
-            {"category": "qualification", "title": "资格B", "check_rule": "B"},
-            {"category": "other", "title": "响应A", "check_rule": "A"},
-            {"category": "other", "title": "响应B", "check_rule": "B"},
-            {"category": "objective", "title": "报价评分", "check_rule": "评分", "scoring": {"max_score": 10}},
-        ]
-        calls = []
-
-        def finalise_pass(_app, _task, _profile, _system_prompt, values, *, focus_key, focus):
-            calls.append((focus_key, [item["category"] for item in values]))
-            if focus_key == "统一规范化":
-                return values, {"applied": False, "dropped_count": 0, "rewritten_count": 0,
-                                "merged_count": 0, "failure_count": 1}
-            return values, {"applied": True, "dropped_count": 0, "rewritten_count": 0,
-                            "merged_count": 0, "failure_count": 0}
-
-        with patch.object(worker, "_finalise_rule_operations_pass", side_effect=finalise_pass):
-            result, stats = worker._finalise_rule_operations(
-                self.app, {"task_id": "task", "project_id": self.project["project_id"]},
-                {"profile_id": "model"}, "系统提示", rules,
-            )
-
-        self.assertEqual(len(result), len(rules))
-        self.assertEqual(len(calls), 3)
-        self.assertTrue(any(key.endswith("qualification") for key, _ in calls))
-        self.assertTrue(any(key.endswith("other") for key, _ in calls))
-        self.assertFalse(any(categories == ["objective"] for _, categories in calls[1:]))
-        self.assertEqual(stats["failure_count"], 1)
-
-    def test_rule_finalisation_protects_manual_and_global_but_not_old_ai_edits(self):
-        """重新提取提示词也不得受历史 AI 编辑规则影响。"""
-        current = [
-            {"source_type": "manual", "title": "人工规则", "category": "other"},
-            {"source_type": "ai_edited", "title": "旧 AI 编辑", "category": "other"},
-            {"source_type": "ai", "title": "旧 AI", "category": "other"},
-        ]
-        global_rules = [{"source_type": "global", "title": "通用规则", "category": "other"}]
-        with patch.object(storage, "list_rules", return_value=({}, current)), \
-             patch.object(storage, "list_global_rules", return_value=global_rules):
-            protected = worker._protected_rules_for_normalisation(self.app, self.project["project_id"])
-
-        self.assertEqual([item["title"] for item in protected], ["人工规则", "通用规则"])
+        self.assertEqual(finished["result"]["source_ledger"]["pipeline_version"], "source-ledger-v2.2")
 
     def test_unmapped_ai_score_rule_blocks_confirmation(self):
         """没有原文评分台账锚点的纯 AI 评分规则不能进入已确认规则集。"""
@@ -7437,6 +7158,82 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             self.assertNotEqual(first, second)
         finally:
             storage._RUNTIME_CODE_CACHE = original_cache
+
+    def test_source_units_are_stable_and_recover_unique_model_excerpt(self):
+        text = """[第8页]
+投标文件应提供有效营业执照。
+
+投标文件应提供法定代表人身份证明。"""
+        units = worker._source_units_for_text(text, source_document_key="tender-a")
+        self.assertEqual(len(units), 2)
+        catalog = {item["unit_id"]: {"page": item["page"], "text": item["text"]} for item in units}
+        attached = worker._attach_rule_source_units([{
+            "category": "qualification", "title": "营业执照", "check_rule": "核验营业执照有效性",
+            "source_text": "投标文件应提供有效营业执照。",
+        }], catalog)
+        self.assertEqual(attached[0]["source_unit_ids"], [units[0]["unit_id"]])
+        self.assertEqual(attached[0]["source_page"], 8)
+
+    def test_same_source_unit_merges_only_when_review_intent_is_equivalent(self):
+        unit = "SU-test-P68-1-abcdef01"
+        duplicate_left = {
+            "category": "compliance", "title": "技术条款偏离表填写要求",
+            "check_rule": "核验技术条款偏离表逐条响应，不得遗漏，负偏离应说明。",
+            "source_text": "技术条款偏离表应逐条响应。", "source_unit_ids": [unit],
+        }
+        duplicate_right = {
+            "category": "compliance", "title": "技术条款偏离表审查",
+            "check_rule": "核验技术条款偏离表逐条响应，不得遗漏，负偏离应说明。",
+            "source_text": "技术条款偏离表应逐条响应。", "source_unit_ids": [unit],
+        }
+        distinct = {
+            "category": "compliance", "title": "星号条款响应",
+            "check_rule": "核验星号实质性条款是否响应。",
+            "source_text": "技术条款偏离表应逐条响应。", "source_unit_ids": [unit],
+        }
+        rules = worker._attach_source_fact_metadata([duplicate_left, duplicate_right, distinct])
+        merged, count = worker._consolidate_same_named_non_score_rules(rules)
+        self.assertEqual(count, 1)
+        self.assertEqual(len(merged), 2)
+
+    def test_score_packets_join_letter_grades_and_cross_page_zero_score_condition(self):
+        text = """[第33页]
+售后服务方案
+A、方案完整，每项得2分；
+B、方案基本完整，每项得1.5分；
+[第34页]
+C、方案较差，每项得1分；
+D、不提供者不得分。
+
+财务履约能力（6分）
+财务状况健全得6分；
+[第35页]
+财务报告未提供或有保留意见的得0分。"""
+        packets = worker._score_clause_packets(text)
+        sale = next(item for item in packets if "售后服务方案" in item["text"])
+        finance = next(item for item in packets if "财务履约能力" in item["text"])
+        self.assertIn("C、方案较差", sale["text"])
+        self.assertIn("不提供者不得分", sale["text"])
+        self.assertEqual(sale["source_pages"], [33, 34])
+        self.assertIn("财务报告未提供", finance["text"])
+        self.assertEqual(finance["source_pages"], [34, 35])
+
+    def test_score_packets_do_not_carry_page_footer_into_next_scoring_item(self):
+        text = """[第36页]
+网络系统升级改造方案
+方案不存在瑕疵得8分；
+方案存在1处瑕疵得6分；
+方案存在2处瑕疵得4分；
+方案存在3处瑕疵得2分；
+方案存在4处及以上瑕疵或未提供不得分。
+30
+[第37页]
+技术参数响应
+每项重要指标得0.3分，满分24.9分。"""
+        packets = worker._score_clause_packets(text)
+        technical = next(item for item in packets if "技术参数响应" in item["text"])
+        self.assertNotIn("方案存在4处", technical["text"])
+        self.assertNotIn("\n30", technical["text"])
 
 
 if __name__ == "__main__":

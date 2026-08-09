@@ -200,14 +200,12 @@ def task_prompt_template_fingerprint(app, task_type: str) -> str | None:
     templates_by_task = {
         "compare_documents": {"compare_ai_assessment", "compare_ai_assessment_user", "json_repair", "json_repair_user"},
         "extract_rules": {
-            "extract_rules", "extract_rules_guidance", "extract_rules_validation_guidance", "extract_rules_user", "extract_rules_compile_user",
-            "extract_rules_continue_user", "extract_rules_coverage_user",
-            "extract_rules_finalise_user", "extract_rules_finalise_unified_focus",
+            "extract_rules", "extract_rules_guidance", "extract_rules_validation_guidance", "extract_rules_user",
+            "extract_rules_continue_user",
             "extract_rules_supplement_user",
             "extract_rules_qualification_supplement_user",
             "extract_rules_hard_anchor_supplement_user",
             "extract_rules_scoring_structure_repair_user",
-            "extract_rules_scoring_reconcile_user",
             "json_repair", "json_repair_user",
         },
         "review_documents": {"review_documents", "review_documents_user", "json_repair", "json_repair_user"},
@@ -2877,6 +2875,10 @@ def rule_execution_meta(rule: dict) -> dict:
     if not isinstance(fact_ids, list):
         fact_ids = []
     fact_ids = [str(item).strip() for item in fact_ids if str(item).strip()]
+    source_unit_ids = value.get("source_unit_ids")
+    if not isinstance(source_unit_ids, list):
+        source_unit_ids = []
+    source_unit_ids = [str(item).strip() for item in source_unit_ids if str(item).strip()]
     source_locations = value.get("source_locations")
     if not isinstance(source_locations, list):
         source_locations = []
@@ -2923,6 +2925,7 @@ def rule_execution_meta(rule: dict) -> dict:
         "evidence_items": _normalise_evidence_items(value.get("evidence_items")),
         "source_clause_ids": list(dict.fromkeys(clause_ids)),
         "source_fact_ids": list(dict.fromkeys(fact_ids)),
+        "source_unit_ids": list(dict.fromkeys(source_unit_ids)),
         "source_locations": normalised_locations,
         "score_sections": normalised_sections,
     }
@@ -3010,6 +3013,10 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
     if not isinstance(fact_ids, list):
         fact_ids = []
     fact_ids = [str(item).strip() for item in fact_ids if str(item).strip()]
+    source_unit_ids = payload.get("source_unit_ids", base.get("source_unit_ids"))
+    if not isinstance(source_unit_ids, list):
+        source_unit_ids = []
+    source_unit_ids = [str(item).strip() for item in source_unit_ids if str(item).strip()]
     source_locations = payload.get("source_locations", base.get("source_locations"))
     if not isinstance(source_locations, list):
         source_locations = []
@@ -3056,6 +3063,7 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
         "evidence_items": _normalise_evidence_items(payload.get("evidence_items", base.get("evidence_items"))),
         "source_clause_ids": list(dict.fromkeys(clause_ids)),
         "source_fact_ids": list(dict.fromkeys(fact_ids)),
+        "source_unit_ids": list(dict.fromkeys(source_unit_ids)),
         "source_locations": normalised_locations,
         "score_sections": normalised_sections,
     }
