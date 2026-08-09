@@ -2870,6 +2870,13 @@ def rule_execution_meta(rule: dict) -> dict:
     if not isinstance(clause_ids, list):
         clause_ids = []
     clause_ids = [str(item).strip() for item in clause_ids if str(item).strip()]
+    # 来源事实 ID 是规则提取 V2 的稳定追溯键。它与评分条款 ID 不同：前者覆盖
+    # 所有类别的直接招标原文事实，后者仅用于评分表守恒。旧规则没有该字段时保持空
+    # 列表，不改变既有接口或执行行为。
+    fact_ids = value.get("source_fact_ids")
+    if not isinstance(fact_ids, list):
+        fact_ids = []
+    fact_ids = [str(item).strip() for item in fact_ids if str(item).strip()]
     sections = value.get("score_sections")
     if not isinstance(sections, list):
         sections = []
@@ -2902,6 +2909,7 @@ def rule_execution_meta(rule: dict) -> dict:
         "baseline_ocr_mode": baseline_ocr_mode,
         "evidence_items": _normalise_evidence_items(value.get("evidence_items")),
         "source_clause_ids": list(dict.fromkeys(clause_ids)),
+        "source_fact_ids": list(dict.fromkeys(fact_ids)),
         "score_sections": normalised_sections,
     }
 
@@ -2984,6 +2992,10 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
     if not isinstance(clause_ids, list):
         clause_ids = []
     clause_ids = [str(item).strip() for item in clause_ids if str(item).strip()]
+    fact_ids = payload.get("source_fact_ids", base.get("source_fact_ids"))
+    if not isinstance(fact_ids, list):
+        fact_ids = []
+    fact_ids = [str(item).strip() for item in fact_ids if str(item).strip()]
     sections = payload.get("score_sections", base.get("score_sections"))
     if not isinstance(sections, list):
         sections = []
@@ -3016,6 +3028,7 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
         "baseline_ocr_mode": baseline_ocr_mode,
         "evidence_items": _normalise_evidence_items(payload.get("evidence_items", base.get("evidence_items"))),
         "source_clause_ids": list(dict.fromkeys(clause_ids)),
+        "source_fact_ids": list(dict.fromkeys(fact_ids)),
         "score_sections": normalised_sections,
     }
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))

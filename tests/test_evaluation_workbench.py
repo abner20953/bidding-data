@@ -3369,7 +3369,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_subjective_user"]["content"])
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"])
         self.assertIn("统一为 partial 或需图片核验", PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v46")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v47")
 
     def test_scope_chapter_and_text_error_guidance_present(self):
         from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
@@ -3387,7 +3387,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(text_marker, PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("必须点名最具辨识度的偏离对象", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("risk_level 应为 high", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v46")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v47")
 
     def test_ocr_visual_contracts_deduplicated_but_keep_hard_constraints(self):
         from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
@@ -5922,7 +5922,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不限定行业或采购类型", guidance)
         scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v46")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v47")
 
     def test_full_scan_does_not_reinject_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")
@@ -7022,8 +7022,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(len(rules), 2)
         self.assertEqual(sum(item["title"] == "法定代表人身份证明" for item in rules), 1)
 
-    def test_same_named_non_score_rules_merge_all_sources_without_cross_category_merge(self):
-        """同类别同对象的跨章节副本合并，但资格门槛与符合性结论保持独立。"""
+    def test_same_named_non_score_rules_do_not_merge_without_same_source_fact(self):
+        """同名不等于同一事实；不同章节的条件不能由本地代码直接拼接。"""
         rules, merged_count = worker._consolidate_same_named_non_score_rules([
             {
                 "category": "other", "title": "中小企业声明函审查",
@@ -7041,17 +7041,113 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             },
         ])
 
-        self.assertEqual(len(rules), 2)
-        self.assertEqual(merged_count, 1)
-        combined = next(item for item in rules if item["category"] == "other")
-        self.assertIn("所属行业", combined["check_rule"])
-        self.assertIn("企业类型", combined["check_rule"])
-        self.assertIn("声明函应填写所属行业", combined["source_text"])
-        self.assertIn("声明函应填写企业类型", combined["source_text"])
-        self.assertIn("第10页", combined["source_text"])
-        self.assertIn("第18页", combined["source_text"])
-        self.assertEqual(set(combined["source_clause_ids"]), {"Q-1", "Q-2"})
-        self.assertTrue(combined["ocr_required"])
+        self.assertEqual(len(rules), 3)
+        self.assertEqual(merged_count, 0)
+        self.assertEqual(sum(item["category"] == "other" for item in rules), 2)
+
+    def test_source_fact_ledger_is_stable_and_preserved_when_rules_merge(self):
+        values = worker._attach_source_fact_metadata([
+            {
+                "category": "other", "title": "响应覆盖", "check_rule": "核验功能响应",
+                "source_text": "投标文件应逐项响应功能要求。", "source_page": 12,
+            },
+            {
+                "category": "other", "title": "响应覆盖", "check_rule": "核验功能响应与证明材料",
+                "source_text": "投标文件应逐项响应功能要求。", "source_page": 12,
+            },
+        ])
+        self.assertEqual(values[0]["source_fact_ids"], values[1]["source_fact_ids"])
+        merged = worker._merge_duplicate_non_score_rule(values[0], values[1])
+        self.assertEqual(merged["source_fact_ids"], values[0]["source_fact_ids"])
+        stats = worker._source_ledger_stats(values)
+        self.assertEqual(stats["source_fact_count"], 1)
+        self.assertEqual(stats["unanchored_rule_count"], 0)
+
+    def test_source_fact_ids_survive_rule_set_storage_round_trip(self):
+        storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-source", [{
+            "category": "other", "title": "响应覆盖", "check_rule": "核验响应覆盖",
+            "source_text": "投标文件应逐项响应。", "source_fact_ids": ["SF-rule-test"],
+        }])
+        _, rules = storage.list_rules(self.app, self.project["project_id"])
+        meta = storage.rule_execution_meta(rules[0])
+        self.assertEqual(meta["source_fact_ids"], ["SF-rule-test"])
+
+    def test_scoring_source_plan_only_removes_proven_duplicate(self):
+        packets = worker._score_clause_packets("业绩A：每项2分，最高4分。\n业绩B：每项2分，最高4分。")
+        clause_ids = [packet["clause_id"] for packet in packets]
+        rules = [
+            {
+                "category": "objective", "title": "相关业绩评分", "check_rule": "A、B各2分，共8分",
+                "source_text": "业绩A：每项2分，最高4分。业绩B：每项2分，最高4分。",
+                "scoring": {"max_score": 8, "kind": "manual"},
+            },
+            {
+                "category": "objective", "title": "业绩A评分", "check_rule": "A每项2分，最高4分",
+                "source_text": "业绩A：每项2分，最高4分。",
+                "source_clause_ids": [clause_ids[0]], "scoring": {"max_score": 4, "kind": "manual"},
+            },
+            {
+                "category": "objective", "title": "业绩B评分", "check_rule": "B每项2分，最高4分",
+                "source_text": "业绩B：每项2分，最高4分。",
+                "source_clause_ids": [clause_ids[1]], "scoring": {"max_score": 4, "kind": "manual"},
+            },
+        ]
+        planned = worker._apply_scoring_source_plan(rules, packets, [
+            {"rule_id": "SR1", "source_clause_ids": clause_ids},
+        ])
+        self.assertIsNotNone(planned)
+        self.assertEqual([item["title"] for item in planned], ["相关业绩评分"])
+        self.assertEqual(set(planned[0]["source_clause_ids"]), set(clause_ids))
+
+    def test_scoring_source_plan_rejects_incomplete_or_overlapping_assignment(self):
+        packets = worker._score_clause_packets("业绩：每项2分，最高4分。\n报价：最高10分。")
+        rules = [
+            {"category": "objective", "title": "业绩", "check_rule": "业绩", "source_text": "业绩：每项2分，最高4分。", "scoring": {"max_score": 4}},
+            {"category": "objective", "title": "报价", "check_rule": "报价", "source_text": "报价：最高10分。", "scoring": {"max_score": 10}},
+        ]
+        self.assertIsNone(worker._apply_scoring_source_plan(rules, packets, [
+            {"rule_id": "SR1", "source_clause_ids": [packets[0]["clause_id"]]},
+        ]))
+        self.assertIsNone(worker._apply_scoring_source_plan(rules, packets, [
+            {"rule_id": "SR1", "source_clause_ids": [packets[0]["clause_id"], packets[1]["clause_id"]]},
+            {"rule_id": "SR2", "source_clause_ids": [packets[1]["clause_id"]]},
+        ]))
+
+    def test_rule_extraction_v2_uses_source_plan_without_semantic_compile_chain(self):
+        tender_text = "业绩评分：每提供一份业绩得2分，最高4分。\n报价评分：按报价公式计算，最高10分。"
+        self._add_pdf("tender.pdf", "tender", "", tender_text)
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        tender_document = next(item for item in storage.list_documents(self.app, self.project["project_id"]) if item["role"] == "tender")
+        Path(tender_document["parsed_path"]).write_text(tender_text, encoding="utf-8")
+        storage.create_task(self.app, self.project["project_id"], "extract_rules")
+
+        def response(_profile, _system, prompt, **kwargs):
+            if "规划每条评分原文应归属" in prompt:
+                clause_ids = list(dict.fromkeys(re.findall(r"SC-[A-Za-z0-9-]+", prompt)))
+                return {"assignments": [
+                    {"rule_id": "SR1", "source_clause_ids": [clause_ids[0]]},
+                    {"rule_id": "SR2", "source_clause_ids": [clause_ids[1]]},
+                ]}
+            if "请对完整候选规则集做一次规范化" in prompt:
+                return {"drops": [], "rewrites": [], "merges": []}
+            if "招标文件原文：" in prompt:
+                return {"rules": [
+                    {"category": "objective", "title": "业绩评分", "check_rule": "每份业绩2分，最高4分",
+                     "source_text": "业绩评分：每提供一份业绩得2分，最高4分。", "scoring": {"max_score": 4, "kind": "manual"}},
+                    {"category": "objective", "title": "报价评分", "check_rule": "按报价公式计算，最高10分",
+                     "source_text": "报价评分：按报价公式计算，最高10分。", "scoring": {"max_score": 10, "kind": "manual"}},
+                ]}
+            self.fail("不应进入旧语义编译链")
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=response) as request_json:
+            finished = self._run_next_task()
+
+        prompts = [call.args[2] for call in request_json.call_args_list]
+        self.assertEqual(finished["status"], "success")
+        self.assertTrue(finished["result"]["scoring_source_plan_applied"])
+        self.assertFalse(any("统一编译并合并评审规则" in value or "审计规则覆盖范围" in value for value in prompts))
+        self.assertEqual(finished["result"]["source_ledger"]["pipeline_version"], "source-ledger-v2")
 
     def test_rule_finalisation_failure_retries_non_score_categories_only(self):
         """完整规范化异常后按类别恢复，评分规则不额外改写。"""
