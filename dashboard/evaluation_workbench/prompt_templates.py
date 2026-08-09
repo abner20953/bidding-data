@@ -24,6 +24,7 @@ PROMPT_TEMPLATES = {
     "extract_rules_continue_user": _template("评审规则提取 · 本地恢复后续提", "模型 JSON 尾部异常时，在已回收完整规则基础上只补充遗漏项。", "上一次提取的 JSON 在尾部异常；系统已从其中安全回收下列完整规则。请重新阅读当前原文，只补充尚未被已回收规则覆盖、且符合系统规则的独立审查点；不要复述、改写或重复已回收规则，不得猜测截断项。若没有遗漏，只返回 {\"rules\":[]}。\n\n只返回一个合法 JSON 对象：\n{\"rules\":[{\"category\":\"qualification|compliance|substantive|rejection|objective|subjective|other\",\"title\":\"简明规则名称\",\"check_rule\":\"面向投标文件的明确检查指令\",\"source_text\":\"招标原文短摘录\",\"source_page\":数字或null,\"source_clause_ids\":[\"评分条款ID\"],\"ocr_required\":false,\"scoring\":{\"max_score\":数字,\"kind\":\"boolean|manual\",\"items\":[{\"name\":\"叶子评分项\",\"max_score\":数字,\"criterion\":\"计分或扣分条件\"}]}}]}\n\nqualification/compliance/substantive/rejection 仍须能对应下列正式评审依据；普通技术描述不得补成否决项。当前采购包成组、编号且可由投标文件核验的技术/服务叶子要求，可按主题合并为 category=other 的逐项响应覆盖规则，每包通常1至3条，保留原编号且不得补造“不响应/否决/扣分”等后果。\n正式评审依据目录：\n{{review_anchor_catalog}}\n\n已回收规则：\n{{existing_rules}}\n\n当前招标文件原文：\n{{text}}", "existing_rules", "review_anchor_catalog", "text"),
     "extract_rules_supplement_user": _template("评审规则提取 · 评分补充", "遗漏评分条款的补充提取。", "仅根据以下评分条款，补充主规则提取遗漏的明确评分项。只返回合法 JSON：\n{\"rules\":[{\"category\":\"objective|subjective\",\"title\":\"简明规则名称\",\"check_rule\":\"面向投标文件的明确检查指令\",\"source_text\":\"原文短摘录\",\"source_page\":数字或null,\"source_clause_ids\":[\"评分条款ID\"],\"ocr_required\":false,\"scoring\":{\"max_score\":数字,\"kind\":\"boolean|manual\",\"items\":[{\"name\":\"叶子评分项\",\"max_score\":数字,\"criterion\":\"计分或扣分条件\"}]}}]}\n\n已有评分规则：{{existing_rules}}\n必须仅返回缺失项，不得重复已有项；每个明确评分条款都要覆盖，并把条款标题中的评分条款 ID 原样写入 source_clause_ids。对于按多个服务模块或功能点累计得分的主观项，输出一条保留总分的规则，在 scoring.items 中逐项列明模块、每项分值和扣分逻辑，同时让 check_rule 保留完整可读口径，不能拆成无法核对总分的零散标题。objective 和 subjective 都必须有 scoring.max_score，且仅能填写原文明确的满分。决定性证明材料必须查看证照、签章、凭证或其他图片外观时，ocr_required 必须为 true；source_page 填写最直接依据页，无法确定时为 null。不得使用 Markdown 或添加说明；title 最多 30 字，普通 check_rule 尽量控制在 320 字内，但不得删减叶子评分项；source_text 最多 180 字。\n\n评分条款：\n{{packet_text}}", "existing_rules", "packet_text"),
     "extract_rules_hard_anchor_supplement_user": _template("评审规则提取 · 硬性条款补充", "招标文件出现法律/政策硬性条款而规则集未覆盖时的补充提取。", "根据以下招标原文关键条款，补充生成对应的审查规则。只返回合法 JSON：\n{\"rules\":[{\"category\":\"qualification|compliance|substantive|rejection|other\",\"title\":\"简明规则名称\",\"check_rule\":\"面向投标文件的完整检查指令\",\"source_text\":\"原文短摘录\",\"source_page\":数字或null,\"source_clause_ids\":[],\"ocr_required\":false}]}\n\n已有规则：{{existing_rules}}\n只补缺失条款，不得重复已有规则；检查指令必须可直接核验投标文件内容，不得包含评审过程事项（澄清、补正、谈判、澄清说明等）；source_text 取原文短摘录；title 最多 30 字。\n\n关键条款原文：\n{{packet_text}}", "existing_rules", "packet_text"),
+    "extract_rules_dedupe_adjudication_user": _template("评审规则提取 · 疑似重复裁决", "只裁决小范围疑似重复组，不改写规则内容。", "以下候选已通过来源和单文件核验门控，但标题或核验对象相近。请仅判断哪些候选属于同一个审查义务。只返回合法 JSON：\n{\"decisions\":[{\"candidate_ids\":[\"C-1\",\"C-2\"],\"action\":\"merge|keep_separate\"}]}\n\n严格限制：1. 只可引用输入中同一候选组的 ID；2. 仅当两条规则核验的是同一材料/字段/响应事实，且合并不会丢失独立资格、否决后果、证明材料或审查结论时，才返回 action=merge；3. 不同字段、不同证明材料、不同适用条件、不同独立后果必须 keep_separate；4. 不得新增、删除、改写规则，不得改变类别、来源、OCR 设置或评分；5. 每个候选组必须返回一次 keep_separate 或一个/多个 merge 决定。\n\n疑似重复候选组：\n{{candidate_groups}}", "candidate_groups"),
     "extract_rules_scoring_structure_repair_user": _template("评审规则提取 · 评分结构修复", "评分规则叶子合计与满分不符时的定向修复。", "以下评分规则的正分叶子项合计不等于满分，疑似跨页截断或漏项。请只根据每条规则随附的 score_clause_source 修正 scoring.items：正分叶子项分值合计必须等于 max_score（max_score<=0 的扣分项不计入）；保留全部原始计分对象，不得新增原文没有的评分项。该步骤仅允许补全叶子项，禁止改变 category、title、max_score、source_clause_ids 或将规则改挂到其他评分分部；返回的 source_clause_ids 必须与输入完全一致。只返回合法 JSON：\n{\"rules\":[{\"category\":\"objective|subjective\",\"title\":\"简明规则名称\",\"check_rule\":\"面向投标文件的完整检查指令\",\"source_text\":\"原文短摘录\",\"source_page\":数字或null,\"source_clause_ids\":[\"评分条款ID\"],\"ocr_required\":false,\"scoring\":{\"max_score\":数字,\"kind\":\"boolean|manual\",\"items\":[{\"name\":\"叶子评分项\",\"max_score\":数字,\"criterion\":\"计分或扣分条件\"}]}}]}\n\n规则与原文：\n{{rules}}", "rules"),
     "extract_rules_qualification_supplement_user": _template("评审规则提取 · 资格条款补充", "依据正式资格章节或资格评审表，补充主提取遗漏的资格审查规则。", "仅根据以下正式资格候选区段，补充尚未被已有资格规则完整承接的资格审查点。只返回合法 JSON：\n{\"rules\":[{\"category\":\"qualification\",\"title\":\"简明资格规则名称\",\"check_rule\":\"面向响应/投标文件的完整检查指令\",\"source_text\":\"最直接资格原文摘录\",\"source_page\":数字或null,\"source_clause_ids\":[\"资格区段ID\"],\"ocr_required\":false}]}\n\n已有资格规则：{{existing_rules}}\n候选区段可能来自投标人/供应商资格要求、资格审查/评审标准及其跨页上下文，也可能为保持跨页完整而带入少量相邻非资格内容；只能为原文明示的当前投标资格条件生成 qualification 规则，不得把相邻技术要求、评分项或流程安排误作资格。每个标明“适用”或实际提出当前文件证明材料的资格条件，都必须由至少一条已有或返回规则完整承接；被明确标记为“不适用”的条件不得生成规则。资格区段中列出的主体证明/账户、纳税或社会保障凭证、财务证明、资格业绩及其时间、数量和合同证明材料等，属于不同审查事实：可在一条规则中完整列明，也可拆为互不重叠的规则，但不得以“名称一致性”“资料完整”或同一事实的评分规则代替。资格业绩门槛与同一业绩的加分条款必须同时保留。只核验当前文件中的材料、文字与必要 OCR，不推断官网、平台或未来履约事实。决定性证据需要证照、凭证、截图、签章或扫描件外观时 ocr_required=true。每条返回规则的 source_clause_ids 必须原样填写其直接依据所在的资格区段 ID；不得使用 Markdown 或添加说明。\n\n正式资格候选区段：\n{{packet_text}}", "existing_rules", "packet_text"),
     "extract_rules_scoring_assembly_user": _template("评审规则提取 · 评分原文组装", "仅由评分原文一次生成可执行评分规则，不与正文分批提取混用。", "仅根据以下评分原文台账生成评分规则，只返回合法 JSON：\n{\"rules\":[{\"category\":\"objective|subjective\",\"title\":\"简明评分名称\",\"check_rule\":\"完整评分检查指令\",\"source_text\":\"最直接评分原文摘录\",\"source_page\":数字或null,\"source_clause_ids\":[\"评分条款ID\"],\"ocr_required\":false,\"scoring\":{\"max_score\":数字,\"kind\":\"boolean|manual\",\"items\":[{\"name\":\"叶子评分项\",\"max_score\":数字,\"criterion\":\"计分或扣分条件\"}]}}]}\n\n严格规则：1. 每个输入评分条款 ID 必须且只能属于一条输出规则；同一可执行评分事实的续行、公式说明、证明材料和叶子项可放在同一 source_clause_ids 中。2. 只输出可独立评分的规则；章节总分、合计标题、排序、四舍五入和评委操作不单独成规则。3. 固定数量、次数、比例、公式、证书或满足即固定得分为 objective；需要优劣、完整性、合理性、针对性或评委裁量判断的为 subjective。4. 必须保留计分对象、有效期、证明材料、公式、扣分条件、叶子项和满分；不得新造原文未规定的分值或后果。5. 不得输出 qualification、compliance、substantive、rejection 或 other；不得添加输入中不存在的评分条款 ID。6. 无法判断的条款也必须附属到最接近的规则，并在 check_rule 中保留原文口径，不得静默遗漏。\n\n评分原文台账：\n{{score_packets}}", "score_packets"),
@@ -430,7 +431,31 @@ _extend_prompt("evaluate_all_cross_bid_price_user", "报价暂定建议", (
 for _rule_template_id in ("extract_rules_user", "extract_rules_continue_user"):
     PROMPT_TEMPLATES[_rule_template_id]["content"] = (
         PROMPT_TEMPLATES[_rule_template_id]["content"]
-        .replace('"ocr_required":false,"scoring"', '"ocr_required":false,"evidence_requirements":["text|document|field|visual|cross_bid|external"],"scoring"')
+        .replace(
+            '"ocr_required":false,"scoring"',
+            '"verification_target":"单份投标文件中需核验的具体材料、字段或响应事实",'
+            '"verifiability":"single_bid|cross_bid|external_procedure",'
+            '"ocr_required":false,"evidence_requirements":["text|document|field|visual|cross_bid|external"],"scoring"',
+        )
+    )
+
+for _rule_template_id in ("extract_rules_qualification_supplement_user", "extract_rules_hard_anchor_supplement_user"):
+    PROMPT_TEMPLATES[_rule_template_id]["content"] = PROMPT_TEMPLATES[_rule_template_id]["content"].replace(
+        '"ocr_required":false}]}',
+        '"verification_target":"当前文件核验对象","verifiability":"single_bid|cross_bid|external_procedure",'
+        '"ocr_required":false}]}',
+    )
+
+for _rule_template_id in (
+    "extract_rules_user", "extract_rules_continue_user",
+    "extract_rules_qualification_supplement_user", "extract_rules_hard_anchor_supplement_user",
+):
+    _extend_prompt(
+        _rule_template_id, "单文件核验契约",
+        " 每条非评分规则必须返回 verification_target（单份投标文件中要核验的具体材料、字段或响应事实）"
+        "和 verifiability（single_bid|cross_bid|external_procedure）。只有无需其他投标人数据、外部网站、"
+        "开评标现场、后续澄清或评审程序即可由当前投标文件得出结论的规则，才可返回并填写 single_bid；"
+        "其余事项直接忽略。source_text 必须是原文直接摘录，供系统绑定稳定来源单元。",
     )
     _extend_prompt(
         _rule_template_id, "取证元数据", "\n\n取证元数据：每条规则可返回 evidence_requirements。text=文字/表格；document=材料本体；"
@@ -581,6 +606,8 @@ PROMPT_TEMPLATE_PRESENTATION = {
     # 保留旧模板展示和历史配置兼容；当前规则提取不再分别调用两轮规范化。
     "extract_rules_supplement_user": ("system", "评审规则内部处理", 257, "advanced"),
     "extract_rules_qualification_supplement_user": ("system", "评审规则内部处理", 258, "advanced"),
+    "extract_rules_hard_anchor_supplement_user": ("system", "评审规则内部处理", 259, "advanced"),
+    "extract_rules_dedupe_adjudication_user": ("system", "评审规则内部处理", 260, "advanced"),
     "extract_rules_scoring_assembly_user": ("system", "评审规则内部处理", 261, "advanced"),
 }
 

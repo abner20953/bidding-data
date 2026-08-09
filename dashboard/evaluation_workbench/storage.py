@@ -2879,6 +2879,10 @@ def rule_execution_meta(rule: dict) -> dict:
     if not isinstance(source_unit_ids, list):
         source_unit_ids = []
     source_unit_ids = [str(item).strip() for item in source_unit_ids if str(item).strip()]
+    verification_target = str(value.get("verification_target") or "").strip()
+    verifiability = str(value.get("verifiability") or "").strip()
+    if verifiability not in {"single_bid", "cross_bid", "external_procedure"}:
+        verifiability = ""
     source_locations = value.get("source_locations")
     if not isinstance(source_locations, list):
         source_locations = []
@@ -2926,6 +2930,8 @@ def rule_execution_meta(rule: dict) -> dict:
         "source_clause_ids": list(dict.fromkeys(clause_ids)),
         "source_fact_ids": list(dict.fromkeys(fact_ids)),
         "source_unit_ids": list(dict.fromkeys(source_unit_ids)),
+        "verification_target": verification_target,
+        "verifiability": verifiability,
         "source_locations": normalised_locations,
         "score_sections": normalised_sections,
     }
@@ -3017,6 +3023,10 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
     if not isinstance(source_unit_ids, list):
         source_unit_ids = []
     source_unit_ids = [str(item).strip() for item in source_unit_ids if str(item).strip()]
+    verification_target = str(payload.get("verification_target", base.get("verification_target")) or "").strip()
+    verifiability = str(payload.get("verifiability", base.get("verifiability")) or "").strip()
+    if verifiability not in {"single_bid", "cross_bid", "external_procedure"}:
+        verifiability = ""
     source_locations = payload.get("source_locations", base.get("source_locations"))
     if not isinstance(source_locations, list):
         source_locations = []
@@ -3064,6 +3074,8 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
         "source_clause_ids": list(dict.fromkeys(clause_ids)),
         "source_fact_ids": list(dict.fromkeys(fact_ids)),
         "source_unit_ids": list(dict.fromkeys(source_unit_ids)),
+        "verification_target": verification_target,
+        "verifiability": verifiability,
         "source_locations": normalised_locations,
         "score_sections": normalised_sections,
     }

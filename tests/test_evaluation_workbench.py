@@ -6238,7 +6238,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(request_json.call_count, 1)
         self.assertEqual(reviews[0]["status"], "satisfied")
 
-    def test_rule_extraction_does_not_hard_filter_model_returned_rules(self):
+    def test_rule_extraction_excludes_non_verifiable_candidates_without_source_anchor(self):
         self._add_pdf("tender.pdf", "tender", "", "资格审查和评分标准。")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
         self._run_next_task()
@@ -6251,8 +6251,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             finished = self._run_next_task()
 
         _, rules = storage.list_rules(self.app, self.project["project_id"])
-        self.assertEqual(finished["result"]["excluded_rule_count"], 0)
-        self.assertEqual({item["title"] for item in rules}, {"具备资质", "响应文件份数"})
+        self.assertGreaterEqual(finished["result"]["source_contract_excluded_count"], 1)
+        self.assertNotIn("具备资质", {item["title"] for item in rules if item["source_type"] == "ai"})
 
     def test_rule_extraction_keeps_performance_score_with_bid_deadline_range(self):
         tender_text = "业绩每有一个得3分，最高9分。"
@@ -6282,7 +6282,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         _, rules = storage.list_rules(self.app, self.project["project_id"])
         self.assertEqual(finished["status"], "success")
-        self.assertEqual(finished["result"]["excluded_rule_count"], 0)
+        self.assertEqual(finished["result"]["excluded_rule_count"], 1)
         performance_rule = next(item for item in rules if item["title"] == "同类项目业绩")
         self.assertEqual(performance_rule["category"], "objective")
         self.assertEqual(performance_rule["scoring_json"], '{"max_score": 9, "kind": "manual"}')
@@ -6916,7 +6916,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(merged["source_fact_ids"], values[0]["source_fact_ids"])
         stats = worker._source_ledger_stats(values)
         self.assertEqual(stats["source_fact_count"], 1)
-        self.assertEqual(stats["unanchored_rule_count"], 0)
+        self.assertEqual(stats["unanchored_rule_count"], 2)
 
     def test_source_fact_identity_uses_content_but_preserves_multiple_page_locations(self):
         values = worker._attach_source_fact_metadata([
@@ -6980,13 +6980,68 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             "category": "other", "title": "响应覆盖", "check_rule": "核验响应覆盖",
             "source_text": "投标文件应逐项响应。", "source_fact_ids": ["SF-rule-test"],
             "source_unit_ids": ["SU-test-P1-1-abc"],
+            "verification_target": "技术要求逐项响应情况", "verifiability": "single_bid",
         }])
         _, rules = storage.list_rules(self.app, self.project["project_id"])
         meta = storage.rule_execution_meta(rules[0])
         self.assertEqual(meta["source_fact_ids"], ["SF-rule-test"])
         self.assertEqual(meta["source_unit_ids"], ["SU-test-P1-1-abc"])
+        self.assertEqual(meta["verification_target"], "技术要求逐项响应情况")
+        self.assertEqual(meta["verifiability"], "single_bid")
 
-    def test_rule_extraction_v22_uses_scoring_ledger_without_legacy_compile_chain(self):
+    def test_non_score_candidate_contract_requires_source_target_and_single_bid(self):
+        catalog = {
+            "SU-test-P1-1-a": {"page": 1, "text": "投标人应提供有效营业执照。"},
+        }
+        candidates = worker._normalise_non_score_candidate_contract([
+            {
+                "category": "qualification", "title": "营业执照", "check_rule": "核验有效营业执照",
+                "source_text": "提供有效营业执照",
+            },
+            {
+                "category": "other", "title": "横向报价比较", "check_rule": "比较各投标人报价",
+                "source_text": "评标时比较报价", "evidence_requirements": ["cross_bid"],
+            },
+        ], catalog)
+        kept, excluded = worker._enforce_non_score_candidate_contract(candidates)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["verifiability"], "single_bid")
+        self.assertEqual(kept[0]["source_unit_ids"], ["SU-test-P1-1-a"])
+        self.assertEqual(len(excluded), 1)
+        self.assertEqual(excluded[0]["verifiability"], "cross_bid")
+
+    def test_semantic_duplicate_adjudication_merges_only_model_confirmed_candidate_group(self):
+        rules = [
+            {
+                "category": "qualification", "title": "营业执照", "check_rule": "核验营业执照有效性",
+                "verification_target": "营业执照有效性", "source_text": "提供有效营业执照",
+                "source_unit_ids": ["SU-test-P1-1-a"],
+            },
+            {
+                "category": "qualification", "title": "资格性审查-营业执照", "check_rule": "核验营业执照有效性",
+                "verification_target": "营业执照有效性", "source_text": "营业执照应有效",
+                "source_unit_ids": ["SU-test-P2-1-b"],
+            },
+            {
+                "category": "qualification", "title": "法定代表人身份证明", "check_rule": "核验法定代表人身份证明",
+                "verification_target": "法定代表人身份证明", "source_text": "提供法定代表人身份证明",
+                "source_unit_ids": ["SU-test-P3-1-c"],
+            },
+        ]
+        with patch("dashboard.evaluation_workbench.worker._request_task_json", return_value={
+            "decisions": [{"candidate_ids": ["C-1", "C-2"], "action": "merge"}],
+        }):
+            merged, stats = worker._adjudicate_semantic_duplicate_groups(
+                self.app, {"task_id": "task-semantic"}, {"profile_id": "profile-1"}, "system", rules,
+                document_id="doc-1",
+            )
+        self.assertEqual(stats["group_count"], 1)
+        self.assertEqual(stats["merged_count"], 1)
+        self.assertEqual(len(merged), 2)
+        license_rule = next(item for item in merged if "营业执照" in item["title"])
+        self.assertEqual(set(license_rule["source_unit_ids"]), {"SU-test-P1-1-a", "SU-test-P2-1-b"})
+
+    def test_rule_extraction_v23_uses_scoring_ledger_without_legacy_compile_chain(self):
         tender_text = "业绩评分：每提供一份业绩得2分，最高4分。\n报价评分：按报价公式计算，最高10分。"
         self._add_pdf("tender.pdf", "tender", "", tender_text)
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
@@ -7019,7 +7074,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(finished["result"]["scoring_assembly_mode"], "direct_assembly")
         self.assertFalse(any("统一编译并合并评审规则" in value or "审计规则覆盖范围" in value for value in prompts))
         self.assertFalse(any("规划每条评分原文应归属" in value for value in prompts))
-        self.assertEqual(finished["result"]["source_ledger"]["pipeline_version"], "source-ledger-v2.2")
+        self.assertEqual(finished["result"]["source_ledger"]["pipeline_version"], "source-ledger-v2.3")
 
     def test_unmapped_ai_score_rule_blocks_confirmation(self):
         """没有原文评分台账锚点的纯 AI 评分规则不能进入已确认规则集。"""

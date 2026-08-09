@@ -873,10 +873,10 @@ def _filter_inapplicable_template_rules(rules: list[dict], tender_text: str) -> 
 
 
 def _filter_non_file_verifiable_candidates(rules: list[dict]) -> list[dict]:
-    """只采信模型显式标记为可由单份投标文件核验的非评分候选。
+    """只采信可由单份投标文件核验的非评分候选。
 
-    缺少新字段的历史模型输出保持兼容，仍交由既有提示词和人工确认；不会凭关键词
-    静默删除规则。新输出若明确承认依赖横向比较或评审程序，则在来源映射阶段剔除。
+    新链路要求模型明确给出核验范围；兼容旧输出时由候选规范化阶段补齐最保守的
+    ``single_bid`` 默认值。横向比较和外部/程序事项不能以普通规则混入当前文件审查。
     """
     kept: list[dict] = []
     for item in rules:
@@ -884,6 +884,8 @@ def _filter_non_file_verifiable_candidates(rules: list[dict]) -> list[dict]:
             continue
         category = str(item.get("category") or "")
         scope = str(item.get("verifiability") or "").strip()
+        # 缺少契约字段的候选交给最终门控统一记录排除原因，不能在中途静默消失；
+        # 已明确声明为横向比较或外部/程序事项的则立即排除。
         if category not in {"objective", "subjective"} and scope in {"cross_bid", "external_procedure"}:
             continue
         kept.append(item)
@@ -1313,13 +1315,20 @@ def _attach_rule_source_units(rules: list[dict], catalog: dict[str, dict] | None
             source = storage._normalise_rule_source(value.get("source_text"))
             matches = [
                 unit_id for unit_id, unit in catalog.items()
-                if len(source) >= 12 and (
+                if len(source) >= 7 and (
                     source in storage._normalise_rule_source(unit.get("text"))
                     or storage._normalise_rule_source(unit.get("text")) in source
                 )
             ]
             if len(matches) == 1:
                 unit_ids = matches
+            elif matches and len({
+                storage._normalise_rule_source(catalog[unit_id].get("text")) for unit_id in matches
+            }) == 1:
+                # 同一段原文在一页或一个批次中因表格/页眉展开而重复时，全部绑定会
+                # 让来源台账无意义膨胀；内容完全一致时选择首个稳定单元即可，后续
+                # 同源候选仍会按来源事实收敛。
+                unit_ids = [matches[0]]
             elif matches and all(
                 len(storage._normalise_rule_source(catalog[unit_id].get("text"))) >= 20
                 and storage._normalise_rule_source(catalog[unit_id].get("text")) in source
@@ -1335,6 +1344,82 @@ def _attach_rule_source_units(rules: list[dict], catalog: dict[str, dict] | None
                 value["source_page"] = page
         result.append(value)
     return result
+
+
+_NON_SCORE_CATEGORIES = {"qualification", "compliance", "substantive", "rejection", "other"}
+_NON_SCORE_VERIFIABILITY = {"single_bid", "cross_bid", "external_procedure"}
+
+
+def _normalise_non_score_candidate_contract(rules: list[dict], source_unit_catalog: dict[str, dict] | None) -> list[dict]:
+    """统一全部非评分候选入口的最小可执行契约。
+
+    主分段、资格补漏和硬性条款补漏都必须走这里。来源单元优先由模型引用，缺失时
+    仅按直接摘录回填；核验对象缺失时以完整检查指令作为可审计的保守回填。模型未
+    填写核验范围时，不从标题猜测跨标/外部事实：只有没有这两类取证需求的候选才
+    视为单份文件规则，其余候选留给门控剔除。
+    """
+    attached = _attach_rule_source_units(rules, source_unit_catalog)
+    result: list[dict] = []
+    for item in attached:
+        if not isinstance(item, dict):
+            continue
+        value = dict(item)
+        category = str(value.get("category") or "")
+        if category not in _NON_SCORE_CATEGORIES:
+            result.append(value)
+            continue
+        target = re.sub(r"\s+", " ", str(value.get("verification_target") or "")).strip()
+        if not target:
+            target = re.sub(r"\s+", " ", str(value.get("check_rule") or value.get("title") or "")).strip()
+        value["verification_target"] = target[:500]
+        scope = str(value.get("verifiability") or "").strip()
+        requirements = value.get("evidence_requirements") if isinstance(value.get("evidence_requirements"), list) else []
+        requirement_values = {str(requirement).strip() for requirement in requirements}
+        if scope not in _NON_SCORE_VERIFIABILITY:
+            if "cross_bid" in requirement_values:
+                scope = "cross_bid"
+            elif "external" in requirement_values:
+                scope = "external_procedure"
+            elif target and _rule_source_unit_ids(value):
+                # 旧模板或局部补漏偶尔不回传新字段；只在已具备直接来源和具体检查
+                # 指令时作兼容回填，避免把无来源的流程性事项默认放行。
+                scope = "single_bid"
+            else:
+                scope = ""
+        value["verifiability"] = scope
+        result.append(value)
+    return result
+
+
+def _enforce_non_score_candidate_contract(rules: list[dict]) -> tuple[list[dict], list[dict]]:
+    """在落库前剔除没有来源、对象或单文件核验范围的非评分候选。
+
+    返回被排除候选，调用方只将数量和原因写入任务结果，避免以静默删除伪造成功。
+    评分规则仍由独立评分原文台账负责，完全不走本门控。
+    """
+    kept: list[dict] = []
+    excluded: list[dict] = []
+    for item in rules:
+        if not isinstance(item, dict):
+            continue
+        category = str(item.get("category") or "")
+        if category not in _NON_SCORE_CATEGORIES:
+            kept.append(item)
+            continue
+        missing: list[str] = []
+        if not _rule_source_unit_ids(item):
+            missing.append("来源单元")
+        if not str(item.get("verification_target") or "").strip():
+            missing.append("核验对象")
+        if str(item.get("verifiability") or "") != "single_bid":
+            missing.append("单文件核验范围")
+        if missing:
+            value = dict(item)
+            value["_contract_exclusion_reason"] = "、".join(missing)
+            excluded.append(value)
+            continue
+        kept.append(item)
+    return kept, excluded
 
 
 def _score_packet_prompt_text(score_packets: list[object]) -> str:
@@ -1875,9 +1960,9 @@ def _rule_signature(item: dict) -> tuple[str, str, str]:
     )
 
 
-RULE_EXTRACTION_PIPELINE_VERSION = "source-ledger-v2.2"
-# 规则提取只保留来源台账 V2.2：评分表与普通规则分别生成，再由同一份原文
-# 台账收口。规则提取只保留来源单元映射、评分原文台账与本地确定性收口。
+RULE_EXTRACTION_PIPELINE_VERSION = "source-ledger-v2.3"
+# 规则提取只保留来源台账 V2.3：评分表与普通规则分别生成，再由同一份原文
+# 台账收口；少量跨来源疑似重复仅接受受约束的 AI 裁决，不再恢复全局自由改写。
 
 
 def _source_fact_fingerprint(item: dict) -> str:
@@ -1976,14 +2061,17 @@ def _attach_source_fact_metadata(rules: list[dict]) -> list[dict]:
 
 
 def _source_ledger_stats(rules: list[dict]) -> dict:
-    """来源台账只报告可证明事实，不以标题相似度推导业务重复。"""
+    """来源台账只报告真实原文单元，不将派生指纹误报为已锚定。"""
     ai_rules = [item for item in rules if isinstance(item, dict)]
-    anchored = [item for item in ai_rules if _rule_source_fact_ids(item)]
-    unanchored = [item for item in ai_rules if not _rule_source_fact_ids(item)]
+    unanchored = [
+        item for item in ai_rules
+        if str(item.get("category") or "") not in {"objective", "subjective"}
+        and not _rule_source_unit_ids(item)
+    ]
     return {
         "pipeline_version": RULE_EXTRACTION_PIPELINE_VERSION,
         "rule_count": len(ai_rules),
-        "source_fact_count": len({fact_id for item in anchored for fact_id in _rule_source_fact_ids(item)}),
+        "source_fact_count": len({fact_id for item in ai_rules for fact_id in _rule_source_fact_ids(item)}),
         "source_unit_count": len({unit_id for item in ai_rules for unit_id in _rule_source_unit_ids(item)}),
         "unanchored_rule_count": len(unanchored),
         "unanchored_score_rule_count": sum(
@@ -2214,6 +2302,177 @@ def _consolidate_same_named_non_score_rules(items: list[dict]) -> tuple[list[dic
             source_indexes.setdefault((category, unit_id), []).append(index)
         merged_count += 1
     return result, merged_count
+
+
+def _semantic_candidate_text(value: object) -> str:
+    return re.sub(r"[\s\W_]+", "", str(value or "")).casefold()
+
+
+def _semantic_duplicate_candidate_groups(items: list[dict], *, max_group_size: int = 6) -> list[list[int]]:
+    """从已完成确定性去重的候选中找出少量“可能同义”的规则组。
+
+    这里只用于缩小 AI 裁决范围，不直接删除任何规则。标题和核验对象都要相近才会
+    入组；相同来源、完全相同原文等确定性副本此前已经被本地收口，不会重复消耗调用。
+    """
+    candidates = [
+        index for index, item in enumerate(items)
+        if isinstance(item, dict) and str(item.get("category") or "") in _NON_SCORE_CATEGORIES
+    ]
+    linked: dict[int, set[int]] = {index: set() for index in candidates}
+    for left_offset, left_index in enumerate(candidates):
+        left = items[left_index]
+        left_category = str(left.get("category") or "")
+        left_title = storage._rule_title_identity(left.get("title"), left_category)
+        left_target = _semantic_candidate_text(left.get("verification_target") or left.get("check_rule"))
+        for right_index in candidates[left_offset + 1:]:
+            right = items[right_index]
+            if str(right.get("category") or "") != left_category:
+                continue
+            right_title = storage._rule_title_identity(right.get("title"), left_category)
+            right_target = _semantic_candidate_text(right.get("verification_target") or right.get("check_rule"))
+            title_related = bool(left_title and right_title and (
+                left_title == right_title
+                or storage._rule_titles_compatible(left.get("title"), right.get("title"), left_category)
+            ))
+            if not title_related:
+                continue
+            target_similarity = (
+                difflib.SequenceMatcher(None, left_target, right_target).ratio()
+                if left_target and right_target else 0.0
+            )
+            if left_target == right_target or target_similarity >= 0.62:
+                linked[left_index].add(right_index)
+                linked[right_index].add(left_index)
+    groups: list[list[int]] = []
+    visited: set[int] = set()
+    for index in candidates:
+        if index in visited or not linked[index]:
+            continue
+        stack, component = [index], []
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            component.append(current)
+            stack.extend(linked[current] - visited)
+        for start in range(0, len(component), max_group_size):
+            group = sorted(component[start:start + max_group_size])
+            if len(group) >= 2:
+                groups.append(group)
+    return groups
+
+
+def _merge_semantic_non_score_group(items: list[dict]) -> dict:
+    """合并已被 AI 明确认定为同一审查义务的候选，保留信息最全的一条表述。"""
+    primary = max(items, key=_rule_candidate_richness)
+    merged = dict(primary)
+    for item in items:
+        if item is primary:
+            continue
+        merged = _merge_duplicate_non_score_rule(merged, item)
+    evidence_items: list[dict] = []
+    seen: set[str] = set()
+    for item in items:
+        for evidence in item.get("evidence_items") or []:
+            if not isinstance(evidence, dict):
+                continue
+            signature = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            if signature not in seen:
+                seen.add(signature)
+                evidence_items.append(evidence)
+    if evidence_items:
+        merged["evidence_items"] = evidence_items
+    return merged
+
+
+def _semantic_dedupe_prompt(app, groups: list[list[int]], rules: list[dict]) -> str:
+    payload = []
+    for group_number, indexes in enumerate(groups, start=1):
+        candidates = []
+        for index in indexes:
+            item = rules[index]
+            candidates.append({
+                "candidate_id": f"C-{index + 1}", "category": item.get("category"),
+                "title": item.get("title"), "verification_target": item.get("verification_target"),
+                "check_rule": item.get("check_rule"), "source_text": item.get("source_text"),
+                "source_unit_ids": item.get("source_unit_ids") or [],
+            })
+        payload.append({"group_id": f"G-{group_number}", "candidates": candidates})
+    return storage.render_prompt_template(
+        app, "extract_rules_dedupe_adjudication_user",
+        candidate_groups=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+    )
+
+
+def _adjudicate_semantic_duplicate_groups(app, task: dict, profile: dict, system_prompt: str, rules: list[dict], *,
+                                          document_id: str) -> tuple[list[dict], dict]:
+    """仅让模型裁决小范围疑似重复组；失败时原样保留，绝不影响整轮提取。"""
+    groups = _semantic_duplicate_candidate_groups(rules)
+    stats = {"group_count": len(groups), "merged_count": 0, "failure_count": 0}
+    if not groups:
+        return rules, stats
+    try:
+        response = _request_task_json(
+            app, task, profile, "extract_rules_dedupe_adjudication", system_prompt,
+            _semantic_dedupe_prompt(app, groups, rules), document_id=document_id,
+            context_mode="semantic_duplicate_adjudication",
+            max_tokens=_output_token_budget(profile, min(3_000, 800 + len(groups) * 450)),
+            thinking_mode="disabled",
+        )
+    except ValueError:
+        stats["failure_count"] = 1
+        return rules, stats
+    decisions = response.get("decisions") if isinstance(response, dict) else None
+    if not isinstance(decisions, list):
+        stats["failure_count"] = 1
+        return rules, stats
+    permitted_groups = [{f"C-{index + 1}" for index in group} for group in groups]
+    merge_sets: list[set[int]] = []
+    for decision in decisions:
+        if not isinstance(decision, dict) or str(decision.get("action") or "") != "merge":
+            continue
+        candidate_ids = decision.get("candidate_ids")
+        if not isinstance(candidate_ids, list):
+            continue
+        ids = {str(value).strip() for value in candidate_ids if str(value).strip()}
+        if len(ids) < 2 or not any(ids.issubset(group) for group in permitted_groups):
+            continue
+        indexes = {
+            int(candidate_id.removeprefix("C-")) - 1
+            for candidate_id in ids if re.fullmatch(r"C-\d+", candidate_id)
+        }
+        if len(indexes) == len(ids):
+            merge_sets.append(indexes)
+    if not merge_sets:
+        return rules, stats
+    # 同一组内模型可能给出重叠的两两裁决，按并集收敛，仍不会跨候选组扩张。
+    components: list[set[int]] = []
+    for indexes in merge_sets:
+        overlaps = [component for component in components if component & indexes]
+        if overlaps:
+            merged_indexes = set(indexes)
+            for component in overlaps:
+                merged_indexes.update(component)
+                components.remove(component)
+            components.append(merged_indexes)
+        else:
+            components.append(set(indexes))
+    replacements = {index: component for component in components for index in component}
+    result: list[dict] = []
+    emitted: set[frozenset[int]] = set()
+    for index, item in enumerate(rules):
+        component = replacements.get(index)
+        if not component:
+            result.append(item)
+            continue
+        frozen = frozenset(component)
+        if frozen in emitted:
+            continue
+        emitted.add(frozen)
+        result.append(_merge_semantic_non_score_group([rules[item_index] for item_index in sorted(component)]))
+        stats["merged_count"] += len(component) - 1
+    return result, stats
 
 
 def _merge_duplicate_score_rule(existing: dict, candidate: dict) -> dict:
@@ -2733,8 +2992,13 @@ def _extract_rules(app, task: dict) -> dict:
     qualification_packets = _qualification_clause_packets(text)
     review_anchor_catalog = _initial_review_anchor_catalog(main_text)
     batches = []
+    source_unit_catalog: dict[str, dict] = {}
     for label, value, document_key in source_documents:
         units = _source_units_for_text(value, source_document_key=document_key)
+        source_unit_catalog.update({
+            str(unit.get("unit_id")): {"page": unit.get("page"), "text": unit.get("text")}
+            for unit in units if str(unit.get("unit_id") or "").strip() and str(unit.get("text") or "").strip()
+        })
         unit_batches = _source_unit_batches(units, RULE_EXTRACTION_BATCH_CHARS)
         # 极端解析文本没有可分单元时保留旧分段入口，避免因来源台账增强而拒绝文件。
         if not unit_batches:
@@ -2762,6 +3026,7 @@ def _extract_rules(app, task: dict) -> dict:
         app, task, profile, system_prompt, batches, document_id=tender["document_id"],
         review_anchor_catalog=review_anchor_catalog, include_scoring=False,
     )
+    raw_rules = _normalise_non_score_candidate_contract(raw_rules, source_unit_catalog)
     raw_rules = _filter_non_file_verifiable_candidates(_filter_inapplicable_template_rules(
         _filter_rules_for_package(_dedupe_rule_candidates(raw_rules), package_number), text,
     ))
@@ -2805,6 +3070,9 @@ def _extract_rules(app, task: dict) -> dict:
                 kept_supplement_rules = _filter_rules_for_package(
                     [item for item in supplement_rules if isinstance(item, dict)], package_number,
                 )
+                kept_supplement_rules = _normalise_non_score_candidate_contract(
+                    kept_supplement_rules, source_unit_catalog,
+                )
                 raw_rules.extend(kept_supplement_rules)
                 qualification_supplement_count = len(kept_supplement_rules)
         except ValueError as exc:
@@ -2816,6 +3084,7 @@ def _extract_rules(app, task: dict) -> dict:
         and isinstance(item.get("category"), str)
         and item.get("category") in {"qualification", "compliance", "substantive", "rejection", "objective", "subjective", "other"}
     ]
+    mapped_candidates = _normalise_non_score_candidate_contract(mapped_candidates, source_unit_catalog)
     mapped_candidates = _filter_non_file_verifiable_candidates(_filter_rules_for_package(mapped_candidates, package_number))
     mapped_candidates = _attach_source_fact_metadata(mapped_candidates)
     # 硬性条款补漏属于候选生成，不属于最终结果补丁。必须在来源台账收口前加入，
@@ -2838,7 +3107,9 @@ def _extract_rules(app, task: dict) -> dict:
                     and str(item.get("title", "")).strip()
                     and item.get("category") in {"qualification", "compliance", "substantive", "rejection", "other"}
                 ]
-                kept = _filter_rules_for_package(kept, package_number)
+                kept = _normalise_non_score_candidate_contract(
+                    _filter_rules_for_package(kept, package_number), source_unit_catalog,
+                )
                 before = len(_dedupe_rule_candidates(mapped_candidates))
                 mapped_candidates = _dedupe_rule_candidates([*mapped_candidates, *kept])
                 hard_anchor_supplement_count = max(0, len(mapped_candidates) - before)
@@ -2850,17 +3121,22 @@ def _extract_rules(app, task: dict) -> dict:
     if not _has_technical_star_requirement_rule(mapped_candidates):
         technical_star_seed = _technical_star_requirement_seed(text, package_number)
         if technical_star_seed:
-            mapped_candidates = _dedupe_rule_candidates([*mapped_candidates, technical_star_seed])
-    # 来源事实台账 V2.2：分段映射已经完成“从原文到候选事实”的唯一生成。后续只
+            mapped_candidates = _dedupe_rule_candidates([
+                *mapped_candidates,
+                *_normalise_non_score_candidate_contract([technical_star_seed], source_unit_catalog),
+            ])
+    # 来源事实台账 V2.3：分段映射已经完成“从原文到候选事实”的唯一生成。后续只
     # 做本地、可追溯的收口，不能再由多轮全局模型改写反复
     # 改写标题、类别和来源。评分/资格/硬性条款的定向补漏均已在此前进入同一候选集。
     candidates, coverage_missing_rules, compilation_used = _dedupe_rule_candidates(mapped_candidates), [], False
     compilation_failure_count = 0
     storage.update_task(app, task["task_id"], progress=68, message="正在按来源事实台账整理评审规则")
     # 是否可由投标文件核验交给完整提示词与人工确认判断；不以词表硬过滤，避免误删业绩有效期等规则。
-    rules = _filter_non_file_verifiable_candidates(_filter_inapplicable_template_rules(_filter_rules_for_package(candidates, package_number), text))
+    rules = _normalise_non_score_candidate_contract(candidates, source_unit_catalog)
+    rules = _filter_non_file_verifiable_candidates(_filter_inapplicable_template_rules(_filter_rules_for_package(rules, package_number), text))
+    rules, contract_excluded_rules = _enforce_non_score_candidate_contract(rules)
     rules = _attach_source_fact_metadata(rules)
-    excluded_rule_count = 0
+    excluded_rule_count = len(contract_excluded_rules)
     for item in rules:
         if item.get("category") not in {"objective", "subjective"}:
             continue
@@ -2905,13 +3181,17 @@ def _extract_rules(app, task: dict) -> dict:
     # 后续模型操作再次碰触评分类别、满分或条款归属。
     non_score_rules = [item for item in rules if item.get("category") not in {"objective", "subjective"}]
     assembled_score_rules = [item for item in rules if item.get("category") in {"objective", "subjective"}]
-    # V2.2 的来源单元已经在映射阶段提供稳定身份；再把全部规则交给一次全局模型
-    # “最终整理”会重新引入长度截断和标题漂移。这里仅做同源、同意图的确定性收口；
-    # 不能证明重复的候选保留给人工确认，绝不以静默删除换取表面整洁。
+    # 来源单元已经在映射阶段提供稳定身份；不能恢复旧的全量“最终整理”，否则会
+    # 重新引入长度截断和标题漂移。确定性收口后，仅将少量跨来源的疑似重复组交给
+    # 模型做合并/保留裁决，模型不拥有改写规则内容、类别或评分的权限。
     non_score_rules, local_finalisation_merged = _consolidate_same_named_non_score_rules(non_score_rules)
+    non_score_rules, semantic_dedupe = _adjudicate_semantic_duplicate_groups(
+        app, task, profile, system_prompt, non_score_rules, document_id=tender["document_id"],
+    )
     finalisation = {
-        "applied": bool(local_finalisation_merged), "dropped_count": 0,
-        "rewritten_count": 0, "merged_count": local_finalisation_merged, "failure_count": 0,
+        "applied": bool(local_finalisation_merged or semantic_dedupe["merged_count"]), "dropped_count": 0,
+        "rewritten_count": 0, "merged_count": local_finalisation_merged + semantic_dedupe["merged_count"],
+        "failure_count": semantic_dedupe["failure_count"],
     }
     rules = [*non_score_rules, *assembled_score_rules]
     # 前序定向补漏可能带来同源候选；再次执行同一套确定性收口，且补做同源候选去重。
@@ -3036,6 +3316,10 @@ def _extract_rules(app, task: dict) -> dict:
             "finalisation_merged_count": finalisation["merged_count"],
             "finalisation_failure_count": finalisation["failure_count"],
             "same_name_rule_merged_count": same_name_pre_merged_count + same_name_post_merged_count,
+            "source_contract_excluded_count": len(contract_excluded_rules),
+            "semantic_dedupe_group_count": semantic_dedupe["group_count"],
+            "semantic_dedupe_merged_count": semantic_dedupe["merged_count"],
+            "semantic_dedupe_failure_count": semantic_dedupe["failure_count"],
             "source_ledger": source_ledger,
             "preserved_rule_count": rule_set.get("preserved_rule_count", 0), "split_retry_count": split_retry_count,
             "execution_metadata": _task_execution_metadata(app, task, profile)}
