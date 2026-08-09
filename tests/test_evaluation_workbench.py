@@ -7203,7 +7203,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         reference = {
             "category": "objective", "title": "价格分值", "check_rule": "按第三章规定计算价格分。",
             "source_text": "本项目采用综合评分法，其中价格分值为10分，其他因素分值为90分，详见招标文件第三章。",
-            "scoring": {"max_score": 10, "kind": "manual", "items": [{"name": "价格分", "max_score": 10, "criterion": "按第三章规定计算。"}]},
+            "scoring": {"max_score": 10, "kind": "manual", "items": [{"name": "价格分", "max_score": 10, "criterion": "按第三章规定的价格分计算公式计算。"}]},
         }
         detail = {
             "category": "objective", "title": "投标报价得分", "check_rule": "以最低报价为基准价，按公式计算。",

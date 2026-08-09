@@ -3036,7 +3036,9 @@ def _is_non_executable_score_section_summary(item: dict) -> bool:
     # 真正的评分细则会由同一份评分台账中的独立条款生成规则；若解析文本里没有细则，
     # 这条导航文字本身也无法支持任何建议分。
     reference_only = bool(_SCORE_REFERENCE_ONLY_PATTERN.search(compact_source + criterion))
-    executable_detail = bool(_SCORE_EXECUTABLE_DETAIL_PATTERN.search(source + criterion))
+    # 是否存在可执行细则只能以招标原文为准，不能相信模型在 criterion/check_rule 中
+    # 补写的“按公式计算”。否则纯导航文字会被模型扩写后重新伪装成独立评分规则。
+    executable_detail = bool(_SCORE_EXECUTABLE_DETAIL_PATTERN.search(source))
     if reference_only and not executable_detail:
         return True
     header_title = bool(re.search(
