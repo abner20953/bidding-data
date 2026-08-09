@@ -3226,7 +3226,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("表格字段、填写格式", PROMPT_TEMPLATES["extract_rules_obligation_compile_user"]["content"])
         self.assertIn("系统仅能核验已上传文件", PROMPT_TEMPLATES["extract_rules_guidance"]["content"])
         self.assertIn("当一条候选仅概述同一表单、附件或材料的格式", PROMPT_TEMPLATES["extract_rules_dedupe_adjudication_user"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v53")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v54")
 
     def test_scope_chapter_and_text_error_guidance_present(self):
         from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
@@ -3244,7 +3244,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(text_marker, PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("必须点名最具辨识度的偏离对象", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("risk_level 应为 high", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v53")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v54")
 
     def test_ocr_visual_contracts_deduplicated_but_keep_hard_constraints(self):
         from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
@@ -4710,6 +4710,49 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             [mixed_signature, package_scope],
         )
 
+    def test_review_method_summary_and_external_payment_without_file_evidence_are_excluded(self):
+        method_summary = {
+            "category": "compliance", "title": "投标文件有效性及完整性",
+            "check_rule": "核验投标文件的有效性、完整性和响应程度。",
+            "source_text": "由评审小组依据采购文件规定，从投标文件的有效性、完整性和响应程度进行审查，以确定是否实质性响应。",
+            "verifiability": "single_bid",
+        }
+        concrete = {
+            "category": "compliance", "title": "签字签章及投标有效期",
+            "check_rule": "核验签字签章及投标有效期。",
+            "source_text": "符合性审查：投标文件是否按要求签字签章，投标有效期是否符合规定。",
+            "verifiability": "single_bid",
+        }
+        payment_only = {
+            "category": "rejection", "title": "投标保证金提交",
+            "check_rule": "核验投标文件是否包含保证金凭证。",
+            "source_text": "投标人不按采购文件要求提交投标保证金的，评审小组将否决其响应。",
+            "verifiability": "single_bid",
+        }
+        payment_evidence = {
+            "category": "rejection", "title": "投标保证金证明材料",
+            "check_rule": "核验投标文件所附保证金凭证。",
+            "source_text": "投标人应在响应文件中附银行转账回单或投标保函复印件。",
+            "verifiability": "single_bid",
+        }
+        reverse_payment_evidence = {
+            "category": "rejection", "title": "投标保函随文件提交",
+            "check_rule": "核验随投标文件提交的投标保函。",
+            "source_text": "投标保证金采用银行保函形式时，保函应随投标文件提交。",
+            "verifiability": "single_bid",
+        }
+        self.assertTrue(worker._is_non_executable_review_method_summary(method_summary))
+        self.assertFalse(worker._is_non_executable_review_method_summary(concrete))
+        self.assertTrue(worker._is_external_payment_without_file_evidence(payment_only))
+        self.assertFalse(worker._is_external_payment_without_file_evidence(payment_evidence))
+        self.assertFalse(worker._is_external_payment_without_file_evidence(reverse_payment_evidence))
+        self.assertEqual(
+            worker._filter_non_file_verifiable_candidates([
+                method_summary, concrete, payment_only, payment_evidence, reverse_payment_evidence,
+            ]),
+            [concrete, payment_evidence, reverse_payment_evidence],
+        )
+
     def test_material_detail_groups_are_only_candidates_for_model_adjudication(self):
         summary = {
             "category": "compliance", "title": "正在实施和新承接项目合同情况",
@@ -5848,7 +5891,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不限定行业或采购类型", guidance)
         scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v53")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v54")
 
     def test_full_scan_does_not_reinject_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")
@@ -7075,6 +7118,67 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         }], packets)
         self.assertEqual(rules[0]["source_clause_ids"], [packets[0]["clause_id"]])
 
+    def test_scoring_fragment_repair_merges_only_validated_continuous_same_score_group(self):
+        packets = [
+            {"clause_id": "SC-doc-P34-2", "text": "技术指标全部满足得24分。"},
+            {"clause_id": "SC-doc-P34-3", "text": "带星参数每项负偏离扣1分。"},
+            {"clause_id": "SC-doc-P34-4", "text": "普通参数每项负偏离扣0.5分，扣完24分为止。"},
+        ]
+        rules = [{
+            "category": "objective", "title": "技术指标评分", "check_rule": "全部满足得24分，带星参数每项扣1分。",
+            "source_text": "技术指标全部满足得24分。带星参数每项负偏离扣1分。", "source_page": 34,
+            "source_clause_ids": ["SC-doc-P34-2", "SC-doc-P34-3"], "scoring": {"max_score": 24, "kind": "manual"},
+        }, {
+            "category": "objective", "title": "技术参数扣分", "check_rule": "普通参数每项扣0.5分。",
+            "source_text": "普通参数每项负偏离扣0.5分，扣完24分为止。", "source_page": 34,
+            "source_clause_ids": ["SC-doc-P34-4"], "scoring": {"max_score": 24, "kind": "manual"},
+        }]
+        merged_rule = {
+            "category": "objective", "title": "技术指标响应评分",
+            "check_rule": "全部满足得24分；带星参数每项负偏离扣1分；普通参数每项负偏离扣0.5分，扣完为止。",
+            "source_text": "技术指标全部满足得24分；带星参数每项负偏离扣1分；普通参数每项负偏离扣0.5分。",
+            "source_page": 34, "source_clause_ids": ["SC-doc-P34-2", "SC-doc-P34-3", "SC-doc-P34-4"],
+            "scoring": {"max_score": 24, "kind": "manual", "items": [
+                {"name": "技术指标响应", "max_score": 24, "criterion": "按负偏离项累计扣分，扣完为止。"},
+            ]},
+        }
+        self.assertEqual(worker._score_fragment_candidate_groups(rules), [[0, 1]])
+        with patch("dashboard.evaluation_workbench.worker._request_task_json", return_value={
+            "action": "merge", "rule": merged_rule,
+        }):
+            repaired, stats = worker._repair_scoring_fragments(
+                self.app, {"task_id": "task-score-fragment"}, {"profile_id": "profile-1"},
+                "system", rules, packets, document_id="doc-1",
+            )
+        self.assertEqual(len(repaired), 1)
+        self.assertEqual(repaired[0]["title"], "技术指标响应评分")
+        self.assertEqual(stats["merged_count"], 1)
+
+    def test_scoring_fragment_repair_keeps_original_when_model_changes_score(self):
+        packets = [
+            {"clause_id": "SC-doc-P8-1", "text": "实施方案完整性甲最高10分。"},
+            {"clause_id": "SC-doc-P8-2", "text": "实施方案完整性乙最高10分。"},
+        ]
+        rules = [{
+            "category": "subjective", "title": "实施方案完整性甲", "check_rule": "评审实施方案完整性甲", "source_text": "实施方案完整性甲最高10分。",
+            "source_page": 8, "source_clause_ids": ["SC-doc-P8-1"], "scoring": {"max_score": 10},
+        }, {
+            "category": "subjective", "title": "实施方案完整性乙", "check_rule": "评审实施方案完整性乙", "source_text": "实施方案完整性乙最高10分。",
+            "source_page": 8, "source_clause_ids": ["SC-doc-P8-2"], "scoring": {"max_score": 10},
+        }]
+        with patch("dashboard.evaluation_workbench.worker._request_task_json", return_value={
+            "action": "merge", "rule": {
+                "category": "subjective", "title": "错误合并", "check_rule": "错误合并", "source_text": "错误合并",
+                "source_page": 8, "source_clause_ids": ["SC-doc-P8-1", "SC-doc-P8-2"], "scoring": {"max_score": 20},
+            },
+        }):
+            repaired, stats = worker._repair_scoring_fragments(
+                self.app, {"task_id": "task-score-fragment-invalid"}, {"profile_id": "profile-1"},
+                "system", rules, packets, document_id="doc-1",
+            )
+        self.assertEqual(repaired, rules)
+        self.assertEqual(stats["failure_count"], 1)
+
     def test_source_fact_ids_survive_rule_set_storage_round_trip(self):
         storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-source", [{
             "category": "other", "title": "响应覆盖", "check_rule": "核验响应覆盖",
@@ -7331,6 +7435,16 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(rules[0]["compiled_group_id"], "OC-9")
         self.assertEqual(rules[0]["compiled_categories"], ["other", "substantive"])
         self.assertEqual(rules[0]["compiled_child_requirements"][0]["title"], "参数组一")
+
+    def test_compiled_coverage_title_is_neutral_without_changing_rule_content(self):
+        original = {
+            "category": "other", "title": "技术/服务要求逐项响应覆盖-某局部主题",
+            "check_rule": "逐项核验全部采购要求。", "source_text": "采购要求原文。",
+        }
+        normalised = worker._normalise_compiled_coverage_rule_titles([original])[0]
+        self.assertEqual(normalised["title"], "技术/服务要求逐项响应覆盖")
+        self.assertEqual(normalised["check_rule"], original["check_rule"])
+        self.assertEqual(normalised["source_text"], original["source_text"])
 
     def test_unmapped_ai_score_rule_blocks_confirmation(self):
         """没有原文评分台账锚点的纯 AI 评分规则不能进入已确认规则集。"""

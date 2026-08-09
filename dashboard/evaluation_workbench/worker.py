@@ -937,6 +937,10 @@ def _filter_non_file_verifiable_candidates(rules: list[dict]) -> list[dict]:
             continue
         if category not in {"objective", "subjective"} and _is_pure_unobservable_submission_operation(item):
             continue
+        if category not in {"objective", "subjective"} and _is_non_executable_review_method_summary(item):
+            continue
+        if category not in {"objective", "subjective"} and _is_external_payment_without_file_evidence(item):
+            continue
         kept.append(item)
     return kept
 
@@ -948,6 +952,53 @@ _DIRECT_DOCUMENT_FACT_PATTERN = re.compile(
     r"(?:签字|签署|签章|盖章|电子印章|内容|范围|报价|金额|参数|型号|数量|期限|"
     r"声明|承诺|合同|证书|许可证|营业执照|授权|偏离|响应表|技术方案|服务方案)"
 )
+
+_REVIEW_METHOD_SUMMARY_PATTERN = re.compile(
+    r"(?:评审小组|评标委员会|评审委员会).{0,45}?(?:依据|按照).{0,45}?(?:审查|评审)"
+    r"|(?:从|对).{0,18}?有效性.{0,18}?完整性.{0,30}?(?:响应程度|实质性响应)"
+)
+_SPECIFIC_DOCUMENT_OBLIGATION_PATTERN = re.compile(
+    r"签字|签署|签章|盖章|有效期|服务期|工期|交付期|报价|金额|税率|参数|型号|数量|"
+    r"声明函|承诺函|合同|证书|许可证|营业执照|授权书|偏离表|响应表|技术方案|服务方案"
+)
+_EXTERNAL_PAYMENT_OPERATION_PATTERN = re.compile(
+    r"(?:提交|缴纳|交纳|支付|汇付).{0,24}?(?:投标|响应|履约)?(?:保证金|押金|费用|款项)"
+    r"|(?:投标|响应|履约)?(?:保证金|押金|费用|款项).{0,24}?(?:提交|缴纳|交纳|支付|汇付)"
+)
+_FILE_EVIDENCE_REQUIREMENT_PATTERN = re.compile(
+    r"(?:投标|响应)文件.{0,30}?(?:附|提供|包含|装入).{0,24}?(?:凭证|回单|保函|证明|复印件|扫描件)"
+    r"|(?:附|提供|提交).{0,24}?(?:凭证|回单|保函|证明材料|复印件|扫描件)"
+    r"|(?:凭证|回单|保函|证明材料|复印件|扫描件).{0,24}?(?:随|附于|装入)(?:投标|响应)文件"
+    r"|随(?:投标|响应)文件.{0,18}?(?:提交|附送)"
+)
+
+
+def _is_non_executable_review_method_summary(rule: dict) -> bool:
+    """剔除“评委如何审查”的方法概述，只保留具体文件事实。
+
+    该判断不依赖项目、行业或材料名称：必须同时命中评审方法表述，且原文没有列出
+    签章、期限、报价、证书等具体核验对象。混合条款因此仍会保留并交给模型拆分。
+    """
+    source = re.sub(r"\s+", "", str(rule.get("source_text") or ""))
+    return bool(
+        source
+        and _REVIEW_METHOD_SUMMARY_PATTERN.search(source)
+        and not _SPECIFIC_DOCUMENT_OBLIGATION_PATTERN.search(source)
+    )
+
+
+def _is_external_payment_without_file_evidence(rule: dict) -> bool:
+    """文件外缴费/保证金动作不能被改写成“文件内存在凭证”。
+
+    只有直接原文明确要求投标/响应文件附凭证、保函、回单或证明时才保留。这样既
+    排除平台或银行侧事实，也不会误删确实要求随文件提交证明材料的规则。
+    """
+    source = re.sub(r"\s+", "", str(rule.get("source_text") or ""))
+    return bool(
+        source
+        and _EXTERNAL_PAYMENT_OPERATION_PATTERN.search(source)
+        and not _FILE_EVIDENCE_REQUIREMENT_PATTERN.search(source)
+    )
 
 
 def _is_pure_unobservable_submission_operation(rule: dict) -> bool:
@@ -1687,6 +1738,187 @@ def _normalise_scoring_assembly_rules(value: object, score_packets: list[dict]) 
     return rules
 
 
+def _score_clause_position(clause_id: object) -> tuple[int, int] | None:
+    """从稳定评分条款 ID 读取页码与页内顺序。"""
+    match = re.search(r"-P(\d+)-(\d+)$", str(clause_id or ""))
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def _score_fragment_text_related(left: dict, right: dict) -> bool:
+    """判断两个连续评分规则是否还共享足够长的评分对象/条件片段。"""
+    def compact(rule: dict) -> str:
+        return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", " ".join(
+            str(rule.get(key) or "") for key in ("title", "check_rule", "source_text")
+        )).casefold()
+
+    left_text, right_text = compact(left), compact(right)
+    if min(len(left_text), len(right_text)) < 8:
+        return False
+    left_shingles = {left_text[index:index + 8] for index in range(len(left_text) - 7)}
+    return any(right_text[index:index + 8] in left_shingles for index in range(len(right_text) - 7))
+
+
+def _score_fragment_candidate_groups(rules: list[dict], *, max_group_size: int = 4) -> list[list[int]]:
+    """召回同页、同分、条款连续的疑似评分碎片，不在本地直接合并。
+
+    同一页相邻评分项可能恰好同分，所以这些条件只决定是否做一次小范围 AI 复核；
+    任何模型异常或无法证明的关系都保留原规则。
+    """
+    positions: dict[int, list[tuple[int, int]]] = {}
+    for index, rule in enumerate(rules):
+        values = [
+            position for clause_id in _score_rule_clause_ids(rule)
+            if (position := _score_clause_position(clause_id)) is not None
+        ]
+        if values:
+            positions[index] = sorted(values)
+    linked: dict[int, set[int]] = {index: set() for index in positions}
+    for left_index in positions:
+        left = rules[left_index]
+        left_scoring = left.get("scoring") if isinstance(left.get("scoring"), dict) else {}
+        left_max = storage._valid_max_score(left_scoring)
+        if left_max is None:
+            continue
+        for right_index in range(left_index + 1, len(rules)):
+            if right_index not in positions:
+                continue
+            right = rules[right_index]
+            if str(right.get("category") or "") != str(left.get("category") or ""):
+                continue
+            right_scoring = right.get("scoring") if isinstance(right.get("scoring"), dict) else {}
+            right_max = storage._valid_max_score(right_scoring)
+            if right_max is None or abs(float(left_max) - float(right_max)) > 0.001:
+                continue
+            if not _score_fragment_text_related(left, right):
+                continue
+            left_pages = {page for page, _ in positions[left_index]}
+            right_pages = {page for page, _ in positions[right_index]}
+            if len(left_pages) != 1 or left_pages != right_pages:
+                continue
+            left_ordinals = {ordinal for _, ordinal in positions[left_index]}
+            right_ordinals = {ordinal for _, ordinal in positions[right_index]}
+            distance = min(abs(left_ordinal - right_ordinal) for left_ordinal in left_ordinals for right_ordinal in right_ordinals)
+            if distance != 1:
+                continue
+            left_sections = {
+                str(value.get("section_id") or "") for value in left.get("score_sections") or []
+                if isinstance(value, dict) and str(value.get("section_id") or "")
+            }
+            right_sections = {
+                str(value.get("section_id") or "") for value in right.get("score_sections") or []
+                if isinstance(value, dict) and str(value.get("section_id") or "")
+            }
+            if left_sections and right_sections and left_sections.isdisjoint(right_sections):
+                continue
+            linked[left_index].add(right_index)
+            linked[right_index].add(left_index)
+    groups: list[list[int]] = []
+    visited: set[int] = set()
+    for index in sorted(linked):
+        if index in visited or not linked[index]:
+            continue
+        stack, component = [index], []
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            component.append(current)
+            stack.extend(sorted(linked[current] - visited, reverse=True))
+        component.sort()
+        for start in range(0, len(component), max_group_size):
+            group = component[start:start + max_group_size]
+            if len(group) >= 2:
+                groups.append(group)
+    return groups
+
+
+def _score_fragment_repair_payload(rules: list[dict], score_packets: list[dict]) -> str:
+    packet_by_id = {_score_packet_id(packet): packet for packet in score_packets if _score_packet_id(packet)}
+    values = []
+    for index, rule in enumerate(rules, start=1):
+        clause_ids = sorted(_score_rule_clause_ids(rule), key=lambda value: _score_clause_position(value) or (0, 0))
+        values.append({
+            "candidate_id": f"S-{index}", "category": rule.get("category"),
+            "title": rule.get("title"), "check_rule": rule.get("check_rule"),
+            "source_text": rule.get("source_text"), "source_page": rule.get("source_page"),
+            "source_clause_ids": clause_ids, "scoring": rule.get("scoring"),
+            "source_packets": [
+                {"clause_id": clause_id, "text": _score_packet_text(packet_by_id[clause_id])}
+                for clause_id in clause_ids if clause_id in packet_by_id
+            ],
+        })
+    return json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+
+
+def _normalise_score_fragment_repair(response: object, rules: list[dict], score_packets: list[dict]) -> dict | None:
+    """验证定向重组：只能合并输入全部条款，类别和满分不得改变。"""
+    if not isinstance(response, dict):
+        return None
+    action = str(response.get("action") or "").strip()
+    if action == "keep_separate":
+        return {}
+    if action != "merge" or not isinstance(response.get("rule"), dict):
+        return None
+    categories = {str(rule.get("category") or "") for rule in rules}
+    max_scores = {
+        float(value) for rule in rules
+        if (value := storage._valid_max_score(rule.get("scoring") if isinstance(rule.get("scoring"), dict) else {})) is not None
+    }
+    expected_ids = {clause_id for rule in rules for clause_id in _score_rule_clause_ids(rule)}
+    if len(categories) != 1 or len(max_scores) != 1 or not expected_ids:
+        return None
+    candidate = response["rule"]
+    if str(candidate.get("category") or "") not in categories:
+        return None
+    candidate_max = storage._valid_max_score(candidate.get("scoring") if isinstance(candidate.get("scoring"), dict) else {})
+    if candidate_max is None or abs(float(candidate_max) - next(iter(max_scores))) > 0.001:
+        return None
+    if _score_rule_clause_ids(candidate) != expected_ids:
+        return None
+    normalised = _normalise_scoring_assembly_rules([candidate], score_packets)
+    if len(normalised) != 1 or _score_rule_clause_ids(normalised[0]) != expected_ids:
+        return None
+    return normalised[0]
+
+
+def _repair_scoring_fragments(app, task: dict, profile: dict, system_prompt: str, rules: list[dict],
+                              score_packets: list[dict], *, document_id: str) -> tuple[list[dict], dict]:
+    """对疑似评分碎片逐组定向重组；失败时原样保留该组。"""
+    groups = _score_fragment_candidate_groups(rules)
+    stats = {"candidate_group_count": len(groups), "merged_count": 0, "failure_count": 0}
+    if not groups:
+        return rules, stats
+    replacements: dict[int, dict] = {}
+    removed: set[int] = set()
+    for group_number, indexes in enumerate(groups, start=1):
+        group_rules = [rules[index] for index in indexes]
+        group_ids = {clause_id for rule in group_rules for clause_id in _score_rule_clause_ids(rule)}
+        group_packets = [packet for packet in score_packets if _score_packet_id(packet) in group_ids]
+        prompt = storage.render_prompt_template(
+            app, "extract_rules_scoring_fragment_repair_user",
+            candidates=_score_fragment_repair_payload(group_rules, group_packets),
+        )
+        try:
+            response = _request_task_json(
+                app, task, profile, "extract_rules_scoring_fragment_repair", system_prompt, prompt,
+                document_id=document_id, context_mode=f"score_fragment_repair_{group_number}",
+                max_tokens=_output_token_budget(profile, 3_000), thinking_mode="disabled",
+            )
+            merged = _normalise_score_fragment_repair(response, group_rules, group_packets)
+            if merged is None:
+                stats["failure_count"] += 1
+                continue
+            if not merged:
+                continue
+            replacements[indexes[0]] = merged
+            removed.update(indexes[1:])
+            stats["merged_count"] += len(indexes) - 1
+        except ValueError:
+            stats["failure_count"] += 1
+    return [replacements.get(index, rule) for index, rule in enumerate(rules) if index not in removed], stats
+
+
 def _extract_scoring_rules_from_ledger(app, task: dict, profile: dict, system_prompt: str,
                                        score_packets: list[dict], *, document_id: str) -> tuple[list[dict], dict]:
     """V2.2 的唯一评分生成链路：评分表不再混入正文分批映射。"""
@@ -1727,6 +1959,12 @@ def _extract_scoring_rules_from_ledger(app, task: dict, profile: dict, system_pr
             stats["failure_count"] += 1
             storage.update_task(app, task["task_id"], message=f"评分原文第{index}组未完成：{exc}")
     rules = _attach_score_ledger_metadata(_dedupe_rule_candidates(rules), score_packets)
+    rules, fragment_repair = _repair_scoring_fragments(
+        app, task, profile, system_prompt, rules, score_packets, document_id=document_id,
+    )
+    stats["fragment_repair_candidate_group_count"] = fragment_repair["candidate_group_count"]
+    stats["fragment_repair_merged_count"] = fragment_repair["merged_count"]
+    stats["fragment_repair_failure_count"] = fragment_repair["failure_count"]
     covered = {clause_id for item in rules for clause_id in _score_rule_clause_ids(item)}
     stats["uncovered_clause_ids"] = [
         _score_packet_id(packet) for packet in score_packets if _score_packet_id(packet) not in covered
@@ -2795,6 +3033,24 @@ def _merge_obligation_compilation_group(items: list[dict], *, group_number: int)
     return merged
 
 
+def _normalise_compiled_coverage_rule_titles(rules: list[dict]) -> list[dict]:
+    """统一逐项覆盖规则的展示名称，不改变其来源、子项或执行范围。
+
+    模型常用首个原文主题给合并后的规则命名，导致一个同时覆盖多个主题的规则仍被
+    叫作某个局部模块。这里只处理已明确写成“逐项响应覆盖”的 other 规则。
+    """
+    values: list[dict] = []
+    for item in rules:
+        if not isinstance(item, dict):
+            continue
+        value = dict(item)
+        title = str(value.get("title") or "")
+        if str(value.get("category") or "") == "other" and "逐项响应覆盖" in title:
+            value["title"] = "技术/服务要求逐项响应覆盖"
+        values.append(value)
+    return values
+
+
 def _compile_non_score_obligations(app, task: dict, profile: dict, system_prompt: str, rules: list[dict], *,
                                    document_id: str) -> tuple[list[dict], dict]:
     """全局汇总非评分候选：AI 只给 ID 分组，代码负责合并与来源保护。
@@ -3470,7 +3726,9 @@ def _extract_rules(app, task: dict) -> dict:
         and item.get("category") in {"qualification", "compliance", "substantive", "rejection", "objective", "subjective", "other"}
     ]
     mapped_candidates = _normalise_non_score_candidate_contract(mapped_candidates, source_unit_catalog)
+    boundary_excluded_rule_count = len(mapped_candidates)
     mapped_candidates = _filter_non_file_verifiable_candidates(_filter_rules_for_package(mapped_candidates, package_number))
+    boundary_excluded_rule_count -= len(mapped_candidates)
     mapped_candidates = _attach_source_fact_metadata(mapped_candidates)
     # 硬性条款补漏属于候选生成，不属于最终结果补丁。必须在来源台账收口前加入，
     # 让它经历同一套同源去重与文件边界校验，避免同一事实在尾部绕过治理。
@@ -3520,10 +3778,12 @@ def _extract_rules(app, task: dict) -> dict:
     # 是否可由投标文件核验交给完整提示词与人工确认判断；不以词表硬过滤，避免误删业绩有效期等规则。
     rules = _normalise_non_score_candidate_contract(candidates, source_unit_catalog)
     rules, scoring_source_excluded_rules = _filter_non_score_candidates_from_scoring_ledger(rules, score_packets)
+    before_boundary_filter = len(rules)
     rules = _filter_non_file_verifiable_candidates(_filter_inapplicable_template_rules(_filter_rules_for_package(rules, package_number), text))
+    boundary_excluded_rule_count += before_boundary_filter - len(rules)
     rules, contract_excluded_rules = _enforce_non_score_candidate_contract(rules)
     rules = _attach_source_fact_metadata(rules)
-    excluded_rule_count = len(contract_excluded_rules) + len(scoring_source_excluded_rules)
+    excluded_rule_count = boundary_excluded_rule_count + len(contract_excluded_rules) + len(scoring_source_excluded_rules)
     for item in rules:
         if item.get("category") not in {"objective", "subjective"}:
             continue
@@ -3586,6 +3846,7 @@ def _extract_rules(app, task: dict) -> dict:
         non_score_rules, semantic_dedupe = _adjudicate_semantic_duplicate_groups(
             app, task, profile, system_prompt, non_score_rules, document_id=tender["document_id"],
         )
+    non_score_rules = _normalise_compiled_coverage_rule_titles(non_score_rules)
     finalisation = {
         "applied": bool(local_finalisation_merged or obligation_compilation["merged_count"] or semantic_dedupe["merged_count"]), "dropped_count": 0,
         "rewritten_count": 0,
@@ -3700,6 +3961,9 @@ def _extract_rules(app, task: dict) -> dict:
             "scoring_assembly_mode": scoring_assembly_status["mode"],
             "scoring_assembly_group_count": scoring_assembly["group_count"],
             "scoring_assembly_uncovered_clause_ids": scoring_assembly["uncovered_clause_ids"],
+            "scoring_fragment_candidate_group_count": scoring_assembly.get("fragment_repair_candidate_group_count", 0),
+            "scoring_fragment_merged_count": scoring_assembly.get("fragment_repair_merged_count", 0),
+            "scoring_fragment_failure_count": scoring_assembly.get("fragment_repair_failure_count", 0),
             "quality_gate_applied": quality_gate["applied"],
             "quality_gate_dropped_count": quality_gate["dropped_count"],
             "quality_gate_failure_count": quality_gate["failure_count"],
