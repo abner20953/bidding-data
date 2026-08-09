@@ -3720,6 +3720,23 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         expanded_rule = {**rule, "execution_meta_json": json.dumps({"evidence_items": six_items}, ensure_ascii=False)}
         self.assertEqual(worker._compound_acquisition_page_limit(expanded_rule, "standard", "ocr", 6), 8)
 
+    def test_compiled_children_only_reorder_existing_acquisition_candidates(self):
+        rule = {
+            "title": "汇总规则", "check_rule": "核验全部要求",
+            "execution_meta_json": json.dumps({"compiled_child_requirements": [
+                {"title": "材料甲", "check_rule": "核验材料甲", "source_page": 3, "evidence_requirements": ["text"]},
+                {"title": "材料乙", "check_rule": "核验材料乙", "source_page": 6, "evidence_requirements": ["visual"]},
+            ]}, ensure_ascii=False),
+        }
+        candidates = {"汇总规则": [9, 6, 3], "材料甲": [3, 5], "材料乙": [6, 8]}
+        with patch.object(worker, "_vision_page_candidates", side_effect=lambda _doc, view, _result: candidates.get(view["title"], [])), \
+             patch.object(worker, "_prioritise_material_pages", side_effect=lambda _doc, _rule, pages, **_kwargs: pages):
+            plan = worker._compound_acquisition_plan({"extension": ".pdf", "page_count": 12}, rule, {})
+
+        self.assertEqual(set(plan["candidate_pages"]), {3, 6, 9})
+        self.assertEqual(plan["candidate_pages"][:2], [3, 6])
+        self.assertEqual(worker._compound_acquisition_page_limit(rule, "standard", "ocr", 6), 6)
+
     def test_ocr_discovery_does_not_early_stop_counting_or_form_rules(self):
         values = [{"page": 3, "text": "检测报告 编号 ABC-2026"}]
         normal = {"title": "检测报告核验", "check_rule": "核验检测报告编号", "category": "qualification"}
@@ -7161,7 +7178,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         }):
             repaired, stats = worker._repair_scoring_fragments(
                 self.app, {"task_id": "task-score-fragment"}, {"profile_id": "profile-1"},
-                "system", rules, packets, document_id="doc-1",
+                "system", rules, packets, document_id="doc-1", declared_total=24,
             )
         self.assertEqual(len(repaired), 1)
         self.assertEqual(repaired[0]["title"], "技术指标响应评分")
@@ -7191,6 +7208,49 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             )
         self.assertEqual(repaired, rules)
         self.assertEqual(stats["failure_count"], 1)
+
+    def test_scoring_fragment_repair_requires_total_score_anchor(self):
+        packets = [
+            {"clause_id": "SC-doc-P8-1", "text": "实施方案甲最高10分。"},
+            {"clause_id": "SC-doc-P8-2", "text": "实施方案乙最高10分。"},
+        ]
+        rules = [
+            {"category": "subjective", "title": "实施方案甲", "check_rule": "评审实施方案甲", "source_text": "实施方案甲最高10分。",
+             "source_page": 8, "source_clause_ids": ["SC-doc-P8-1"], "scoring": {"max_score": 10}},
+            {"category": "subjective", "title": "实施方案乙", "check_rule": "评审实施方案乙", "source_text": "实施方案乙最高10分。",
+             "source_page": 8, "source_clause_ids": ["SC-doc-P8-2"], "scoring": {"max_score": 10}},
+        ]
+        with patch("dashboard.evaluation_workbench.worker._score_fragment_candidate_groups", return_value=[[0, 1]]), patch(
+            "dashboard.evaluation_workbench.worker._request_task_json", return_value={
+                "action": "merge", "rule": {
+                    "category": "subjective", "title": "错误合并", "check_rule": "错误合并",
+                    "source_text": "错误合并", "source_page": 8,
+                    "source_clause_ids": ["SC-doc-P8-1", "SC-doc-P8-2"], "scoring": {"max_score": 10},
+                },
+            }
+        ):
+            repaired, stats = worker._repair_scoring_fragments(
+                self.app, {"task_id": "task-score-fragment-anchor"}, {"profile_id": "profile-1"},
+                "system", rules, packets, document_id="doc-1", declared_total=None,
+            )
+        self.assertEqual(repaired, rules)
+        self.assertEqual(stats["guarded_count"], 1)
+
+    def test_declared_total_requires_single_explicit_overall_value(self):
+        self.assertEqual(worker._declared_total_score_from_text("分值构成（总分100分）。"), 100)
+        self.assertIsNone(worker._declared_total_score_from_text("包1总分100分；包2总分120分。"))
+        self.assertIsNone(worker._declared_total_score_from_text("技术部分满分60分；商务部分满分40分。"))
+
+    def test_score_contract_repair_rejects_redistributed_score_values(self):
+        original = [
+            {"category": "objective", "title": "业绩", "source_clause_ids": ["SC-1"], "scoring": {"max_score": 10}},
+            {"category": "objective", "title": "认证", "source_clause_ids": ["SC-2"], "scoring": {"max_score": 20}},
+        ]
+        changed = [
+            {"category": "objective", "title": "业绩", "source_clause_ids": ["SC-1"], "scoring": {"max_score": 15}},
+            {"category": "objective", "title": "认证", "source_clause_ids": ["SC-2"], "scoring": {"max_score": 15}},
+        ]
+        self.assertFalse(worker._score_contract_candidate_preserves_anchors(changed, original))
 
     def test_score_section_header_never_treats_specific_item_as_section(self):
         self.assertIsNone(worker._SCORE_SECTION_PARENT_PATTERN.match(
@@ -7406,7 +7466,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertFalse(any("规划每条评分原文应归属" in value for value in prompts))
         self.assertEqual(finished["result"]["source_ledger"]["pipeline_version"], "obligation-compiler-v3.0")
 
-    def test_obligation_compilation_merges_cross_category_restatements_and_keeps_children(self):
+    def test_obligation_compilation_keeps_cross_category_restatements_separate(self):
         rules = [
             {
                 "category": "compliance", "title": "报价未超预算", "check_rule": "核验报价不超过最高限价。",
@@ -7433,14 +7493,14 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             compiled, stats = worker._compile_non_score_obligations(
                 self.app, {"task_id": "task-compile"}, {"profile_id": "profile-1"}, "system", rules,
                 document_id="doc-1",
-            )
+        )
         self.assertTrue(stats["applied"])
-        self.assertEqual(stats["merged_count"], 1)
-        self.assertEqual(len(compiled), 2)
-        quote = next(item for item in compiled if "报价" in item["title"])
-        self.assertEqual(quote["category"], "rejection")
-        self.assertEqual(len(quote["compiled_child_requirements"]), 2)
-        self.assertEqual(set(quote["source_unit_ids"]), {"SU-test-P12-1-a", "SU-test-P24-2-b"})
+        self.assertEqual(stats["merged_count"], 0)
+        self.assertEqual(len(compiled), 3)
+        quote_categories = {
+            item["category"] for item in compiled if "报价" in item["title"]
+        }
+        self.assertEqual(quote_categories, {"compliance", "rejection"})
 
     def test_obligation_compilation_recovers_missing_candidates_without_losing_valid_groups(self):
         rules = [
@@ -7460,10 +7520,9 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertTrue(stats["applied"])
         self.assertEqual(stats["failure_count"], 0)
         self.assertEqual(stats["recovered_candidate_count"], 1)
-        self.assertEqual(stats["merged_count"], 1)
-        self.assertEqual(len(compiled), 2)
-        self.assertEqual(len(compiled[0]["compiled_child_requirements"]), 2)
-        self.assertEqual(compiled[1]["title"], "法定代表人身份证明")
+        self.assertEqual(stats["merged_count"], 0)
+        self.assertEqual(len(compiled), 3)
+        self.assertEqual(compiled[-1]["title"], "法定代表人身份证明")
 
     def test_obligation_compilation_rejects_duplicate_candidate_ids(self):
         rules = [
@@ -7523,12 +7582,16 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             "compiled_child_requirements": [{
                 "category": "other", "title": "参数组一", "verification_target": "参数组一响应",
                 "check_rule": "核验参数组一逐项响应。", "source_page": 16, "source_unit_ids": ["SU-test-P16-1-a"],
+                "evidence_requirements": ["text", "visual"], "ocr_required": True, "baseline_ocr_mode": "local_ocr",
             }],
         }])
         _, rules = storage.list_rules(self.app, self.project["project_id"])
         self.assertEqual(rules[0]["compiled_group_id"], "OC-9")
         self.assertEqual(rules[0]["compiled_categories"], ["other", "substantive"])
         self.assertEqual(rules[0]["compiled_child_requirements"][0]["title"], "参数组一")
+        self.assertEqual(rules[0]["compiled_child_requirements"][0]["evidence_requirements"], ["text", "visual"])
+        self.assertTrue(rules[0]["compiled_child_requirements"][0]["ocr_required"])
+        self.assertEqual(rules[0]["compiled_child_requirements"][0]["baseline_ocr_mode"], "local_ocr")
 
     def test_compiled_coverage_title_is_neutral_without_changing_rule_content(self):
         original = {

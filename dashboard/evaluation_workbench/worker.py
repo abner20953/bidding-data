@@ -1924,12 +1924,20 @@ def _normalise_score_fragment_repair(response: object, rules: list[dict], score_
 
 
 def _repair_scoring_fragments(app, task: dict, profile: dict, system_prompt: str, rules: list[dict],
-                              score_packets: list[dict], *, document_id: str) -> tuple[list[dict], dict]:
-    """对疑似评分碎片逐组定向重组；失败时原样保留该组。"""
+                              score_packets: list[dict], *, document_id: str,
+                              declared_total: float | None = None) -> tuple[list[dict], dict]:
+    """对可由整体总分证明的评分碎片执行定向重组。
+
+    两条同页同分规则未必是同一评分事实。没有可靠整体总分时，自动合并会把两个
+    独立评分项静默压成一项，直接影响综合评分。因此只在合并本身恰好让总分回到
+    原文明确总分时应用；其余疑似碎片保留给后续完整评分表重组或人工确认。
+    """
     groups = _score_fragment_candidate_groups(rules)
-    stats = {"candidate_group_count": len(groups), "merged_count": 0, "failure_count": 0}
+    stats = {"candidate_group_count": len(groups), "merged_count": 0, "failure_count": 0,
+             "guarded_count": 0}
     if not groups:
         return rules, stats
+    before_total = _score_rules_total(rules)
     replacements: dict[int, dict] = {}
     removed: set[int] = set()
     for group_number, indexes in enumerate(groups, start=1):
@@ -1952,6 +1960,20 @@ def _repair_scoring_fragments(app, task: dict, profile: dict, system_prompt: str
                 continue
             if not merged:
                 continue
+            # 合并会将同一满分的多条规则收敛为一条。只有本地整体台账可以证明
+            # 这正是重复分值时才接受，避免把独立同分项少算为一个分值。
+            tentative_replacements = {**replacements, indexes[0]: merged}
+            tentative_removed = removed | set(indexes[1:])
+            trial = [tentative_replacements.get(item_index, rule) for item_index, rule in enumerate(rules)
+                     if item_index not in tentative_removed]
+            trial_total = _score_rules_total(trial)
+            if (
+                declared_total is None
+                or before_total <= float(declared_total) + 0.01
+                or abs(trial_total - float(declared_total)) > 0.01
+            ):
+                stats["guarded_count"] += 1
+                continue
             replacements[indexes[0]] = merged
             removed.update(indexes[1:])
             stats["merged_count"] += len(indexes) - 1
@@ -1961,17 +1983,18 @@ def _repair_scoring_fragments(app, task: dict, profile: dict, system_prompt: str
 
 
 def _declared_total_score_from_text(text: str) -> float | None:
-    """从原文读取唯一且可信的总分声明；无法确定时不启用总分重组。"""
-    votes: dict[float, int] = {}
-    for pattern in storage._TENDER_TOTAL_SCORE_PATTERNS:
-        for match in pattern.finditer(text or ""):
-            try:
-                value = float(match.group(1))
-            except (IndexError, TypeError, ValueError):
-                continue
-            if 50 <= value <= 1_000:
-                votes[value] = votes.get(value, 0) + 1
-    return max(sorted(votes), key=lambda value: votes[value]) if votes else None
+    """从原文读取唯一、明确的整体总分；不把分部满分当成自动修复锚点。"""
+    values: set[float] = set()
+    # 与确认前预检统一口径：只有“总分”表述才能约束整张评分表；出现多个
+    # 不同总分（通常代表多包或多套评分表）时，宁可不自动重组。
+    for match in storage._TENDER_TOTAL_SCORE_PATTERNS[0].finditer(text or ""):
+        try:
+            value = float(match.group(1))
+        except (IndexError, TypeError, ValueError):
+            continue
+        if 50 <= value <= 1_000:
+            values.add(value)
+    return next(iter(values)) if len(values) == 1 else None
 
 
 def _score_rules_total(rules: list[dict]) -> float:
@@ -2061,7 +2084,7 @@ def _repair_scoring_contract(app, task: dict, profile: dict, system_prompt: str,
             candidate_contract["missing_clause_ids"]
             or candidate_contract["duplicate_clause_ids"]
             or candidate_contract["total_mismatch"]
-        ):
+        ) and _score_contract_candidate_preserves_anchors(candidate, rules):
             stats["applied"] = True
             stats["contract"] = candidate_contract
             return candidate, stats
@@ -2069,6 +2092,40 @@ def _repair_scoring_contract(app, task: dict, profile: dict, system_prompt: str,
     except ValueError:
         stats["failure_count"] = 1
     return rules, stats
+
+
+def _score_contract_candidate_preserves_anchors(candidate: list[dict], existing: list[dict]) -> bool:
+    """阻止“总分凑对了、单项却被改错”的评分表重组。
+
+    评分结构修复可把同一条评分事实的跨页片段并回一条，但不得把已存在的满分改成
+    另一个数、也不得将评分性质从客观改成主观（或相反）。这里按来源条款 ID 对照
+    本轮已有规则；遇到无法定位的候选直接拒绝自动替换，保留原规则集供确认前校验。
+    """
+    by_clause: dict[str, list[dict]] = {}
+    for rule in existing:
+        if not isinstance(rule, dict) or rule.get("category") not in {"objective", "subjective"}:
+            continue
+        for clause_id in _score_rule_clause_ids(rule):
+            by_clause.setdefault(clause_id, []).append(rule)
+    for rule in candidate:
+        if not isinstance(rule, dict):
+            return False
+        clause_ids = _score_rule_clause_ids(rule)
+        anchors = [anchor for clause_id in clause_ids for anchor in by_clause.get(clause_id, [])]
+        if not anchors:
+            return False
+        max_score = storage._valid_max_score(rule.get("scoring") if isinstance(rule.get("scoring"), dict) else {})
+        anchor_scores = {
+            storage._valid_max_score(anchor.get("scoring") if isinstance(anchor.get("scoring"), dict) else {})
+            for anchor in anchors
+        }
+        anchor_scores.discard(None)
+        anchor_categories = {str(anchor.get("category") or "") for anchor in anchors}
+        if max_score is None or max_score not in anchor_scores:
+            return False
+        if str(rule.get("category") or "") not in anchor_categories:
+            return False
+    return True
 
 
 def _extract_scoring_rules_from_ledger(app, task: dict, profile: dict, system_prompt: str,
@@ -2115,10 +2172,12 @@ def _extract_scoring_rules_from_ledger(app, task: dict, profile: dict, system_pr
     rules = _attach_score_ledger_metadata(_dedupe_rule_candidates(rules), score_packets)
     rules, fragment_repair = _repair_scoring_fragments(
         app, task, profile, system_prompt, rules, score_packets, document_id=document_id,
+        declared_total=declared_total,
     )
     stats["fragment_repair_candidate_group_count"] = fragment_repair["candidate_group_count"]
     stats["fragment_repair_merged_count"] = fragment_repair["merged_count"]
     stats["fragment_repair_failure_count"] = fragment_repair["failure_count"]
+    stats["fragment_repair_guarded_count"] = fragment_repair["guarded_count"]
     rules, contract_repair = _repair_scoring_contract(
         app, task, profile, system_prompt, rules, score_packets, groups,
         declared_total=declared_total, document_id=document_id,
@@ -3153,6 +3212,9 @@ _RULE_CATEGORY_PRIORITY = {
 
 def _compiled_child_requirement(item: dict) -> dict:
     """保留被汇总候选的最小可执行信息，供综合评审继续逐项核验。"""
+    requirements = item.get("evidence_requirements")
+    if not isinstance(requirements, list):
+        requirements = []
     return {
         "category": str(item.get("category") or ""),
         "title": str(item.get("title") or "")[:120],
@@ -3160,6 +3222,12 @@ def _compiled_child_requirement(item: dict) -> dict:
         "check_rule": str(item.get("check_rule") or item.get("title") or "")[:520],
         "source_page": item.get("source_page") if isinstance(item.get("source_page"), int) else None,
         "source_unit_ids": [str(value) for value in item.get("source_unit_ids") or [] if str(value).strip()][:24],
+        # 汇总只改变卡片展示，不能抹平叶子项的文字/图片取证边界。
+        "evidence_requirements": [str(value) for value in requirements if str(value) in {
+            "text", "document", "field", "visual", "cross_bid", "external"
+        }],
+        "ocr_required": bool(item.get("ocr_required")),
+        "baseline_ocr_mode": str(item.get("baseline_ocr_mode") or "auto"),
     }
 
 
@@ -3246,6 +3314,18 @@ def _compile_non_score_obligations(app, task: dict, profile: dict, system_prompt
         stats["failure_count"] = 1
         return rules, stats
     groups, missing_indexes = normalised
+    # 不同类别对应不同业务后果。过去将 qualification/compliance/rejection 等候选
+    # 放进同一卡片后，会按优先级提升为 rejection，综合评审便可能把普通响应问题
+    # 展示成废标风险。类别不同即使材料相同，也保留为独立执行语义；它们仍可在同一
+    # 批模型请求中处理，不增加额外的流程或图片调用。
+    category_safe_groups: list[list[int]] = []
+    for indexes in groups:
+        buckets: dict[str, list[int]] = {}
+        for index in indexes:
+            category = str(rules[index].get("category") or "")
+            buckets.setdefault(category, []).append(index)
+        category_safe_groups.extend(values for values in buckets.values() if values)
+    groups = category_safe_groups
     if missing_indexes:
         # 仅回收模型未列出的候选；不补造 merge 关系，保证“缺失时宁可多留、不误并”。
         groups.extend([[index] for index in missing_indexes])
@@ -7660,13 +7740,33 @@ def _compound_acquisition_plan(document: dict, rule: dict, result: dict) -> dict
     页级缓存均不改写。因此子项元数据缺失、候选定位失败或旧规则均会自然退回原链路。
     """
     items = _rule_evidence_items(rule)
+    using_compiled_children = False
+    # 义务汇总规则没有模型生成的 evidence_items 时，使用其已保留的子检查项
+    # 改善候选页排序。只从既有父规则候选页中重排，不扩大页数预算、不增加 OCR /
+    # 图片调用，也不会影响没有汇总子项的存量规则。
+    if len(items) < 2:
+        children = _compiled_child_requirements(rule)
+        if len(children) >= 2:
+            using_compiled_children = True
+            items = [{
+                "item_id": f"compiled_{index}",
+                "name": str(child.get("title") or child.get("verification_target") or ""),
+                "requirement": str(child.get("check_rule") or ""),
+                "source_page": child.get("source_page"),
+                "evidence_requirements": child.get("evidence_requirements") or [],
+            } for index, child in enumerate(children[:12], start=1)]
     if len(items) < 2:
         return {"items": [], "candidate_pages": []}
     base_pages = _vision_page_candidates(document, rule, result)
+    base_page_set = set(base_pages)
     branches: list[dict] = []
     for index, item in enumerate(items[:12], start=1):
         child_rule = _evidence_item_rule(rule, item)
         pages = _prioritise_material_pages(document, child_rule, _vision_page_candidates(document, child_rule, result))
+        # 编译子项不能凭自身关键词额外扩张取证范围；只有本来就会检查的父规则
+        # 候选页才能被提前，确保综合评审性能与既有页数上限保持不变。
+        if using_compiled_children and base_page_set:
+            pages = [page for page in pages if page in base_page_set]
         if not pages:
             pages = list(base_pages)
         branches.append({

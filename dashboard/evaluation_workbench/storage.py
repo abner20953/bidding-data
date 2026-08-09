@@ -2941,6 +2941,15 @@ def rule_execution_meta(rule: dict) -> dict:
         source_units = child.get("source_unit_ids")
         if not isinstance(source_units, list):
             source_units = []
+        child_requirements = child.get("evidence_requirements")
+        if not isinstance(child_requirements, list):
+            child_requirements = []
+        child_requirements = [
+            str(item) for item in child_requirements if str(item) in _RULE_EVIDENCE_TYPES
+        ]
+        child_baseline_ocr_mode = str(child.get("baseline_ocr_mode") or "auto")
+        if child_baseline_ocr_mode not in _BASELINE_OCR_MODES:
+            child_baseline_ocr_mode = "auto"
         page = child.get("source_page")
         normalised_children.append({
             "category": str(child.get("category") or "") if str(child.get("category") or "") in {"qualification", "compliance", "substantive", "rejection", "other"} else "",
@@ -2949,6 +2958,11 @@ def rule_execution_meta(rule: dict) -> dict:
             "check_rule": check_rule,
             "source_page": page if isinstance(page, int) and page > 0 else None,
             "source_unit_ids": list(dict.fromkeys(str(item).strip() for item in source_units if str(item).strip()))[:24],
+            # 子项的取证语义必须随汇总规则一并落库。它当前主要供全文扫描和
+            # 后续图片取证规划读取；缺失时仍按父规则安全回退。
+            "evidence_requirements": list(dict.fromkeys(child_requirements)),
+            "ocr_required": bool(child.get("ocr_required")),
+            "baseline_ocr_mode": child_baseline_ocr_mode,
         })
     return {
         "execution_strategy": strategy if strategy in _RULE_EXECUTION_STRATEGIES else "",
@@ -3119,6 +3133,15 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
         source_units = child.get("source_unit_ids")
         if not isinstance(source_units, list):
             source_units = []
+        child_requirements = child.get("evidence_requirements")
+        if not isinstance(child_requirements, list):
+            child_requirements = []
+        child_requirements = [
+            str(item) for item in child_requirements if str(item) in _RULE_EVIDENCE_TYPES
+        ]
+        child_baseline_ocr_mode = str(child.get("baseline_ocr_mode") or "auto")
+        if child_baseline_ocr_mode not in _BASELINE_OCR_MODES:
+            child_baseline_ocr_mode = "auto"
         page = child.get("source_page")
         normalised_children.append({
             "category": str(child.get("category") or "") if str(child.get("category") or "") in {"qualification", "compliance", "substantive", "rejection", "other"} else "",
@@ -3127,6 +3150,9 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
             "check_rule": check_rule,
             "source_page": page if isinstance(page, int) and page > 0 else None,
             "source_unit_ids": list(dict.fromkeys(str(item).strip() for item in source_units if str(item).strip()))[:24],
+            "evidence_requirements": list(dict.fromkeys(child_requirements)),
+            "ocr_required": bool(child.get("ocr_required")),
+            "baseline_ocr_mode": child_baseline_ocr_mode,
         })
     value = {
         "execution_strategy": strategy if strategy in _RULE_EXECUTION_STRATEGIES else "",
@@ -4094,10 +4120,10 @@ def _hard_tender_anchor_scan(app, project_id: str, rules: list[dict]) -> list[di
 
 
 def _tender_declared_total_score(app, project_id: str) -> float | None:
-    """从招标文件解析文本读取明示总分（如“（总分100分）”），取出现次数最多的分值。
+    """从招标文件读取唯一、明确的整体总分声明。
 
-    只采纳“总分/满分 X 分”的显式表述且要求不小于 50 分，避免把单个评分项的
-    分值误当声明总分。找不到招标文件、解析文本或声明总分时返回 None，预检保持静默。
+    只采纳“总分 X 分”的显式表述且要求不小于 50 分。找不到招标文件、解析文本
+    或出现多个不同总分时返回 None，预检保持静默。
     """
     tender = next((item for item in list_documents(app, project_id) if item.get("role") == "tender"), None)
     parsed_path = str((tender or {}).get("parsed_path") or "")
@@ -4107,15 +4133,17 @@ def _tender_declared_total_score(app, project_id: str) -> float | None:
         text = Path(parsed_path).read_text(encoding="utf-8", errors="ignore")[:500_000]
     except OSError:
         return None
-    votes: dict[float, int] = {}
-    for pattern in _TENDER_TOTAL_SCORE_PATTERNS:
-        for match in pattern.finditer(text):
-            value = float(match.group(1))
-            if 50 <= value <= 1000:
-                votes[value] = votes.get(value, 0) + 1
-    if not votes:
+    # “某部分满分 X 分”在多包、分部评分表中极易出现，不能再作为全项目总分
+    # 使用；否则会错误阻断规则确认或驱动错误的评分重组。只采纳“总分”明示，
+    # 且全文存在不同总分时返回 None，交由人工确认而不是猜测多数值。
+    values: set[float] = set()
+    for match in _TENDER_TOTAL_SCORE_PATTERNS[0].finditer(text):
+        value = float(match.group(1))
+        if 50 <= value <= 1000:
+            values.add(value)
+    if len(values) != 1:
         return None
-    return max(sorted(votes), key=lambda value: votes[value])
+    return next(iter(values))
 
 
 def rule_set_acquisition_validation(app, project_id: str) -> dict:
