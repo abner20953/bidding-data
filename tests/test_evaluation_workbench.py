@@ -3221,7 +3221,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_subjective_user"]["content"])
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"])
         self.assertIn("统一为 partial 或需图片核验", PROMPT_TEMPLATES["evaluate_all_review_user"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v49")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v50")
 
     def test_scope_chapter_and_text_error_guidance_present(self):
         from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
@@ -3239,7 +3239,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(text_marker, PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("必须点名最具辨识度的偏离对象", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("risk_level 应为 high", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v49")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v50")
 
     def test_ocr_visual_contracts_deduplicated_but_keep_hard_constraints(self):
         from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
@@ -5773,7 +5773,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不限定行业或采购类型", guidance)
         scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v49")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v50")
 
     def test_full_scan_does_not_reinject_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")
@@ -7184,6 +7184,37 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertFalse(stats["applied"])
         self.assertEqual(stats["failure_count"], 1)
         self.assertEqual(compiled, rules)
+
+    def test_template_filter_removes_only_explicitly_inapplicable_current_project_condition(self):
+        inactive = {
+            "category": "rejection", "title": "条件性认证材料", "check_rule": "核验认证材料。",
+            "source_text": "本项目中采购相关产品的货物名称：无。后续认证要求不适用。",
+        }
+        executable = {
+            "category": "rejection", "title": "进口产品限制", "check_rule": "核验不得提供进口产品。",
+            "source_text": "本项目不接受进口产品参加投标。",
+        }
+        self.assertTrue(worker._has_explicitly_inapplicable_source(inactive))
+        self.assertFalse(worker._has_explicitly_inapplicable_source(executable))
+        filtered = worker._filter_inapplicable_template_rules([inactive, executable], "本项目不接受进口产品参加投标。")
+        self.assertEqual(filtered, [executable])
+
+    def test_score_reference_summary_is_not_executable_score_rule(self):
+        reference = {
+            "category": "objective", "title": "价格分值", "check_rule": "按第三章规定计算价格分。",
+            "source_text": "本项目采用综合评分法，其中价格分值为10分，其他因素分值为90分，详见招标文件第三章。",
+            "scoring": {"max_score": 10, "kind": "manual", "items": [{"name": "价格分", "max_score": 10, "criterion": "按第三章规定计算。"}]},
+        }
+        detail = {
+            "category": "objective", "title": "投标报价得分", "check_rule": "以最低报价为基准价，按公式计算。",
+            "source_text": "投标报价得分＝（评标基准价／投标报价）×10。",
+            "scoring": {"max_score": 10, "kind": "manual", "items": [{"name": "投标报价得分", "max_score": 10, "criterion": "按公式计算。"}]},
+        }
+        self.assertTrue(worker._is_non_executable_score_section_summary(reference))
+        self.assertFalse(worker._is_non_executable_score_section_summary(detail))
+        kept, removed = worker._drop_non_executable_score_section_summaries([reference, detail])
+        self.assertEqual(removed, 1)
+        self.assertEqual(kept, [detail])
 
     def test_compiled_child_requirements_survive_rule_storage_round_trip(self):
         storage.replace_rules_from_extraction(self.app, self.project["project_id"], "task-compiled", [{

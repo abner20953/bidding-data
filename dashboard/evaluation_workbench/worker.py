@@ -853,6 +853,26 @@ def _has_explicit_import_restriction(tender_text: str) -> bool:
     ))
 
 
+_EXPLICIT_INAPPLICABLE_CONDITION_PATTERN = re.compile(
+    r"(?:本项目|本包|本次采购|当前采购包).{0,48}?(?:产品|货物|服务|事项|材料|资格|认证|许可)"
+    r".{0,28}?(?:名称|范围|内容)?\s*(?:为|是|：|:)\s*(?:无|不涉及|不适用)"
+    r"|(?:本项目|本包|本次采购|当前采购包).{0,18}?(?:无|不涉及|不适用)"
+    r".{0,36}?(?:产品|货物|服务|事项|材料|资格|认证|许可)",
+    flags=re.IGNORECASE,
+)
+
+
+def _has_explicitly_inapplicable_source(rule: dict) -> bool:
+    """只依据候选直接原文剔除“当前项目明确无此事项”的空条件模板。
+
+    不把“禁止采购”“不得使用”等可执行限制当成不适用，也不从检查标题或行业词表
+    猜测。只有原文已经把当前项目/采购包的对应对象明确写成“无、不涉及、不适用”
+    时，后续的认证、证明或格式要求才没有实际核验对象。
+    """
+    source = re.sub(r"\s+", "", str(rule.get("source_text") or ""))
+    return bool(source and _EXPLICIT_INAPPLICABLE_CONDITION_PATTERN.search(source))
+
+
 def _filter_inapplicable_template_rules(rules: list[dict], tender_text: str) -> list[dict]:
     """剔除没有实际触发条件的模板规则，保守地保留其他候选。"""
     has_star = _has_concrete_star_requirement(tender_text)
@@ -862,6 +882,8 @@ def _filter_inapplicable_template_rules(rules: list[dict], tender_text: str) -> 
         if not isinstance(rule, dict):
             continue
         combined = " ".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text"))
+        if _has_explicitly_inapplicable_source(rule):
+            continue
         if re.search(r"★\s*号|星号条款", combined) and not has_star:
             continue
         if "进口产品" in combined and re.search(r"如有|内容时|如.*?接受", combined) and not has_import_restriction:
@@ -2978,6 +3000,17 @@ _SCORE_SECTION_HEADER_PATTERN = re.compile(
 )
 
 
+_SCORE_REFERENCE_ONLY_PATTERN = re.compile(
+    r"采用(?:综合)?评分法|其中.{0,24}?(?:分值|\d+(?:\.\d+)?分)|其他(?:因素|部分).{0,18}?(?:分|%)"
+    r"|详见.{0,28}?(?:评分|评审|第[一二三四五六七八九十\d]+章)"
+    r"|按.{0,22}?(?:第[一二三四五六七八九十\d]+章|评分细则|评审标准).{0,16}?(?:计算|评分|执行)"
+)
+_SCORE_EXECUTABLE_DETAIL_PATTERN = re.compile(
+    r"公式|每(?:项|份|次|有|处|人|台|套|分)|提供|满足|扣(?:\d|分)|得(?:\d|分)"
+    r"|(?:最低|最高|基准).{0,16}?(?:价|报价)|分档|档次|比例"
+)
+
+
 def _is_non_executable_score_section_summary(item: dict) -> bool:
     """识别“某部分共 X 分”这类评分表导航标题，避免误作为可执行评分规则。
 
@@ -2996,14 +3029,22 @@ def _is_non_executable_score_section_summary(item: dict) -> bool:
     compact_title = re.sub(r"\s+", "", title)
     if _SCORE_SECTION_HEADER_PATTERN.fullmatch(compact_source):
         return True
+    items = scoring.get("items") if isinstance(scoring.get("items"), list) else []
+    criterion = str(items[0].get("criterion") or "") if len(items) == 1 and isinstance(items[0], dict) else ""
+    # “其中价格 X 分，详见第 N 章”这类文字只负责分值分配或索引，没有可据以给分的
+    # 对象、公式、分档或材料。它不因标题未写成“价格部分（X 分）”就成为可执行评分项。
+    # 真正的评分细则会由同一份评分台账中的独立条款生成规则；若解析文本里没有细则，
+    # 这条导航文字本身也无法支持任何建议分。
+    reference_only = bool(_SCORE_REFERENCE_ONLY_PATTERN.search(compact_source + criterion))
+    executable_detail = bool(_SCORE_EXECUTABLE_DETAIL_PATTERN.search(source + criterion))
+    if reference_only and not executable_detail:
+        return True
     header_title = bool(re.search(
         r"(?:第[一二三四五六七八九十\d]+部分)?(?:价格|商务|技术|服务|资格)部分(?:客观|主观)?(?:评分|评审项)?[（(].*?\d+(?:\.\d+)?分",
         compact_title,
     ))
-    items = scoring.get("items") if isinstance(scoring.get("items"), list) else []
     if not header_title or len(items) != 1 or not isinstance(items[0], dict):
         return False
-    criterion = str(items[0].get("criterion") or "")
     # 没有任何可执行条件、仅要求“共同认定/详见评分表”的规则是标题摘要；
     # “每项、提供、公式、分档”等明确计分口径出现时保留。
     generic_summary = bool(re.search(r"共同认定|具体子项|评分细则|评分表为准|现场评分", criterion))
