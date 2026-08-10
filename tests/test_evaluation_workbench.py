@@ -1973,7 +1973,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result["level"], "high")
 
-    def test_acquisition_validation_blocks_confirmation_when_score_total_differs_from_tender_declared(self):
+    def test_acquisition_validation_warns_but_allows_confirmation_when_score_total_differs(self):
         self._add_pdf("tender.pdf", "tender", "", "用于建立解析文件")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
         self._run_next_task()
@@ -2000,9 +2000,9 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(len(mismatch), 1)
         self.assertIn("100", mismatch[0]["message"])
         self.assertIn("80", mismatch[0]["message"])
-        # 总分不守恒属于可由本地确定性校验识别的错误，不能进入综合评审。
-        with self.assertRaisesRegex(ValueError, "启用的评分规则满分合计"):
-            storage.confirm_rule_set(self.app, self.project["project_id"])
+        # 评分总分异常必须展示为提醒，但人工可确认规则集后再按需要调整/启停规则。
+        confirmed = storage.confirm_rule_set(self.app, self.project["project_id"])
+        self.assertEqual(confirmed["status"], "confirmed")
 
     def test_acquisition_validation_silent_when_score_total_matches_tender_declared(self):
         self._add_pdf("tender.pdf", "tender", "", "用于建立解析文件")
@@ -7826,16 +7826,16 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(rule_set["auto_merged_score_rule_count"], 1)
         self.assertFalse(any("人工维护" in item["check_rule"] for item in scores))
 
-    def test_confirm_rule_set_blocks_declared_total_mismatch(self):
-        """明示总分不守恒不能进入综合评审，避免错误总分传播。"""
+    def test_confirm_rule_set_allows_declared_total_mismatch_for_manual_review(self):
+        """明示总分不守恒保留预检提醒，但允许人工确认后继续调整。"""
         storage.add_rule(self.app, self.project["project_id"], {
             "category": "objective", "title": "技术评分",
             "check_rule": "按技术方案评分", "source_text": "技术方案满分 90 分。",
             "scoring": {"max_score": 90, "kind": "manual"},
         })
         with patch.object(storage, "_tender_declared_total_score", return_value=100):
-            with self.assertRaisesRegex(ValueError, "启用的评分规则满分合计"):
-                storage.confirm_rule_set(self.app, self.project["project_id"])
+            confirmed = storage.confirm_rule_set(self.app, self.project["project_id"])
+        self.assertEqual(confirmed["status"], "confirmed")
 
     def test_task_fingerprint_changes_when_runtime_release_changes(self):
         """未改提示词的逻辑修复也不能错误复用旧任务结果。"""

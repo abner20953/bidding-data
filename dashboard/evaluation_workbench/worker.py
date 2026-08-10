@@ -4323,9 +4323,10 @@ def _extract_rules(app, task: dict) -> dict:
             "preserved_rule_count": rule_set.get("preserved_rule_count", 0), "split_retry_count": split_retry_count,
             "execution_metadata": _task_execution_metadata(app, task, profile)}
     if scoring_contract_unresolved:
-        result["completion_state"] = "partial_success"
-        result["completion_message"] = (
-            "规则已生成，但评分原文覆盖或总分校验未通过；当前规则集不能确认，请仅重试规则提取或人工核对评分项。"
+        # 评分台账异常必须可见，但规则集仍由人工确认、勾选和修改后继续使用。它不是
+        # 任务失败，也不应把模型提取的不完整性变成确认流程的硬门槛。
+        result["scoring_contract_warning"] = (
+            "评分原文覆盖或总分校验存在待核对项；请人工核对后按需要修改、启停规则。"
         )
     return result
 

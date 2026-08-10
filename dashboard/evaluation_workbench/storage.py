@@ -3577,13 +3577,13 @@ def confirm_rule_set(app, project_id: str) -> dict:
     # 确认前把“同一计分事实被评分表不同章节/截断副本重复成多条”的评分规则安全合并，
     # 避免重复计分导致总分虚高；只停用次规则、保留信息更全者，不删除记录。
     merge_draft_score_rule_duplicates(app, rule_set["rule_set_id"])
-    # 评分规则不是普通提示项：若招标文件已明确总分，而当前启用规则无法守恒，
-    # 继续确认会把错误直接带入所有投标人的总分。只阻断“重复/总分/叶子截断”
-    # 这三类可由本地确定性校验识别的问题；图片能力、OCR 可用性等仍保持 warning。
+    # 总分、叶子合计和评分台账覆盖是重要的人工核对提醒，不应因模型提取未完整而
+    # 阻断后续人工评审；但同一原文被重复占用或 AI 评分项完全无原文锚点会导致
+    # 重复/无依据计分，仍须先在规则卡片中人工处理。
     validation = rule_set_acquisition_validation(app, project_id)
     blockers = [
         item for item in validation.get("issues", [])
-        if item.get("code") in {"duplicate_score_rule", "score_source_conflict", "score_source_unmapped", "score_total_mismatch", "score_leaf_total_below"}
+        if item.get("code") in {"duplicate_score_rule", "score_source_conflict", "score_source_unmapped"}
     ]
     if blockers:
         details = "；".join(str(item.get("message") or "评分规则校验失败") for item in blockers[:3])
