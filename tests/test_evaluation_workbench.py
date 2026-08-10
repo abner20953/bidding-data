@@ -1892,6 +1892,69 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         ids = [item.get("clause_id") for item in packets]
         self.assertEqual(ids, ["SC-33-1", "SC-33-2", "SC-34-1", "SC-34-2"])
 
+    def test_score_section_parent_accepts_bare_value_with_trailing_content(self):
+        line = "三、价格部分 10分 满足磋商文件要求且最后报价最低的供应商的价格为磋商基准价，其价格分为满分。磋商报价得分=(磋商基准价／最后磋商报价)×10×100%"
+        match = worker._SCORE_SECTION_PARENT_PATTERN.match(line)
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(4), "10")
+
+    def test_score_clause_packets_keeps_price_section_with_formula(self):
+        text = (
+            "[第39页]\n"
+            "一、商务部分 30分 1.供应商业绩 每提供一个类似项目案例得4分，最高得20分。\n"
+            "[第40页]\n"
+            "三、价格部分 10分 满足磋商文件要求且最后报价最低的供应商的价格为磋商基准价，其价格分为满分。磋商报价得分=(磋商基准价／最后磋商报价)×10×100%\n"
+        )
+        packets = worker._score_clause_packets(text)
+        price = next((item for item in packets if "价格部分" in str(item.get("text") or "")), None)
+        self.assertIsNotNone(price)
+        self.assertFalse(price.get("is_section_summary"))
+        self.assertEqual(price.get("score_section", {}).get("max_score"), 10.0)
+
+    def test_score_sections_declared_total(self):
+        packets = [
+            {"score_section": {"label": "一、商务部分 30分", "max_score": 30}},
+            {"score_section": {"label": "二、服务方案部分 60分", "max_score": 60}},
+            {"score_section": {"label": "三、价格部分 10分", "max_score": 10}},
+        ]
+        self.assertEqual(worker._score_sections_declared_total(packets), 100.0)
+        packets.append({"score_section": {"label": "三、价格部分 20分", "max_score": 20}})
+        self.assertIsNone(worker._score_sections_declared_total(packets))
+
+    def test_scope_template_mixing_confirmed_ignores_weak_claims(self):
+        self.assertTrue(worker._scope_template_mixing_confirmed("正文将土建施工总承包、配电柜等写入方案，属模板混用；核验点：是否仅作通用引用。"))
+        self.assertFalse(worker._scope_template_mixing_confirmed("需结合原页核验是否属于方案性描述或模板混用。"))
+        self.assertFalse(worker._scope_template_mixing_confirmed("存在模板混用候选，待复核。"))
+
+    def test_duplicate_review_rule_warns_for_similar_check_rules(self):
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "compliance", "title": "网络安全专用产品安全认证",
+            "check_rule": "若所投产品属于《网络关键设备和网络安全专用产品目录》中的网络安全专用产品，检查响应文件是否提供依据GB 42250检测的安全认证合格证明材料。",
+            "source_text": "投报产品须提供……安全认证合格证明材料",
+        })
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "compliance", "title": "网络安全专用产品安全认证",
+            "check_rule": "若所投产品属于《网络关键设备和网络安全专用产品目录》中的网络安全专用产品，检查响应文件是否提供依据GB 42250检测的安全认证合格证明材料；未提供则响应无效。",
+            "source_text": "投报产品须提供……安全认证合格证明材料；否则",
+        })
+        validation = storage.rule_set_acquisition_validation(self.app, self.project["project_id"])
+        duplicates = [item for item in validation["issues"] if item["code"] == "duplicate_review_rule"]
+        self.assertEqual(len(duplicates), 1)
+        self.assertEqual(len(duplicates[0]["rule_ids"]), 2)
+
+    def test_duplicate_review_rule_keeps_distinct_same_title_rules(self):
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "other", "title": "技术/服务要求逐项响应覆盖",
+            "check_rule": "核对投标文件对软件系统各模块（学校膳食经费管理系统、营养数字化管理平台）的功能要求是否逐项响应，报告已覆盖、部分覆盖和未找到的具体项。",
+        })
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "other", "title": "技术/服务要求逐项响应覆盖",
+            "check_rule": "核对投标文件对硬件设备（网络视频解码器、高清摄像头、POE交换机、硬盘录像机）的技术参数要求是否逐项响应，包括各项性能指标、接口、协议、防护等级等。",
+        })
+        validation = storage.rule_set_acquisition_validation(self.app, self.project["project_id"])
+        duplicates = [item for item in validation["issues"] if item["code"] == "duplicate_review_rule"]
+        self.assertEqual(duplicates, [])
+
     def test_hard_tender_anchor_gaps_detects_uncovered(self):
         text = "投标有效期不少于90日历天；不接受联合体投标；串通投标的作无效处理。"
         gaps = worker._hard_tender_anchor_gaps([], text)

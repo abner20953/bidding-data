@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import importlib.util
 import json
@@ -4234,6 +4235,41 @@ def rule_set_acquisition_validation(app, project_id: str) -> dict:
             "rule_ids": [str(item.get("rule_id") or "") for item in group],
             "title": str(group[0].get("title") or "评分规则"),
             "message": f"疑似同一评分事实的重复规则（均 {max_value:g} 分）：{titles}。重复计分会导致总分虚高，请核对后仅保留一条。",
+        })
+    # 疑似重复审查规则预检：非评分规则同类别、同标题、检查指令高度相似时提示
+    # 人工合并（不自动停用）。只提示最相似的一对，避免把同名但内容不同的规则
+    # （如按章节/模块拆分的“逐项响应覆盖”）全部刷成噪音。
+    review_groups: dict[tuple[str, str], list[dict]] = {}
+    for rule in rules:
+        if not rule.get("enabled") or str(rule.get("category") or "") in {"objective", "subjective"}:
+            continue
+        core = _score_rule_title_core(rule.get("title"))
+        if len(core) < 4:
+            continue
+        review_groups.setdefault((str(rule.get("category") or ""), core), []).append(rule)
+    for (category, core), group in review_groups.items():
+        if len(group) < 2:
+            continue
+        best_pair: tuple[float, dict, dict] | None = None
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                left = re.sub(r"[\s\W_]+", "", str(group[i].get("check_rule") or "")).casefold()
+                right = re.sub(r"[\s\W_]+", "", str(group[j].get("check_rule") or "")).casefold()
+                if not left or not right:
+                    continue
+                ratio = difflib.SequenceMatcher(None, left, right).ratio()
+                if ratio >= 0.85 and (best_pair is None or ratio > best_pair[0]):
+                    best_pair = (ratio, group[i], group[j])
+        if best_pair is None:
+            continue
+        _, left_rule, right_rule = best_pair
+        issues.append({
+            "severity": "warning", "code": "duplicate_review_rule",
+            "rule_id": str(left_rule.get("rule_id") or ""),
+            "rule_ids": [str(left_rule.get("rule_id") or ""), str(right_rule.get("rule_id") or "")],
+            "title": str(left_rule.get("title") or "审查规则"),
+            "message": f"疑似同一审查事实的重复规则（{category}）：“{left_rule.get('title')}”与“{right_rule.get('title')}”"
+                       "检查指令高度相似，重复执行会浪费调用并产生重复结论，请核对后仅保留一条。",
         })
     # 评分条款 ID 是提取阶段按原文位置生成的稳定台账锚点。同一 ID 同时落到两条
     # 启用评分规则时，即使标题或满分不同，也会造成父子项重复或续页片段被误当成

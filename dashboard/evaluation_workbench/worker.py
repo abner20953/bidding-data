@@ -623,9 +623,11 @@ _SCORE_SECTION_PARENT_PATTERN = re.compile(
     # 分部标题必须在“价格/商务/技术/服务/资格”之后明确出现“部分/评审/评分”。
     # 不能只因“技术参数……扣完（24分）”同时出现“技术”和分值就把一个具体
     # 评分项误判为新的评分分部。
-    r"^\s*((?:(?:第\s*[一二三四五六七八九十\d]+\s*部分)\s*[：:]?\s*)?"
+    # 前缀允许“第X部分”“一、”“（1）”等章节序号；分值出现即视为分部，
+    # 行尾可以有公式/说明（如“三、价格部分 10分 满足……磋商报价得分=…”）。
+    r"^\s*((?:(?:第\s*[一二三四五六七八九十\d]+\s*部分|[一二三四五六七八九十]+[、.．]|[（(]\s*\d+\s*[）)])\s*[：:]?\s*)?"
     r"(?:价格|商务|技术|服务|资格)[^（(:：]{0,16}?(?:部分|评审|评分)[^（(:：]{0,8}?)"
-    r"(?:[（(]\s*(\d+(?:\.\d+)?)\s*分\s*[）)]|\s*[：:]\s*(\d+(?:\.\d+)?)\s*分)\s*$"
+    r"(?:[（(]\s*(\d+(?:\.\d+)?)\s*分\s*[）)]|\s*[：:]\s*(\d+(?:\.\d+)?)\s*分|\s*(\d+(?:\.\d+)?)\s*分)"
 )
 _SCORE_TABLE_BOUNDARY_PATTERN = re.compile(r"条款号|评审因素|评分因素|评审标准|评分标准|分值构成|总分\s*\d+\s*分")
 _SCORE_GRADE_FRAGMENT_PATTERN = re.compile(r"^[A-HＡ-Ｈ甲乙丙丁戊己庚辛][、.．:：]")
@@ -1169,7 +1171,7 @@ def _score_clause_packets(text: str, limit: int = 240, *, source_document_key: s
         if section_match:
             page = _score_packet_page(lines, index)
             section_ordinal += 1
-            section_score = section_match.group(2) or section_match.group(3)
+            section_score = section_match.group(2) or section_match.group(3) or section_match.group(4)
             active_section = {
                 "section_id": f"SS-{document_key}-P{page}-{section_ordinal}" if document_key else f"SS-{page}-{section_ordinal}",
                 "label": re.sub(r"\s+", "", section_match.group(1)),
@@ -1199,7 +1201,10 @@ def _score_clause_packets(text: str, limit: int = 240, *, source_document_key: s
                 if page and page not in pages:
                     pages.append(page)
             continue
-        if not _SCORE_CLAUSE_PATTERN.search(re.sub(r"\s+", "", line)):
+        # 分部标题行（如“三、价格部分 10分 满足……公式”）即使不含“得X分”
+        # 等计分前缀，也进入台账：价格等分部可能没有叶子条款，只有公式，
+        # 不生成条款会导致整条价格评分规则缺失。
+        if not _SCORE_CLAUSE_PATTERN.search(re.sub(r"\s+", "", line)) and not section_match:
             continue
         # 评分表经 PDF 文本抽取后，项目名称、证明材料和计分行可能被分页符和大量空行
         # 分开。不能把分页符当作新评分项边界；最近一条明确计分行才是可靠边界。
@@ -1997,6 +2002,35 @@ def _declared_total_score_from_text(text: str) -> float | None:
         if 50 <= value <= 1_000:
             values.add(value)
     return next(iter(values)) if len(values) == 1 else None
+
+
+def _score_sections_declared_total(score_packets: list[dict]) -> float | None:
+    """评分分部台账合计兜底：招标文本没有“总分 X 分”字样时，
+    用唯一明确的分部（价格/商务/服务/技术等）分值合计推导整体总分。
+
+    同一分部名出现不同分值（多包/多套评分表）时视为不唯一，返回 None，
+    避免把分部合计误当成自动修复锚点。
+    """
+    sections: dict[str, float] = {}
+    for packet in score_packets:
+        section = packet.get("score_section") if isinstance(packet, dict) else None
+        if not isinstance(section, dict) or not section.get("label"):
+            continue
+        try:
+            score = float(section.get("max_score"))
+        except (TypeError, ValueError):
+            continue
+        label = re.sub(r"\s+", "", str(section.get("label") or ""))
+        # 分部名可能自带分值（“三、价格部分 10分”），冲突判断必须用去掉分值后的
+        # 分部名，否则同一分部不同分值会被当成不同分部而漏掉“多套评分表”冲突。
+        label_core = re.sub(r"\d+(?:\.\d+)?\s*分?$", "", label)
+        if label_core in sections and abs(sections[label_core] - score) > 0.001:
+            return None
+        sections[label_core] = score
+    if not sections:
+        return None
+    total = sum(sections.values())
+    return total if 1 <= total <= 1_000 else None
 
 
 def _score_rules_total(rules: list[dict]) -> float:
@@ -3983,7 +4017,7 @@ def _extract_rules(app, task: dict) -> dict:
     storage.update_task(app, task["task_id"], progress=60, message="正在按评分原文台账组装评分规则")
     score_rules, scoring_assembly = _extract_scoring_rules_from_ledger(
         app, task, profile, system_prompt, score_packets, document_id=tender["document_id"],
-        declared_total=_declared_total_score_from_text(main_text),
+        declared_total=_declared_total_score_from_text(main_text) or _score_sections_declared_total(score_packets),
     )
     raw_rules.extend(score_rules)
     uncovered_score_packets = [
@@ -4245,7 +4279,8 @@ def _extract_rules(app, task: dict) -> dict:
     rules = _normalise_visual_rule_policies(rules)
     rules = _attach_source_fact_metadata(rules)
     final_score_contract = _score_contract_issues(
-        rules, score_packets, _declared_total_score_from_text(main_text),
+        rules, score_packets,
+        _declared_total_score_from_text(main_text) or _score_sections_declared_total(score_packets),
     )
     scoring_contract_unresolved = _score_contract_requires_attention(final_score_contract)
     # 任务摘要必须基于落库前的最终规则，而不是早期组装阶段的中间覆盖情况。
@@ -4815,6 +4850,24 @@ _SCOPE_TEMPLATE_MIXING_PATTERN = re.compile(
     r"|不属于采购(?:范围)?|采购范围外|服务范围外|实施范围外|技术范围外|交付范围外"
     r"|与采购需求.{0,12}(?:不符|不一致|无关)"
 )
+_SCOPE_WEAK_CLAIM_PATTERN = re.compile(
+    r"是否|待核验|待复核|疑似|疑点|无法(?:排除|确认|判定)|不能(?:确认|判定)|未确认|需结合.{0,16}(?:是否|确认)"
+)
+
+
+def _scope_template_mixing_confirmed(text: str) -> bool:
+    """只有“模板混用”命中所在的整句不含弱化语境时，才视为确认性发现。
+
+    按分句（；。！？换行）独立判断：结论句为“属模板混用”而下一句是“核验点：
+    是否仅作通用引用”时仍视为确认；结论句本身是“是否属于…模板混用”或
+    “待核验/疑似/候选”时才不注入，避免把弱疑点误升级成 high。
+    """
+    for sentence in re.split(r"(?<=[；;。！？\n])", text):
+        if _SCOPE_TEMPLATE_MIXING_PATTERN.search(sentence) and not _SCOPE_WEAK_CLAIM_PATTERN.search(sentence):
+            return True
+    return False
+
+
 _PAGE_RANGE_PATTERN = re.compile(r"第(\d+(?:-\d+)?)页")
 _SCOPE_OBJECT_LIST_PATTERN = re.compile(r"范围画像(?:中)?不含([^，。；;]{2,60}?)等")
 _SCOPE_PAREN_OBJECT_PATTERN = re.compile(r"[（(]([^（）()]{4,80})[）)]")
@@ -11471,7 +11524,7 @@ def _scope_highlight_fallback_candidate(document_id: str, highlights: list[dict]
         if candidate.get("risk_level") != "high":
             continue
         text = " ".join(str(candidate.get(key) or "") for key in ("reason", "evidence", "conclusion_summary"))
-        if not _SCOPE_TEMPLATE_MIXING_PATTERN.search(text):
+        if not _scope_template_mixing_confirmed(text):
             continue
         fallback = candidate
         break
