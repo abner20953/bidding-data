@@ -26,7 +26,7 @@ from dashboard.evaluation_workbench.prompt_context import (
     split_full_text_chunks,
 )
 from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
-from dashboard.utils.comparator import CollusionDetector
+from dashboard.utils.comparator import CollusionDetector, MAX_PDF_PAGES
 
 
 class EvaluationWorkbenchTests(unittest.TestCase):
@@ -83,6 +83,41 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         documents = storage.list_documents(self.app, self.project["project_id"])
         self.assertTrue(all(item["parse_status"] == "success" for item in documents))
         self.assertTrue(all(item["text_length"] is not None for item in documents))
+
+    def test_parse_and_comparison_share_2500_page_limit(self):
+        self.assertEqual(worker.MAX_PARSE_PAGES, 2500)
+        self.assertEqual(worker.MAX_PARSE_PAGES, MAX_PDF_PAGES)
+        self.assertEqual(worker.MAX_PARSED_CHARS, 2_500_000)
+
+    def test_parse_accepts_pdf_at_2500_page_limit(self):
+        document = self._add_pdf("long-bid.pdf", "bid", "甲公司", "占位页")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+
+        class FakePage:
+            @staticmethod
+            def get_text(*_args, **_kwargs):
+                return "有效内容"
+
+        class FakePdf:
+            page_count = 2500
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                return iter([FakePage()] * self.page_count)
+
+        with patch("dashboard.evaluation_workbench.worker.fitz.open", return_value=FakePdf()):
+            finished = self._run_next_task()
+
+        self.assertEqual(finished["status"], "success")
+        parsed = next(item for item in storage.list_documents(self.app, self.project["project_id"])
+                      if item["document_id"] == document["document_id"])
+        self.assertEqual(parsed["page_count"], 2500)
+        self.assertEqual(parsed["parse_status"], "success")
 
     def test_bid_upload_requires_bidder_name(self):
         with self.assertRaisesRegex(ValueError, "必须填写投标人名称"):

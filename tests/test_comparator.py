@@ -69,13 +69,13 @@ class ComparatorTests(unittest.TestCase):
         self.assertEqual(kinds, {"person_name", "email", "address"})
         self.assertTrue(all(item["page_a"] == 1 and item["page_b"] == 1 for item in result["paragraphs"] if item.get("type") == "entity"))
 
-    def test_pdf_page_limits_allow_2000_pages_per_file(self):
-        self.assertEqual(comparator.MAX_PDF_PAGES, 2000)
-        comparator._validate_total_page_budget((2000, 2000))
+    def test_pdf_page_limits_allow_2500_pages_per_file(self):
+        self.assertEqual(comparator.MAX_PDF_PAGES, 2500)
+        comparator._validate_total_page_budget((2500, 2500, 2500))
 
-    def test_total_pdf_page_limit_rejects_4001_pages(self):
-        with self.assertRaisesRegex(comparator.ComparisonLimitError, "4000"):
-            comparator._validate_total_page_budget((2000, 2000, 1))
+    def test_total_pdf_page_limit_rejects_7501_pages(self):
+        with self.assertRaisesRegex(comparator.ComparisonLimitError, "7500"):
+            comparator._validate_total_page_budget((2500, 2500, 2501))
 
     def test_total_character_limit_rejects_oversized_comparison(self):
         with self.assertRaisesRegex(comparator.ComparisonLimitError, "12,000,000"):

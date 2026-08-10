@@ -36,11 +36,13 @@ from dashboard.evaluation_workbench.prompt_context import (
 )
 from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION
 from dashboard.blueprints.evaluation_workbench import create_worker_app
-from dashboard.utils.comparator import CollusionDetector, ComparisonLimitError
+from dashboard.utils.comparator import CollusionDetector, ComparisonLimitError, MAX_PDF_PAGES
 
 
-MAX_PARSE_PAGES = 2000
-MAX_PARSED_CHARS = 2_000_000
+# 解析、综合评审与查重共用同一单文件 PDF 页数上限，避免某一环节接受后
+# 在下一环节才失败。字符上限按页数同比放宽，仍作为 2 GB 服务器的独立保护。
+MAX_PARSE_PAGES = MAX_PDF_PAGES
+MAX_PARSED_CHARS = 2_500_000
 MAX_DOCX_XML_BYTES = 50 * 1024 * 1024
 PROMPT_VERSION = EVALUATION_PROMPT_VERSION
 COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v3"
