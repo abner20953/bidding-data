@@ -1531,6 +1531,37 @@ def _attach_rule_source_units(rules: list[dict], catalog: dict[str, dict] | None
 _NON_SCORE_CATEGORIES = {"qualification", "compliance", "substantive", "rejection", "other"}
 _NON_SCORE_VERIFIABILITY = {"single_bid", "cross_bid", "external_procedure"}
 
+# 这是招投标文件中稳定的法律/程序后果表达，而不是某个项目的业务词表。它只用于
+# 规则类别、重点结论资格和结构化风险传递，不直接根据命中的字面文本作出废标结论。
+_FORMAL_REJECTION_OUTCOME_PATTERN = re.compile(
+    r"(?:投标|响应|磋商|报价|文件).{0,12}(?:无效|被拒绝|予以否决|不通过)"
+    r"|(?:无效(?:投标|响应|磋商|报价|文件)?)"
+    r"|(?:予以否决|否决(?:投标|响应|磋商|报价)?|取消(?:投标|响应|磋商)?资格)"
+    r"|(?:不得再?参加.{0,18}(?:采购|投标|响应|磋商))"
+)
+
+
+def _has_formal_rejection_consequence(rule: dict) -> bool:
+    """仅从招标原文判断规则是否含明确否决后果，避免相信模型补写的后果。"""
+    return bool(_FORMAL_REJECTION_OUTCOME_PATTERN.search(str(rule.get("source_text") or "")))
+
+
+def _rule_decision_impact(rule: dict) -> str:
+    """返回规则的结构化决策影响，不依赖页面标题或模型风险措辞。"""
+    category = str(rule.get("category") or "")
+    if category == "rejection" or _has_formal_rejection_consequence(rule):
+        return "rejection"
+    children = _compiled_child_requirements(rule)
+    if any(
+        str(child.get("category") or "") == "rejection"
+        or _has_formal_rejection_consequence(child)
+        for child in children
+    ):
+        return "rejection"
+    if category in {"qualification", "compliance", "substantive"}:
+        return "material"
+    return "ordinary"
+
 
 def _normalise_non_score_candidate_contract(rules: list[dict], source_unit_catalog: dict[str, dict] | None) -> list[dict]:
     """统一全部非评分候选入口的最小可执行契约。
@@ -1547,6 +1578,12 @@ def _normalise_non_score_candidate_contract(rules: list[dict], source_unit_catal
             continue
         value = dict(item)
         category = str(value.get("category") or "")
+        # `other` 只承载没有独立否决后果的逐项覆盖。原文已经明确无效/否决后果
+        # 时，不能因为模型分类保守而降级为普通检查项；这会导致后续风险、排序和
+        # 重点结论都失去业务语义。资格/符合性等既有类别保持不变。
+        if category == "other" and _has_formal_rejection_consequence(value):
+            category = "rejection"
+            value["category"] = category
         if category not in _NON_SCORE_CATEGORIES:
             result.append(value)
             continue
@@ -3250,6 +3287,7 @@ def _obligation_compilation_payload(rules: list[dict]) -> str:
         values.append({
             "candidate_id": f"O-{index}",
             "category": item.get("category"),
+            "decision_impact": _rule_decision_impact(item),
             "title": str(item.get("title") or "")[:80],
             "verification_target": str(item.get("verification_target") or "")[:180],
             "check_rule": str(item.get("check_rule") or "")[:420],
@@ -3423,16 +3461,15 @@ def _compile_non_score_obligations(app, task: dict, profile: dict, system_prompt
         stats["failure_count"] = 1
         return rules, stats
     groups, missing_indexes = normalised
-    # 不同类别对应不同业务后果。过去将 qualification/compliance/rejection 等候选
-    # 放进同一卡片后，会按优先级提升为 rejection，综合评审便可能把普通响应问题
-    # 展示成废标风险。类别不同即使材料相同，也保留为独立执行语义；它们仍可在同一
-    # 批模型请求中处理，不增加额外的流程或图片调用。
+    # 不同决策后果不能共用一张规则卡。类别不同即使材料相同，也保留为独立执行
+    # 语义；同时以原文后果计算 impact，防止模型把明确否决条款误报为 other 后又
+    # 与普通检查项合并。它们仍可在同一批模型请求中处理，不增加额外流程或图片调用。
     category_safe_groups: list[list[int]] = []
     for indexes in groups:
-        buckets: dict[str, list[int]] = {}
+        buckets: dict[tuple[str, str], list[int]] = {}
         for index in indexes:
             category = str(rules[index].get("category") or "")
-            buckets.setdefault(category, []).append(index)
+            buckets.setdefault((category, _rule_decision_impact(rules[index])), []).append(index)
         category_safe_groups.extend(values for values in buckets.values() if values)
     groups = category_safe_groups
     if missing_indexes:
@@ -4809,7 +4846,9 @@ def _normalise_conclusion_summary(value: object, limit: int = 60) -> str:
     return text.strip()
 
 
-_TRUNCATED_END_PATTERN = re.compile(r"(?:但|而|且|并且|以及|还有|另外|：|:|，|,|；|;|、)$")
+# 分号、逗号和顿号可以是完整的并列事实结尾；把它们一概当作截断会将正常的
+# 短结论清空摘要并触发无意义补评。只保留真正悬空的连词和冒号等高置信信号。
+_TRUNCATED_END_PATTERN = re.compile(r"(?:但|而|且|并且|以及|还有|另外|：|:)$")
 _TRUNCATED_PAGE_PREFIX_PATTERN = re.compile(r"第?\d+(?:-\d+)?页\s*[:：]$")
 _INCOMPLETE_OUTPUT_MARKER = "…（结论输出不完整，需人工复核）"
 
@@ -5877,6 +5916,7 @@ def _combined_batch_payload(component: str, rules: list[dict]) -> list[dict]:
     if component == "review":
         return [{"rule_id": item["rule_id"], "category": item["category"], "title": item["title"],
                  "check_rule": item.get("check_rule") or item["title"], "source_text": item["source_text"],
+                 "decision_impact": _rule_decision_impact(item),
                  "ocr_required": _rule_requires_visual_verification(item),
                  "execution_strategy": _rule_execution_strategy(item),
                  "evidence_requirements": item.get("evidence_requirements") or [],
@@ -5920,6 +5960,7 @@ def _full_scan_catalog(rules: list[dict]) -> list[dict]:
             "rule_id": rule["rule_id"],
             "q": query[:query_limit],
             "type": rule["category"],
+            "impact": _rule_decision_impact(rule),
             "strategy": _rule_execution_strategy(rule),
             "coverage": 1 if is_coverage_rule else 0,
             "evidence_requirements": rule.get("evidence_requirements") or [],
@@ -7018,6 +7059,10 @@ def _build_shadow_evidence_pack(task: dict, document: dict, component: str, rule
             "checked_pages": _shadow_pages(layer.get("checked_pages")),
             "evidence_pages": _shadow_pages(layer.get("evidence_pages")),
             "service": str(layer.get("service") or "")[:160], "model": str(layer.get("model") or "")[:160],
+            "fact_relation": _enum_text(layer.get("fact_relation"), {"supports", "contradicts", "uncertain"}, "uncertain"),
+            "adverse_impact": _enum_text(layer.get("adverse_impact"), {"rejection", "material", "ordinary"}, "ordinary"),
+            "visual_dependency": _enum_text(layer.get("visual_dependency"), {"none", "confirmation_only", "decisive"}, "decisive"),
+            "rule_decision_impact": _enum_text(layer.get("rule_decision_impact"), {"rejection", "material", "ordinary"}, "ordinary"),
         })
     snapshot = {
         "status": result.get("status"), "suggested_score": result.get("suggested_score"),
@@ -8002,6 +8047,59 @@ def _ocr_response_scope(value: dict) -> str:
     return scope if scope in {"full", "partial", "none"} else "partial"
 
 
+def _ocr_fact_metadata(value: dict, rule: dict) -> dict:
+    """规范 OCR 对“事实方向—业务影响—图片依赖”的结构化说明。
+
+    这三项只描述本次已识别文字的含义，不能把 OCR 直接升级为法定废标决定；
+    但能避免“已读到直接反证、仅待原图确认”被笼统降成普通低风险。
+    """
+    relation = _enum_text(value.get("fact_relation"), {"supports", "contradicts", "uncertain"}, "uncertain")
+    adverse_impact = _enum_text(value.get("adverse_impact"), {"rejection", "material", "ordinary"}, "ordinary")
+    visual_dependency = _enum_text(
+        value.get("visual_dependency"), {"none", "confirmation_only", "decisive"}, "decisive",
+    )
+    return {
+        "fact_relation": relation,
+        "adverse_impact": adverse_impact,
+        "visual_dependency": visual_dependency,
+        "rule_decision_impact": _rule_decision_impact(rule),
+    }
+
+
+def _apply_direct_adverse_ocr_guard(result: dict, parsed: dict, rule: dict, *, can_apply: bool) -> dict:
+    """让已有直接反证在人工复核前保持应有的风险可见性。
+
+    触发条件完全来自模型的结构化事实方向和招标原文已明确的否决后果。这里不判断
+    某个词、某个表单或某个项目是否违法；原图仍待确认时保留 partial，不自动作出
+    不满足或最终废标结论。
+    """
+    metadata = _ocr_fact_metadata(parsed, rule)
+    direct_adverse = (
+        can_apply
+        and metadata["fact_relation"] == "contradicts"
+        and metadata["rule_decision_impact"] == "rejection"
+        and metadata["adverse_impact"] in {"rejection", "material"}
+    )
+    if not direct_adverse:
+        return {**result, "_ocr_fact_metadata": metadata}
+    summary = _normalise_conclusion_summary(parsed.get("summary"))
+    if not summary:
+        summary = "识别到与明确否决条件相冲突的文字，需重点复核原页。"
+    status = str(result.get("status") or "partial")
+    # 只有文字与原图都不再存在决定性缺口时，才允许模型的“不满足”结论落定；
+    # 其他情况仍是人工可复核的高风险候选，绝不由系统替代人工决定。
+    if metadata["visual_dependency"] != "none" and status == "not_satisfied":
+        status = "partial"
+    return {
+        **result,
+        "status": status,
+        "risk_level": "high",
+        "conclusion_summary": summary,
+        "evidence_quality": "sufficient" if str(result.get("evidence") or "").strip() else result.get("evidence_quality"),
+        "_ocr_fact_metadata": metadata,
+    }
+
+
 def _ocr_candidate_pages(document: dict, rule: dict, result: dict, level: str) -> list[int]:
     pages = _prioritise_material_pages(
         document, rule, _acquisition_candidate_pages(document, rule, result),
@@ -8906,10 +9004,12 @@ def _apply_ocr_summary(component: str, rule: dict, working_result: dict, parsed:
         merged["conclusion_summary"] = _reconcile_summary_score(merged["conclusion_summary"], suggested)
     # 本地 OCR 归纳模型会判定是否仍有外观事实待核验；该信号只在本轮任务内流转，
     # 用于决定后续是否升级多模态，不改变落库结构。
+    if component == "review":
+        merged = _apply_direct_adverse_ocr_guard(merged, parsed, rule, can_apply=can_apply)
     merged["_ocr_visual_review_required"] = _ocr_visual_gap_flag(parsed, content_covered)
     merged = _append_evidence_layer(
         merged, source="local_ocr" if local_only else "tencent_ocr", summary=evidence or reason, checked_pages=pages,
-        evidence_pages=evidence_pages, service=service_labels,
+        evidence_pages=evidence_pages, service=service_labels, fact_metadata=merged.pop("_ocr_fact_metadata", None),
     )
     return _with_vision_execution(
         _set_result_coverage(merged, "covered" if can_apply else "partial"), status, pages, {"display_name": service_labels},
@@ -9165,10 +9265,12 @@ def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: d
                   "confidence": _enum_text(parsed.get("confidence"), {"high", "medium", "low"}, working_result.get("confidence")) if can_apply_text_conclusion else working_result.get("confidence"),
                   "ocr_candidate_pages": pages, "ocr_evidence_pages": evidence_pages,
                   "requires_review": True, "automation_status": "needs_review", "review_reason": f"{service_labels} 结果已补充，需人工复核。"}
+    if component == "review":
+        merged = _apply_direct_adverse_ocr_guard(merged, parsed, rule, can_apply=can_apply_text_conclusion)
     merged["_ocr_visual_review_required"] = _ocr_visual_gap_flag(parsed, content_covered)
     merged = _append_evidence_layer(
         merged, source="local_ocr" if local_only else "tencent_ocr", summary=evidence or reason, checked_pages=pages,
-        evidence_pages=evidence_pages, service=service_labels,
+        evidence_pages=evidence_pages, service=service_labels, fact_metadata=merged.pop("_ocr_fact_metadata", None),
     )
     return _with_vision_execution(
         _set_result_coverage(merged, "covered" if can_apply_text_conclusion else "partial"), status, pages, {"display_name": service_labels},
@@ -10123,6 +10225,7 @@ def _visual_rule_packet(rule: dict) -> dict:
     return {
         "rule_id": rule["rule_id"], "category": rule.get("category"), "title": rule.get("title"),
         "check_rule": rule.get("check_rule") or rule.get("title"), "source_text": rule.get("source_text"),
+        "decision_impact": _rule_decision_impact(rule),
         "evidence_items": _rule_evidence_items(rule),
         "sub_requirements": _compiled_child_requirements(rule),
         "scoring": scoring if scoring else None,
@@ -10142,7 +10245,8 @@ def _normalise_result_pages(values: object) -> list[int]:
 
 
 def _append_evidence_layer(result: dict, *, source: str, summary: object, checked_pages: object,
-                           evidence_pages: object, service: str = "", model: str = "") -> dict:
+                           evidence_pages: object, service: str = "", model: str = "",
+                           fact_metadata: dict | None = None) -> dict:
     """以结构化方式保留 OCR/图片证据，旧 evidence/reason 字段仍完整兼容。"""
     current = result.get("evidence_layers")
     layers = [dict(value) for value in current if isinstance(value, dict)] if isinstance(current, list) else []
@@ -10154,6 +10258,19 @@ def _append_evidence_layer(result: dict, *, source: str, summary: object, checke
         "service": str(service or "")[:160],
         "model": str(model or "")[:160],
     }
+    if isinstance(fact_metadata, dict):
+        relation = _enum_text(fact_metadata.get("fact_relation"), {"supports", "contradicts", "uncertain"}, "uncertain")
+        adverse_impact = _enum_text(fact_metadata.get("adverse_impact"), {"rejection", "material", "ordinary"}, "ordinary")
+        visual_dependency = _enum_text(
+            fact_metadata.get("visual_dependency"), {"none", "confirmation_only", "decisive"}, "decisive",
+        )
+        rule_impact = _enum_text(fact_metadata.get("rule_decision_impact"), {"rejection", "material", "ordinary"}, "ordinary")
+        layer.update({
+            "fact_relation": relation,
+            "adverse_impact": adverse_impact,
+            "visual_dependency": visual_dependency,
+            "rule_decision_impact": rule_impact,
+        })
     # 同一来源的本次补充替换旧层，避免重试或二次合并反复堆叠。
     layers = [value for value in layers if value.get("source") != source]
     layers.append(layer)
@@ -11606,8 +11723,13 @@ def _evaluation_highlight_candidates(app, project_id: str) -> tuple[list[dict], 
         rule_id = str(item.get("rule_id") or "")
         if not document_id or not rule_id:
             continue
+        decision_impact = _rule_decision_impact(item)
+        # 存量规则可能在早期提取时被模型误归为 other。重点结论只需要知道招标原文
+        # 是否明确了否决后果，不能因旧类别失真把高价值反证排到普通提示之后。
+        effective_category = "rejection" if decision_impact == "rejection" else item.get("category")
         candidate = {
-            "type": "review", "rule_id": rule_id, "category": item.get("category"),
+            "type": "review", "rule_id": rule_id, "category": effective_category,
+            "decision_impact": decision_impact,
             "title": item.get("title"), "check_rule": item.get("check_rule"),
             "status": item.get("status"), "risk_level": item.get("risk_level"),
             "confidence": item.get("confidence"), "evidence_quality": item.get("evidence_quality"),
@@ -11616,7 +11738,7 @@ def _evaluation_highlight_candidates(app, project_id: str) -> tuple[list[dict], 
         }
         candidate["_rank"] = (
             review_rank.get(str(item.get("status")), 0),
-            category_rank.get(str(item.get("category")), 0),
+            category_rank.get(str(effective_category), 0),
             risk_rank.get(str(item.get("risk_level")), 0),
         )
         candidate["_critical_eligible"] = (
@@ -11624,8 +11746,8 @@ def _evaluation_highlight_candidates(app, project_id: str) -> tuple[list[dict], 
             and item.get("risk_level") == "high"
             and item.get("confidence") == "high"
             and item.get("evidence_quality") == "sufficient"
-            and item.get("category") in {"qualification", "compliance", "substantive", "rejection"}
-            and bool(re.search(r"投标无效|否决|不通过|废标|无效投标", str(item.get("check_rule") or "")))
+            and effective_category in {"qualification", "compliance", "substantive", "rejection"}
+            and decision_impact == "rejection"
         )
         group = grouped.setdefault(document_id, {
             "document_id": document_id,

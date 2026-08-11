@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 PROMPT_TEMPLATE_SETTING = "evaluation_workbench_prompt_templates"
-EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v56"
+EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v58"
 
 
 def _template(name: str, description: str, content: str, *placeholders: str) -> dict:
@@ -25,7 +25,7 @@ PROMPT_TEMPLATES = {
     "extract_rules_supplement_user": _template("评审规则提取 · 评分补充", "遗漏评分条款的补充提取。", "仅根据以下评分条款，补充主规则提取遗漏的明确评分项。只返回合法 JSON：\n{\"rules\":[{\"category\":\"objective|subjective\",\"title\":\"简明规则名称\",\"check_rule\":\"面向投标文件的明确检查指令\",\"source_text\":\"原文短摘录\",\"source_page\":数字或null,\"source_clause_ids\":[\"评分条款ID\"],\"ocr_required\":false,\"scoring\":{\"max_score\":数字,\"kind\":\"boolean|manual\",\"items\":[{\"name\":\"叶子评分项\",\"max_score\":数字,\"criterion\":\"计分或扣分条件\"}]}}]}\n\n已有评分规则：{{existing_rules}}\n必须仅返回缺失项，不得重复已有项；每个明确评分条款都要覆盖，并把条款标题中的评分条款 ID 原样写入 source_clause_ids。对于按多个服务模块或功能点累计得分的主观项，输出一条保留总分的规则，在 scoring.items 中逐项列明模块、每项分值和扣分逻辑，同时让 check_rule 保留完整可读口径，不能拆成无法核对总分的零散标题。objective 和 subjective 都必须有 scoring.max_score，且仅能填写原文明确的满分。决定性证明材料必须查看证照、签章、凭证或其他图片外观时，ocr_required 必须为 true；source_page 填写最直接依据页，无法确定时为 null。不得使用 Markdown 或添加说明；title 最多 30 字，普通 check_rule 尽量控制在 320 字内，但不得删减叶子评分项；source_text 最多 180 字。\n\n评分条款：\n{{packet_text}}", "existing_rules", "packet_text"),
     "extract_rules_hard_anchor_supplement_user": _template("评审规则提取 · 硬性条款补充", "招标文件出现法律/政策硬性条款而规则集未覆盖时的补充提取。", "根据以下招标原文关键条款，补充生成对应的审查规则。只返回合法 JSON：\n{\"rules\":[{\"category\":\"qualification|compliance|substantive|rejection|other\",\"title\":\"简明规则名称\",\"check_rule\":\"面向投标文件的完整检查指令\",\"source_text\":\"原文短摘录\",\"source_page\":数字或null,\"source_clause_ids\":[],\"ocr_required\":false}]}\n\n已有规则：{{existing_rules}}\n只补缺失条款，不得重复已有规则；检查指令必须可直接核验投标文件内容，不得包含评审过程事项（澄清、补正、谈判、澄清说明等）；source_text 取原文短摘录；title 最多 30 字。\n\n关键条款原文：\n{{packet_text}}", "existing_rules", "packet_text"),
     "extract_rules_dedupe_adjudication_user": _template("评审规则提取 · 疑似重复裁决", "只裁决小范围疑似重复组，不改写规则内容。", "以下候选已通过来源和单文件核验门控，但标题或核验对象相近。请仅判断哪些候选属于同一个审查义务。只返回合法 JSON：\n{\"decisions\":[{\"candidate_ids\":[\"C-1\",\"C-2\"],\"action\":\"merge|keep_separate\"}]}\n\n严格限制：1. 只可引用输入中同一候选组的 ID；2. 仅当两条规则核验的是同一材料/字段/响应事实，且合并不会丢失独立资格、否决后果、证明材料或审查结论时，才返回 action=merge；3. 不同字段、不同证明材料、不同适用条件、不同独立后果必须 keep_separate；4. 不得新增、删除、改写规则，不得改变类别、来源、OCR 设置或评分；5. 每个候选组必须返回一次 keep_separate 或一个/多个 merge 决定。\n\n疑似重复候选组：\n{{candidate_groups}}", "candidate_groups"),
-    "extract_rules_obligation_compile_user": _template("评审规则提取 · 义务汇总编译", "全局汇总已锚定的非评分候选；只返回候选分组，不生成新规则文字。", "以下候选均已通过原文来源、分包和单份投标文件核验门控。请把它们划分为最终审查义务组，只返回合法 JSON：\n{\"groups\":[{\"candidate_ids\":[\"O-1\",\"O-2\"],\"action\":\"merge\"},{\"candidate_ids\":[\"O-3\"],\"action\":\"keep_separate\"}]}\n\n每个 O-* 必须且只能出现一次。以“少而精、一个底层审查事实一张规则卡”为目标：同一投标文件事实被不同章节重复表述，或同一材料/字段/响应要求及其后果被拆成多条时必须 merge；不得因标题、类别或来源页不同而保留重复卡。若多个候选的核验动作相同，均为“逐项/逐条/完整响应/覆盖/对照同一来源范围”，仅因一个是总范围、其余是按章节、清单、模块、场景、分组或物项展开而不同，必须全部 merge 为一张覆盖规则；系统会保留全部子检查项，不能因担心范围过宽而留下总规则和分组规则的多张重复卡。不同材料、不同字段、不同适用条件、不同独立证明要求或可分别成立的不响应事实必须 keep_separate。不得仅依据标题相似就合并；不得新增、删除、改写候选，不得改变评分、原文、OCR 或来源。\n\n候选：\n{{candidates}}", "candidates"),
+    "extract_rules_obligation_compile_user": _template("评审规则提取 · 义务汇总编译", "全局汇总已锚定的非评分候选；只返回候选分组，不生成新规则文字。", "以下候选均已通过原文来源、分包和单份投标文件核验门控。请把它们划分为最终审查义务组，只返回合法 JSON：\n{\"groups\":[{\"candidate_ids\":[\"O-1\",\"O-2\"],\"action\":\"merge\"},{\"candidate_ids\":[\"O-3\"],\"action\":\"keep_separate\"}]}\n\n每个 O-* 必须且只能出现一次。以“少而精、一个底层审查事实一张规则卡”为目标：同一投标文件事实被不同章节重复表述，或同一材料/字段/响应要求及其后果被拆成多条时必须 merge；不得因标题、类别或来源页不同而保留重复卡。若多个候选的核验动作相同，均为“逐项/逐条/完整响应/覆盖/对照同一来源范围”，仅因一个是总范围、其余是按章节、清单、模块、场景、分组或物项展开而不同，必须全部 merge 为一张覆盖规则；系统会保留全部子检查项，不能因担心范围过宽而留下总规则和分组规则的多张重复卡。不同材料、不同字段、不同适用条件、不同独立证明要求或可分别成立的不响应事实必须 keep_separate。decision_impact 为 rejection 的候选具有明确否决后果，绝不得与 decision_impact 非 rejection 的候选合并。不得仅依据标题相似就合并；不得新增、删除、改写候选，不得改变评分、原文、OCR 或来源。\n\n候选：\n{{candidates}}", "candidates"),
     "extract_rules_scoring_structure_repair_user": _template("评审规则提取 · 评分结构修复", "评分规则叶子合计与满分不符时的定向修复。", "以下评分规则的正分叶子项合计不等于满分，疑似跨页截断或漏项。请只根据每条规则随附的 score_clause_source 修正 scoring.items：正分叶子项分值合计必须等于 max_score（max_score<=0 的扣分项不计入）；保留全部原始计分对象，不得新增原文没有的评分项。该步骤仅允许补全叶子项，禁止改变 category、title、max_score、source_clause_ids 或将规则改挂到其他评分分部；返回的 source_clause_ids 必须与输入完全一致。只返回合法 JSON：\n{\"rules\":[{\"category\":\"objective|subjective\",\"title\":\"简明规则名称\",\"check_rule\":\"面向投标文件的完整检查指令\",\"source_text\":\"原文短摘录\",\"source_page\":数字或null,\"source_clause_ids\":[\"评分条款ID\"],\"ocr_required\":false,\"scoring\":{\"max_score\":数字,\"kind\":\"boolean|manual\",\"items\":[{\"name\":\"叶子评分项\",\"max_score\":数字,\"criterion\":\"计分或扣分条件\"}]}}]}\n\n规则与原文：\n{{rules}}", "rules"),
     "extract_rules_qualification_supplement_user": _template("评审规则提取 · 资格条款补充", "依据正式资格章节或资格评审表，补充主提取遗漏的资格审查规则。", "仅根据以下正式资格候选区段，补充尚未被已有资格规则完整承接的资格审查点。只返回合法 JSON：\n{\"rules\":[{\"category\":\"qualification\",\"title\":\"简明资格规则名称\",\"check_rule\":\"面向响应/投标文件的完整检查指令\",\"source_text\":\"最直接资格原文摘录\",\"source_page\":数字或null,\"source_clause_ids\":[\"资格区段ID\"],\"ocr_required\":false}]}\n\n已有资格规则：{{existing_rules}}\n候选区段可能来自投标人/供应商资格要求、资格审查/评审标准及其跨页上下文，也可能为保持跨页完整而带入少量相邻非资格内容；只能为原文明示的当前投标资格条件生成 qualification 规则，不得把相邻技术要求、评分项或流程安排误作资格。每个标明“适用”或实际提出当前文件证明材料的资格条件，都必须由至少一条已有或返回规则完整承接；被明确标记为“不适用”的条件不得生成规则。资格区段中列出的主体证明/账户、纳税或社会保障凭证、财务证明、资格业绩及其时间、数量和合同证明材料等，属于不同审查事实：可在一条规则中完整列明，也可拆为互不重叠的规则，但不得以“名称一致性”“资料完整”或同一事实的评分规则代替。资格业绩门槛与同一业绩的加分条款必须同时保留。只核验当前文件中的材料、文字与必要 OCR，不推断官网、平台或未来履约事实。决定性证据需要证照、凭证、截图、签章或扫描件外观时 ocr_required=true。每条返回规则的 source_clause_ids 必须原样填写其直接依据所在的资格区段 ID；不得使用 Markdown 或添加说明。\n\n正式资格候选区段：\n{{packet_text}}", "existing_rules", "packet_text"),
     "extract_rules_scoring_assembly_user": _template("评审规则提取 · 评分原文组装", "仅由评分原文一次生成可执行评分规则，不与正文分批提取混用。", "仅根据以下评分原文台账生成评分规则，只返回合法 JSON：\n{\"rules\":[{\"category\":\"objective|subjective\",\"title\":\"简明评分名称\",\"check_rule\":\"完整评分检查指令\",\"source_text\":\"最直接评分原文摘录\",\"source_page\":数字或null,\"source_clause_ids\":[\"评分条款ID\"],\"ocr_required\":false,\"scoring\":{\"max_score\":数字,\"kind\":\"boolean|manual\",\"items\":[{\"name\":\"叶子评分项\",\"max_score\":数字,\"criterion\":\"计分或扣分条件\"}]}}]}\n\n严格规则：1. 每个输入评分条款 ID 必须且只能属于一条输出规则；同一可执行评分事实的标题、满分、续行、分档、公式、扣分说明、证明材料和叶子项必须合为一条规则，并共同列入 source_clause_ids。连续页面的开头可能只是上一页评分项的 C/D 档、扣分条件、公式尾部或材料说明；这类片段必须附属到最近的有明确评分对象的规则，绝不能仅凭“得分/扣分”虚构独立评分对象。PDF 表格可能把一条评分标准拆成连续多个评分条款 ID；不能因为后续片段再次出现“扣分、得分、满分”就另建一个同满分规则。2. 只输出可独立评分的规则；章节总分、合计标题、排序、四舍五入和评委操作不单独成规则。仅说明“采用某种评标法、其中某部分 X 分、其他部分 Y 分、按某章/细则计算、详见评分表”的分值分配或交叉引用，不含实际公式、分档、数量、对象、材料或扣分条件时，是导航说明，不得单独输出；应把它附属到其后真正可执行的评分规则。3. 固定数量、次数、比例、公式、证书或满足即固定得分为 objective；需要优劣、完整性、合理性、针对性或评委裁量判断的为 subjective。4. 必须保留计分对象、有效期、证明材料、公式、扣分条件、叶子项和满分；不得新造原文未规定的分值或后果。5. 不得输出 qualification、compliance、substantive、rejection 或 other；不得添加输入中不存在的评分条款 ID。6. 无法判断的条款也必须附属到最接近的规则，并在 check_rule 中保留原文口径，不得静默遗漏。\n\n评分原文台账：\n{{score_packets}}", "score_packets"),
@@ -606,6 +606,39 @@ _SCOPE_CANDIDATE_COMPLETENESS_GUIDANCE = (
     "dimension 必须写能区分该类事实的简短开放描述，不得统一写“其他范围偏离”或“模板问题”。"
 )
 _extend_prompt("evaluate_all_scope_anomaly_guidance", "范围候选完整性", "\n\n" + _SCOPE_CANDIDATE_COMPLETENESS_GUIDANCE)
+
+# 明确否决后果属于规则的结构身份。它必须从招标原文和可定位的投标文件事实中
+# 推导，OCR/图片只负责补充事实，不把“仍需看原页”错误降级为普通低风险。
+_ADVERSE_EVIDENCE_GUIDANCE = (
+    "规则包中的 decision_impact=rejection 表示招标原文已明确无效、否决、不得参加或等效后果。"
+    "若发现投标文件存在与该条件直接相反的可定位文字，应如实列为高风险候选并说明待复核的原页；"
+    "是否仍需核验勾选、签章、版式或原图，只影响最终确定性，不得抹掉该直接反证。"
+    "没有直接反证、仅材料未覆盖或 OCR 未读取时，仍按原有低风险/待核验口径。"
+)
+_extend_prompt("extract_rules_guidance", "明确否决后果分类", "\n\n" + _ADVERSE_EVIDENCE_GUIDANCE)
+_extend_prompt("evaluate_all_full_scan_user", "明确否决候选", "\n\n" + _ADVERSE_EVIDENCE_GUIDANCE)
+_extend_prompt("evaluate_all_review_user", "明确否决候选", "\n\n" + _ADVERSE_EVIDENCE_GUIDANCE)
+_extend_prompt("evaluate_all_highlights_user", "明确否决候选", "\n\n已有候选若已标为高风险且 decision_impact=rejection，即使仍待原图确认，也应优先提炼为 high；只有全部严格条件满足时才可写 critical。")
+
+_OCR_ADVERSE_FACT_CONTRACT = (
+    " OCR 输出还必须包含 \"fact_relation\":\"supports|contradicts|uncertain\"、"
+    "\"adverse_impact\":\"rejection|material|ordinary\"、"
+    "\"visual_dependency\":\"none|confirmation_only|decisive\"。"
+    "fact_relation 仅表示 OCR 已读到的文字与当前规则的关系；若规则 decision_impact=rejection 且 OCR"
+    " 已读到直接相反文字，返回 contradicts 与 rejection，即使还需要原图确认；"
+    "仅材料未覆盖、文字模糊或签章未看清时返回 uncertain，不得虚报 contradicts。"
+)
+_extend_prompt("evaluate_all_ocr_user", "OCR 反证结构", "\n\n" + _OCR_ADVERSE_FACT_CONTRACT)
+_extend_prompt("evaluate_all_ocr_batch_user", "OCR 反证结构", "\n\n" + _OCR_ADVERSE_FACT_CONTRACT)
+_extend_prompt("evaluate_all_ocr_contract", "OCR 反证字段", "\n\n" + _OCR_ADVERSE_FACT_CONTRACT)
+for _template_id in ("evaluate_all_ocr_user", "evaluate_all_ocr_batch_user", "evaluate_all_ocr_contract"):
+    _required_literals = tuple(PROMPT_TEMPLATES[_template_id].get("required_literals", ()))
+    PROMPT_TEMPLATES[_template_id]["required_literals"] = (
+        *_required_literals, "fact_relation", "adverse_impact", "visual_dependency",
+    )
+    # 已保存的旧自定义模板不会自动改写。运行时若发现它仍缺本轮新增字段，存储层
+    # 会补入这一小段不可省略的结构协议，并把实际生效内容回显到配置界面。
+    PROMPT_TEMPLATES[_template_id]["system_required_suffix"] = _OCR_ADVERSE_FACT_CONTRACT
 
 # 上述少量结构化协议模板在定义后会做字段兼容变换；先把这些基础变换固化，再
 # 统一附加命名业务片段。最终对外仍只有每个模板的一份完整可编辑文本。

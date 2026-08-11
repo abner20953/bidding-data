@@ -188,11 +188,27 @@ def _prompt_template_overrides(app) -> dict[str, str]:
     return {key: value for key, value in values.items() if key in PROMPT_TEMPLATES and isinstance(value, str)} if isinstance(values, dict) else {}
 
 
+def _effective_prompt_template_content(template_id: str, override: object = None) -> str:
+    """兼容旧自定义模板缺少后续新增的系统输出字段。
+
+    用户自定义内容保持原样；只有旧配置没有包含新引入且不可缺的协议字段时，才在
+    实际生效内容末尾补充对应的系统短协议。列表接口也使用这里的结果，确保页面可见
+    的提示词与运行时一致，用户保存后即可把协议纳入自己的模板。
+    """
+    meta = PROMPT_TEMPLATES[template_id]
+    content = str(override if isinstance(override, str) else meta["content"])
+    suffix = str(meta.get("system_required_suffix") or "").strip()
+    required = tuple(str(value) for value in meta.get("required_literals", ()) if str(value).strip())
+    if suffix and any(literal not in content for literal in required):
+        return content.rstrip() + "\n\n【系统必需输出协议】\n" + suffix
+    return content
+
+
 def list_prompt_templates(app) -> list[dict]:
     overrides = _prompt_template_overrides(app)
     values = [
         {"template_id": template_id, "name": meta["name"], "description": meta["description"],
-         "content": overrides.get(template_id, meta["content"]), "is_custom": template_id in overrides,
+         "content": _effective_prompt_template_content(template_id, overrides.get(template_id)), "is_custom": template_id in overrides,
          "placeholders": list(meta.get("placeholders", ())), **template_presentation(template_id)}
         for template_id, meta in PROMPT_TEMPLATES.items()
     ]
@@ -202,7 +218,7 @@ def list_prompt_templates(app) -> list[dict]:
 def prompt_template(app, template_id: str) -> str:
     if template_id not in PROMPT_TEMPLATES:
         raise ValueError("不支持的提示词流程")
-    return _prompt_template_overrides(app).get(template_id, PROMPT_TEMPLATES[template_id]["content"])
+    return _effective_prompt_template_content(template_id, _prompt_template_overrides(app).get(template_id))
 
 
 def render_prompt_template(app, template_id: str, **values: object) -> str:
@@ -249,6 +265,7 @@ def task_prompt_template_fingerprint(app, task_type: str) -> str | None:
             "evaluate_all_scope_anomaly_guidance", "evaluate_all_full_scan_user", "evaluate_all_review_user", "evaluate_all_objective_user",
             "evaluate_all_subjective_user", "evaluate_all_cross_bid_price_user", "evaluate_all_highlights_user",
             "evaluate_all_visual_user", "evaluate_all_ocr_user", "evaluate_all_visual_contract", "evaluate_all_ocr_contract",
+            "evaluate_all_ocr_batch_user",
             "evaluate_all_visual_locator_user",
             "evaluate_all_output_contract",
             "json_repair", "json_repair_user",
@@ -4425,6 +4442,21 @@ def _evidence_layers_json(item: dict) -> str:
             "service": str(value.get("service") or "").strip()[:160],
             "model": str(value.get("model") or "").strip()[:160],
         })
+        # OCR/图片层可选地记录“事实方向—业务影响—外观依赖”。这是对旧 API 的
+        # 兼容扩展，供报告、EvidencePack 和重跑审计复用；缺失时仍按旧证据层展示。
+        if source in {"local_ocr", "tencent_ocr", "vision"}:
+            relation = str(value.get("fact_relation") or "")
+            adverse_impact = str(value.get("adverse_impact") or "")
+            visual_dependency = str(value.get("visual_dependency") or "")
+            rule_impact = str(value.get("rule_decision_impact") or "")
+            if relation in {"supports", "contradicts", "uncertain"}:
+                normalized[-1]["fact_relation"] = relation
+            if adverse_impact in {"rejection", "material", "ordinary"}:
+                normalized[-1]["adverse_impact"] = adverse_impact
+            if visual_dependency in {"none", "confirmation_only", "decisive"}:
+                normalized[-1]["visual_dependency"] = visual_dependency
+            if rule_impact in {"rejection", "material", "ordinary"}:
+                normalized[-1]["rule_decision_impact"] = rule_impact
     return json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
 
 

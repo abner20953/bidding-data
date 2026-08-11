@@ -2095,6 +2095,20 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIsNotNone(fallback)
         self.assertEqual(fallback.get("source"), "local_fallback")
 
+    def test_highlight_candidates_use_formal_outcome_not_legacy_other_category(self):
+        reviews = [{
+            "document_id": "d1", "bidder_name": "甲公司", "rule_id": "r1", "category": "other",
+            "title": "禁止性声明", "check_rule": "核验禁止性声明", "source_text": "违反本条件的响应为无效响应。",
+            "status": "partial", "risk_level": "high", "confidence": "high", "evidence_quality": "sufficient",
+            "evidence": "第12页存在直接相反文字", "reason": "需核验原页。",
+        }]
+        with patch("dashboard.evaluation_workbench.worker.storage.latest_review_results", return_value=(None, reviews)), patch(
+            "dashboard.evaluation_workbench.worker.storage.latest_score_results", return_value=(None, []),
+        ):
+            candidates, allowed = worker._evaluation_highlight_candidates(self.app, self.project["project_id"])
+        self.assertEqual(candidates[0]["candidates"][0]["category"], "rejection")
+        self.assertEqual(allowed[("d1", "r1")]["decision_impact"], "rejection")
+
     def test_ocr_summary_does_not_override_full_text_rule_conclusion(self):
         rule = {"rule_id": "r1", "title": "项目范围无关内容核验", "check_rule": "全文检查是否出现与本项目无关内容"}
         working = {
@@ -2115,6 +2129,32 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         point_rule = {"rule_id": "r2", "title": "投标函出具", "check_rule": "核验投标函是否出具"}
         point_merged = worker._apply_ocr_summary("review", point_rule, working, parsed, payload)
         self.assertEqual(point_merged["conclusion_summary"], "已识别页与本项目范围相符")
+
+    def test_ocr_direct_adverse_fact_keeps_rejection_risk_until_image_confirmation(self):
+        """直接反证待原图确认时仍应进入高风险候选，不能被 OCR 谨慎口径吞没。"""
+        rule = {
+            "rule_id": "r-adverse", "category": "other", "title": "禁止性声明",
+            "check_rule": "核验供应商未参与前期服务。",
+            "source_text": "为本项目提供前期服务的供应商不得再参加采购活动，否则为无效响应。",
+        }
+        working = {
+            "rule_id": "r-adverse", "status": "partial", "risk_level": "low", "confidence": "medium",
+            "evidence_quality": "limited", "evidence": "文字层未定位", "reason": "待核验", "conclusion_summary": "待核验",
+        }
+        payload = {"pages": [12], "service_labels": "本地 RapidOCR", "local_only": True, "failure": "", "incomplete_pages": []}
+        parsed = {
+            "status": "partial", "summary": "声明填写内容与禁止条件相冲突，需复核原页。",
+            "evidence": "第12页声明填写为肯定。", "reason": "OCR 已识别到直接相反文字。",
+            "content_coverage": "covered", "coverage": "covered", "conclusion_scope": "partial",
+            "evidence_pages": [12], "risk_level": "low", "confidence": "high",
+            "fact_relation": "contradicts", "adverse_impact": "rejection", "visual_dependency": "confirmation_only",
+        }
+        merged = worker._apply_ocr_summary("review", rule, working, parsed, payload)
+        self.assertEqual(merged["status"], "partial")
+        self.assertEqual(merged["risk_level"], "high")
+        self.assertIn("相冲突", merged["conclusion_summary"])
+        self.assertEqual(merged["evidence_layers"][-1]["fact_relation"], "contradicts")
+        self.assertEqual(merged["evidence_layers"][-1]["rule_decision_impact"], "rejection")
 
     def test_scope_highlight_fallback_upgrades_existing_attention(self):
         allowed = {
@@ -3189,6 +3229,26 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertNotEqual(storage.task_prompt_template_fingerprint(self.app, "extract_rules"), before)
 
+    def test_ocr_batch_template_participates_in_evaluation_fingerprint(self):
+        before = storage.task_prompt_template_fingerprint(self.app, "evaluate_all")
+        current = storage.prompt_template(self.app, "evaluate_all_ocr_batch_user")
+        storage.update_prompt_template(self.app, "evaluate_all_ocr_batch_user", current + "\n指纹回归测试标记。")
+        self.assertNotEqual(storage.task_prompt_template_fingerprint(self.app, "evaluate_all"), before)
+
+    def test_legacy_custom_ocr_template_is_completed_with_required_contract(self):
+        legacy = "只返回合法 JSON，必须包含 status、suggested_score、evidence、reason、risk_level、confidence、coverage、conclusion_scope、evidence_pages。"
+        with storage.connection(self.app) as conn:
+            conn.execute(
+                "INSERT INTO ew_settings(setting_key, setting_value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value, updated_at=excluded.updated_at",
+                (storage.PROMPT_TEMPLATE_SETTING, json.dumps({"evaluate_all_ocr_contract": legacy}, ensure_ascii=False), storage.now_iso()),
+            )
+        effective = storage.prompt_template(self.app, "evaluate_all_ocr_contract")
+        listed = next(item for item in storage.list_prompt_templates(self.app) if item["template_id"] == "evaluate_all_ocr_contract")
+        self.assertIn("【系统必需输出协议】", effective)
+        self.assertIn("fact_relation", effective)
+        self.assertEqual(listed["content"], effective)
+
     def test_global_rules_require_password_and_are_all_imported_with_default_selection(self):
         client = self.app.test_client()
         self.assertEqual(client.get("/api/evaluation-workbench/global-rules").status_code, 200)
@@ -3398,7 +3458,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("表格字段、填写格式", PROMPT_TEMPLATES["extract_rules_obligation_compile_user"]["content"])
         self.assertIn("系统仅能核验已上传文件", PROMPT_TEMPLATES["extract_rules_guidance"]["content"])
         self.assertIn("当一条候选仅概述同一表单、附件或材料的格式", PROMPT_TEMPLATES["extract_rules_dedupe_adjudication_user"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v56")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v58")
 
     def test_scope_chapter_and_text_error_guidance_present(self):
         from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
@@ -3416,7 +3476,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(text_marker, PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("必须点名最具辨识度的偏离对象", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("risk_level 应为 high", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v56")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v58")
 
     def test_ocr_visual_contracts_deduplicated_but_keep_hard_constraints(self):
         from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
@@ -3432,6 +3492,9 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         # 硬约束仍在：字段清单、证据页边界、material 冲突逐字值要求。
         self.assertIn("coverage、conclusion_scope、evidence_pages", ocr_contract)
         self.assertIn("不得机械列出全部处理页", ocr_contract)
+        self.assertIn("fact_relation", ocr_contract)
+        self.assertIn("adverse_impact", ocr_contract)
+        self.assertIn("visual_dependency", ocr_contract)
         self.assertIn("material 冲突必须提供双方非空的逐字值", visual_contract)
         # 被去重的约束在用户模板里仍然存在，去重不丢信息。
         self.assertIn("coverage=covered 仅表示OCR文字覆盖到规则相关材料", ocr_user)
@@ -3578,6 +3641,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertTrue(worker._looks_truncated_text("第57页："))
         self.assertTrue(worker._looks_truncated_text("计分过程："))
         self.assertFalse(worker._looks_truncated_text("已填写，但需人工核验原件。"))
+        self.assertFalse(worker._looks_truncated_text("已核验事实一；已核验事实二；"))
+        self.assertFalse(worker._looks_truncated_text("材料名称、编号、日期均可见，"))
         self.assertTrue(worker._raw_result_text_incomplete("review", {"evidence": "第57页：", "reason": "完整结论。"}))
         self.assertTrue(worker._raw_result_text_incomplete("objective", {"reason": "完整结论。", "calculation": "合计："}))
         self.assertFalse(worker._raw_result_text_incomplete("review", {"evidence": "第57页内容", "reason": "完整结论。"}))
@@ -6164,7 +6229,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不限定行业或采购类型", guidance)
         scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v56")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v58")
 
     def test_full_scan_does_not_reinject_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")
@@ -7789,6 +7854,18 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(len(excluded), 1)
         self.assertEqual(excluded[0]["verifiability"], "cross_bid")
 
+    def test_formal_rejection_outcome_is_not_downgraded_to_other(self):
+        catalog = {
+            "SU-test-P8-1-a": {"page": 8, "text": "提供前期服务的供应商不得再参加采购活动，否则为无效响应。"},
+        }
+        candidates = worker._normalise_non_score_candidate_contract([{
+            "category": "other", "title": "前期服务声明", "check_rule": "核验是否存在前期服务冲突。",
+            "source_text": "提供前期服务的供应商不得再参加采购活动，否则为无效响应。",
+            "verification_target": "响应文件中的相关声明", "source_unit_ids": ["SU-test-P8-1-a"],
+        }], catalog)
+        self.assertEqual(candidates[0]["category"], "rejection")
+        self.assertEqual(worker._rule_decision_impact(candidates[0]), "rejection")
+
     def test_semantic_duplicate_adjudication_merges_only_model_confirmed_candidate_group(self):
         rules = [
             {
@@ -7922,6 +7999,31 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             item["category"] for item in compiled if "报价" in item["title"]
         }
         self.assertEqual(quote_categories, {"compliance", "rejection"})
+
+    def test_obligation_compilation_keeps_legacy_other_rejection_separate(self):
+        rules = [
+            {
+                "category": "other", "title": "禁止前期服务", "check_rule": "核验未参与前期服务。",
+                "verification_target": "是否参与前期服务", "source_text": "参与前期服务的供应商不得再参加采购活动，否则为无效响应。",
+                "source_page": 12, "source_unit_ids": ["SU-test-P12-1-a"], "verifiability": "single_bid",
+            },
+            {
+                "category": "other", "title": "项目名称填写", "check_rule": "核验项目名称填写完整。",
+                "verification_target": "项目名称", "source_text": "响应文件应填写项目名称。",
+                "source_page": 13, "source_unit_ids": ["SU-test-P13-1-b"], "verifiability": "single_bid",
+            },
+        ]
+        with patch("dashboard.evaluation_workbench.worker._request_task_json", return_value={
+            "groups": [{"candidate_ids": ["O-1", "O-2"], "action": "merge"}],
+        }):
+            compiled, stats = worker._compile_non_score_obligations(
+                self.app, {"task_id": "task-compile-impact"}, {"profile_id": "profile-1"}, "system", rules,
+                document_id="doc-1",
+            )
+        self.assertTrue(stats["applied"])
+        self.assertEqual(stats["merged_count"], 0)
+        self.assertEqual(len(compiled), 2)
+        self.assertEqual({worker._rule_decision_impact(item) for item in compiled}, {"rejection", "ordinary"})
 
     def test_obligation_compilation_recovers_missing_candidates_without_losing_valid_groups(self):
         rules = [
