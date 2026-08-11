@@ -4,25 +4,25 @@
 handoff_schema: 1
 updated_at: 2026-08-11
 module: evaluation-workbench
-status: deployed_validation_pending
-base_commit: 2e3f863
+status: ready_for_commit
+base_commit: 6f603cd
 branch: main
-working_tree: clean
-remote_github: 2e3f863
-remote_gitee: 2e3f863
+working_tree: local_changes_capacity_expansion
+remote_github: 6f603cd
+remote_gitee: 6f603cd
 production_commit: 2e3f863
 prompt_version: vision-evidence-contract-v55
 database_change: none
-user_approval: c1_no_human_adjudication;c2_per_project_queue;deploy_tencent
+user_approval: c1_no_human_adjudication;c2_per_project_queue;deploy_tencent;capacity_implementation
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
 
 ## 下一位先做
 
-1. 云端已部署 `2e3f863`：build-info `commit=2e3f863`、`runtime_release_commit=2e3f863`、`version_consistent=true`、`code_source=image`，容器 `.build-commit` 与宿主机 `.deploy-commit` 均为 `2e3f863`（2026-08-11 10:04 核验）。本轮未跑黄金项目验收，云端旧结果（山西大学附中/太原税务/CZ 等）仍是 `f7137eb` 时代产物，不得归因于当前代码；需要时按黄金项目清单重跑验收。
-2. 已停用接口（`compare-signals` PATCH、`review-results/{id}` PATCH、`score-results/{id}` PATCH、`confirm-auto` ×2）云端验证返回 410；待确认 `rokid_glasses_app` 未调用后再彻底删除路由。
-3. 若继续工作台代码任务，按 `AI_CONTEXT.md` 的任务路由阅读稳定设计。
+1. 本地容量调整待用户确认提交：每项目投标文件上限 12 份；工作台上传路由使用自身 500 MB 请求上限，保留全站 300 MB 默认保护；单份 PDF 仍为 2500 页、解析文本仍为 250 万字符。已通过 562 项完整回归、文档校验和差异格式校验，未部署。
+2. 云端已部署 `2e3f863`：build-info `commit=2e3f863`、`runtime_release_commit=2e3f863`、`version_consistent=true`、`code_source=image`，容器 `.build-commit` 与宿主机 `.deploy-commit` 均为 `2e3f863`（2026-08-11 10:04 核验）。本轮未跑黄金项目验收，云端旧结果（山西大学附中/太原税务/CZ 等）仍是 `f7137eb` 时代产物，不得归因于当前代码；需要时按黄金项目清单重跑验收。
+3. 已停用接口（`compare-signals` PATCH、`review-results/{id}` PATCH、`score-results/{id}` PATCH、`confirm-auto` ×2）云端验证返回 410；待确认 `rokid_glasses_app` 未调用后再彻底删除路由。
 
 ## 活跃记录（最多 10 条）
 
@@ -57,11 +57,11 @@ user_approval: c1_no_human_adjudication;c2_per_project_queue;deploy_tencent
 - 已实施：提取任务不再因上述评分契约异常写入 `partial_success` 或“当前规则集不能确认”；确认流程仍校验评分规则满分有效性，并继续阻断“同一原文重复占用”或“AI 评分规则完全无原文锚点”。
 - 云端审查：山西大学附中 MiniMax M3 版本 30 评分条款完整、合计 100 分；两张同名“逐项响应覆盖”分别对应不同采购内容，保留合理。太原税务 MiniMax M3 版本 23 合计 100 分，但有 2 条评分原文未挂接；应提示人工核对，不阻断确认。
 
-### 5. 长投标文件上限统一（已提交）
+### 5. 长投标文件与项目容量上限（本地待提交）
 
-- 单个 PDF 的解析、综合评审和查重上限由 2000 页统一提高到 2500 页；解析文本保护同步由 200 万提高到 250 万字符。
-- 独立三文件查重入口总页数预算由 4000 页调整为 7500 页，以容纳一份招标文件和两份投标文件；1200 万字符总预算、OCR/图片页数和并发限制保持不变，避免放大 2 核 2 GB 服务器峰值资源。
-- 未改变全文分块、查重算法、AI 提示词、OCR/多模态策略、API 字段或存量结果。
+- 单个 PDF 的解析、综合评审和查重上限仍为 2500 页；解析文本保护仍为 250 万字符。独立三文件查重入口总页数仍为 7500 页，1200 万字符总预算、OCR/图片页数和并发限制不变。
+- 本轮将每项目投标文件上限从 10 提升到 12；工作台上传路由在 multipart 解析前设置自身 500 MB 请求上限，消除 UI/存储为 500 MB、全站 Flask 默认为 300 MB 的不一致，其他模块继续受全站保护。
+- 验证：新增 12 份上限、路由独立上传上限回归测试；工作台、AI 网关、查重共 562 项测试通过，文档与差异格式校验通过。未改变全文分块、查重算法、AI 提示词、OCR/多模态策略、API 字段或存量结果；待用户确认提交、推送和部署。
 
 ## 已拒绝或暂停的路线
 

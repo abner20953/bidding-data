@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from flask import Blueprint, current_app, jsonify, render_template, request, send_file, session
+from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.security import check_password_hash
 
 from dashboard.evaluation_workbench import storage
@@ -25,6 +26,12 @@ MODEL_CONFIGURATION_PASSWORD = "108"
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _PROCESS_STARTED_AT = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+@evaluation_workbench_bp.errorhandler(RequestEntityTooLarge)
+def evaluation_workbench_upload_too_large(_error):
+    """工作台上传超过自身上限时返回可读 JSON，而不是通用 HTML 错误页。"""
+    return jsonify({"error": f"单个文件不能超过 {storage.MAX_UPLOAD_MB} MB"}), 413
 
 
 def _read_git_head_commit(base: Path) -> str:
@@ -604,6 +611,9 @@ def documents_api(project_id):
     _, error = _project_or_404(project_id)
     if error:
         return error
+    # Flask 3.1 支持请求级上限。全站仍保留既有 300 MB 防护，工作台上传单独与
+    # storage/UI 的 500 MB 上限一致，避免大文件在进入分块写盘前被全局限制拦截。
+    request.max_content_length = storage.MAX_UPLOAD_BYTES
     upload = request.files.get("file")
     if not upload or not upload.filename:
         return jsonify({"error": "请选择文件"}), 400

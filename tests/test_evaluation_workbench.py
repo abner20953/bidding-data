@@ -123,6 +123,34 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "必须填写投标人名称"):
             self._add_pdf("bid.pdf", "bid", "  ", "技术方案：稳定运行。")
 
+    def test_project_accepts_twelve_bid_documents(self):
+        for index in range(storage.MAX_BID_DOCUMENTS):
+            self._add_pdf(f"bid-{index}.pdf", "bid", f"投标人{index}", "技术方案：稳定运行。")
+
+        documents = storage.list_documents(self.app, self.project["project_id"])
+        self.assertEqual(sum(item["role"] == "bid" for item in documents), 12)
+        with self.assertRaisesRegex(ValueError, "最多上传 12 份投标文件"):
+            self._add_pdf("bid-over-limit.pdf", "bid", "超限投标人", "技术方案：稳定运行。")
+
+    def test_workbench_upload_uses_its_own_500mb_request_limit(self):
+        self.app.config["MAX_CONTENT_LENGTH"] = 1
+        client = self.app.test_client()
+        expected = {"document_id": "workbench-large-upload"}
+        with patch.object(storage, "store_upload", return_value=expected) as store_upload:
+            response = client.post(
+                f"/api/evaluation-workbench/projects/{self.project['project_id']}/documents",
+                data={
+                    "role": "bid",
+                    "bidder_name": "甲公司",
+                    "file": (io.BytesIO(b"x" * 2048), "bid.pdf"),
+                },
+                content_type="multipart/form-data",
+            )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()["document"], expected)
+        store_upload.assert_called_once()
+
     def test_incomplete_model_envelope_retries_only_current_request(self):
         task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
         profile = {"profile_id": "profile-1", "display_name": "测试模型"}

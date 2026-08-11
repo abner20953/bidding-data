@@ -25,7 +25,7 @@ from dashboard.evaluation_workbench.prompt_templates import (
 )
 
 
-MAX_BID_DOCUMENTS = 10
+MAX_BID_DOCUMENTS = 12
 # 排队上限：每项目最多 3 个排队任务，全局最多 12 个。计数只统计 queued，
 # 运行中的任务不计入；入队检查由 create_task 用 BEGIN IMMEDIATE 短事务包住，
 # 保证并发到达的请求不会同时读到未满额度而突破上限。与单 worker、全局 FIFO、
