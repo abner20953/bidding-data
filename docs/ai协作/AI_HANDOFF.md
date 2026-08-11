@@ -4,36 +4,37 @@
 handoff_schema: 1
 updated_at: 2026-08-11
 module: evaluation-workbench
-status: ready_for_commit
-base_commit: a35f530
+status: deployed_validation_pending
+base_commit: 6d74e4d
 branch: main
-working_tree: modified
-remote_github: a35f530
-remote_gitee: a35f530
-production_commit: a35f530
+working_tree: clean
+remote_github: 6d74e4d
+remote_gitee: 6d74e4d
+production_commit: 6d74e4d
 prompt_version: vision-evidence-contract-v58
 database_change: evidence_layers JSON 增补可选事实元数据，无迁移
-user_approval: 已授权实施，待确认提交、推送和部署
+user_approval: submitted_pushed_deployed_6d74e4d
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
 
 ## 下一位先做
 
-1. 当前工作区有未提交的三原县通用修复：明确否决后果的规则影响、OCR 直接反证结构化事实、重点结论承接及完整结论误判修正；本地 487 项工作台/网关测试和文档校验已通过。待用户确认提交、推送和部署。
-2. 部署后强制重跑三原县，比较“企业关联关系承诺书”的原页 P146 直接反证是否以高风险重点结论出现；同时比较此前满意结论、耗时、调用数、拆分数和 Token，任一关键结论下降即回退。
-3. 内容策略拒答单元隔离和范围候选台账继续生效；本轮未改变 OCR/多模态覆盖，子项级 OCR 仍待 EvidencePack 覆盖状态和 A/B 门槛。
-3. 已停用接口（`compare-signals` PATCH、`review-results/{id}` PATCH、`score-results/{id}` PATCH、`confirm-auto` ×2）云端验证返回 410；待确认 `rokid_glasses_app` 未调用后再彻底删除路由。
+1. 云端已部署 `6d74e4d`：build-info `commit=6d74e4d`、`runtime_release_commit=6d74e4d`、`version_consistent=true`、`prompt_version=vision-evidence-contract-v58`，镜像 `.build-commit` 与宿主机 `.deploy-commit` 一致（2026-08-11 23:31 核验），`/pingbiao` 与关键 API 正常。本轮未跑验收：需强制重跑三原县，比较"企业关联关系承诺书"原页 P146 直接反证是否以高风险重点结论出现，同时比较此前满意结论、耗时、调用数、拆分数和 Token，任一关键结论下降即回退。
+2. 已停用接口（`compare-signals` PATCH、`review-results/{id}` PATCH、`score-results/{id}` PATCH、`confirm-auto` ×2）云端验证返回 410；待确认 `rokid_glasses_app` 未调用后再彻底删除路由。
+3. 内容策略拒答单元隔离、范围候选台账和明确否决后果/OCR 反证承接继续生效；子项级 OCR 仍待 EvidencePack 覆盖状态和 A/B 门槛。
+4. 若继续工作台代码任务，按 `AI_CONTEXT.md` 的任务路由阅读稳定设计。
 
 ## 活跃记录（最多 10 条）
 
-### 10. 明确否决后果与 OCR 直接反证承接（本地已验证，待提交部署）
+### 10. 明确否决后果与 OCR 直接反证承接（已提交、已部署）
 
-- 根因：三原县“企业关联关系承诺书”已在 P146 OCR 到“是”的直接填写内容，但规则被旧模型列为 `other`、OCR 只写“待原图确认”，风险降为 low；重点结论只收录中高风险，致使高价值线索不可见。普通完整结论以逗号/分号收尾还被误判为截断，进一步制造空摘要和无效补评。
+- 根因：三原县”企业关联关系承诺书”已在 P146 OCR 到”是”的直接填写内容，但规则被旧模型列为 `other`、OCR 只写”待原图确认”，风险降为 low；重点结论只收录中高风险，致使高价值线索不可见。普通完整结论以逗号/分号收尾还被误判为截断，进一步制造空摘要和无效补评。
 - 已实施：仅以招标原文的明确无效/否决/取消资格/禁止参加后果计算 `decision_impact`，义务编译不得把该类候选与普通规则合并；OCR 新增事实方向、不利影响和视觉依赖元数据，直接反证保留高风险但仍为人工复核；重点结论消费同一结构属性；EvidencePack 影子层同步保存元数据；移除逗号、分号等正常结尾的截断误判。
 - 不变契约：不按项目、投标人、表单或页码写补丁；不自动作出废标；未改变 OCR/图片页数、模型并发、全文范围或评分结构；旧 API/结果字段兼容，新元数据均可选。
-- 验证：新增否决类别、义务编译隔离、OCR 直接反证、重点结论和截断检测回归；工作台与 AI 网关共 487 项测试通过，文档校验与 `git diff --check` 通过。
-- 待办：部署后以三原县强制重跑做质量验收；若 OCR 仍未稳定返回结构字段，再只审查输出契约与模型适配层，不在结果展示层追加文本补丁。
+- 验证：新增否决类别、义务编译隔离、OCR 直接反证、重点结论和截断检测回归；工作台与 AI 网关共 488 项测试通过，文档校验与 `git diff --check` 通过；云端 `6d74e4d` 已部署，build-info `version_consistent=true`、v58 生效。
+- 待办：以三原县强制重跑做质量验收；若 OCR 仍未稳定返回结构字段，再只审查输出契约与模型适配层，不在结果展示层追加文本补丁。
+- 主要文件：`worker.py`、`storage.py`、`prompt_templates.py`、`tests/test_evaluation_workbench.py`、稳定设计与交接。
 
 ### 9. DeepSeek 结构化输出与复合规则分组优化（已部署，待黄金项目验收）
 
