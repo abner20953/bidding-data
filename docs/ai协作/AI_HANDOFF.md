@@ -4,35 +4,35 @@
 handoff_schema: 1
 updated_at: 2026-08-11
 module: evaluation-workbench
-status: ready_for_commit
-base_commit: f2c8fef
+status: deployed_validation_pending
+base_commit: a35f530
 branch: main
 working_tree: modified
-remote_github: f2c8fef
-remote_gitee: f2c8fef
-production_commit: 0a55bf0
+remote_github: a35f530
+remote_gitee: a35f530
+production_commit: a35f530
 prompt_version: vision-evidence-contract-v56
 database_change: none
-user_approval: approved_local_deepseek_evaluation_optimization_no_commit
+user_approval: submitted_pushed_deployed_a35f530
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
 
 ## 下一位先做
 
-1. 本地基于三原县 DeepSeek 运行台账完成结构化输出性能修复，尚未提交/部署：首次判断保留既有思考能力，输出预算和分组改为识别编译子项，事实型触顶才严格恢复；完整回归 482 项通过。提交部署后应强制重跑三原县，比较关键结论、耗时、调用数、拆分数和 Token，任一关键结论下降即回退。
-2. 云端仍为 `0a55bf0`，内容策略拒答单元隔离和范围候选台账已生效；本地 HEAD/远程为仅更新交接的 `f2c8fef`。
+1. `a35f530` 已提交并推送 GitHub/Gitee，腾讯云已部署核验：Git、`.deploy-commit`、镜像 `.build-commit`、容器 `DEPLOY_COMMIT` 全部一致，容器运行正常，`/pingbiao` HTTP 正常。待强制重跑三原县，比较关键结论、耗时、调用数、拆分数和 Token，任一关键结论下降即回退。
+2. 内容策略拒答单元隔离和范围候选台账继续生效；本轮未改变 OCR/多模态覆盖，子项级 OCR 仍待 EvidencePack 覆盖状态和 A/B 门槛。
 3. 已停用接口（`compare-signals` PATCH、`review-results/{id}` PATCH、`score-results/{id}` PATCH、`confirm-auto` ×2）云端验证返回 410；待确认 `rokid_glasses_app` 未调用后再彻底删除路由。
 
 ## 活跃记录（最多 10 条）
 
-### 9. DeepSeek 结构化输出与复合规则分组优化（本地待提交）
+### 9. DeepSeek 结构化输出与复合规则分组优化（已部署，待黄金项目验收）
 
 - 根因：三原县 2 家、55 条规则耗时约 39 分钟；230 次调用中有 50 次拆分、19 次紧凑重试。DeepSeek 多次在 4K–6.8K 上限内耗尽隐藏思考而只留下极短/空 JSON；义务编译已将多个子项合成规则卡，旧分组器仍只按卡片和评分叶子估算复杂度。
 - 已实施：DeepSeek 首次评审/主观评分显式使用其支持的 `enabled`，并预留有界 12K 生成预算；M3、客观分和首次判断语义不变。事实定位/计数组触顶后才可在原证据上做一次禁用思考的严格恢复，开放语义和主观评分仍拆小并保留思考。分组和输出预算计入 `compiled_child_requirements`/`evidence_items`；全文扫描上限按目录规模最多 4800。
 - 不变契约：不删规则、不缩全文、不改 OCR/多模态证据覆盖、评分和结果结构；未实施父规则到子项级 OCR 削减，待 EvidencePack 可表达逐子项覆盖后再 A/B。
 - 验证：新增能力路由、M3预算不放大、复合子项分组及 DeepSeek 触顶不丢规则测试；工作台与 AI 网关共 482 项全过，`git diff --check` 通过。
-- 待办：用户确认后提交/推送/部署；以三原县为质量基线强制重跑，重点检查此前满意结论全部保留，并统计拆分/紧凑重试是否明显下降。
+- 待办：以三原县为质量基线强制重跑，重点检查此前满意结论全部保留，并统计拆分/紧凑重试是否明显下降。
 
 ### 8. 模型内容策略拒答的单元隔离（已提交、已部署）
 
