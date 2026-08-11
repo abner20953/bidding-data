@@ -4,38 +4,38 @@
 handoff_schema: 1
 updated_at: 2026-08-11
 module: evaluation-workbench
-status: ready_for_commit
-base_commit: 72485bc
+status: clean_no_active_work
+base_commit: 0a55bf0
 branch: main
-working_tree: local_changes
-remote_github: 72485bc
-remote_gitee: 72485bc
-production_commit: 72485bc
+working_tree: clean
+remote_github: 0a55bf0
+remote_gitee: 0a55bf0
+production_commit: 0a55bf0
 prompt_version: vision-evidence-contract-v56
 database_change: none
-user_approval: content_filter_isolation_commit_and_deploy
+user_approval: completed_content_filter_isolation_deployment
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
 
 ## 下一位先做
 
-1. 当前本地变更待提交部署：模型内容策略拒答（包括 HTTP 422）按稳定故障类别进入单元级隔离；全文扫描块保留原文并继续，规则组落为人工核验且任务 `partial_success`，禁止删改材料后重试同一请求。工作台与 AI 网关完整回归 479 项通过。部署后优先重跑三原县项目，核验不会在全文扫描约三分之一处整体失败。
-2. 云端已部署 `72485bc`：范围候选台账按开放类型轮转、全文扫描按页数动态给出范围候选额度；容量调整生效（每项目 12 份投标文件、工作台单文件上传 500 MB、单份 PDF 2500 页）。部署后需重新核验 build-info、容器和任务运行时版本一致性；未做真实大文件压力验收。
+1. 云端已部署 `0a55bf0`：模型内容策略拒答（包括 HTTP 422）按稳定故障类别进入单元级隔离；全文扫描块保留原文并继续，规则组落为人工核验且任务 `partial_success`，禁止删改材料后重试同一请求。工作台与 AI 网关完整回归 479 项通过。可重跑三原县项目验收，核验不会在全文扫描约三分之一处整体失败。
+2. `0a55bf0` 部署已核验：云端仓库、运行容器 `/app/.build-commit` 均为该版本，容器运行正常。范围候选台账和容量调整仍已生效；未做真实大文件压力验收。
 3. 已停用接口（`compare-signals` PATCH、`review-results/{id}` PATCH、`score-results/{id}` PATCH、`confirm-auto` ×2）云端验证返回 410；待确认 `rokid_glasses_app` 未调用后再彻底删除路由。
 
 ## 活跃记录（最多 10 条）
 
-### 8. 模型内容策略拒答的单元隔离（本地完成，待提交部署）
+### 8. 模型内容策略拒答的单元隔离（已提交、已部署）
 
 - 根因：服务商返回内容策略拒答时，网关将 HTTP 422 作为普通 `ValueError`；全文扫描并发取回异常直接上抛，整项综合评审被标为失败。
 - 已实施：网关归一化内容策略拒答为不重试的稳定故障类别；全文扫描块记录失败但保留原文供后续规则使用，规则组转人工核验并继续其他组，最终以部分完成和失败项呈现。网络/限流重试、鉴权/参数错误语义不变。
 - 不变契约：不针对项目或服务商文本删改、脱敏或提示词规避；不盲目重试同一请求；成功结果立即落库，模型、提示词、规则、OCR 和 API 契约不变。
 - 验证：新增 HTTP 422 归类、扫描块隔离、规则组部分完成回归；工作台与 AI 网关共 479 项测试通过，`git diff --check` 通过。
-- 待办：提交部署后重跑三原县；确认页面显示“部分完成/仅重跑失败项”且其他投标人的已完成结果可见。
+- 待办：可重跑三原县验收；确认页面显示“部分完成/仅重跑失败项”且其他投标人的已完成结果可见。
 - 主要文件：`ai_gateway.py`、`worker.py`、两个工作台测试文件、稳定设计。
 
-### 7. 全文范围候选台账完整性（本地完成，待提交部署）
+### 7. 全文范围候选台账完整性（已提交、已部署）
 
 - 根因：全文扫描输出曾固定限制范围候选数，最终上下文又只按优先级截取；同类高优先级候选可挤掉其他独立类别，造成范围外工艺、对象或服务内容未进入最终审查。
 - 已实施：范围候选额度按连续页块大小动态限定（正常最多 12、紧凑重试最多 6）；同类可合并、不同开放 `dimension` 在最终范围规则上下文中轮转保留并附原页；提示词要求跨类别分别输出、不得发现一类后停止扫描。即使云端有旧自定义提示词，worker 仍附加同义结构约束。没有项目、投标人、设备、地区、页码或文本特例。
