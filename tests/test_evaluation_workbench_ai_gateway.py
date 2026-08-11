@@ -88,6 +88,16 @@ class EvaluationWorkbenchAiGatewayTests(unittest.TestCase):
         self.assertIn("choices/message/content", str(error.exception))
         self.assertIn("temporary upstream failure", str(error.exception))
 
+    def test_request_json_marks_content_filtered_http_response_as_non_retryable_envelope(self):
+        response = Mock(ok=False, status_code=422, text='{"error":{"message":"output new_sensitive"}}')
+
+        with patch("dashboard.evaluation_workbench.ai_gateway._http_post", return_value=response):
+            with self.assertRaises(ModelResponseEnvelopeError) as error:
+                request_json(self._profile(), "system", "user")
+
+        self.assertEqual(error.exception.failure_kind, "content_filtered")
+        self.assertFalse(error.exception.retryable)
+
     def test_request_json_treats_usage_at_output_limit_without_choices_as_length(self):
         response = Mock(ok=True)
         response.json.return_value = {"choices": [], "usage": {"completion_tokens": 5120}}

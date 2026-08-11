@@ -44,11 +44,15 @@ class InvalidJsonResponse(ValueError):
 
 
 class ModelResponseEnvelopeError(ValueError):
-    """接口 HTTP 成功但未返回 OpenAI-compatible 正文。"""
+    """模型服务未返回可用于当前任务的正文。"""
 
-    def __init__(self, message: str, *, retryable: bool = True, provider_code: object = None):
+    def __init__(self, message: str, *, retryable: bool = True, provider_code: object = None,
+                 failure_kind: str = ""):
         self.retryable = bool(retryable)
         self.provider_code = str(provider_code or "")
+        # 仅记录稳定的故障类别，调用层据此决定“重试”还是“隔离当前单元”。
+        # 不保存服务商返回的敏感正文或策略细节。
+        self.failure_kind = str(failure_kind or "")
         super().__init__(message)
 
 
@@ -413,7 +417,18 @@ def _raise_http_error(response, *, operation: str) -> None:
             f"{operation}鉴权失败（HTTP 401）：API Key 无效、已失效，或不属于当前服务商。"
             "请从对应服务商控制台重新创建并完整复制 API Key；不要填入 API 地址、邮箱或带引号的文本。"
         )
-    raise ValueError(f"{operation}（HTTP {response.status_code}）：{response.text[:500]}")
+    # 各服务商对内容策略拒答的状态码和正文不完全一致。这里仅识别其稳定的协议信号，
+    # 交给任务层隔离当前扫描块或规则组；不能把原始材料删改后盲目重试。
+    response_text = str(getattr(response, "text", "") or "")
+    policy_markers = (
+        "new_sensitive", "input_sensitive", "output_sensitive", "content safety",
+        "content_policy", "safety filter", "内容安全", "内容审核",
+    )
+    if response.status_code == 422 and any(marker in response_text.lower() for marker in policy_markers):
+        raise ModelResponseEnvelopeError(
+            "模型接口因内容安全限制未返回可用正文", retryable=False, failure_kind="content_filtered",
+        )
+    raise ValueError(f"{operation}（HTTP {response.status_code}）：{response_text[:500]}")
 
 
 def _minimax_response_error(body: dict) -> ModelResponseEnvelopeError | InvalidJsonResponse | None:
@@ -461,7 +476,9 @@ def _response_choice(body: object, *, requested_output_tokens: int | None = None
     if minimax_error:
         raise minimax_error
     if body.get("input_sensitive") is True or body.get("output_sensitive") is True:
-        raise ModelResponseEnvelopeError("模型接口因内容安全限制未返回可用正文", retryable=False)
+        raise ModelResponseEnvelopeError(
+            "模型接口因内容安全限制未返回可用正文", retryable=False, failure_kind="content_filtered",
+        )
     try:
         choice = body["choices"][0]
         content = choice["message"]["content"]

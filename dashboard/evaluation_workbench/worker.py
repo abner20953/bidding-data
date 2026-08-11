@@ -150,6 +150,19 @@ def _is_recoverable_model_error(error: Exception) -> bool:
     return _is_rate_limit_error(error) or any(marker in message for marker in _TRANSIENT_TRANSPORT_MARKERS)
 
 
+def _is_content_filtered_model_error(error: Exception) -> bool:
+    """识别服务商内容策略拒答；它不可重试，但可隔离到当前最小业务单元。"""
+    if isinstance(error, ModelResponseEnvelopeError):
+        return error.failure_kind == "content_filtered"
+    # 兼容尚未升级网关的进程内调用方，且只接受网关统一的中文提示，避免按项目文本猜测。
+    return str(error).startswith("模型接口因内容安全限制未返回可用正文")
+
+
+def _is_isolatable_model_error(error: Exception) -> bool:
+    """可以继续其他单元、但不能把同一请求原样盲目重发的模型故障。"""
+    return _is_recoverable_model_error(error) or _is_content_filtered_model_error(error)
+
+
 def _is_minimax_profile(profile: dict) -> bool:
     """MiniMax 的令牌计划按并发突发计量，统一保守地最多两路请求。"""
     return "api.minimaxi.com" in str(profile.get("base_url") or "").lower()
@@ -6464,6 +6477,18 @@ def _run_full_scan_piece(app, task: dict, profile: dict, document: dict, catalog
                     raise
                 format_error = repair_exc
     except ValueError as exc:
+        if _is_content_filtered_model_error(exc):
+            _record_full_scan_risk(
+                app, task, document, "evaluate_all_full_scan", context_mode, max_tokens, output_risk,
+                actual_format_error=False, error_kind="content_filtered", recovery_action="failed_chunk",
+            )
+            storage.update_task(
+                app, task["task_id"],
+                message=f"{document['bidder_name'] or document['original_name']} {_full_scan_chunk_label(chunk)} 未获模型正文，已保留原文并继续后续审查",
+            )
+            return {"findings": [], "scope_anomalies": []}, 0, 0, [{
+                **chunk, "scan_error": "模型接口因内容安全限制未返回可用正文", "failure_kind": "content_filtered",
+            }]
         if not _is_model_format_error(exc) and not str(exc).startswith("模型返回格式不符合全文扫描要求"):
             raise
         format_error = exc
@@ -6499,6 +6524,15 @@ def _run_full_scan_piece(app, task: dict, profile: dict, document: dict, catalog
         )
         return findings, 1, 0, []
     except ValueError as retry_exc:
+        if _is_content_filtered_model_error(retry_exc):
+            _record_full_scan_risk(
+                app, task, document, "evaluate_all_full_scan_compact_retry", compact_context_mode,
+                max_tokens, output_risk, actual_format_error=False,
+                error_kind="content_filtered", recovery_action="failed_chunk",
+            )
+            return {"findings": [], "scope_anomalies": []}, 1, 0, [{
+                **chunk, "scan_error": "模型接口因内容安全限制未返回可用正文", "failure_kind": "content_filtered",
+            }]
         if not _is_model_format_error(retry_exc) and not str(retry_exc).startswith("模型返回格式不符合全文扫描要求"):
             raise
         _record_full_scan_risk(
@@ -6582,7 +6616,16 @@ def _scan_document_fulltext(app, task: dict, profile: dict, document: dict, rule
             )] = (index, chunk, chunk_hash)
         for future in as_completed(futures):
             index, chunk, chunk_hash = futures[future]
-            result = future.result()
+            try:
+                result = future.result()
+            except ValueError as exc:
+                # _run_full_scan_piece 已在正常路径内隔离内容策略拒答；这里保留同一
+                # 语义的边界，避免未来分支漏接后一个页块终止整份长文件。
+                if not _is_content_filtered_model_error(exc):
+                    raise
+                result = ({"findings": [], "scope_anomalies": []}, 0, 0, [{
+                    **chunk, "scan_error": "模型接口因内容安全限制未返回可用正文", "failure_kind": "content_filtered",
+                }])
             merged_scope = _merge_scope_anomalies(result[0]["scope_anomalies"], [])
             result[0]["scope_anomalies"] = merged_scope
             compact_retry_count += result[1]
@@ -11215,17 +11258,25 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
                 )
                 return group_index, label, results, compact_count, split_count, fallback_count, []
             except ValueError as exc:
-                if not _is_recoverable_model_error(exc):
+                if not _is_isolatable_model_error(exc):
                     raise
                 payload = _combined_batch_payload(component, group)
-                reason = "模型连接连续恢复失败，本规则组暂未获得可靠 AI 结论；其他规则已继续完成，可仅重跑本组。"
+                content_filtered = _is_content_filtered_model_error(exc)
+                reason = (
+                    "模型服务因内容安全策略未返回本规则组结论；原文和已获得证据均已保留，需人工核验，可仅重跑本组。"
+                    if content_filtered else
+                    "模型连接连续恢复失败，本规则组暂未获得可靠 AI 结论；其他规则已继续完成，可仅重跑本组。"
+                )
                 results = _combined_manual_results(component, group, payload, reason)
                 failure = {
                     "document_id": document["document_id"], "bidder_name": bidder_name,
                     "component": component, "rule_ids": [rule["rule_id"] for rule in group],
                     "reason": str(exc)[:240],
                 }
-                storage.update_task(app, task["task_id"], message=f"{label} 连接恢复失败，已保留为待重跑项并继续其他规则")
+                storage.update_task(
+                    app, task["task_id"],
+                    message=f"{label} {'未获模型正文' if content_filtered else '连接恢复失败'}，已保留为待重跑项并继续其他规则",
+                )
                 return group_index, label, results, 0, 0, len(group), [failure]
 
         # 单一投标文件过去会把全部规则组串行执行；现在复用任务级请求闸门，在不超过

@@ -271,6 +271,50 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(gate.limit, 2)
         self.assertEqual(storage.project_token_usage(self.app, self.project["project_id"])["call_count"], 1)
 
+    def test_full_scan_content_filter_keeps_chunk_for_later_rule_review(self):
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "投标文件正文。")
+        task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        profile = {"profile_id": "profile-1", "display_name": "测试模型"}
+        chunk = {"chunk_id": "chunk_3", "page_start": 33, "page_end": 48, "text": "待扫描原文"}
+        error = worker.ModelResponseEnvelopeError(
+            "模型接口因内容安全限制未返回可用正文", retryable=False, failure_kind="content_filtered",
+        )
+
+        with patch("dashboard.evaluation_workbench.worker._request_task_json", side_effect=error) as request_json:
+            findings, compact_count, split_count, failed = worker._run_full_scan_piece(
+                self.app, task, profile, document, [{"id": "rule-1"}], chunk, {}, "系统提示",
+            )
+
+        self.assertEqual(request_json.call_count, 1)
+        self.assertEqual(findings, {"findings": [], "scope_anomalies": []})
+        self.assertEqual((compact_count, split_count), (0, 0))
+        self.assertEqual(failed[0]["chunk_id"], "chunk_3")
+        self.assertEqual(failed[0]["failure_kind"], "content_filtered")
+
+    def test_combined_evaluation_content_filter_isolated_as_partial_success(self):
+        self._add_pdf("bid.pdf", "bid", "甲公司", "投标文件包含承诺事项。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "承诺事项", "source_text": "承诺事项",
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        error = worker.ModelResponseEnvelopeError(
+            "模型接口因内容安全限制未返回可用正文", retryable=False, failure_kind="content_filtered",
+        )
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=error):
+            finished = self._run_next_task()
+
+        review_run, results = storage.latest_review_results(self.app, self.project["project_id"])
+        self.assertEqual(finished["status"], "success")
+        self.assertEqual(finished["result"]["completion_state"], "partial_success")
+        self.assertEqual(len(finished["result"]["failed_units"]), 1)
+        self.assertEqual(review_run["task_status"], "success")
+        self.assertEqual(results[0]["status"], "manual")
+        self.assertIn("内容安全策略", results[0]["reason"])
+
     def test_full_scan_checkpoint_is_reusable_by_chunk_hash(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案：稳定运行。")
         findings = [{"rule_id": "rule-1", "chunk_id": "chunk_1", "evidence": "技术方案", "page_hint": "1"}]
