@@ -4,35 +4,35 @@
 handoff_schema: 1
 updated_at: 2026-08-11
 module: evaluation-workbench
-status: local_changes
-base_commit: 287d05d
+status: deployed_validation_pending
+base_commit: 2e3f863
 branch: main
-working_tree: dirty
-remote_github: 287d05d
-remote_gitee: 287d05d
-production_commit: unknown
+working_tree: clean
+remote_github: 2e3f863
+remote_gitee: 2e3f863
+production_commit: 2e3f863
 prompt_version: vision-evidence-contract-v55
 database_change: none
-user_approval: c1_no_human_adjudication;c2_per_project_queue
+user_approval: c1_no_human_adjudication;c2_per_project_queue;deploy_tencent
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
 
 ## 下一位先做
 
-1. 云端版本一致性未恢复：build-info 的 `commit=unknown`、`deploy_record_commit=f7137eb`、`version_consistent=false`；容器 `deployed_at=2026-08-10 15:09:57`；服务器仓库与 GitHub/Gitee 均为 `287d05d`，但镜像 `.build-commit` 缺失、宿主机 `.deploy-commit` 为 `f7137eb`。先用 `redeploy.sh` 重建镜像恢复“镜像、容器、部署记录”三者一致，再决定重跑验收；禁止把旧云端结果归因于当前代码。
-2. 本地有未提交改动（停用人工裁决落库与查重人工处置、排队改为每项目 3 + 全局 12），472 项测试与文档校验均通过；用户确认后提交并推送，部署前验证 `rokid_glasses_app` 未调用已停用的 410 接口（`compare-signals` PATCH、`review-results/{id}` PATCH、`score-results/{id}` PATCH、`confirm-auto` ×2）。
+1. 云端已部署 `2e3f863`：build-info `commit=2e3f863`、`runtime_release_commit=2e3f863`、`version_consistent=true`、`code_source=image`，容器 `.build-commit` 与宿主机 `.deploy-commit` 均为 `2e3f863`（2026-08-11 10:04 核验）。本轮未跑黄金项目验收，云端旧结果（山西大学附中/太原税务/CZ 等）仍是 `f7137eb` 时代产物，不得归因于当前代码；需要时按黄金项目清单重跑验收。
+2. 已停用接口（`compare-signals` PATCH、`review-results/{id}` PATCH、`score-results/{id}` PATCH、`confirm-auto` ×2）云端验证返回 410；待确认 `rokid_glasses_app` 未调用后再彻底删除路由。
 3. 若继续工作台代码任务，按 `AI_CONTEXT.md` 的任务路由阅读稳定设计。
 
 ## 活跃记录（最多 10 条）
 
-### 6. 停用人工裁决落库与查重人工处置、排队改为每项目 3 + 全局 12（已实现，待提交）
+### 6. 停用人工裁决落库与查重人工处置、排队改为每项目 3 + 全局 12（已提交、已部署）
 
 - 用户确认口径：评分/评审只展示 AI 建议，不保存人工调整（含查重不保存人工处置）；API 保留路径固定返回 410，确认 `rokid_glasses_app` 未使用后再删路由；排队改为每项目 3 个 + 全局 12 个（单 worker 全局 FIFO 不变）。
 - 已实施：worker 评分输出移除 `final_score`/`effective_score`；storage 保存与结果复用查询移除两字段，删除 `update_review_final_status`/`update_final_score`/`confirm_auto_review_results`/`confirm_auto_score_results`/`initialize_compare_signal_reviews`/`update_compare_signal_review`；`collusion_signals` 移除信号初始人工字段；5 个 API 改 410（compare-signals PATCH、review-results PATCH、score-results PATCH、confirm-auto ×2）；`create_task` 用 `BEGIN IMMEDIATE` 短事务实现每项目/全局排队上限。
-- 验证：472 项测试全过（新增每项目/全局/并发入队 3 项，改造 4 项）；`git diff --check` 通过；`validate_docs.py` 通过。
+- 验证：472 项测试全过（新增每项目/全局/并发入队 3 项，改造 4 项）；`git diff --check` 通过；`validate_docs.py` 通过；云端 `2e3f863` 已部署，build-info `version_consistent=true`，410 接口实测返回 410。
 - 不变契约：数据库列与历史数据保留（不破坏性迁移）；展示清洗正则（`final_score=` 记法清洗）与结果表字段无关，保留；worker 计算链不读人工字段，准确度零影响。
-- 待办：用户确认后提交并推送；部署前验证 `rokid_glasses_app` 兼容性。
+- 待办：黄金项目验收重跑（可选）；`rokid_glasses_app` 兼容性确认后删除 410 路由。
 - 主要文件：`worker.py`、`storage.py`、`collusion_signals.py`、`blueprints/evaluation_workbench.py`、`tests/test_evaluation_workbench.py`。
 
 ### 2. 评分原文连续页组装与综合评审隔离（仓库已同步，云端待核验）
