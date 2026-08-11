@@ -26,7 +26,12 @@ from dashboard.evaluation_workbench.prompt_templates import (
 
 
 MAX_BID_DOCUMENTS = 10
-MAX_QUEUED_TASKS = 3
+# 排队上限：每项目最多 3 个排队任务，全局最多 12 个。计数只统计 queued，
+# 运行中的任务不计入；入队检查由 create_task 用 BEGIN IMMEDIATE 短事务包住，
+# 保证并发到达的请求不会同时读到未满额度而突破上限。与单 worker、全局 FIFO、
+# 2 核 2 GB 服务器匹配：只增加可排队数量，不增加模型并发、OCR 并发或常驻内存。
+MAX_QUEUED_TASKS_PER_PROJECT = 3
+MAX_QUEUED_TASKS_GLOBAL = 12
 # 分块写盘，避免大文件上传时占用整份内存；生产环境可按磁盘容量通过环境变量下调。
 MAX_UPLOAD_MB = max(1, int(os.environ.get("EVALUATION_WORKBENCH_MAX_UPLOAD_MB", "500")))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
@@ -309,12 +314,16 @@ def database_path(app) -> Path:
 
 
 @contextmanager
-def connection(app):
+def connection(app, *, immediate: bool = False):
     conn = sqlite3.connect(str(database_path(app)), timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
+        if immediate:
+            # 需要“先检查、再写入”原子性的短事务（如入队）必须显式加写锁：
+            # 普通连接在 WAL 下并发读不互斥，两个请求可能同时看到未满额度。
+            conn.execute("BEGIN IMMEDIATE")
         yield conn
         conn.commit()
     finally:
@@ -1434,18 +1443,26 @@ def delete_document(app, project_id: str, document_id: str) -> None:
 
 def create_task(app, project_id: str, task_type: str, payload: dict | None = None) -> dict:
     init_database(app)
-    with connection(app) as conn:
+    task_id = str(uuid.uuid4())
+    timestamp = now_iso()
+    # 入队必须用 BEGIN IMMEDIATE 写锁覆盖“检查数量 + 插入任务”：并发到达的请求
+    # 不会同时读到未满额度而突破每项目/全局上限。该锁只覆盖很短的入队事务，
+    # 不阻塞长任务执行（长任务运行时不持有任何入队锁）。
+    with connection(app, immediate=True) as conn:
         duplicate = conn.execute(
             "SELECT 1 FROM ew_tasks WHERE project_id = ? AND task_type = ? AND status IN ('queued', 'running') LIMIT 1",
             (project_id, task_type),
         ).fetchone()
         if duplicate:
             raise ValueError("相同任务已经在排队或运行中，请勿重复提交")
-        queued = conn.execute("SELECT COUNT(*) FROM ew_tasks WHERE status = 'queued'").fetchone()[0]
-        if queued >= MAX_QUEUED_TASKS:
-            raise ValueError(f"当前最多允许 {MAX_QUEUED_TASKS} 个排队任务，请等待已有任务完成")
-        task_id = str(uuid.uuid4())
-        timestamp = now_iso()
+        project_queued = conn.execute(
+            "SELECT COUNT(*) FROM ew_tasks WHERE project_id = ? AND status = 'queued'", (project_id,)
+        ).fetchone()[0]
+        if project_queued >= MAX_QUEUED_TASKS_PER_PROJECT:
+            raise ValueError(f"该项目最多允许 {MAX_QUEUED_TASKS_PER_PROJECT} 个排队任务，请等待已有任务完成")
+        global_queued = conn.execute("SELECT COUNT(*) FROM ew_tasks WHERE status = 'queued'").fetchone()[0]
+        if global_queued >= MAX_QUEUED_TASKS_GLOBAL:
+            raise ValueError(f"全局排队任务已达 {MAX_QUEUED_TASKS_GLOBAL} 个上限，请等待已有任务完成")
         conn.execute(
             """INSERT INTO ew_tasks(task_id, project_id, task_type, status, payload_json, created_at, updated_at)
             VALUES (?, ?, ?, 'queued', ?, ?, ?)""",
@@ -2324,50 +2341,12 @@ def list_compare_pairs(app, task_id: str) -> list[dict]:
     return result
 
 
-def initialize_compare_signal_reviews(app, task_id: str, signals: list[dict]) -> None:
-    timestamp = now_iso()
-    with connection(app) as conn:
-        conn.executemany(
-            "INSERT OR IGNORE INTO ew_compare_signal_reviews(signal_id, task_id, updated_at) VALUES (?, ?, ?)",
-            [(item["signal_id"], task_id, timestamp) for item in signals],
-        )
-
-
 def compare_analysis(app, task_id: str) -> dict | None:
+    """返回查重分析结果。人工处置已停用（设计基线：不保存人工处置状态），
+    仅返回任务中保存的 AI 判定与线索本身；历史表数据保留可读但不再参与。"""
     task = get_task(app, task_id)
     analysis = (task or {}).get("result", {}).get("cross_bid_analysis")
-    if not analysis:
-        return None
-    with connection(app) as conn:
-        rows = conn.execute(
-            "SELECT signal_id, human_disposition, human_note, reviewed_at FROM ew_compare_signal_reviews WHERE task_id = ?",
-            (task_id,),
-        ).fetchall()
-    reviews = {row["signal_id"]: dict(row) for row in rows}
-    for signal in analysis.get("signals", []):
-        review = reviews.get(signal.get("signal_id"))
-        if review:
-            signal.update(review)
-    return analysis
-
-
-def update_compare_signal_review(app, signal_id: str, disposition: str, note: str = "") -> dict:
-    allowed = {"pending", "verified", "dismissed", "needs_more_evidence"}
-    if disposition not in allowed:
-        raise ValueError("不支持的线索核验状态")
-    note = str(note or "").strip()[:1000]
-    timestamp = now_iso()
-    reviewed_at = None if disposition == "pending" else timestamp
-    with connection(app) as conn:
-        updated = conn.execute(
-            """UPDATE ew_compare_signal_reviews SET human_disposition=?, human_note=?, reviewed_at=?, updated_at=?
-               WHERE signal_id=?""",
-            (disposition, note, reviewed_at, timestamp, signal_id),
-        ).rowcount
-        if not updated:
-            raise ValueError("横向异常线索不存在")
-        row = conn.execute("SELECT * FROM ew_compare_signal_reviews WHERE signal_id=?", (signal_id,)).fetchone()
-    return dict(row)
+    return analysis if isinstance(analysis, dict) else None
 
 
 def latest_compare_results(app, project_id: str) -> tuple[dict | None, list[dict]]:
@@ -4489,7 +4468,7 @@ def save_review_results(app, review_run_id: str, document_id: str, results: list
                 ocr_status=excluded.ocr_status, multimodal_status=excluded.multimodal_status,
                 vision_pages_json=excluded.vision_pages_json, vision_evidence_pages_json=excluded.vision_evidence_pages_json,
                 evidence_layers_json=excluded.evidence_layers_json, vision_model=excluded.vision_model,
-                vision_message=excluded.vision_message, final_status=NULL, confirmed_at=NULL, created_at=excluded.created_at""",
+                vision_message=excluded.vision_message, created_at=excluded.created_at""",
                 (str(uuid.uuid4()), review_run_id, document_id, item["rule_id"], item["status"], item.get("evidence", ""),
                  item.get("page_hint"), item.get("reason", ""), item.get("conclusion_summary", ""), item.get("risk_level", "medium"), item.get("confidence", "medium"),
                  item.get("evidence_quality", "limited"), item.get("coverage_status", "covered"), item.get("automation_status", "needs_review"),
@@ -4608,7 +4587,7 @@ def reusable_evaluation_document_results(app, project_id: str, rule_set_id: str,
                         valid = False
                         break
                     rows = conn.execute(
-                        """SELECT rule_id, suggested_score, effective_score, max_score, evidence, reason, conclusion_summary, confidence, coverage_status,
+                        """SELECT rule_id, suggested_score, max_score, evidence, reason, conclusion_summary, confidence, coverage_status,
                            automation_status, requires_review, review_reason, vision_status, ocr_status, multimodal_status, vision_pages_json,
                            vision_evidence_pages_json, evidence_layers_json,
                            vision_model, vision_message FROM ew_score_results
@@ -4623,38 +4602,6 @@ def reusable_evaluation_document_results(app, project_id: str, rule_set_id: str,
             if valid:
                 return copied
     return None
-
-
-def update_review_final_status(app, review_result_id: str, final_status: str) -> dict:
-    allowed = {"satisfied", "not_satisfied", "partial", "not_found", "manual"}
-    if final_status not in allowed:
-        raise ValueError("不支持的人工复核结论")
-    with connection(app) as conn:
-        updated = conn.execute(
-            "UPDATE ew_review_results SET final_status = ?, confirmed_at = ? WHERE review_result_id = ?",
-            (final_status, now_iso(), review_result_id),
-        ).rowcount
-        if not updated:
-            raise ValueError("审查结果不存在")
-        row = conn.execute("SELECT * FROM ew_review_results WHERE review_result_id = ?", (review_result_id,)).fetchone()
-    return dict(row)
-
-
-def confirm_auto_review_results(app, project_id: str) -> int:
-    """一次确认所有证据充分的 AI 结论；异常项仍必须逐条复核。"""
-    with connection(app) as conn:
-        updated = conn.execute(
-            """UPDATE ew_review_results SET final_status=status, confirmed_at=?, automation_status='confirmed'
-               WHERE review_result_id IN (
-                   SELECT r.review_result_id FROM ew_review_results r JOIN ew_review_runs run ON run.review_run_id=r.review_run_id
-                   JOIN ew_tasks task ON task.task_id=run.task_id
-                   WHERE run.project_id=? AND task.status='success' AND r.requires_review=0
-                     AND r.final_status IS NULL
-                     AND run.rule_set_id=(SELECT rule_set_id FROM ew_rule_sets WHERE project_id=? ORDER BY version DESC LIMIT 1)
-               )""",
-            (now_iso(), project_id, project_id),
-        ).rowcount
-    return updated
 
 
 def create_score_run(app, project_id: str, task_id: str, score_type: str, profile_id: str | None) -> dict:
@@ -4672,12 +4619,12 @@ def save_score_results(app, score_run_id: str, document_id: str, results: list[d
     with connection(app) as conn:
         for item in results:
             conn.execute(
-                """INSERT INTO ew_score_results(score_result_id, score_run_id, document_id, rule_id, suggested_score, final_score, effective_score, max_score,
+                """INSERT INTO ew_score_results(score_result_id, score_run_id, document_id, rule_id, suggested_score, max_score,
                    evidence, reason, conclusion_summary, confidence, coverage_status, automation_status, requires_review, review_reason,
                    vision_status, ocr_status, multimodal_status, vision_pages_json, vision_evidence_pages_json, evidence_layers_json, vision_model, vision_message, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(score_run_id, document_id, rule_id) DO UPDATE SET
-                suggested_score=excluded.suggested_score, final_score=excluded.final_score, effective_score=excluded.effective_score,
+                suggested_score=excluded.suggested_score,
                 max_score=excluded.max_score, evidence=excluded.evidence, reason=excluded.reason, conclusion_summary=excluded.conclusion_summary, confidence=excluded.confidence, coverage_status=excluded.coverage_status,
                 automation_status=excluded.automation_status, requires_review=excluded.requires_review,
                 review_reason=excluded.review_reason, vision_status=excluded.vision_status,
@@ -4685,8 +4632,8 @@ def save_score_results(app, score_run_id: str, document_id: str, results: list[d
                 vision_pages_json=excluded.vision_pages_json, vision_evidence_pages_json=excluded.vision_evidence_pages_json,
                 evidence_layers_json=excluded.evidence_layers_json, vision_model=excluded.vision_model,
                 vision_message=excluded.vision_message, updated_at=excluded.updated_at""",
-                (str(uuid.uuid4()), score_run_id, document_id, item["rule_id"], item.get("suggested_score"), item.get("final_score"),
-                 item.get("effective_score"), item.get("max_score"), item.get("evidence", ""), item.get("reason", ""), item.get("conclusion_summary", ""), item.get("confidence"), item.get("coverage_status", "covered"),
+                (str(uuid.uuid4()), score_run_id, document_id, item["rule_id"], item.get("suggested_score"),
+                 item.get("max_score"), item.get("evidence", ""), item.get("reason", ""), item.get("conclusion_summary", ""), item.get("confidence"), item.get("coverage_status", "covered"),
                  item.get("automation_status", "needs_review"), 1 if item.get("requires_review", True) else 0,
                  item.get("review_reason", ""), item.get("vision_status", "not_requested"), _ocr_status_value(item), _multimodal_status_value(item),
                  _vision_pages_json(item), _vision_evidence_pages_json(item), _evidence_layers_json(item),
@@ -4822,38 +4769,3 @@ def latest_score_results(app, project_id: str, score_type: str) -> tuple[dict | 
             if isinstance(item, dict) and item.get("document_id")
         ]
     return value, [_public_vision_result(dict(row)) for row in rows]
-
-
-def update_final_score(app, score_result_id: str, final_score: float) -> dict:
-    if not math.isfinite(final_score):
-        raise ValueError("最终分数必须是有效数字")
-    with connection(app) as conn:
-        row = conn.execute("SELECT max_score FROM ew_score_results WHERE score_result_id = ?", (score_result_id,)).fetchone()
-        if not row:
-            raise ValueError("评分结果不存在")
-        max_score = row["max_score"]
-        if final_score < 0 or (max_score is not None and final_score > max_score):
-            raise ValueError("最终分数必须在 0 与该项满分之间")
-        conn.execute("UPDATE ew_score_results SET final_score = ?, effective_score = ?, automation_status='confirmed', updated_at = ? WHERE score_result_id = ?", (final_score, final_score, now_iso(), score_result_id))
-        updated = conn.execute("SELECT * FROM ew_score_results WHERE score_result_id = ?", (score_result_id,)).fetchone()
-    return dict(updated)
-
-
-def confirm_auto_score_results(app, project_id: str, score_type: str | None = None) -> int:
-    params: list[object] = [now_iso(), project_id, project_id]
-    type_sql = ""
-    if score_type:
-        type_sql = " AND run.score_type=?"
-        params.append(score_type)
-    with connection(app) as conn:
-        updated = conn.execute(
-            """UPDATE ew_score_results SET final_score=effective_score, automation_status='confirmed', updated_at=?
-               WHERE score_result_id IN (
-                   SELECT s.score_result_id FROM ew_score_results s JOIN ew_score_runs run ON run.score_run_id=s.score_run_id
-                   JOIN ew_tasks task ON task.task_id=run.task_id
-                   WHERE run.project_id=? AND task.status='success' AND s.requires_review=0
-                     AND s.final_score IS NULL
-                     AND run.rule_set_id=(SELECT rule_set_id FROM ew_rule_sets WHERE project_id=? ORDER BY version DESC LIMIT 1)""" + type_sql + ")",
-            params,
-        ).rowcount
-    return updated

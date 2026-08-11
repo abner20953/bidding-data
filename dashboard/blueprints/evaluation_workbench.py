@@ -773,15 +773,13 @@ def compare_results_api(task_id):
 
 @evaluation_workbench_bp.route("/api/evaluation-workbench/compare-signals/<signal_id>", methods=["PATCH"])
 def update_compare_signal_api(signal_id):
+    """人工处置已按业务口径停用（设计基线：查重不保存人工处置状态）。
+
+    保留路径并固定返回 410，避免未知外部调用方从 404 难以诊断；
+    背后的写入逻辑已随 storage 一并移除。
+    """
     _init()
-    data = _json_body()
-    try:
-        review = storage.update_compare_signal_review(
-            current_app, signal_id, str(data.get("human_disposition", "")), data.get("human_note", "")
-        )
-        return jsonify({"review": review})
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
+    return jsonify({"error": "横向线索人工处置已停用；系统只提供线索和 AI 判定，不保存人工处置状态"}), 410
 
 
 @evaluation_workbench_bp.route("/api/evaluation-workbench/model-configuration/unlock", methods=["POST"])
@@ -1032,21 +1030,27 @@ def review_results_api(project_id):
 
 @evaluation_workbench_bp.route("/api/evaluation-workbench/review-results/<review_result_id>", methods=["PATCH"])
 def update_review_result_api(review_result_id):
+    """审查结果人工改判已按业务口径停用（设计基线：AI 建议即最终展示）。
+
+    保留路径并固定返回 410，避免未知外部调用方从 404 难以诊断；
+    背后的写入逻辑已随 storage 一并移除。
+    """
     _init()
-    try:
-        result = storage.update_review_final_status(current_app, review_result_id, str(_json_body().get("final_status", "")))
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-    return jsonify({"review_result": result})
+    return jsonify({"error": "审查结果人工改判已停用；系统只展示 AI 审查建议，不保存人工调整"}), 410
 
 
 @evaluation_workbench_bp.route("/api/evaluation-workbench/projects/<project_id>/review-results/confirm-auto", methods=["POST"])
 def confirm_auto_review_results_api(project_id):
+    """审查结果一键确认已按业务口径停用（设计基线：不保存人工调整）。
+
+    保留路径并固定返回 410，避免未知外部调用方从 404 难以诊断；
+    背后的写入逻辑已随 storage 一并移除。
+    """
     _init()
     _, error = _project_or_404(project_id)
     if error:
         return error
-    return jsonify({"confirmed_count": storage.confirm_auto_review_results(current_app, project_id)})
+    return jsonify({"error": "审查结果一键确认已停用；系统只展示 AI 审查建议，不保存人工调整"}), 410
 
 
 @evaluation_workbench_bp.route("/api/evaluation-workbench/projects/<project_id>/score-results/<score_type>")
@@ -1063,25 +1067,27 @@ def score_results_api(project_id, score_type):
 
 @evaluation_workbench_bp.route("/api/evaluation-workbench/score-results/<score_result_id>", methods=["PATCH"])
 def update_score_result_api(score_result_id):
+    """评分人工改分已按业务口径停用（设计基线：只展示 AI 建议得分）。
+
+    保留路径并固定返回 410，避免未知外部调用方从 404 难以诊断；
+    背后的写入逻辑已随 storage 一并移除。
+    """
     _init()
-    data = _json_body()
-    try:
-        final_score = float(data.get("final_score"))
-        return jsonify({"score_result": storage.update_final_score(current_app, score_result_id, final_score)})
-    except (TypeError, ValueError) as exc:
-        return jsonify({"error": str(exc) if str(exc) else "请填写有效的最终分数"}), 400
+    return jsonify({"error": "评分人工改分已停用；系统只展示 AI 建议得分，不保存人工最终分"}), 410
 
 
 @evaluation_workbench_bp.route("/api/evaluation-workbench/projects/<project_id>/score-results/confirm-auto", methods=["POST"])
 def confirm_auto_score_results_api(project_id):
+    """评分一键确认已按业务口径停用（设计基线：只展示 AI 建议得分）。
+
+    保留路径并固定返回 410，避免未知外部调用方从 404 难以诊断；
+    背后的写入逻辑已随 storage 一并移除。
+    """
     _init()
     _, error = _project_or_404(project_id)
     if error:
         return error
-    score_type = str(_json_body().get("score_type", "")).strip() or None
-    if score_type not in {None, "objective", "subjective"}:
-        return jsonify({"error": "不支持的评分类型"}), 400
-    return jsonify({"confirmed_count": storage.confirm_auto_score_results(current_app, project_id, score_type)})
+    return jsonify({"error": "评分一键确认已停用；系统只展示 AI 建议得分，不保存人工最终分"}), 410
 
 
 @evaluation_workbench_bp.route("/pingbiao/projects/<project_id>/report")

@@ -2,18 +2,18 @@
 
 ```yaml
 handoff_schema: 1
-updated_at: 2026-08-10
+updated_at: 2026-08-11
 module: evaluation-workbench
-status: repository_synced_cloud_unverified
+status: local_changes
 base_commit: 287d05d
 branch: main
-working_tree: clean
+working_tree: dirty
 remote_github: 287d05d
 remote_gitee: 287d05d
 production_commit: unknown
 prompt_version: vision-evidence-contract-v55
 database_change: none
-user_approval: review_docs_only
+user_approval: c1_no_human_adjudication;c2_per_project_queue
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
@@ -21,10 +21,19 @@ user_approval: review_docs_only
 ## 下一位先做
 
 1. 云端版本一致性未恢复：build-info 的 `commit=unknown`、`deploy_record_commit=f7137eb`、`version_consistent=false`；容器 `deployed_at=2026-08-10 15:09:57`；服务器仓库与 GitHub/Gitee 均为 `287d05d`，但镜像 `.build-commit` 缺失、宿主机 `.deploy-commit` 为 `f7137eb`。先用 `redeploy.sh` 重建镜像恢复“镜像、容器、部署记录”三者一致，再决定重跑验收；禁止把旧云端结果归因于当前代码。
-2. 若继续工作台代码任务，按 `AI_CONTEXT.md` 的任务路由阅读稳定设计。
-3. 当前工作树干净；本地/远程均已在 `287d05d`，无未提交代码变更。
+2. 本地有未提交改动（停用人工裁决落库与查重人工处置、排队改为每项目 3 + 全局 12），472 项测试与文档校验均通过；用户确认后提交并推送，部署前验证 `rokid_glasses_app` 未调用已停用的 410 接口（`compare-signals` PATCH、`review-results/{id}` PATCH、`score-results/{id}` PATCH、`confirm-auto` ×2）。
+3. 若继续工作台代码任务，按 `AI_CONTEXT.md` 的任务路由阅读稳定设计。
 
 ## 活跃记录（最多 10 条）
+
+### 6. 停用人工裁决落库与查重人工处置、排队改为每项目 3 + 全局 12（已实现，待提交）
+
+- 用户确认口径：评分/评审只展示 AI 建议，不保存人工调整（含查重不保存人工处置）；API 保留路径固定返回 410，确认 `rokid_glasses_app` 未使用后再删路由；排队改为每项目 3 个 + 全局 12 个（单 worker 全局 FIFO 不变）。
+- 已实施：worker 评分输出移除 `final_score`/`effective_score`；storage 保存与结果复用查询移除两字段，删除 `update_review_final_status`/`update_final_score`/`confirm_auto_review_results`/`confirm_auto_score_results`/`initialize_compare_signal_reviews`/`update_compare_signal_review`；`collusion_signals` 移除信号初始人工字段；5 个 API 改 410（compare-signals PATCH、review-results PATCH、score-results PATCH、confirm-auto ×2）；`create_task` 用 `BEGIN IMMEDIATE` 短事务实现每项目/全局排队上限。
+- 验证：472 项测试全过（新增每项目/全局/并发入队 3 项，改造 4 项）；`git diff --check` 通过；`validate_docs.py` 通过。
+- 不变契约：数据库列与历史数据保留（不破坏性迁移）；展示清洗正则（`final_score=` 记法清洗）与结果表字段无关，保留；worker 计算链不读人工字段，准确度零影响。
+- 待办：用户确认后提交并推送；部署前验证 `rokid_glasses_app` 兼容性。
+- 主要文件：`worker.py`、`storage.py`、`collusion_signals.py`、`blueprints/evaluation_workbench.py`、`tests/test_evaluation_workbench.py`。
 
 ### 2. 评分原文连续页组装与综合评审隔离（仓库已同步，云端待核验）
 

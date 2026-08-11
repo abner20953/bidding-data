@@ -875,11 +875,11 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(analysis["ai_assessment"]["assessed_count"], 0)
         self.assertEqual(signal["ai_assessment"]["reason"], "AI 未返回该线索的可用判定。")
 
-    def test_compare_signal_disposition_is_persisted_separately(self):
+    def test_compare_signal_disposition_api_is_disabled(self):
+        """查重线索人工处置已按业务口径停用：路径保留但固定返回 410。"""
         task = storage.create_task(self.app, self.project["project_id"], "compare_documents")
-        storage.initialize_compare_signal_reviews(self.app, task["task_id"], [{"signal_id": "signal-1"}])
         storage.update_task(self.app, task["task_id"], result={"cross_bid_analysis": {
-            "signals": [{"signal_id": "signal-1", "human_disposition": "pending", "human_note": ""}]
+            "signals": [{"signal_id": "signal-1"}]
         }})
 
         response = self.app.test_client().patch(
@@ -887,13 +887,9 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             json={"human_disposition": "dismissed", "human_note": "公共模板造成"},
         )
 
-        self.assertEqual(response.status_code, 200)
-        review = response.get_json()["review"]
-        self.assertEqual(review["human_disposition"], "dismissed")
-        self.assertEqual(review["human_note"], "公共模板造成")
-        self.assertIsNotNone(review["reviewed_at"])
+        self.assertEqual(response.status_code, 410)
         analysis = storage.compare_analysis(self.app, task["task_id"])
-        self.assertEqual(analysis["signals"][0]["human_disposition"], "dismissed")
+        self.assertNotIn("human_disposition", analysis["signals"][0])
 
     def test_rule_extraction_creates_a_draft_rule_set(self):
         tender_text = "投标人应具备有效资质，技术方案满分十分。"
@@ -3240,7 +3236,9 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(finished["status"], "success")
         self.assertEqual(reviews[0]["category"], "other")
 
-    def test_auto_results_can_be_confirmed_in_batch_while_exceptions_remain(self):
+    def test_auto_confirmation_apis_are_disabled(self):
+        """评审/评分一键确认已按业务口径停用：路径保留但固定返回 410，
+        新任务不再写入 final_status/final_score。"""
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案。")
         review_rule = storage.add_rule(self.app, self.project["project_id"], {"category": "qualification", "title": "资质"})
         score_rule = storage.add_rule(self.app, self.project["project_id"], {"category": "objective", "title": "资质评分", "scoring": {"kind": "boolean", "max_score": 5}})
@@ -3256,7 +3254,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
              "vision_model": "图片模型", "vision_message": "图片证据已写入。"},
         ])
         storage.save_score_results(self.app, score_run["score_run_id"], document["document_id"], [
-            {"rule_id": score_rule["rule_id"], "suggested_score": 5, "effective_score": 5, "max_score": 5, "confidence": "high", "evidence": "资质证书", "requires_review": False, "automation_status": "ready_for_batch_confirmation",
+            {"rule_id": score_rule["rule_id"], "suggested_score": 5, "max_score": 5, "confidence": "high", "evidence": "资质证书", "requires_review": False, "automation_status": "ready_for_batch_confirmation",
              "vision_status": "applied_partial", "vision_pages": [8], "vision_model": "图片模型", "vision_message": "已补充部分图片事实。"},
         ])
 
@@ -3265,14 +3263,15 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         _, review_rows = storage.latest_review_results(self.app, self.project["project_id"])
         _, score_rows = storage.latest_score_results(self.app, self.project["project_id"], "objective")
 
-        self.assertEqual(reviews.get_json()["confirmed_count"], 1)
-        self.assertEqual(scores.get_json()["confirmed_count"], 1)
-        self.assertEqual(review_rows[0]["final_status"], "satisfied")
+        self.assertEqual(reviews.status_code, 410)
+        self.assertEqual(scores.status_code, 410)
+        self.assertIsNone(review_rows[0]["final_status"])
         self.assertEqual(review_rows[0]["vision_pages"], [3, 5])
         self.assertEqual(review_rows[0]["vision_evidence_pages"], [5])
         self.assertEqual(review_rows[0]["evidence_layers"][0]["evidence_pages"], [5])
         self.assertEqual(review_rows[0]["vision_status"], "applied")
-        self.assertEqual(score_rows[0]["final_score"], 5.0)
+        self.assertIsNone(score_rows[0]["final_score"])
+        self.assertEqual(score_rows[0]["suggested_score"], 5.0)
         self.assertEqual(score_rows[0]["vision_pages"], [8])
         self.assertEqual(score_rows[0]["vision_status"], "applied_partial")
 
@@ -3662,8 +3661,6 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["rule_id"], rule["rule_id"])
         self.assertEqual(results[0]["status"], "manual")
-        confirmed = storage.update_review_final_status(self.app, results[0]["review_result_id"], "satisfied")
-        self.assertEqual(confirmed["final_status"], "satisfied")
 
     def test_page_context_retrieval_falls_back_when_rule_has_no_local_clue(self):
         parsed = self.temp_dir / "parsed.txt"
@@ -4232,6 +4229,42 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(context["waiting_count"], 1)
         self.assertEqual(context["active_task"]["project_name"], "评标测试项目")
 
+    def test_create_task_enforces_per_project_queue_limit(self):
+        """排队上限按项目独立计数：同项目第 4 个排队任务被拒，其他项目仍可排队。"""
+        second_project = storage.create_project(self.app, "同项目排队项目", "TEST-02", "包1")
+        for task_type in ("parse_documents", "compare_documents", "extract_rules"):
+            storage.create_task(self.app, second_project["project_id"], task_type)
+        with self.assertRaises(ValueError):
+            storage.create_task(self.app, second_project["project_id"], "evaluate_all")
+        storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+
+    def test_create_task_enforces_global_queue_limit(self):
+        """全局排队上限独立于每项目上限：触顶后即使项目内未满也被拒。"""
+        with patch.object(storage, "MAX_QUEUED_TASKS_GLOBAL", 4), patch.object(storage, "MAX_QUEUED_TASKS_PER_PROJECT", 10):
+            for task_type in ("parse_documents", "compare_documents", "extract_rules", "review_documents"):
+                storage.create_task(self.app, self.project["project_id"], task_type)
+            with self.assertRaises(ValueError):
+                storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+
+    def test_create_task_queue_admission_is_atomic_under_concurrency(self):
+        """并发入队由 BEGIN IMMEDIATE 串行化：同时到达的请求不会突破全局上限。"""
+        from concurrent.futures import ThreadPoolExecutor
+
+        project_ids = [
+            storage.create_project(self.app, f"并发排队项目{i}", f"C-{i}", "包1")["project_id"]
+            for i in range(10)
+        ]
+        with patch.object(storage, "MAX_QUEUED_TASKS_GLOBAL", 5), patch.object(storage, "MAX_QUEUED_TASKS_PER_PROJECT", 10):
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                futures = [executor.submit(storage.create_task, self.app, project_id, "evaluate_all") for project_id in project_ids]
+                succeeded = sum(1 for future in futures if future.exception() is None)
+                failed = sum(1 for future in futures if isinstance(future.exception(), ValueError))
+        with storage.connection(self.app) as conn:
+            queued = conn.execute("SELECT COUNT(*) FROM ew_tasks WHERE status = 'queued'").fetchone()[0]
+        self.assertEqual(succeeded, 5)
+        self.assertEqual(failed, 5)
+        self.assertEqual(queued, 5)
+
     def test_long_document_is_fully_scanned_before_rule_group_synthesis(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "近年的类似项目情况表：项目一。")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
@@ -4391,7 +4424,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         self.assertEqual(results[0]["suggested_score"], 5.0)
         self.assertTrue(results[0]["requires_review"])
-        self.assertIsNone(results[0]["effective_score"])
+        self.assertNotIn("effective_score", results[0])
         self.assertNotIn("OCR", results[0]["reason"])
         self.assertIn("复核", results[0]["review_reason"])
 
@@ -6601,8 +6634,6 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["suggested_score"], 5.0)
         self.assertIsNone(results[0]["final_score"])
-        updated = storage.update_final_score(self.app, results[0]["score_result_id"], 4.5)
-        self.assertEqual(updated["final_score"], 4.5)
 
     def test_confirming_rules_infers_explicit_max_score_from_source_text(self):
         rule = storage.add_rule(self.app, self.project["project_id"], {
@@ -6825,7 +6856,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             "evidence_quality": "missing", "reason": "未定位直接证据。",
         })
         score = worker._apply_document_evidence_guard(document, "objective", rule, {
-            "rule_id": "license", "suggested_score": 0.0, "effective_score": None, "confidence": "low",
+            "rule_id": "license", "suggested_score": 0.0, "confidence": "low",
             "reason": "未提供证书。",
         })
 

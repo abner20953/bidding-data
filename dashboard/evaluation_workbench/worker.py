@@ -414,7 +414,6 @@ def _compare_documents(app, task: dict) -> dict:
             "summary": result.get("summary", {}),
         })
     analysis = build_cross_bid_analysis(task["task_id"], analyzed_pairs, tender_loaded=bool(tender))
-    storage.initialize_compare_signal_reviews(app, task["task_id"], analysis["signals"])
     _assess_compare_signals_with_ai(app, task, analysis)
     return {"pair_count": len(pairs), "pairs": summaries, "cross_bid_analysis": analysis}
 
@@ -5568,8 +5567,7 @@ def _score_result_from_model(rule_id: str, suggested: float | None, max_score: f
     if suggested is not None:
         conclusion_summary = _reconcile_summary_score(conclusion_summary, suggested)
     result = {
-        "rule_id": rule_id, "suggested_score": suggested, "final_score": None,
-        "effective_score": suggested if auto_ready else None, "max_score": max_score or None,
+        "rule_id": rule_id, "suggested_score": suggested, "max_score": max_score or None,
         "evidence": evidence,
         "reason": reason,
         "conclusion_summary": conclusion_summary,
@@ -9067,7 +9065,7 @@ def _apply_document_evidence_guard(document: dict, component: str, rule: dict, r
         }
     return {
         **_set_result_coverage(result, "uncovered"),
-        "suggested_score": None, "effective_score": None, "confidence": "low",
+        "suggested_score": None, "confidence": "low",
         "requires_review": True, "automation_status": "needs_review",
         "review_reason": "扫描型文件尚未形成该评分规则的完整证据覆盖，暂不建议计分。",
         "reason": note,
@@ -10325,8 +10323,7 @@ def _merge_compound_score_results(rule: dict, left: dict, right: dict) -> dict:
     ) if value)
     requires_review = bool(left.get("requires_review", True) or right.get("requires_review", True) or suggested is None)
     return {
-        "rule_id": rule["rule_id"], "suggested_score": suggested, "final_score": None,
-        "effective_score": suggested if not requires_review else None, "max_score": max_score or None,
+        "rule_id": rule["rule_id"], "suggested_score": suggested, "max_score": max_score or None,
         "evidence": evidence[:2000], "reason": reason[:2000], "confidence": confidence,
         "automation_status": "needs_review" if requires_review else "ready_for_batch_confirmation",
         "requires_review": requires_review,

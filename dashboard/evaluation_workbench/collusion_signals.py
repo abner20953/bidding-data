@@ -155,8 +155,6 @@ def _signal(task_id: str, left: dict, right: dict, dimension: str, confidence: s
         "confidence": confidence,
         "evidence_status": "human_verification_required",
         "assessment_result": "pending_human_review",
-        "human_disposition": "pending",
-        "human_note": "",
         "basis": basis,
         "evidence": evidence[:5],
         "counter_evidence": counter_evidence or [],
