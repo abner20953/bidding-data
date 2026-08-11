@@ -4,27 +4,36 @@
 handoff_schema: 1
 updated_at: 2026-08-11
 module: evaluation-workbench
-status: deployed_validation_pending
+status: ready_for_commit
 base_commit: 3a7f096
 branch: main
-working_tree: clean
+working_tree: local_changes
 remote_github: 3a7f096
 remote_gitee: 3a7f096
 production_commit: 3a7f096
-prompt_version: vision-evidence-contract-v55
+prompt_version: vision-evidence-contract-v56
 database_change: none
-user_approval: c1_no_human_adjudication;c2_per_project_queue;deploy_tencent;capacity_implementation
+user_approval: scope_candidate_ledger_implementation
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
 
 ## 下一位先做
 
-1. 云端已部署 `3a7f096`：容量调整生效（每项目 12 份投标文件、工作台单文件上传 500 MB、单份 PDF 2500 页）；build-info 的 `commit`、`runtime_release_commit`、部署记录、容器 `.build-commit` 与宿主机 `.deploy-commit` 均为 `3a7f096`，`version_consistent=true`（2026-08-11 10:44 核验）。完整回归 562 项通过；未做大文件实测，后续可用真实 300–500 MB 文件验收。
-2. 云端旧结果（山西大学附中/太原税务/CZ 等）仍是 `f7137eb` 时代产物，不得归因于当前代码；需要时按黄金项目清单重跑验收。
+1. 当前本地变更待用户确认提交：范围候选台账按开放类型轮转、全文扫描按页数动态给出范围候选额度，提示词版本升至 v56；完整回归 476 项通过。提交部署后优先重跑太原税务的综合评审，核验不同类别的范围外内容能否并列出现。
+2. 云端已部署 `3a7f096`：容量调整生效（每项目 12 份投标文件、工作台单文件上传 500 MB、单份 PDF 2500 页）；build-info 的 `commit`、`runtime_release_commit`、部署记录、容器 `.build-commit` 与宿主机 `.deploy-commit` 均为 `3a7f096`，`version_consistent=true`（2026-08-11 10:44 核验）。未做真实大文件压力验收。
 3. 已停用接口（`compare-signals` PATCH、`review-results/{id}` PATCH、`score-results/{id}` PATCH、`confirm-auto` ×2）云端验证返回 410；待确认 `rokid_glasses_app` 未调用后再彻底删除路由。
 
 ## 活跃记录（最多 10 条）
+
+### 7. 全文范围候选台账完整性（本地完成，待提交部署）
+
+- 根因：全文扫描输出曾固定限制范围候选数，最终上下文又只按优先级截取；同类高优先级候选可挤掉其他独立类别，造成范围外工艺、对象或服务内容未进入最终审查。
+- 已实施：范围候选额度按连续页块大小动态限定（正常最多 12、紧凑重试最多 6）；同类可合并、不同开放 `dimension` 在最终范围规则上下文中轮转保留并附原页；提示词要求跨类别分别输出、不得发现一类后停止扫描。即使云端有旧自定义提示词，worker 仍附加同义结构约束。没有项目、投标人、设备、地区、页码或文本特例。
+- 不变契约：仍只使用本轮扫描候选，不回灌旧模型结论；范围候选只是线索，最终仍结合招标范围与原页判断；规则命中上限、OCR策略、评分和 API 不变。
+- 验证：新增“单一类型密集时仍保留其他类型”和页块额度测试；工作台与 AI 网关完整回归 476 项通过。
+- 待办：提交部署后重跑太原税务并检查多类别范围偏离的召回、误报和耗时；若云端自定义提示词覆盖默认，确认右上角配置中已同步 v56 范围候选完整性片段。
+- 主要文件：`worker.py`、`prompt_templates.py`、`tests/test_evaluation_workbench.py`、稳定设计。
 
 ### 6. 停用人工裁决落库与查重人工处置、排队改为每项目 3 + 全局 12（已提交、已部署）
 

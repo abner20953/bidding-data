@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 PROMPT_TEMPLATE_SETTING = "evaluation_workbench_prompt_templates"
-EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v55"
+EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v56"
 
 
 def _template(name: str, description: str, content: str, *placeholders: str) -> dict:
@@ -549,8 +549,9 @@ _SCOPE_CHAPTER_TEMPLATE_GUIDANCE = (
     "工艺/工序/作业/处理方式、材料/设备/组件、标准/规范、服务/交付物、时间/地点等；"
     "画像中未包含的上述任何类别内容，若被作为本项目方案、响应、承诺或实施安排写入，即为范围偏离候选，"
     "只有原文明确标注为法规条文、标准编号、通用示例或可选方案时才可放行；"
-    "同一章节连续出现多个画像外对象时，应合并为一条“整章模板混用”候选，"
-    "逐项列出每个对象与代表页码，不要逐条忽略。"
+    "同一章节连续出现多个画像外对象时，同一具体类别的重复表述可合并为一条“整章模板混用”候选；"
+    "若属于不同类别的主体、对象、工艺、设备、服务或地点，必须分别返回独立候选，"
+    "每条保留最具辨识度的对象与代表页码，不得因为已经发现一类偏离而省略另一类。"
 )
 _TEXT_ERROR_LINE_GUIDANCE = (
     "正文中出现明显断字、错字或上下文不通的字符组合（完整句子中夹入无意义词、同音/形近字误写、"
@@ -595,6 +596,16 @@ _SCOPE_SUMMARY_RISK_GUIDANCE = (
     "（是否最终排除仍由人工裁决），不要因措辞像通用规范而整体降为 medium。"
 )
 _extend_prompt("evaluate_all_scope_anomaly_guidance", "范围结论摘要", "\n\n" + _SCOPE_SUMMARY_RISK_GUIDANCE)
+
+# 全文扫描的范围候选是独立证据台账，不是“只挑一个最严重问题”的摘要。该约束只
+# 规定输出完整性和开放类型，不包含任何项目、行业或对象特例。
+_SCOPE_CANDIDATE_COMPLETENESS_GUIDANCE = (
+    "范围候选须按彼此独立的偏离类型建立台账：同类重复可合并，跨类型不得互相替代。"
+    "发现日期/主体/技术对象/工艺/设备材料/服务对象/交付物等任一类候选后，仍须继续扫描"
+    "当前页块其余内容；不得因已发现较高优先级候选而停止返回其他类型。"
+    "dimension 必须写能区分该类事实的简短开放描述，不得统一写“其他范围偏离”或“模板问题”。"
+)
+_extend_prompt("evaluate_all_scope_anomaly_guidance", "范围候选完整性", "\n\n" + _SCOPE_CANDIDATE_COMPLETENESS_GUIDANCE)
 
 # 上述少量结构化协议模板在定义后会做字段兼容变换；先把这些基础变换固化，再
 # 统一附加命名业务片段。最终对外仍只有每个模板的一份完整可编辑文本。

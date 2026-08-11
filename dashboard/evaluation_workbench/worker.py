@@ -5886,13 +5886,38 @@ def _full_scan_chunk_label(chunk: dict) -> str:
     return str(chunk.get("chunk_id") or "连续文本块")
 
 
+def _scope_anomaly_output_limit(chunk: dict, *, compact: bool) -> int:
+    """按连续页块大小分配范围候选输出额度。
+
+    范围候选与规则命中是两条独立通道。固定的小上限会让某一类异常（例如日期）
+    挤掉同一页块中其他不同类型的范围偏离；这里仅依据页数分配有界额度，不按行业
+    或具体名词区别对待。紧凑重试保留较小上限，优先保证 JSON 可恢复。
+    """
+    try:
+        start = int(chunk.get("start_page") or 0)
+        end = int(chunk.get("end_page") or 0)
+    except (TypeError, ValueError):
+        start = end = 0
+    page_count = max(1, end - start + 1) if start and end else 10
+    per_ten_pages = 1 if compact else 2
+    maximum = 6 if compact else 12
+    return min(maximum, max(2 if not compact else 1, ((page_count + 9) // 10) * per_ten_pages))
+
+
+_SCOPE_CANDIDATE_COMPLETENESS_CONTRACT = (
+    "【范围候选输出完整性（系统结构约束）】范围候选按彼此独立的开放类型记录：同类重复可合并，"
+    "不同类型必须分别返回；发现一类候选后仍继续扫描当前页块，不得因优先级更高的候选而省略其他类型。"
+    "dimension 必须写能够区分该类事实的简短描述，不得统一写为泛化的“其他范围偏离”。"
+)
+
 def _full_scan_prompt(app, document: dict, catalog: list[dict], chunk: dict, project_scope: dict, *, compact: bool) -> str:
+    scope_limit = _scope_anomaly_output_limit(chunk, compact=compact)
     retry_note = (
-        "这是格式异常后的严格 JSON 重试：只输出一个 JSON 对象；matches 最多 16 条、scope_anomalies 最多 4 条，每段摘录最多 60 字；"
+        f"这是格式异常后的严格 JSON 重试：只输出一个 JSON 对象；matches 最多 16 条、scope_anomalies 最多 {scope_limit} 条，每段摘录最多 60 字；"
         "复合评分规则的不同叶子项可分别返回，但同一规则最多 6 条；若后文出现不同的数量限制，以本段限制为准；"
         "不得使用 Markdown、注释或前后说明。\n"
         if compact else
-        "本次正常扫描 matches 最多 24 条、scope_anomalies 最多 6 条；复合评分规则的不同叶子项可分别返回，"
+        f"本次正常扫描 matches 最多 24 条、scope_anomalies 最多 {scope_limit} 条；复合评分规则的不同叶子项可分别返回，"
         "同一规则最多 3 条；优先保留投标人自主内容或直接影响判断的原文。若后文的通用限制与本段冲突，以本段为准。\n"
     )
     prompt = storage.render_prompt_template(
@@ -5905,14 +5930,18 @@ def _full_scan_prompt(app, document: dict, catalog: list[dict], chunk: dict, pro
     # 范围判断原则独立于用户可能保留的旧版全文扫描模板，既可在右上角查看和编辑，
     # 又能保证规则目录变动后仍执行相同的“上位主题/具体对象”两层判断。
     scope_guidance = storage.render_prompt_template(app, "evaluate_all_scope_anomaly_guidance")
-    prompt = f"【项目范围偏离独立判断原则】\n{scope_guidance}\n\n{prompt}"
-    # 同步兼容云端尚未恢复默认的旧自定义模板。正常扫描的输出上限从 36 收为 24，
-    # 但每条规则仍有本地章节召回兜底；这样减少 M3 因长 JSON 截断而触发的整块拆分。
+    # 结构约束与可编辑业务口径分离：即使云端仍保留旧版自定义提示词，也不能因少了
+    # 某段说明而让范围候选重新退化为“只返回最严重的一类”。默认模板同步展示同义
+    # 指引，便于后续在提示词配置中理解和维护。
+    prompt = (
+        f"【项目范围偏离独立判断原则】\n{scope_guidance}\n\n"
+        f"{_SCOPE_CANDIDATE_COMPLETENESS_CONTRACT}\n\n{prompt}"
+    )
+    # 同步兼容云端尚未恢复默认的旧自定义模板。规则命中固定收为 24；范围候选按
+    # 页块动态限定，避免单一异常类型在扫描出口被静默吞掉。
     prompt = prompt.replace("最多36条", "最多24条").replace("最多 36 条", "最多 24 条")
-    prompt = prompt.replace("最多8条", "最多6条").replace("最多 8 条", "最多 6 条")
     if compact:
         prompt = prompt.replace("最多24条", "最多16条").replace("最多 24 条", "最多 16 条")
-        prompt = prompt.replace("最多6条", "最多4条").replace("最多 6 条", "最多 4 条")
     return prompt
 
 
@@ -6098,6 +6127,56 @@ def _merge_scope_anomalies(current: list[dict], previous: list[dict]) -> list[di
             merged.append(item)
     priority_rank = {"high": 0, "medium": 1, "low": 2}
     return sorted(merged, key=lambda item: priority_rank.get(item.get("candidate_priority"), 1))[:24]
+
+
+def _select_scope_anomaly_ledger(candidates: list[dict], limit: int) -> list[dict]:
+    """在固定上下文预算内，按开放类型轮转保留范围候选。
+
+    早期实现只按优先级截断：同一类别的多条候选会占满前排，导致其他独立类型的
+    模板混用从最终范围规则上下文中消失。这里不判断候选是否成立，也不使用行业
+    词表；只按模型给出的开放 ``dimension`` 分组，并在每一轮中保留各组当前最强
+    证据。这样日期、主体、技术对象、工艺、服务对象等不同类型可并列由最终模型
+    结合原页判断。
+    """
+    if limit <= 0:
+        return []
+    priority_rank = {"high": 0, "medium": 1, "low": 2}
+    groups: dict[str, list[tuple[int, dict]]] = {}
+    for index, item in enumerate(candidates):
+        if not isinstance(item, dict):
+            continue
+        dimension = re.sub(r"\s+", "", str(item.get("dimension") or ""))[:80]
+        # 维度缺失时仍单列为开放类型，不能因字段不完整而静默丢弃候选。
+        key = dimension or "未分类范围候选"
+        groups.setdefault(key, []).append((index, item))
+    for values in groups.values():
+        values.sort(key=lambda value: (
+            priority_rank.get(value[1].get("candidate_priority"), 1), value[0],
+        ))
+    ordered_keys = sorted(
+        groups,
+        key=lambda key: (
+            priority_rank.get(groups[key][0][1].get("candidate_priority"), 1),
+            groups[key][0][0], key,
+        ),
+    )
+    selected: list[dict] = []
+    cursor = {key: 0 for key in ordered_keys}
+    while len(selected) < limit:
+        progressed = False
+        for key in ordered_keys:
+            position = cursor[key]
+            values = groups[key]
+            if position >= len(values):
+                continue
+            selected.append(values[position][1])
+            cursor[key] = position + 1
+            progressed = True
+            if len(selected) >= limit:
+                break
+        if not progressed:
+            break
+    return selected
 
 
 def _normalise_scope_anomalies(output: object, chunk: dict) -> list[dict]:
@@ -7332,12 +7411,13 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
         anomaly_chunk_cap = 1 if targeted else 2
     else:
         anomaly_limit = anomaly_chunk_cap = 0
+    scope_candidate_ledger = _select_scope_anomaly_ledger(scope_anomalies, anomaly_limit)
     if anomaly_limit:
         # 该通道不依赖“地区、项目名”等固定关键词：任何范围偏离候选的原页都会
         # 进入复核组，最终是否构成问题仍完全由 AI 结合规则和原文判断。
         anomaly_ids = []
         # 每条候选同时需要保留原页；过多的摘要会挤掉原文，故按优先级限量保留。
-        for item in scope_anomalies[:anomaly_limit]:
+        for item in scope_candidate_ledger:
             root_id = str(item.get("chunk_id") or "").split(".", 1)[0]
             if root_id and root_id not in anomaly_ids:
                 anomaly_ids.append(root_id)
@@ -7383,19 +7463,24 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
             "\n\n【项目范围画像（来自招标文件和已确认规则）】\n"
             + json.dumps(_scope_prompt_profile(scan.get("project_scope", {})), ensure_ascii=False, separators=(",", ":"))
             + "\n\n【项目范围偏离候选（仅供结合原页和规则核验，不是既成结论）】\n"
-            + json.dumps(scope_anomalies[:anomaly_limit], ensure_ascii=False, separators=(",", ":"))
+            + json.dumps(scope_candidate_ledger, ensure_ascii=False, separators=(",", ":"))
             + item_appendix
         )
     elif flaw_group:
         scope_packet = (
             "\n\n【项目范围偏离候选提示（仅供瑕疵/套用模板/针对性判断参考，不是既成结论，最终以原页为准）】\n"
-            + json.dumps(scope_anomalies[:anomaly_limit], ensure_ascii=False, separators=(",", ":"))
+            + json.dumps(scope_candidate_ledger, ensure_ascii=False, separators=(",", ":"))
         )
     header = (
         f"【全文覆盖说明】已按连续页块扫描全文，共 {scan.get('chunk_count', 0)} 个页块；本规则组采用{strategy}汇总策略；"
         f"首轮为当前规则组报告 {len(findings)} 条候选证据。"
         "首轮未报告候选不等于技术失败，应结合规则给出‘全文扫描未发现’或其他最可能建议。"
     )
+    if is_review_group and has_scope_rule and scope_anomalies:
+        header += (
+            f"项目范围候选共{len(scope_anomalies)}条，已按开放类型轮转保留"
+            f"{len(scope_candidate_ledger)}条并附对应原页；不得仅因某一类候选优先级更高而忽略其他类型。"
+        )
     form_date_packet_text = ""
     if form_date_packet:
         form_date_packet_text = (

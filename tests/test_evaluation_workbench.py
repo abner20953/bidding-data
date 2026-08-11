@@ -3354,7 +3354,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("表格字段、填写格式", PROMPT_TEMPLATES["extract_rules_obligation_compile_user"]["content"])
         self.assertIn("系统仅能核验已上传文件", PROMPT_TEMPLATES["extract_rules_guidance"]["content"])
         self.assertIn("当一条候选仅概述同一表单、附件或材料的格式", PROMPT_TEMPLATES["extract_rules_dedupe_adjudication_user"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v55")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v56")
 
     def test_scope_chapter_and_text_error_guidance_present(self):
         from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
@@ -3372,7 +3372,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(text_marker, PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("必须点名最具辨识度的偏离对象", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("risk_level 应为 high", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v55")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v56")
 
     def test_ocr_visual_contracts_deduplicated_but_keep_hard_constraints(self):
         from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
@@ -4502,6 +4502,41 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         context = worker._full_scan_review_context(scan, rules, 20_000)
         self.assertIn("锅炉燃烧控制设备安装", context["text"])
         self.assertIn("chunk_12", context["pages"])
+
+    def test_scope_anomaly_ledger_keeps_distinct_types_when_one_type_is_dense(self):
+        chunks = []
+        candidates = []
+        for index in range(1, 13):
+            evidence = f"第{index}处固定表单日期异常"
+            chunks.append({"chunk_id": f"date_{index}", "start_page": index, "end_page": index,
+                           "text": evidence})
+            candidates.append({"chunk_id": f"date_{index}", "dimension": "固定表单日期",
+                               "candidate_priority": "high", "evidence": evidence,
+                               "relation": "与本项目时点不一致"})
+        for index, (dimension, evidence) in enumerate((
+            ("施工工艺", "与采购范围无关的具体施工工艺"),
+            ("服务对象", "被作为本项目服务对象的无关主体"),
+            ("技术对象", "方案中出现的范围外技术对象"),
+        ), start=1):
+            chunk_id = f"other_{index}"
+            chunks.append({"chunk_id": chunk_id, "start_page": 30 + index, "end_page": 30 + index,
+                           "text": evidence})
+            candidates.append({"chunk_id": chunk_id, "dimension": dimension,
+                               "candidate_priority": "medium", "evidence": evidence,
+                               "relation": "缺少项目范围依据"})
+        scan = {
+            "chunks": chunks, "findings": [], "failed_chunks": [], "chunk_count": len(chunks),
+            "project_scope": {"scope_summary": "信息系统升级服务"}, "scope_anomalies": candidates,
+        }
+        rules = [{"rule_id": "scope", "category": "other", "title": "项目范围无关内容核验",
+                  "check_rule": "全文检查与本项目无关的内容", "source_text": ""}]
+
+        context = worker._full_scan_review_context(scan, rules, 80_000)
+
+        self.assertIn("与采购范围无关的具体施工工艺", context["text"])
+        self.assertIn("被作为本项目服务对象的无关主体", context["text"])
+        self.assertIn("方案中出现的范围外技术对象", context["text"])
+        self.assertIn("已按开放类型轮转保留", context["text"])
 
     def test_scope_anomaly_context_is_not_injected_into_unrelated_review_group(self):
         scan = {
@@ -6007,6 +6042,17 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(candidates[0]["candidate_priority"], "high")
         self.assertEqual(candidates[0]["page_range"], "第121-130页")
 
+    def test_scope_anomaly_output_limit_scales_with_chunk_and_compacts_safely(self):
+        chunk = {"chunk_id": "chunk_1", "start_page": 1, "end_page": 36}
+
+        self.assertEqual(worker._scope_anomaly_output_limit(chunk, compact=False), 8)
+        self.assertEqual(worker._scope_anomaly_output_limit(chunk, compact=True), 4)
+        prompt = worker._full_scan_prompt(
+            self.app, {"original_name": "投标.pdf", "bidder_name": "甲公司"}, [],
+            {**chunk, "text": "投标方案"}, {"scope_summary": "信息系统建设"}, compact=False,
+        )
+        self.assertIn("scope_anomalies 最多 8 条", prompt)
+
     def test_scope_anomaly_filters_explicit_normal_items_but_keeps_outside_scope(self):
         candidates = worker._normalise_scope_anomalies([
             ["12", "设备", "low", "网络交换机安装", "与本项目技术要求一致，无异常"],
@@ -6074,7 +6120,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不限定行业或采购类型", guidance)
         scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v55")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v56")
 
     def test_full_scan_does_not_reinject_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")
@@ -6116,6 +6162,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         self.assertIn("先判断章节上位主题是否相关", prompt)
         self.assertIn("具体对象或工艺", prompt)
+        self.assertIn("范围候选输出完整性", prompt)
         self.assertNotIn("青铅", prompt)
 
     def test_combined_evaluation_splits_review_rules_into_small_groups(self):
