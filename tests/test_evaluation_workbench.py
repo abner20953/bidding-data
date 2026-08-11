@@ -3968,9 +3968,9 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(usage["call_count"], 4)
         self.assertEqual(usage["input_chars"] > 0, True)
         self.assertEqual(request_json.call_args_list[0].args[0]["thinking_mode"], "disabled")
-        self.assertEqual(request_json.call_args_list[1].args[0]["thinking_mode"], "adaptive")
+        self.assertEqual(request_json.call_args_list[1].args[0]["thinking_mode"], "disabled")
         self.assertEqual(request_json.call_args_list[2].args[0]["thinking_mode"], "disabled")
-        self.assertEqual(request_json.call_args_list[3].args[0]["thinking_mode"], "adaptive")
+        self.assertEqual(request_json.call_args_list[3].args[0]["thinking_mode"], "disabled")
 
     def test_evaluation_highlights_downgrade_unqualified_critical_and_deduplicate(self):
         candidates = [{"document_id": "bid-a", "bidder_name": "甲公司", "candidates": []}]
@@ -6243,6 +6243,51 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertTrue(all(len({worker._rule_execution_strategy(rule) for rule in group}) == 1 for group in groups))
         self.assertEqual(next(group for group in groups if group[0]["rule_id"] == "section"), [rules[2]])
 
+    def test_evaluation_batches_and_output_budget_count_compiled_children(self):
+        children = [
+            {"title": f"子检查项{index}", "check_rule": f"逐项核验材料{index}"}
+            for index in range(6)
+        ]
+        rules = [
+            {"rule_id": f"compiled-{index}", "category": "qualification", "title": f"汇总规则{index}",
+             "check_rule": "逐项核验全部要求", "execution_meta_json": json.dumps({
+                 "compiled_child_requirements": children,
+             }, ensure_ascii=False)}
+            for index in range(2)
+        ]
+        simple = {"rule_id": "simple", "category": "qualification", "title": "单点规则", "check_rule": "核验材料"}
+
+        groups = worker._evaluation_rule_batches("review", rules)
+
+        self.assertEqual(len(groups), 2)
+        self.assertGreater(worker._rule_complexity(rules[0]), worker._rule_complexity(simple) + 3)
+        self.assertGreater(
+            worker._combined_batch_output_budget("review", [rules[0]]),
+            worker._combined_batch_output_budget("review", [simple]),
+        )
+
+    def test_evaluation_thinking_policy_preserves_deepseek_reasoning_and_minimax_baseline(self):
+        rule = {"rule_id": "r1", "category": "qualification", "title": "资格核验", "check_rule": "核验证据"}
+        deepseek = {
+            "base_url": "https://api.deepseek.com", "model_name": "deepseek-v4-flash",
+            "thinking_mode": "enabled",
+        }
+        deepseek_disabled = {**deepseek, "thinking_mode": "disabled"}
+        minimax = {
+            "base_url": "https://api.minimaxi.com/v1", "model_name": "MiniMax-M3",
+            "thinking_mode": "adaptive",
+        }
+
+        self.assertEqual(worker._evaluation_thinking_mode(deepseek, "review", [rule]), "enabled")
+        self.assertEqual(worker._evaluation_thinking_mode(deepseek, "subjective", [rule]), "enabled")
+        self.assertEqual(worker._evaluation_thinking_mode(deepseek, "objective", [rule]), "disabled")
+        self.assertEqual(worker._evaluation_thinking_mode(deepseek, "review", [rule], compact=True), "disabled")
+        self.assertEqual(worker._evaluation_thinking_mode(deepseek_disabled, "review", [rule]), "disabled")
+        self.assertEqual(worker._evaluation_thinking_mode(minimax, "review", [rule]), "disabled")
+        self.assertEqual(worker._evaluation_thinking_mode(minimax, "subjective", [rule]), "adaptive")
+        self.assertEqual(worker._evaluation_output_budget(deepseek, "subjective", [rule], "enabled"), 12_000)
+        self.assertEqual(worker._evaluation_output_budget(minimax, "subjective", [rule], "adaptive"), 4_500)
+
     def test_evaluation_request_gate_promotes_then_degrades_one_level_at_a_time(self):
         gate = worker._EvaluationRequestGate(2, max_limit=3)
 
@@ -6319,8 +6364,43 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(finished["result"]["compact_retry_count"], 1)
         self.assertEqual(request_json.call_count, 5)
         self.assertEqual(request_json.call_args_list[0].args[0]["thinking_mode"], "disabled")
-        self.assertEqual(request_json.call_args_list[1].args[0]["thinking_mode"], "adaptive")
+        self.assertEqual(request_json.call_args_list[1].args[0]["thinking_mode"], "disabled")
         self.assertEqual(request_json.call_args_list[2].args[0]["thinking_mode"], "disabled")
+
+    def test_deepseek_fact_review_recovers_length_once_without_splitting_or_losing_rules(self):
+        self._add_pdf("bid.pdf", "bid", "甲公司", "本公司已提供营业执照及纳税证明。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        document = next(item for item in storage.list_documents(self.app, self.project["project_id"]) if item["role"] == "bid")
+        rules = [
+            storage.add_rule(self.app, self.project["project_id"], {
+                "category": "qualification", "title": title, "check_rule": f"核验{title}", "source_text": title,
+            })
+            for title in ("营业执照", "纳税证明")
+        ]
+        task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        profile = storage.get_model_profile(self.app, None)
+        profile["thinking_mode"] = "enabled"
+        recovered = {"results": [
+            {"rule_id": rule["rule_id"], "status": "satisfied", "evidence": rule["title"],
+             "reason": "已提供", "risk_level": "low", "confidence": "high", "evidence_quality": "sufficient"}
+            for rule in rules
+        ]}
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[
+            worker.InvalidJsonResponse("", "length"), recovered,
+        ]) as request_json:
+            results, retry_count, split_count, manual_count, mode = worker._run_combined_batch(
+                self.app, task, profile, document, "review", rules, "综合评审系统提示", 60_000, "事实规则组",
+            )
+
+        self.assertEqual({item["rule_id"] for item in results}, {rule["rule_id"] for rule in rules})
+        self.assertEqual((retry_count, split_count, manual_count), (1, 0, 0))
+        self.assertEqual(mode, "full_document+reasoning_retry")
+        self.assertEqual(request_json.call_count, 2)
+        self.assertEqual(request_json.call_args_list[0].args[0]["thinking_mode"], "enabled")
+        self.assertEqual(request_json.call_args_list[0].kwargs["max_tokens"], 12_000)
+        self.assertEqual(request_json.call_args_list[1].args[0]["thinking_mode"], "disabled")
 
     def test_combined_evaluation_retries_only_truncated_rule_with_compact_prompt(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "本公司已提供中小企业声明函及全部字段。")

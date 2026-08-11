@@ -4,27 +4,35 @@
 handoff_schema: 1
 updated_at: 2026-08-11
 module: evaluation-workbench
-status: clean_no_active_work
-base_commit: 0a55bf0
+status: ready_for_commit
+base_commit: f2c8fef
 branch: main
-working_tree: clean
-remote_github: 0a55bf0
-remote_gitee: 0a55bf0
+working_tree: modified
+remote_github: f2c8fef
+remote_gitee: f2c8fef
 production_commit: 0a55bf0
 prompt_version: vision-evidence-contract-v56
 database_change: none
-user_approval: completed_content_filter_isolation_deployment
+user_approval: approved_local_deepseek_evaluation_optimization_no_commit
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
 
 ## 下一位先做
 
-1. 云端已部署 `0a55bf0`：模型内容策略拒答（包括 HTTP 422）按稳定故障类别进入单元级隔离；全文扫描块保留原文并继续，规则组落为人工核验且任务 `partial_success`，禁止删改材料后重试同一请求。工作台与 AI 网关完整回归 479 项通过。可重跑三原县项目验收，核验不会在全文扫描约三分之一处整体失败。
-2. `0a55bf0` 部署已核验：云端仓库、运行容器 `/app/.build-commit` 均为该版本，容器运行正常。范围候选台账和容量调整仍已生效；未做真实大文件压力验收。
+1. 本地基于三原县 DeepSeek 运行台账完成结构化输出性能修复，尚未提交/部署：首次判断保留既有思考能力，输出预算和分组改为识别编译子项，事实型触顶才严格恢复；完整回归 482 项通过。提交部署后应强制重跑三原县，比较关键结论、耗时、调用数、拆分数和 Token，任一关键结论下降即回退。
+2. 云端仍为 `0a55bf0`，内容策略拒答单元隔离和范围候选台账已生效；本地 HEAD/远程为仅更新交接的 `f2c8fef`。
 3. 已停用接口（`compare-signals` PATCH、`review-results/{id}` PATCH、`score-results/{id}` PATCH、`confirm-auto` ×2）云端验证返回 410；待确认 `rokid_glasses_app` 未调用后再彻底删除路由。
 
 ## 活跃记录（最多 10 条）
+
+### 9. DeepSeek 结构化输出与复合规则分组优化（本地待提交）
+
+- 根因：三原县 2 家、55 条规则耗时约 39 分钟；230 次调用中有 50 次拆分、19 次紧凑重试。DeepSeek 多次在 4K–6.8K 上限内耗尽隐藏思考而只留下极短/空 JSON；义务编译已将多个子项合成规则卡，旧分组器仍只按卡片和评分叶子估算复杂度。
+- 已实施：DeepSeek 首次评审/主观评分显式使用其支持的 `enabled`，并预留有界 12K 生成预算；M3、客观分和首次判断语义不变。事实定位/计数组触顶后才可在原证据上做一次禁用思考的严格恢复，开放语义和主观评分仍拆小并保留思考。分组和输出预算计入 `compiled_child_requirements`/`evidence_items`；全文扫描上限按目录规模最多 4800。
+- 不变契约：不删规则、不缩全文、不改 OCR/多模态证据覆盖、评分和结果结构；未实施父规则到子项级 OCR 削减，待 EvidencePack 可表达逐子项覆盖后再 A/B。
+- 验证：新增能力路由、M3预算不放大、复合子项分组及 DeepSeek 触顶不丢规则测试；工作台与 AI 网关共 482 项全过，`git diff --check` 通过。
+- 待办：用户确认后提交/推送/部署；以三原县为质量基线强制重跑，重点检查此前满意结论全部保留，并统计拆分/紧凑重试是否明显下降。
 
 ### 8. 模型内容策略拒答的单元隔离（已提交、已部署）
 
@@ -52,22 +60,6 @@ user_approval: completed_content_filter_isolation_deployment
 - 不变契约：数据库列与历史数据保留（不破坏性迁移）；展示清洗正则（`final_score=` 记法清洗）与结果表字段无关，保留；worker 计算链不读人工字段，准确度零影响。
 - 待办：黄金项目验收重跑（可选）；`rokid_glasses_app` 兼容性确认后删除 410 路由。
 - 主要文件：`worker.py`、`storage.py`、`collusion_signals.py`、`blueprints/evaluation_workbench.py`、`tests/test_evaluation_workbench.py`。
-
-### 2. 评分原文连续页组装与综合评审隔离（仓库已同步，云端待核验）
-
-- 提交：`c28941e` 及后续提交链（当前 `287d05d`），本地 `main`、GitHub 与 Gitee 均已同步。
-- 范围：评分自动重组只接受唯一明确总分；无可靠总分或多包多总分时不猜测；全表修复必须保持来源条款分值/类别锚点；非评分跨类别候选不合并；编译子项只在父规则候选页内排序，不扩张 OCR/图片预算。
-- 已验证：`tests.test_evaluation_workbench` 与 `tests.test_evaluation_workbench_ai_gateway` 全量通过（2026-08-10 核对），`git diff --check` 通过。
-- 待核验：云端容器 `/app/.build-commit` 为 `unknown`、宿主机 `.deploy-commit` 为 `f7137eb`；CZ 最新任务仍记录旧版本。必须先用 `redeploy.sh` 恢复镜像、容器和任务版本三者一致，再验收；否则不能归因于当前仓库代码。
-- 主要文件：`storage.py`、`worker.py`、`tests/test_evaluation_workbench.py`、稳定设计。
-
-### 3. CZ 两模型规则提取差异（已提交，云端待重建后验收）
-
-- 对比对象：同一文件、同一 v55 提示词、同一旧运行提交 `f7137eb`；MiniMax M3 产生 48 条 AI 规则、DeepSeek V4 Flash 产生 33 条。
-- 关键事实：MiniMax 有 6/18 次调用依赖本地 JSON 修复，两个关键补漏调用只返回 10/12 token，评分总分为 94/100；DeepSeek 评分为 100/100，但语义编译失败而保留了更多重复/宽泛规则。
-- 已实施：镜像 `.build-commit` 存在但无效时，任务与蓝点均明确显示 `unknown`，不再用环境变量、部署记录或 Git 冒充运行版本；评分遗漏/重复归属/总分不守恒时只做定向严格重试和一次全表重组，仍异常则以 `partial_success` 保存草稿并阻断确认；义务编译 JSON 异常时只用原模板重试一次，仍失败回退确定性同源收口。
-- 验证：工作台与 AI 网关全量测试通过（2026-08-10 核对）；新增镜像标记、跨组评分恢复、评分异常判断、补漏失败保留主结果和编译严格重试回归测试。
-- 待完成：云端镜像仍须用 `redeploy.sh` 重建后，分别以 DeepSeek V4 Flash 与 MiniMax M3 重跑同一项目验收。不得为 CZ 或某类条款写特例。
 
 ### 4. 评分校验改为可见提醒（已提交，云端待核验）
 

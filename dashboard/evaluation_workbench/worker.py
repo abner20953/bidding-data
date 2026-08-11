@@ -5702,8 +5702,15 @@ def _rule_complexity(rule: dict) -> float:
     """用结构复杂度而非固定条数估算一次模型输出负担，不参与业务判断。"""
     scoring = _rule_scoring(rule)
     items = scoring.get("items") if isinstance(scoring.get("items"), list) else []
+    compiled_children = _compiled_child_requirements(rule)
+    evidence_items = _rule_evidence_items(rule)
     text_length = len(str(rule.get("check_rule") or "")) + len(str(rule.get("source_text") or ""))
     complexity = 1.0 + min(3.0, len(items) * 0.45) + min(2.0, max(0, text_length - 350) / 700)
+    # 义务编译器把多个原子检查项汇总为一张规则卡后，模型仍须逐项核验。旧分组器
+    # 只按“卡片数”计费，会把一条含多个子检查项的规则误当成普通单点规则，造成
+    # 输出触顶后反复拆分。这里仅修正执行复杂度，不拆散规则、不改变最终结论口径。
+    complexity += min(5.0, max(0, len(compiled_children) - 1) * 0.75)
+    complexity += min(2.0, max(0, len(evidence_items) - 1) * 0.35)
     if _rule_execution_strategy(rule) in {"counting", "section", "consistency"}:
         complexity += 0.35
     return complexity
@@ -5776,14 +5783,55 @@ def _evaluation_rule_batches(component: str, rules: list[dict], scan_index: dict
 
 
 def _combined_batch_output_budget(component: str, rules: list[dict]) -> int:
-    """按规则数量和叶子评分复杂度共同分配输出，避免单条复合规则仍被截断。"""
+    """按规则、评分叶子和义务子项共同分配最终 JSON 输出预算。"""
     count = max(1, len(rules))
     item_count = sum(len((_rule_scoring(rule).get("items") or [])) for rule in rules)
+    child_count = sum(max(1, len(_compiled_child_requirements(rule))) for rule in rules)
+    child_extra = max(0, child_count - count)
     if component == "review":
-        return max(4_000, 1_600 + count * 650 + item_count * 120)
+        return max(4_000, 1_600 + count * 650 + child_extra * 480 + item_count * 120)
     if component == "subjective":
-        return max(4_500, 1_800 + count * 700 + item_count * 320)
-    return max(2_000, 800 + count * 300 + item_count * 220)
+        return max(4_500, 1_800 + count * 700 + child_extra * 420 + item_count * 320)
+    return max(2_000, 800 + count * 300 + child_extra * 280 + item_count * 220)
+
+
+def _evaluation_thinking_mode(profile: dict, component: str, rules: list[dict], *, compact: bool = False) -> str | None:
+    """按任务性质和模型能力选择思考模式，不把服务商判断散落到评审流程。"""
+    capabilities = model_capabilities(profile)
+    modes = {str(value) for value in capabilities.get("thinking_modes") or []}
+    if "disabled" not in modes:
+        # 无法关闭思考的模型保持自身默认行为，后续仍受复杂度分组和失败隔离保护。
+        return None
+    if compact or component == "objective":
+        return "disabled"
+    if component == "review":
+        # MiniMax M3 只声明 adaptive/disabled，既有稳定基线是审查阶段禁用思考。
+        if "adaptive" in modes and "enabled" not in modes:
+            return "disabled"
+    # 除既有的客观分/M3 审查口径外，首次判断始终尊重模型档案设置。DeepSeek
+    # 档案为 enabled 时会显式传入其支持的值，不再被错误的 adaptive 覆盖；这里不以
+    # “简单规则”为由主动关闭思考，确保优化执行速度时不改变已验证的结论质量。
+    configured = str(profile.get("thinking_mode") or "")
+    if configured in modes:
+        return configured
+    if configured == "enabled" and "adaptive" in modes:
+        return "adaptive"
+    if "enabled" in modes:
+        return "enabled"
+    if "adaptive" in modes:
+        return "adaptive"
+    return "disabled"
+
+
+def _evaluation_output_budget(profile: dict, component: str, rules: list[dict], thinking_mode: str | None) -> int | None:
+    """为共享生成预算的思考模型保留最终 JSON 空间；不要求模型用满额度。"""
+    target = _combined_batch_output_budget(component, rules)
+    if thinking_mode in {"enabled", "adaptive"} and not _is_minimax_m3_profile(profile):
+        # 思考与正文是否共享预算属于服务商实现细节；按保守上限准备，正常 stop 会
+        # 提前结束。M3 已由网关按 adaptive 单独预留 16K~24K，不能在这里重复放大。
+        # 相比触顶后重复调用，这既更快也更少 token，且保留复杂判断能力。
+        target = max(12_000, target)
+    return _output_token_budget(profile, target)
 
 
 def _combined_batch_prompt(app, component: str, document: dict, payload: list[dict], text: str, *, compact: bool) -> str:
@@ -6416,7 +6464,10 @@ def _run_full_scan_piece(app, task: dict, profile: dict, document: dict, catalog
     allowed_ids = {item["id"] for item in catalog}
     # 首轮只输出紧凑候选索引。24 条短证据的预算足以闭合 JSON，又比旧的 36 条
     # 结构显著减少长度截断；最终结论仍读取本地全文片段，不以此处的条数代替覆盖率。
-    max_tokens = _output_token_budget(profile, min(3_200, max(1_800, 900 + len(catalog) * 48)))
+    # 正常输出除规则命中外还要容纳彼此独立的范围偏离候选。旧 3200 上限在 50+ 条
+    # 规则时已由云端台账反复证实会截断；按目录规模提高到有界 4800，只给合法 JSON
+    # 留空间，不增加候选条数，也不改变全文覆盖或判断口径。
+    max_tokens = _output_token_budget(profile, min(4_800, max(1_800, 900 + len(catalog) * 70)))
     output_risk = _full_scan_output_risk(catalog, chunk, max_tokens)
     context_mode = f"full_scan:{chunk['chunk_id']}"
 
@@ -10517,11 +10568,9 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
     if context["mode"] == "unmatched_rules":
         reason = "本地页级检索未定位到该规则的直接证据，未发送无关全文；请结合投标文件人工核验。"
         return _combined_manual_results(component, rules, payload, reason), 0, 0, len(rules), context["mode"]
-    # MiniMax M3 的结构化审查在 adaptive 下会把大量预算用于思考并偶发破坏 JSON；
-    # 审查/客观分禁用思考更稳定，主观评分仍保留 adaptive 以维持方案判断质量。
-    thinking_mode = "disabled" if component == "objective" or (
-        component == "review" and _is_minimax_m3_profile(profile)
-    ) else "adaptive"
+    # 首次判断沿用模型档案的思考能力；只在服务商明确支持时传入合法参数。
+    # 这避免 DeepSeek 被错误覆盖为其接口不识别的 adaptive，继而退回服务商默认值。
+    thinking_mode = _evaluation_thinking_mode(profile, component, rules, compact=compact_retry)
 
     def finish(parsed: object, retry_count: int, result_mode: str) -> tuple[list[dict], int, int, int, str]:
         if not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list):
@@ -10587,7 +10636,7 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
             app, task, profile, f"evaluate_all_{component}_batch", system_prompt,
             _combined_batch_prompt(app, component, document, payload, context["text"], compact=compact_retry),
             document_id=document["document_id"], context_mode=f"{label}:{context['mode']}",
-            max_tokens=_output_token_budget(profile, _combined_batch_output_budget(component, rules)), thinking_mode=thinking_mode,
+            max_tokens=_evaluation_output_budget(profile, component, rules, thinking_mode), thinking_mode=thinking_mode,
         )
         return finish(parsed, 0, context["mode"])
     except InvalidJsonResponse as exc:
@@ -10628,6 +10677,34 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
             merged = _merge_compound_score_results(rules[0], left[0][0], right[0][0])
             return [merged], left[1] + right[1], left[2] + right[2] + 1, left[3] + right[3], "split_score_items"
 
+    # 首次思考结果已因触顶而不可用时，只有事实定位/计数类审查才允许在相同证据上
+    # 做一次禁用思考的严格 JSON 恢复。开放语义、范围一致性和所有主观评分仍按原有
+    # 思考模式拆小后重评，避免为了速度牺牲判断质量。
+    retry_without_thinking = (
+        isinstance(format_error, InvalidJsonResponse)
+        and format_error.finish_reason.lower() in {"length", "max_tokens"}
+        and thinking_mode in {"enabled", "adaptive"}
+        and component == "review"
+        and len(rules) > 1
+        and {_rule_execution_strategy(rule) for rule in rules} <= {"point", "counting"}
+        and all(len(_compiled_child_requirements(rule)) <= 2 for rule in rules)
+    )
+    if retry_without_thinking:
+        storage.update_task(app, task["task_id"], message=f"{label} 思考输出达到上限，正在保留原证据并严格生成结论")
+        try:
+            parsed = _request_task_json(
+                app, task, profile, f"evaluate_all_{component}_reasoning_retry", system_prompt,
+                _combined_batch_prompt(app, component, document, payload, context["text"], compact=True),
+                document_id=document["document_id"], context_mode=f"{label}_reasoning_retry:{context['mode']}",
+                max_tokens=_evaluation_output_budget(profile, component, rules, "disabled"), thinking_mode="disabled",
+            )
+            return finish(parsed, 1, f"{context['mode']}+reasoning_retry")
+        except ValueError as retry_exc:
+            if not _is_model_format_error(retry_exc):
+                raise
+            # 保留首次的 length 分类，随后按原有机制拆小规则组；不得把失败的严格
+            # 重试改写成普通格式异常后再重复发送同一大组。
+
     # 截断响应不能可靠补尾；直接拆小规则组，避免把同一大上下文完整重发一遍。
     if isinstance(format_error, InvalidJsonResponse) and format_error.finish_reason.lower() in {"length", "max_tokens"} and len(rules) > 1 and depth < 3:
         storage.update_task(app, task["task_id"], message=f"{label} 输出达到上限，正在仅拆分该规则组")
@@ -10646,7 +10723,7 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
                 app, task, profile, f"evaluate_all_{component}_compact_retry", system_prompt,
                 _combined_batch_prompt(app, component, document, payload, context["text"], compact=True),
                 document_id=document["document_id"], context_mode=f"{label}_compact:{context['mode']}",
-                max_tokens=_output_token_budget(profile, _combined_batch_output_budget(component, rules)), thinking_mode="disabled",
+                max_tokens=_evaluation_output_budget(profile, component, rules, "disabled"), thinking_mode="disabled",
             )
             return finish(parsed, 1, context["mode"])
         except ValueError as retry_exc:
