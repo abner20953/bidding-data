@@ -4,36 +4,36 @@
 handoff_schema: 1
 updated_at: 2026-08-12
 module: evaluation-workbench
-status: local_changes
-base_commit: 6d74e4d
+status: deployed_validation_pending
+base_commit: 418409a
 branch: main
-working_tree: modified
-remote_github: 6d74e4d
-remote_gitee: 6d74e4d
-production_commit: 6d74e4d
+working_tree: clean
+remote_github: 418409a
+remote_gitee: 418409a
+production_commit: 418409a
 prompt_version: vision-evidence-contract-v58（评审版本未变；规则提取指纹已变化）
 database_change: rule execution metadata 新增可选 RC 否决条款身份，无迁移
-user_approval: 已授权实现与云端验收；未授权提交、推送或部署
+user_approval: submitted_pushed_deployed_418409a
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
 
 ## 下一位先做
 
-1. 本地完整回归已通过（495 项，2026-08-12）；本轮仍未提交、未部署，云端仍为 `6d74e4d`/v58。
-2. 用户确认提交部署后，以三原县先做一次 DeepSeek V4 Flash “仅规则提取”A/B：核对 RC 来源、分包、规则数量和关键否决条款；通过后再做一次完整综合评审，比较高风险重点结论、耗时、调用数、Token、OCR 页数与失败单元。
-3. 任一关键结论、规则来源、速度或 Token 无法达到 `6d74e4d` 三原县基线（2026-08-11 任务 `27126ec6-b4cc-44e3-a2b0-a70ad30157d2`）时，不推广 RC 路径，先回退本轮代码；不要改全文扫描重叠或亮点过滤。
-4. OCR 评分反证与 EvidencePack 仍只处于后续规划，未满足三黄金项目连续三轮门槛前不得接管主链。
+1. 云端已部署 `418409a`：build-info `commit=418409a`、`runtime_release_commit=418409a`、`version_consistent=true`，镜像 `.build-commit` 与宿主机 `.deploy-commit` 一致（2026-08-12 09:06 核验），`/pingbiao` 与关键 API 正常。
+2. **三原县 A/B 验收（下一步）**：先做一次 DeepSeek V4 Flash"仅规则提取"A/B，核对 RC 来源、分包、规则数量和关键否决条款；通过后再做一次完整综合评审，对比高风险重点结论、耗时、调用数、Token、OCR 页数与失败单元 vs 基线任务 `27126ec6-b4cc-44e3-a2b0-a70ad30157d2`（6d74e4d，25 分钟/55 规则）。任一关键结论、规则来源、速度或 Token 不达基线时，不推广 RC 路径，先回退本轮代码；不要改全文扫描重叠或亮点过滤。
+3. 已停用接口（`compare-signals` PATCH、`review-results/{id}` PATCH、`score-results/{id}` PATCH、`confirm-auto` ×2）仍返回 410；待确认 `rokid_glasses_app` 未调用后再彻底删除路由。
+4. 若继续工作台代码任务，按 `AI_CONTEXT.md` 的任务路由阅读稳定设计。
 
 ## 活跃记录（最多 10 条）
 
-### 1. 稳定优先的 RC 否决条款台账与进度节流（本地完成，待云端验收）
+### 1. 稳定优先的 RC 否决条款台账与进度节流（已提交、已部署，待三原县 A/B 验收）
 
 - 目标：以原文台账替代 `decision_impact` 对全文正则的主依赖，同时降低高频进度写 SQLite 的锁竞争。
 - 已实施：`RC-*` 仅从稳定 `source_unit_ids` 候选中由一次受约束模型调用确认，要求逐字后果短句，ID 只基于原文身份；校验最近分包标题范围、来源、否定语境和唯一 ID，并完整保存紧凑台账。候选超出单次预算时显式回退旧链路而不截断；RC 未被承接时才定向补提取。义务编译、全文扫描、OCR 和重点结论统一读取同一决策影响；旧类别和高精度原文后备仍兼容。`_EvaluationProgress` 对高频 advance 做 400ms 合并，阶段消息、文件完成和最终状态立即落库。
 - 不变契约：不按项目或投标人写补丁；不自动废标；不改全文覆盖、OCR/图片策略、评分、API 或数据库表结构；RC 调用失败时保留旧链路，不阻断规则提取。
-- 验证：新增来源、否定语境、条件例外、“按无效文件处理”、分包范围、RC 挂接/持久化/溢出回退和进度节流测试；完整回归 495 项通过。对三原县旧规则的本地核查已确认“按无效文件处理”类 4 条后果仍由兼容后备识别，企业关联关系承诺书的关键线索不降级。
-- 风险/待办：RC 额外增加一次紧凑文本调用，必须以三原县 A/B 核验规则数量、关键结论、耗时和 Token；云端自定义提示词与本地规则提取模板指纹须按任务实际值核验。
+- 验证：新增来源、否定语境、条件例外、”按无效文件处理”、分包范围、RC 挂接/持久化/溢出回退和进度节流测试；完整回归 495 项通过；`git diff --check` 与文档校验通过；云端 `418409a` 已部署，build-info `version_consistent=true`。对三原县旧规则的本地核查已确认”按无效文件处理”类 4 条后果仍由兼容后备识别，企业关联关系承诺书的关键线索不降级。
+- 风险/待办：RC 额外增加一次紧凑文本调用，必须以三原县 A/B 核验规则数量、关键结论、耗时和 Token（基线任务 `27126ec6-b4cc-44e3-a2b0-a70ad30157d2`）；云端自定义提示词与本地规则提取模板指纹须按任务实际值核验。
 - 主要文件：`worker.py`、`storage.py`、`prompt_templates.py`、`tests/test_evaluation_workbench.py`、稳定设计。
 
 ### 2. 已部署的三原县基线（保留作 A/B 对照）
