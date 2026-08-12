@@ -4,16 +4,16 @@
 handoff_schema: 1
 updated_at: 2026-08-12
 module: evaluation-workbench
-status: deployed_validation_pending
+status: local_changes
 base_commit: 418409a
 branch: main
-working_tree: clean
+working_tree: worker/test/docs 的未提交事实账本影子层改动
 remote_github: 418409a
 remote_gitee: 418409a
 production_commit: 418409a
 prompt_version: vision-evidence-contract-v58（评审版本未变；规则提取指纹已变化）
 database_change: rule execution metadata 新增可选 RC 否决条款身份，无迁移
-user_approval: submitted_pushed_deployed_418409a
+user_approval: 已授权按稳定优先方式实施；未授权提交、推送或部署本轮本地改动
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
@@ -21,9 +21,10 @@ user_approval: submitted_pushed_deployed_418409a
 ## 下一位先做
 
 1. 云端已部署 `418409a`：build-info `commit=418409a`、`runtime_release_commit=418409a`、`version_consistent=true`，镜像 `.build-commit` 与宿主机 `.deploy-commit` 一致（2026-08-12 09:06 核验），`/pingbiao` 与关键 API 正常。
-2. **三原县 A/B 验收（下一步）**：先做一次 DeepSeek V4 Flash"仅规则提取"A/B，核对 RC 来源、分包、规则数量和关键否决条款；通过后再做一次完整综合评审，对比高风险重点结论、耗时、调用数、Token、OCR 页数与失败单元 vs 基线任务 `27126ec6-b4cc-44e3-a2b0-a70ad30157d2`（6d74e4d，25 分钟/55 规则）。任一关键结论、规则来源、速度或 Token 不达基线时，不推广 RC 路径，先回退本轮代码；不要改全文扫描重叠或亮点过滤。
-3. 已停用接口（`compare-signals` PATCH、`review-results/{id}` PATCH、`score-results/{id}` PATCH、`confirm-auto` ×2）仍返回 410；待确认 `rokid_glasses_app` 未调用后再彻底删除路由。
-4. 若继续工作台代码任务，按 `AI_CONTEXT.md` 的任务路由阅读稳定设计。
+2. **三原县综合评审 A/B 尚未验收通过**：新任务 `17843339-98e8-40bf-85b3-e0fcd231a97f`（418409a）成功，3 份文件、20 分 17 秒、无失败单元；企业关联关系承诺书和范围偏离重点线索保留，聚点旧“名称不一致”经原页核查为旧 OCR 误报。但星飞 P141 的“1 套/3 套且填无偏离”未进入关键要素一致性结论，辰航 P211/P212 的负责人姓名矛盾虽被专项规则发现、却与另一条“一致”结论冲突。根因是全文扫描候选的有损汇总及规则间事实未统一收口；在补足通用的结构化矛盾事实台账、跨规则一致性校验并用三原县复测前，不得把本轮视为质量不劣于基线，也不得继续推广 RC 路径。
+3. 本地已完成事实账本第一步：只读提取跨页表单字段与“要求/响应”数量差异候选，写入现有 EvidencePack 影子层和任务计数；不参与模型输入、选页、OCR、风险、建议分或展示。定向及完整回归 497 项通过。下一步须先部署并用三原县核验候选召回/误报，再决定是否将经原页确认的事实按规则定向注入一致性复核；不得直接开启自动改判。
+4. 已停用接口（`compare-signals` PATCH、`review-results/{id}` PATCH、`score-results/{id}` PATCH、`confirm-auto` ×2）仍返回 410；待确认 `rokid_glasses_app` 未调用后再彻底删除路由。
+5. 若继续工作台代码任务，按 `AI_CONTEXT.md` 的任务路由阅读稳定设计。
 
 ## 活跃记录（最多 10 条）
 
@@ -34,6 +35,7 @@ user_approval: submitted_pushed_deployed_418409a
 - 不变契约：不按项目或投标人写补丁；不自动废标；不改全文覆盖、OCR/图片策略、评分、API 或数据库表结构；RC 调用失败时保留旧链路，不阻断规则提取。
 - 验证：新增来源、否定语境、条件例外、”按无效文件处理”、分包范围、RC 挂接/持久化/溢出回退和进度节流测试；完整回归 495 项通过；`git diff --check` 与文档校验通过；云端 `418409a` 已部署，build-info `version_consistent=true`。对三原县旧规则的本地核查已确认”按无效文件处理”类 4 条后果仍由兼容后备识别，企业关联关系承诺书的关键线索不降级。
 - 风险/待办：RC 额外增加一次紧凑文本调用，必须以三原县 A/B 核验规则数量、关键结论、耗时和 Token（基线任务 `27126ec6-b4cc-44e3-a2b0-a70ad30157d2`）；云端自定义提示词与本地规则提取模板指纹须按任务实际值核验。
+- 云端复测：新任务总 Token 3,118,930（较基线 3,067,026 增约 1.7%），调用 173 次（基线 170 次），2 次输出截断与基线相同；格式本地修复 1 次（基线 3 次）。性能可接受但质量未通过，不以速度掩盖事实漏检。
 - 主要文件：`worker.py`、`storage.py`、`prompt_templates.py`、`tests/test_evaluation_workbench.py`、稳定设计。
 
 ### 2. 已部署的三原县基线（保留作 A/B 对照）
@@ -45,3 +47,10 @@ user_approval: submitted_pushed_deployed_418409a
 
 - 客观分 OCR 反证只进入结构化事实并触发同规则重算，未完成图片确认不得自动扣分；主观分只补理由与页码。
 - EvidencePack 保持影子记录；三原县、太原税务和 sxyh 连续三轮达到关键召回、建议分、错误高风险、失败率、耗时和 Token 门槛后，才可在高价值规则试点正式输入。
+
+### 4. 文档事实账本影子层（本地完成，待云端验证）
+
+- 目标：为跨规则一致性提供可追溯事实候选，先解决“候选丢失”和“同一事实结论冲突”的观测问题，不改变现有评审结果。
+- 范围：仅识别通用表单字段和值差异、以及具有明确要求/响应列结构的数量差异；不含项目、行业、投标人或页码特例，不调用额外模型，不增加 OCR/图片调用。
+- 不变契约：事实候选不参与提示词、选页、OCR、风险、评分、重点结论或 API；无数据库迁移，EvidencePack 只扩展可选 JSON 字段。
+- 验证：新增跨页字段差异、要求/响应数量差异和普通技术数字不误报测试；完整回归 497 项通过。待以三原县云端任务核对候选是否覆盖“1 套/3 套”和负责人姓名差异，并记录误报、耗时与 Token 后再开展第二步。

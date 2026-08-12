@@ -7093,8 +7093,9 @@ def _scan_strategy(rules: list[dict]) -> str:
     return "point"
 
 
-_EVIDENCE_PACK_VERSION = "candidate-v2"
+_EVIDENCE_PACK_VERSION = "candidate-v3"
 _ACQUISITION_PLAN_VERSION = "shadow-v1"
+_FACT_LEDGER_VERSION = "shadow-v1"
 
 
 def _shadow_rule_fingerprint(rule: dict) -> str:
@@ -7402,6 +7403,26 @@ def _build_shadow_evidence_pack(task: dict, document: dict, component: str, rule
             "material_key": material_key, "payload": payload}
 
 
+def _attach_document_fact_ledger_shadow(packs: list[dict], scan_index: dict | None) -> None:
+    """将一份文件的事实账本只附到一个影子包，避免按规则重复占用磁盘。"""
+    if not packs or not isinstance(scan_index, dict):
+        return
+    fact_ledger = scan_index.get("fact_ledger")
+    if not isinstance(fact_ledger, dict):
+        return
+    payload = packs[0].get("payload") if isinstance(packs[0], dict) else None
+    if not isinstance(payload, dict):
+        return
+    payload["document_fact_ledger"] = {
+        "version": str(fact_ledger.get("version") or _FACT_LEDGER_VERSION),
+        "decision_participation": False,
+        "observation_count": int(fact_ledger.get("observation_count") or 0),
+        "conflict_count": int(fact_ledger.get("conflict_count") or 0),
+        "conflicts": [item for item in fact_ledger.get("conflicts", []) if isinstance(item, dict)][:24],
+        "storage_scope": "one_pack_per_document",
+    }
+
+
 def _build_rule_evidence_ledger(scan: dict, rules: list[dict]) -> dict[str, dict]:
     """将全文扫描和本地召回合成为逐规则证据账本。
 
@@ -7536,6 +7557,145 @@ def _form_date_page_fragments(chunks: list[dict]):
         for index, current in enumerate(markers):
             end = markers[index + 1].start() if index + 1 < len(markers) else len(text)
             yield chunk, int(current.group(1)), text[current.end():end], current.end()
+
+
+# 事实台账只识别跨项目稳定的“表单字段”和“响应对照表结构”。它是影子观察层，
+# 不把候选直接升级为风险或分数，避免一次本地抽取误差改变当前结论。
+_FACT_LEDGER_LABELS = (
+    "法定代表人", "单位负责人", "项目负责人", "授权代表", "委托代理人",
+    "投标人名称", "供应商名称", "项目名称", "项目编号", "投标有效期", "响应有效期",
+    "交货期", "服务期限", "质保期", "总报价", "投标报价",
+)
+_FACT_LEDGER_LABEL_RE = re.compile(
+    r"(?P<label>" + "|".join(re.escape(value) for value in _FACT_LEDGER_LABELS) + r")"
+    r"\s*(?:[:：]|为|是)\s*(?P<value>[^\n\r|｜]{1,80})"
+)
+_FACT_LEDGER_VALUE_END_RE = re.compile(r"\s*(?:，|。|；|;|\(|（|\[|【|\||｜).*$")
+_FACT_LEDGER_TABLE_HEADERS = re.compile(
+    r"(?:招标|采购|技术|规格|参数|需求|要求).{0,40}(?:投标|响应|承诺|供货|偏离)"
+    r"|(?:投标|响应|承诺|供货|偏离).{0,40}(?:招标|采购|技术|规格|参数|需求|要求)",
+    re.S,
+)
+_FACT_LEDGER_TABLE_DECLARATION = re.compile(r"无偏离|无偏差|完全响应|均无偏离")
+_FACT_LEDGER_QUANTITY_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?P<number>\d+(?:\.\d+)?)\s*(?P<unit>台|套|个|项|份|名|人|张|只|部|台/套|批|组|家|年|月|日|小时|%|％)"
+)
+
+
+def _fact_ledger_normalize_value(value: object) -> str:
+    """归一表单值，仅用于判断是否存在需复核的不同填写值。"""
+    text = _FACT_LEDGER_VALUE_END_RE.sub("", _clean_model_text(value))
+    text = re.sub(r"\s+", "", text).strip("：:；;，,。.、")
+    return text[:80]
+
+
+def _fact_ledger_excerpt(text: str, start: int, end: int, *, limit: int = 220) -> str:
+    left = max(0, start - 80)
+    right = min(len(text), end + 140)
+    return _clean_model_text(text[left:right])[:limit]
+
+
+def _build_document_fact_ledger(chunks: list[dict], *, observation_limit: int = 120,
+                                conflict_limit: int = 24) -> dict:
+    """从已解析全文建立只读的结构化事实候选账本。
+
+    该函数不依赖项目、行业或投标人名称，也不调用模型。它只记录来源明确的表单字段
+    和“要求/响应”对照表中的不同数量，供后续在独立 A/B 验证后做跨规则一致性复核。
+    当前阶段不被提示词、结论、OCR 路由或评分读取。
+    """
+    observations: list[dict] = []
+    seen_observations: set[tuple[str, str, int | None, str]] = set()
+
+    def add_observation(kind: str, field: str, value: str, chunk_id: str, page: int | None,
+                        evidence: str, *, extra: dict | None = None) -> None:
+        normalized = _fact_ledger_normalize_value(value)
+        if not field or not normalized or len(observations) >= max(1, observation_limit):
+            return
+        key = (kind, field, page, normalized)
+        if key in seen_observations:
+            return
+        seen_observations.add(key)
+        item = {
+            "fact_id": f"F-{len(observations) + 1:03d}", "kind": kind,
+            "field": field, "value": normalized, "chunk_id": chunk_id,
+            "page": page, "evidence": evidence[:220], "source": "local_structure",
+        }
+        if extra:
+            item.update(extra)
+        observations.append(item)
+
+    for chunk, page, body, _offset in _form_date_page_fragments(chunks):
+        chunk_id = str(chunk.get("chunk_id") or "")
+        if not body.strip():
+            continue
+        for match in _FACT_LEDGER_LABEL_RE.finditer(body):
+            label = str(match.group("label") or "").strip()
+            value = _fact_ledger_normalize_value(match.group("value"))
+            # 名称/代表人字段的值通常很短；异常长的段落是双栏/表格错位候选，
+            # 影子层不把它伪装成可靠字段事实。
+            if not value or len(value) > 56:
+                continue
+            add_observation(
+                "label_value", label, value, chunk_id, page,
+                _fact_ledger_excerpt(body, match.start(), match.end()),
+            )
+
+        # 仅在同页出现“要求/响应”列结构时提取两端的可比数量；纯参数正文里的
+        # 多个数字不会进入。记录的是“数量不同”事实，不推断正/负偏离或是否否决。
+        if not _FACT_LEDGER_TABLE_HEADERS.search(body):
+            continue
+        quantities = list(_FACT_LEDGER_QUANTITY_RE.finditer(body))
+        if len(quantities) < 2:
+            continue
+        for index in range(len(quantities) - 1):
+            left, right = quantities[index], quantities[index + 1]
+            if left.group("unit") != right.group("unit"):
+                continue
+            if abs(right.start() - left.end()) > 240:
+                continue
+            expected = f"{left.group('number')}{left.group('unit')}"
+            response = f"{right.group('number')}{right.group('unit')}"
+            if expected == response:
+                continue
+            evidence = _fact_ledger_excerpt(body, left.start(), right.end())
+            add_observation(
+                "requirement_response_quantity", "要求与响应数量", response, chunk_id, page, evidence,
+                extra={
+                    "expected_value": expected, "response_value": response,
+                    "declaration": "no_deviation" if _FACT_LEDGER_TABLE_DECLARATION.search(evidence) else "",
+                },
+            )
+
+    conflicts: list[dict] = []
+    by_field: dict[str, list[dict]] = {}
+    for item in observations:
+        if item.get("kind") == "label_value":
+            by_field.setdefault(str(item.get("field") or ""), []).append(item)
+        elif item.get("kind") == "requirement_response_quantity":
+            conflicts.append({
+                "conflict_id": f"C-{len(conflicts) + 1:03d}", "kind": "requirement_response_quantity",
+                "field": item.get("field"), "expected_value": item.get("expected_value"),
+                "response_value": item.get("response_value"), "declaration": item.get("declaration"),
+                "fact_ids": [item.get("fact_id")], "pages": [item.get("page")],
+                "evidence": item.get("evidence"), "confidence": "medium",
+            })
+    for field, values in by_field.items():
+        distinct = {str(item.get("value") or "") for item in values}
+        if len(distinct) < 2:
+            continue
+        conflicts.append({
+            "conflict_id": f"C-{len(conflicts) + 1:03d}", "kind": "same_label_different_value",
+            "field": field, "values": sorted(distinct),
+            "fact_ids": [item.get("fact_id") for item in values],
+            "pages": sorted({item.get("page") for item in values if item.get("page") is not None}),
+            "evidence": "；".join(str(item.get("evidence") or "") for item in values[:4])[:600],
+            "confidence": "medium",
+        })
+    return {
+        "version": _FACT_LEDGER_VERSION, "decision_participation": False,
+        "observations": observations, "conflicts": conflicts[:max(1, conflict_limit)],
+        "observation_count": len(observations), "conflict_count": min(len(conflicts), max(1, conflict_limit)),
+    }
 
 
 def _form_date_kind(text: str) -> str:
@@ -11733,10 +11893,15 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
         scan_index["evidence_ledger"] = _build_rule_evidence_ledger(
             scan_index, review_rules + objective_rules + subjective_rules,
         )
+        # 结构化事实台账当前只作影子记录：它独立于模型扫描候选，保留跨页字段
+        # 和“要求/响应”数量差异的来源，尚不参与选页、提示词、OCR、评分或结论。
+        # 这样可先用真实任务验证召回，不让尚未验收的机制影响既有结果。
+        scan_index["fact_ledger"] = _build_document_fact_ledger(scan_index.get("chunks", []))
         # 仅供本地结果归因使用，绝不随提示词发送给模型；避免模型把招标原文中的
         # 参数写法误判为投标文件自身矛盾。
         scan_index["tender_technical_baseline"] = _project_tender_technical_baseline(app, task["project_id"])
     ledger = scan_index.get("evidence_ledger", {}) if scan_index else {}
+    fact_ledger = scan_index.get("fact_ledger", {}) if scan_index else {}
     values = {
         "reused_document_count": 0,
         "full_scan_document_count": 1 if scan_index else 0,
@@ -11750,6 +11915,8 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
         "evidence_ledger_empty_rule_count": sum(
             1 for value in ledger.values() if not value.get("candidates")
         ) if isinstance(ledger, dict) else 0,
+        "fact_ledger_observation_count": int(fact_ledger.get("observation_count") or 0) if isinstance(fact_ledger, dict) else 0,
+        "fact_ledger_conflict_count": int(fact_ledger.get("conflict_count") or 0) if isinstance(fact_ledger, dict) else 0,
         "local_ocr_rule_count": 0,
         "local_ocr_skipped_rule_count": 0,
         "local_ocr_seconds": 0.0,
@@ -12000,6 +12167,7 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
                     # 单条规则的影子构造失败不影响其他规则和文档完成状态。
                     traceback.print_exc()
         if shadow_packs:
+            _attach_document_fact_ledger_shadow(shadow_packs, scan_index)
             storage.save_evidence_packs(
                 app, task["project_id"], task["task_id"], document["document_id"],
                 str(document.get("sha256") or ""), shadow_packs,
@@ -12515,6 +12683,7 @@ def _evaluate_all(app, task: dict) -> dict:
     compact_retry_count = split_retry_count = 0
     manual_fallback_rule_count = 0
     evidence_ledger_rule_count = evidence_ledger_empty_rule_count = 0
+    fact_ledger_observation_count = fact_ledger_conflict_count = 0
     failed_units: list[dict] = []
     reused_document_count = 0
     batch_count = 0
@@ -12576,6 +12745,8 @@ def _evaluate_all(app, task: dict) -> dict:
         manual_fallback_rule_count += value.get("manual_fallback_rule_count", 0)
         evidence_ledger_rule_count += value.get("evidence_ledger_rule_count", 0)
         evidence_ledger_empty_rule_count += value.get("evidence_ledger_empty_rule_count", 0)
+        fact_ledger_observation_count += value.get("fact_ledger_observation_count", 0)
+        fact_ledger_conflict_count += value.get("fact_ledger_conflict_count", 0)
         failed_units.extend(item for item in value.get("failed_units", []) if isinstance(item, dict))
         batch_count += value.get("batch_count", 0)
         full_scan_document_count += value.get("full_scan_document_count", 0)
@@ -12630,6 +12801,9 @@ def _evaluate_all(app, task: dict) -> dict:
             "price_review_reconciled_count": price_review_reconciled_count,
             "evidence_ledger_rule_count": evidence_ledger_rule_count,
             "evidence_ledger_empty_rule_count": evidence_ledger_empty_rule_count,
+            "fact_ledger_mode": "shadow_only",
+            "fact_ledger_observation_count": fact_ledger_observation_count,
+            "fact_ledger_conflict_count": fact_ledger_conflict_count,
             "local_ocr_rule_count": local_ocr_rule_count,
             "local_ocr_skipped_rule_count": local_ocr_skipped_rule_count,
             "local_ocr_seconds": round(local_ocr_seconds, 2),

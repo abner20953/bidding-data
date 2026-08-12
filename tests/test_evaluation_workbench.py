@@ -3740,6 +3740,55 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(reused["evidence_pack_candidate_pages"], [12])
         self.assertEqual(reused["status"], "manual")
 
+    def test_document_fact_ledger_only_records_generic_cross_page_candidates(self):
+        chunks = [{
+            "chunk_id": "chunk-1", "start_page": 1, "end_page": 3,
+            "text": (
+                "[第1页]法定代表人：王甲\n"
+                "[第2页]法定代表人：李乙\n"
+                "[第3页]采购需求｜投标响应｜偏离情况\n"
+                "服务数量 1套 3套 无偏离"
+            ),
+        }]
+        ledger = worker._build_document_fact_ledger(chunks)
+
+        self.assertTrue(ledger["decision_participation"] is False)
+        self.assertGreaterEqual(ledger["observation_count"], 3)
+        conflicts = {item["kind"]: item for item in ledger["conflicts"]}
+        self.assertEqual(conflicts["same_label_different_value"]["field"], "法定代表人")
+        self.assertEqual(conflicts["same_label_different_value"]["values"], ["李乙", "王甲"])
+        quantity = conflicts["requirement_response_quantity"]
+        self.assertEqual(quantity["expected_value"], "1套")
+        self.assertEqual(quantity["response_value"], "3套")
+        self.assertEqual(quantity["declaration"], "no_deviation")
+
+    def test_document_fact_ledger_does_not_treat_plain_technical_numbers_as_response_conflict(self):
+        ledger = worker._build_document_fact_ledger([{
+            "chunk_id": "chunk-1", "start_page": 1, "end_page": 1,
+            "text": "[第1页]系统由1套主机、3套终端和2台交换设备组成。",
+        }])
+        self.assertEqual(ledger["observation_count"], 0)
+        self.assertEqual(ledger["conflicts"], [])
+
+    def test_fact_ledger_shadow_is_observational_and_persisted_without_result_change(self):
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "法定代表人：王甲")
+        rule = storage.add_rule(self.app, self.project["project_id"], {"category": "compliance", "title": "关键要素一致性"})
+        task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        result = {"rule_id": rule["rule_id"], "status": "satisfied", "evidence": "原有结论", "reason": "原有理由"}
+        scan = {
+            "chunks": [{"chunk_id": "chunk-1", "start_page": 1, "end_page": 2,
+                        "text": "[第1页]法定代表人：王甲\n[第2页]法定代表人：李乙"}],
+        }
+        scan["fact_ledger"] = worker._build_document_fact_ledger(scan["chunks"])
+        before = dict(result)
+        pack = worker._build_shadow_evidence_pack(task, document, "review", rule, result, scan)
+        worker._attach_document_fact_ledger_shadow([pack], scan)
+
+        self.assertEqual(result, before)
+        payload = pack["payload"]
+        self.assertTrue(payload["document_fact_ledger"]["decision_participation"] is False)
+        self.assertGreater(payload["document_fact_ledger"]["conflict_count"], 0)
+
     def test_shadow_acquisition_plan_is_generic_and_does_not_change_result(self):
         rule = {
             "rule_id": "certificate", "title": "材料证明", "check_rule": "核验材料名称、型号、编号和有效期",
