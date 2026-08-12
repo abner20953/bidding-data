@@ -4,16 +4,16 @@
 handoff_schema: 1
 updated_at: 2026-08-12
 module: evaluation-workbench
-status: local_changes
-base_commit: 418409a
+status: deployed_validation_pending
+base_commit: ffac408
 branch: main
-working_tree: worker/test/docs 的未提交事实账本影子层改动
+working_tree: clean
 remote_github: 418409a
 remote_gitee: 418409a
-production_commit: 418409a
+production_commit: ffac408
 prompt_version: vision-evidence-contract-v58（评审版本未变；规则提取指纹已变化）
 database_change: rule execution metadata 新增可选 RC 否决条款身份，无迁移
-user_approval: 已授权按稳定优先方式实施；未授权提交、推送或部署本轮本地改动
+user_approval: submitted_pushed_deployed_ffac408
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
@@ -22,7 +22,7 @@ user_approval: 已授权按稳定优先方式实施；未授权提交、推送�
 
 1. 云端已部署 `418409a`：build-info `commit=418409a`、`runtime_release_commit=418409a`、`version_consistent=true`，镜像 `.build-commit` 与宿主机 `.deploy-commit` 一致（2026-08-12 09:06 核验），`/pingbiao` 与关键 API 正常。
 2. **三原县综合评审 A/B 尚未验收通过**：新任务 `17843339-98e8-40bf-85b3-e0fcd231a97f`（418409a）成功，3 份文件、20 分 17 秒、无失败单元；企业关联关系承诺书和范围偏离重点线索保留，聚点旧“名称不一致”经原页核查为旧 OCR 误报。但星飞 P141 的“1 套/3 套且填无偏离”未进入关键要素一致性结论，辰航 P211/P212 的负责人姓名矛盾虽被专项规则发现、却与另一条“一致”结论冲突。根因是全文扫描候选的有损汇总及规则间事实未统一收口；在补足通用的结构化矛盾事实台账、跨规则一致性校验并用三原县复测前，不得把本轮视为质量不劣于基线，也不得继续推广 RC 路径。
-3. 本地已完成事实账本第一步：只读提取跨页表单字段与“要求/响应”数量差异候选，写入现有 EvidencePack 影子层和任务计数；不参与模型输入、选页、OCR、风险、建议分或展示。定向及完整回归 497 项通过。下一步须先部署并用三原县核验候选召回/误报，再决定是否将经原页确认的事实按规则定向注入一致性复核；不得直接开启自动改判。
+3. 事实账本第一步已部署：只读提取跨页表单字段与“要求/响应”数量差异候选，写入现有 EvidencePack 影子层和任务计数；不参与模型输入、选页、OCR、风险、建议分或展示。定向及完整回归 498 项通过；云端 `build-info` 已核验 `ffac408`、`version_consistent=true`，工作台返回 200。下一步须用三原县核验候选召回/误报，再决定是否将经原页确认的事实按规则定向注入一致性复核；不得直接开启自动改判。
 4. 已停用接口（`compare-signals` PATCH、`review-results/{id}` PATCH、`score-results/{id}` PATCH、`confirm-auto` ×2）仍返回 410；待确认 `rokid_glasses_app` 未调用后再彻底删除路由。
 5. 若继续工作台代码任务，按 `AI_CONTEXT.md` 的任务路由阅读稳定设计。
 
