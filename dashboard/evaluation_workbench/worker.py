@@ -4955,7 +4955,8 @@ def _is_copying_only_rule(rule: dict) -> bool:
     return any(term in text for term in ("照抄", "照搬", "机械复制"))
 
 
-def _normalise_review_results(output: object, rules: list[dict], tender_baseline: object = "") -> list[dict]:
+def _normalise_review_results(output: object, rules: list[dict], tender_baseline: object = "",
+                              source_chunks: list[dict] | None = None) -> list[dict]:
     by_id = {item["rule_id"]: item for item in rules}
     normalized = []
     for item in output if isinstance(output, list) else []:
@@ -5019,6 +5020,20 @@ def _normalise_review_results(output: object, rules: list[dict], tender_baseline
             }
             if status == "not_satisfied":
                 status = "partial"
+        # 数量填写不同是可复核事实，但“响应数量更多”本身不等于虚假、无效或否决。
+        # 只有招标原文已明确数量必须相等、不得正偏离或设置上限时，才允许把该差异
+        # 直接升级为强负面业务后果。该收口只约束自动确定性，不掩盖原始差异事实。
+        quantity_guard = _unqualified_positive_quantity_difference(item, rule)
+        if quantity_guard:
+            item = {**item, **quantity_guard}
+            status = "partial"
+        # 高风险结论必须至少有可回溯的解析原文支撑。此处不重新判断业务语义，也不
+        # 触发额外模型调用；仅在模型给出的关键填写值无法在已解析全文中复核时显式
+        # 回落为待人工确认，防止 OCR/模型幻觉被展示成确定性高风险。
+        source_guard = _unbacked_high_risk_evidence_guard(item, status, source_chunks)
+        if source_guard:
+            item = {**item, **source_guard}
+            status = "partial"
         visual_rule = _rule_requires_visual_verification(rule)
         # OCR 规则在当前流程尚未真正识别图像时，不能因文本层未命中就输出高风险
         # 不满足；模型若在理由中明确提出 OCR 缺口，也统一回落到待 OCR。
@@ -5046,6 +5061,157 @@ def _normalise_review_results(output: object, rules: list[dict], tender_baseline
         for rule in rules if rule["rule_id"] not in returned_ids
     )
     return normalized
+
+
+_QUANTITY_FACT_PATTERN = r"(?P<number>\d+(?:\.\d+)?)\s*(?P<unit>台|套|个|项|份|名|人|张|只|部|批|组|家|年|月|日|小时|%|％)"
+_QUANTITY_VALUE_PATTERN = r"\d+(?:\.\d+)?\s*(?:台|套|个|项|份|名|人|张|只|部|批|组|家|年|月|日|小时|%|％)"
+_POSITIVE_QUANTITY_DIFFERENCE_PATTERNS = (
+    re.compile(
+        r"(?:招标|采购|要求|需求|规格|参数).{0,80}?" + _QUANTITY_VALUE_PATTERN
+        + r".{0,80}?(?:投标|响应|提供|填写|承诺).{0,80}?" + _QUANTITY_VALUE_PATTERN,
+        re.S,
+    ),
+    re.compile(
+        r"(?:投标|响应|提供|填写|承诺).{0,80}?" + _QUANTITY_VALUE_PATTERN
+        + r".{0,80}?(?:招标|采购|要求|需求|规格|参数).{0,80}?" + _QUANTITY_VALUE_PATTERN,
+        re.S,
+    ),
+)
+_EXPLICIT_QUANTITY_CONSTRAINT_PATTERN = re.compile(
+    r"(?:完全一致|必须一致|数量一致|不得偏离|不允许.{0,8}偏离|不得超过|不超过|最多|上限|"
+    r"限(?:于|为)|≤|小于等于|不得大于|仅限)",
+)
+_HIGH_RISK_CONTRADICTION_PATTERN = re.compile(r"(?:不一致|矛盾|不同|虚假|冒用|错填|错误填写|前后不一)")
+_HIGH_RISK_FIELD_VALUE_PATTERN = re.compile(
+    r"(?:供应商名称|投标人名称|法定代表人|单位负责人|项目负责人|授权代表|委托代理人|"
+    r"项目名称|项目编号|总报价|投标报价)\s*(?:为|是|[:：])\s*[“\"']?"
+    r"(?P<value>[^，,。；;\n\r]{2,80})"
+)
+
+
+def _parse_quantity_value(value: str) -> tuple[Decimal, str] | None:
+    match = re.fullmatch(_QUANTITY_FACT_PATTERN, str(value or "").strip())
+    if not match:
+        return None
+    try:
+        return Decimal(match.group("number")), match.group("unit").replace("％", "%")
+    except InvalidOperation:
+        return None
+
+
+def _positive_quantity_difference(item: dict) -> tuple[str, str] | None:
+    """只提取模型已明确写出的“要求/响应”同单位数量差异，不从正文猜测。"""
+    text = "\n".join(_clean_model_text(item.get(key)) for key in ("evidence", "reason", "summary"))
+    for index, pattern in enumerate(_POSITIVE_QUANTITY_DIFFERENCE_PATTERNS):
+        match = pattern.search(text)
+        if not match:
+            continue
+        # 只接受一个要求值对应一个响应值的明确表述。复合参数含多组数量时不在此
+        # 做本地配对，避免把“1 台主机、3 台终端”误解为彼此存在数量差异。
+        values = [f"{number}{unit}" for number, unit in re.findall(
+            r"(\d+(?:\.\d+)?)\s*(台|套|个|项|份|名|人|张|只|部|批|组|家|年|月|日|小时|%|％)",
+            match.group(0),
+        )]
+        if len(values) != 2:
+            continue
+        first, second = (_parse_quantity_value(values[0]), _parse_quantity_value(values[1]))
+        if not first or not second or first[1] != second[1]:
+            continue
+        required, response = (first, second) if index == 0 else (second, first)
+        if response[0] > required[0]:
+            return values[0] if index == 0 else values[1], values[1] if index == 0 else values[0]
+    return None
+
+
+def _unqualified_positive_quantity_difference(item: dict, rule: dict) -> dict | None:
+    """防止将未设上限的正偏离直接推断为虚假或否决。"""
+    difference = _positive_quantity_difference(item)
+    if not difference:
+        return None
+    rule_text = " ".join(_clean_model_text(rule.get(key)) for key in ("title", "check_rule", "source_text"))
+    if _EXPLICIT_QUANTITY_CONSTRAINT_PATTERN.search(rule_text):
+        return None
+    required, response = difference
+    page_hint = _clean_model_text(item.get("page_hint"))
+    page_text = f"（{page_hint}）" if page_hint else ""
+    return {
+        "risk_level": "medium",
+        "confidence": "medium",
+        "evidence_quality": "limited",
+        "evidence": f"已定位到数量填写差异{page_text}：要求{required}，响应{response}。",
+        "reason": (
+            "当前规则原文未明确数量必须相等、不得正偏离或设置上限；该差异需结合条款口径和偏离表填写方式人工确认，"
+            "不能仅据此认定虚假、无效或否决。"
+        ),
+        "summary": f"要求{required}、响应{response}存在数量差异，需确认是否允许正偏离。",
+    }
+
+
+def _source_text_for_evidence_guard(chunks: list[dict] | None) -> str:
+    if not isinstance(chunks, list):
+        return ""
+    return "\n".join(str(chunk.get("text") or "") for chunk in chunks if isinstance(chunk, dict))
+
+
+def _evidence_guard_normalize(value: object) -> str:
+    return re.sub(r"[\s\u3000，,。；;：:、|｜()（）\[\]【】'\"“”]", "", _clean_model_text(value)).lower()
+
+
+def _evidence_has_source_anchor(evidence: str, source_text: str) -> bool:
+    """证据摘录至少要有一段可在解析全文复核的直接原文锚点。"""
+    source = _evidence_guard_normalize(source_text)
+    if len(source) < 8:
+        return False
+    for clause in re.split(r"[\n。；;！!？?]+", _clean_model_text(evidence)):
+        compact = _evidence_guard_normalize(clause)
+        if len(compact) < 8:
+            continue
+        if compact in source:
+            return True
+        # 模型可能只截取原句的一部分；连续 12 字锚点仍可避免“泛泛关键词命中”。
+        for start in range(0, max(0, len(compact) - 11)):
+            if compact[start:start + 12] in source:
+                return True
+    return False
+
+
+def _unbacked_field_values(text: str, source_text: str) -> list[str]:
+    source = _evidence_guard_normalize(source_text)
+    values: list[str] = []
+    for match in _HIGH_RISK_FIELD_VALUE_PATTERN.finditer(_clean_model_text(text)):
+        raw = match.group("value")
+        for value in re.split(r"(?:与|和|、|/|分别为|分别是)", raw):
+            value = re.sub(r"(?:不一致|不同|矛盾|前后不一|错误|错填|虚假).*$", "", value).strip(" ：:，,。；;“”\"'")
+            compact = _evidence_guard_normalize(value)
+            if len(compact) >= 4 and compact not in source:
+                values.append(value[:48])
+    return list(dict.fromkeys(values))[:3]
+
+
+def _unbacked_high_risk_evidence_guard(item: dict, status: str, source_chunks: list[dict] | None) -> dict | None:
+    """把无原文锚点的高风险模型断言回落为显式待核验，不重跑整组。"""
+    risk = _enum_text(item.get("risk_level"), {"low", "medium", "high"}, "medium")
+    if risk != "high" or status not in {"not_satisfied", "partial"}:
+        return None
+    source_text = _source_text_for_evidence_guard(source_chunks)
+    if not source_text:
+        return None  # 兼容短文件和历史调用：没有完整来源时不擅自改变旧结果。
+    evidence = _clean_model_text(item.get("evidence"))
+    combined = f"{evidence} {_clean_model_text(item.get('reason'))} {_clean_model_text(item.get('summary'))}"
+    unbacked_values = _unbacked_field_values(combined, source_text) if _HIGH_RISK_CONTRADICTION_PATTERN.search(combined) else []
+    no_anchor = not _evidence_has_source_anchor(evidence, source_text)
+    if not unbacked_values and not no_anchor:
+        return None
+    pending = "高风险结论中的关键事实尚未与已解析原文形成可复核对应，需回看原页确认；当前不得作为确定性否决依据。"
+    if unbacked_values:
+        pending = f"{pending} 待核验填写值：{'、'.join(unbacked_values)}。"
+    return {
+        "risk_level": "medium",
+        "confidence": "low",
+        "evidence_quality": "limited",
+        "reason": pending,
+        "summary": "关键填写值待原页核验，暂不形成确定性高风险结论。",
+    }
 
 
 def _review_result_from_model(item: dict, rule_id: str, status: str, *, scope_rule: bool = False) -> dict:
@@ -7095,7 +7261,7 @@ def _scan_strategy(rules: list[dict]) -> str:
 
 _EVIDENCE_PACK_VERSION = "candidate-v3"
 _ACQUISITION_PLAN_VERSION = "shadow-v1"
-_FACT_LEDGER_VERSION = "shadow-v1"
+_FACT_LEDGER_VERSION = "shadow-v2"
 
 
 def _shadow_rule_fingerprint(rule: dict) -> str:
@@ -7567,7 +7733,7 @@ _FACT_LEDGER_LABELS = (
     "交货期", "服务期限", "质保期", "总报价", "投标报价",
 )
 _FACT_LEDGER_LABEL_RE = re.compile(
-    r"(?P<label>" + "|".join(re.escape(value) for value in _FACT_LEDGER_LABELS) + r")"
+    r"(?:^|[\n\r|｜])\s*(?P<label>" + "|".join(re.escape(value) for value in _FACT_LEDGER_LABELS) + r")"
     r"\s*(?:[:：]|为|是)\s*(?P<value>[^\n\r|｜]{1,80})"
 )
 _FACT_LEDGER_VALUE_END_RE = re.compile(r"\s*(?:，|。|；|;|\(|（|\[|【|\||｜).*$")
@@ -7579,6 +7745,13 @@ _FACT_LEDGER_TABLE_HEADERS = re.compile(
 _FACT_LEDGER_TABLE_DECLARATION = re.compile(r"无偏离|无偏差|完全响应|均无偏离")
 _FACT_LEDGER_QUANTITY_RE = re.compile(
     r"(?<![A-Za-z0-9])(?P<number>\d+(?:\.\d+)?)\s*(?P<unit>台|套|个|项|份|名|人|张|只|部|台/套|批|组|家|年|月|日|小时|%|％)"
+)
+_FACT_LEDGER_GENERIC_VALUES = re.compile(
+    r"^(?:同一人|同一单位|同一主体|本单位|本公司|投标人|供应商|法定代表人|单位负责人|"
+    r"项目负责人|详见|见附件|无|不适用|/|-|—)"
+)
+_FACT_LEDGER_QUANTITY_ROW_SUBJECT = re.compile(
+    r"(?:数量|台数|套数|份数|人数|规模|配置|规格|参数|服务|供货|采购|需求|投标|响应|偏离)"
 )
 
 
@@ -7593,6 +7766,24 @@ def _fact_ledger_excerpt(text: str, start: int, end: int, *, limit: int = 220) -
     left = max(0, start - 80)
     right = min(len(text), end + 140)
     return _clean_model_text(text[left:right])[:limit]
+
+
+def _fact_ledger_row(text: str, start: int, end: int) -> str:
+    """返回同一解析行/表格单元，避免把相邻独立行的数字错误配对。"""
+    left = text.rfind("\n", 0, start)
+    right = text.find("\n", end)
+    if right < 0:
+        right = len(text)
+    return text[left + 1:right]
+
+
+def _fact_ledger_requirement_first(text: str) -> bool:
+    """根据表头的左右顺序判断数量列归属；无明确表头时不生成影子差异。"""
+    requirement_positions = [text.find(value) for value in ("招标", "采购", "要求", "需求", "规格", "参数") if text.find(value) >= 0]
+    response_positions = [text.find(value) for value in ("投标", "响应", "承诺", "供货", "偏离") if text.find(value) >= 0]
+    if not requirement_positions or not response_positions:
+        return False
+    return min(requirement_positions) < min(response_positions)
 
 
 def _build_document_fact_ledger(chunks: list[dict], *, observation_limit: int = 120,
@@ -7633,7 +7824,7 @@ def _build_document_fact_ledger(chunks: list[dict], *, observation_limit: int = 
             value = _fact_ledger_normalize_value(match.group("value"))
             # 名称/代表人字段的值通常很短；异常长的段落是双栏/表格错位候选，
             # 影子层不把它伪装成可靠字段事实。
-            if not value or len(value) > 56:
+            if not value or len(value) > 56 or _FACT_LEDGER_GENERIC_VALUES.search(value):
                 continue
             add_observation(
                 "label_value", label, value, chunk_id, page,
@@ -7642,7 +7833,7 @@ def _build_document_fact_ledger(chunks: list[dict], *, observation_limit: int = 
 
         # 仅在同页出现“要求/响应”列结构时提取两端的可比数量；纯参数正文里的
         # 多个数字不会进入。记录的是“数量不同”事实，不推断正/负偏离或是否否决。
-        if not _FACT_LEDGER_TABLE_HEADERS.search(body):
+        if not _FACT_LEDGER_TABLE_HEADERS.search(body) or not _fact_ledger_requirement_first(body):
             continue
         quantities = list(_FACT_LEDGER_QUANTITY_RE.finditer(body))
         if len(quantities) < 2:
@@ -7652,6 +7843,13 @@ def _build_document_fact_ledger(chunks: list[dict], *, observation_limit: int = 
             if left.group("unit") != right.group("unit"):
                 continue
             if abs(right.start() - left.end()) > 240:
+                continue
+            row = _fact_ledger_row(body, left.start(), right.end())
+            # 只有两个数位于同一行/单元，且该行自身明确是数量、参数或响应事项时才
+            # 形成候选。页面其他位置存在表头不足以把 90%、8%、1% 之类独立数值配对。
+            if not _FACT_LEDGER_QUANTITY_ROW_SUBJECT.search(row):
+                continue
+            if not _FACT_LEDGER_TABLE_DECLARATION.search(row) and not re.search(r"[|｜]", row):
                 continue
             expected = f"{left.group('number')}{left.group('unit')}"
             response = f"{right.group('number')}{right.group('unit')}"
@@ -8207,9 +8405,9 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
 
 
 def _combined_batch_results(component: str, output: object, rules: list[dict], payload: list[dict],
-                            tender_baseline: object = "") -> list[dict]:
+                            tender_baseline: object = "", source_chunks: list[dict] | None = None) -> list[dict]:
     if component == "review":
-        return _normalise_review_results(output, rules, tender_baseline)
+        return _normalise_review_results(output, rules, tender_baseline, source_chunks)
     return _normalise_score_results(output, payload, component)
 
 
@@ -11105,12 +11303,13 @@ def _merge_compound_score_results(rule: dict, left: dict, right: dict) -> dict:
 
 
 def _normalise_partial_combined_results(component: str, output: list[dict], rules: list[dict],
-                                        tender_baseline: object = "") -> tuple[list[dict], list[dict]]:
+                                        tender_baseline: object = "",
+                                        source_chunks: list[dict] | None = None) -> tuple[list[dict], list[dict]]:
     returned_ids = {item.get("rule_id") for item in output if isinstance(item, dict)}
     present_rules = [item for item in rules if item["rule_id"] in returned_ids]
     missing_rules = [item for item in rules if item["rule_id"] not in returned_ids]
     payload = _combined_batch_payload(component, present_rules)
-    return _combined_batch_results(component, output, present_rules, payload, tender_baseline), missing_rules
+    return _combined_batch_results(component, output, present_rules, payload, tender_baseline, source_chunks), missing_rules
 
 
 def _run_combined_batch(app, task: dict, profile: dict, document: dict, component: str, rules: list[dict],
@@ -11172,6 +11371,7 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
         tender_baseline = str((scan_index or {}).get("tender_technical_baseline") or "")
         results, missing_rules = _normalise_partial_combined_results(
             component, parsed["results"], rules, tender_baseline,
+            (scan_index or {}).get("chunks") if isinstance(scan_index, dict) else None,
         )
         if component == "review":
             results = _apply_form_date_consistency_guard(

@@ -532,6 +532,16 @@ _extend_prompt("evaluate_all_review_user", "金额与声明函溯源", "\n\n" + 
 _extend_prompt("evaluate_all_objective_user", "金额与声明函溯源", "\n\n" + _EVIDENCE_TRACEABILITY_GUIDANCE)
 _extend_prompt("evaluate_all_cross_bid_price_user", "金额与声明函溯源", "\n\n" + _EVIDENCE_TRACEABILITY_GUIDANCE)
 
+# 高风险结论必须与原页事实分离表达。该约束不改变“直接反证仍应提示”的既有口径，
+# 只阻止模型把未被条款明示约束的填写差异推断成自动否决。
+_HIGH_RISK_EVIDENCE_CLOSURE_GUIDANCE = (
+    "高风险、无效或否决候选必须在 evidence 中分别写出至少两段可定位的投标文件原文事实及页码；"
+    "不得凭概括、目录、推测或名称近似补造填写值。对‘要求数量/响应数量’差异，应先如实报告两个值及偏离栏填写；"
+    "仅当本规则原文明确要求数量相等、不得正偏离、设置上限，或明确规定该差异的后果时，才可推断为虚假、无效或否决。"
+    "未见此类明确约束时，只能写‘数量差异需按条款口径人工确认’，不得扩大为否决结论。"
+)
+_extend_prompt("evaluate_all_review_user", "高风险证据闭环", "\n\n" + _HIGH_RISK_EVIDENCE_CLOSURE_GUIDANCE)
+
 
 
 # 范围偏离判断的画像基准与可解释性检验（2026-08-06 人工对照审查后补充，类型无关）

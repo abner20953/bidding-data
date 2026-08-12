@@ -646,6 +646,79 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("满足招标≥30mm", results[0]["reason"])
         self.assertNotIn("差异未披露", results[0]["evidence"])
 
+    def test_positive_quantity_difference_without_explicit_constraint_is_not_direct_rejection(self):
+        rule = {
+            "rule_id": "quantity", "title": "响应数量核验",
+            "check_rule": "核对响应填写情况", "source_text": "供应商应如实填写响应表。",
+        }
+        result = worker._normalise_review_results([{
+            "rule_id": "quantity", "status": "not_satisfied", "risk_level": "high", "confidence": "high",
+            "page_hint": "第12页", "evidence": "第12页招标要求1套，投标响应3套，偏离栏填写无偏离。",
+            "reason": "数量不一致，构成虚假填写并应取消资格。",
+            "summary": "数量不一致，建议取消资格。",
+        }], [rule])[0]
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["risk_level"], "medium")
+        self.assertIn("要求1套，响应3套", result["evidence"])
+        self.assertIn("不能仅据此认定虚假", result["reason"])
+
+    def test_positive_quantity_difference_keeps_high_risk_when_rule_explicitly_forbids_deviation(self):
+        rule = {
+            "rule_id": "quantity", "title": "响应数量核验",
+            "check_rule": "数量必须一致，不得偏离", "source_text": "响应数量必须一致，不得偏离。",
+        }
+        result = worker._normalise_review_results([{
+            "rule_id": "quantity", "status": "not_satisfied", "risk_level": "high", "confidence": "high",
+            "page_hint": "第12页", "evidence": "第12页招标要求1套，投标响应3套，偏离栏填写无偏离。",
+            "reason": "数量不一致。",
+        }], [rule])[0]
+
+        self.assertEqual(result["status"], "not_satisfied")
+        self.assertEqual(result["risk_level"], "high")
+
+    def test_compound_quantity_list_is_not_locally_paired_as_one_difference(self):
+        rule = {"rule_id": "quantity", "title": "参数响应", "check_rule": "核对参数", "source_text": "按参数响应。"}
+        result = worker._normalise_review_results([{
+            "rule_id": "quantity", "status": "not_satisfied", "risk_level": "high", "confidence": "high",
+            "evidence": "招标要求1台主机、3台终端，投标响应1台主机、3台终端。",
+            "reason": "模型提示需复核。",
+        }], [rule])[0]
+
+        self.assertEqual(result["status"], "not_satisfied")
+        self.assertEqual(result["risk_level"], "high")
+
+    def test_high_risk_unbacked_field_value_is_explicitly_downgraded_to_pending(self):
+        rule = {"rule_id": "identity", "title": "主体信息一致性", "check_rule": "核对供应商名称一致性"}
+        chunks = [{
+            "chunk_id": "chunk-1", "start_page": 1, "end_page": 2,
+            "text": "[第1页]供应商名称：山西聚点未来生物科技有限公司\n[第2页]供应商名称：山西聚点未来生物科技有限公司",
+        }]
+        result = worker._normalise_review_results([{
+            "rule_id": "identity", "status": "not_satisfied", "risk_level": "high", "confidence": "high",
+            "page_hint": "第1-2页", "evidence": "供应商名称：山西聚点未来生物科技有限公司与西聚点未来物科技有限公司不一致。",
+            "reason": "主体名称前后不一致。", "summary": "主体名称不一致。",
+        }], [rule], source_chunks=chunks)[0]
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["risk_level"], "medium")
+        self.assertIn("待核验填写值", result["reason"])
+
+    def test_high_risk_with_two_source_backed_values_is_retained(self):
+        rule = {"rule_id": "identity", "title": "主体信息一致性", "check_rule": "核对法定代表人一致性"}
+        chunks = [{
+            "chunk_id": "chunk-1", "start_page": 1, "end_page": 2,
+            "text": "[第1页]法定代表人：王顺清\n[第2页]单位负责人：张顺清",
+        }]
+        result = worker._normalise_review_results([{
+            "rule_id": "identity", "status": "not_satisfied", "risk_level": "high", "confidence": "high",
+            "page_hint": "第1-2页", "evidence": "第1页法定代表人：王顺清；第2页单位负责人：张顺清。",
+            "reason": "负责人姓名不一致。", "summary": "负责人姓名存在矛盾。",
+        }], [rule], source_chunks=chunks)[0]
+
+        self.assertEqual(result["status"], "not_satisfied")
+        self.assertEqual(result["risk_level"], "high")
+
     def test_parse_task_reuses_successful_parse_cache(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案：稳定运行。")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
@@ -3766,6 +3839,18 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         ledger = worker._build_document_fact_ledger([{
             "chunk_id": "chunk-1", "start_page": 1, "end_page": 1,
             "text": "[第1页]系统由1套主机、3套终端和2台交换设备组成。",
+        }])
+        self.assertEqual(ledger["observation_count"], 0)
+        self.assertEqual(ledger["conflicts"], [])
+
+    def test_fact_ledger_ignores_generic_statement_and_cross_row_numbers(self):
+        ledger = worker._build_document_fact_ledger([{
+            "chunk_id": "chunk-1", "start_page": 1, "end_page": 1,
+            "text": (
+                "[第1页]单位负责人为同一人时，应按关联关系处理。\n"
+                "采购需求｜投标响应｜偏离情况\n"
+                "服务质量 90%\n交付进度 8%\n验收比例 1%\n"
+            ),
         }])
         self.assertEqual(ledger["observation_count"], 0)
         self.assertEqual(ledger["conflicts"], [])
