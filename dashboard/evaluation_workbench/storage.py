@@ -252,6 +252,7 @@ def task_prompt_template_fingerprint(app, task_type: str) -> str | None:
             "extract_rules_supplement_user",
             "extract_rules_qualification_supplement_user",
             "extract_rules_hard_anchor_supplement_user",
+            "extract_rules_rejection_ledger_user",
             "extract_rules_dedupe_adjudication_user",
             "extract_rules_obligation_compile_user",
             "extract_rules_scoring_structure_repair_user",
@@ -2853,6 +2854,41 @@ def rule_acquisition_recommendation(rule: dict) -> dict:
     }
 
 
+def _normalise_rejection_clauses(value: object) -> list[dict]:
+    """保存可追溯的 RC 台账摘要；只接受来源明确的可选元数据。"""
+    rows = value if isinstance(value, list) else []
+    result: list[dict] = []
+    seen: set[str] = set()
+    for row in rows[:48]:
+        if not isinstance(row, dict):
+            continue
+        clause_id = str(row.get("clause_id") or "").strip()
+        if not clause_id.startswith("RC-") or clause_id in seen:
+            continue
+        source_units = row.get("source_unit_ids") if isinstance(row.get("source_unit_ids"), list) else []
+        source_units = list(dict.fromkeys(str(item).strip() for item in source_units if str(item).strip()))[:24]
+        quote = str(row.get("consequence_quote") or "").strip()[:500]
+        if not source_units or not quote:
+            continue
+        source_pages = row.get("source_pages") if isinstance(row.get("source_pages"), list) else []
+        source_pages = sorted({int(page) for page in source_pages if isinstance(page, int) and page > 0})[:24]
+        scope = str(row.get("scope") or "").strip()
+        if scope not in {"current_package", "all_packages"}:
+            scope = "all_packages"
+        result.append({
+            "clause_id": clause_id,
+            "source_unit_ids": source_units,
+            "source_pages": source_pages,
+            "trigger": str(row.get("trigger") or "").strip()[:500],
+            "consequence_quote": quote,
+            "consequence": str(row.get("consequence") or "").strip()[:500],
+            "exceptions": str(row.get("exceptions") or "").strip()[:500],
+            "scope": scope,
+        })
+        seen.add(clause_id)
+    return result
+
+
 def rule_execution_meta(rule: dict) -> dict:
     """读取可向后兼容的规则执行元数据；旧规则安全回退为空元数据。"""
     raw = rule.get("execution_meta_json")
@@ -2903,6 +2939,18 @@ def rule_execution_meta(rule: dict) -> dict:
     if not isinstance(source_unit_ids, list):
         source_unit_ids = []
     source_unit_ids = [str(item).strip() for item in source_unit_ids if str(item).strip()]
+    rejection_clause_ids = value.get("rejection_clause_ids")
+    if not isinstance(rejection_clause_ids, list):
+        rejection_clause_ids = []
+    rejection_clause_ids = list(dict.fromkeys(
+        item for raw in rejection_clause_ids if (item := str(raw).strip()).startswith("RC-")
+    ))[:48]
+    rejection_clauses = _normalise_rejection_clauses(value.get("rejection_clauses"))
+    if rejection_clauses:
+        rejection_clause_ids = [item["clause_id"] for item in rejection_clauses]
+    decision_impact_source = str(value.get("decision_impact_source") or "").strip()
+    if decision_impact_source not in {"", "rule_category", "legacy_source_fallback", "rc_ledger"}:
+        decision_impact_source = ""
     verification_target = str(value.get("verification_target") or "").strip()
     verifiability = str(value.get("verifiability") or "").strip()
     if verifiability not in {"single_bid", "cross_bid", "external_procedure"}:
@@ -2980,6 +3028,12 @@ def rule_execution_meta(rule: dict) -> dict:
             "check_rule": check_rule,
             "source_page": page if isinstance(page, int) and page > 0 else None,
             "source_unit_ids": list(dict.fromkeys(str(item).strip() for item in source_units if str(item).strip()))[:24],
+            "rejection_clause_ids": list(dict.fromkeys(
+                item for raw in child.get("rejection_clause_ids") or []
+                if (item := str(raw).strip()).startswith("RC-")
+            ))[:48],
+            "rejection_clauses": _normalise_rejection_clauses(child.get("rejection_clauses")),
+            "decision_impact_source": str(child.get("decision_impact_source") or "") if str(child.get("decision_impact_source") or "") in {"", "rule_category", "legacy_source_fallback", "rc_ledger"} else "",
             # 子项的取证语义必须随汇总规则一并落库。它当前主要供全文扫描和
             # 后续图片取证规划读取；缺失时仍按父规则安全回退。
             "evidence_requirements": list(dict.fromkeys(child_requirements)),
@@ -2999,6 +3053,9 @@ def rule_execution_meta(rule: dict) -> dict:
         "source_clause_ids": list(dict.fromkeys(clause_ids)),
         "source_fact_ids": list(dict.fromkeys(fact_ids)),
         "source_unit_ids": list(dict.fromkeys(source_unit_ids)),
+        "rejection_clause_ids": rejection_clause_ids,
+        "rejection_clauses": rejection_clauses,
+        "decision_impact_source": decision_impact_source,
         "verification_target": verification_target,
         "verifiability": verifiability,
         "source_locations": normalised_locations,
@@ -3095,6 +3152,18 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
     if not isinstance(source_unit_ids, list):
         source_unit_ids = []
     source_unit_ids = [str(item).strip() for item in source_unit_ids if str(item).strip()]
+    rejection_clause_ids = payload.get("rejection_clause_ids", base.get("rejection_clause_ids"))
+    if not isinstance(rejection_clause_ids, list):
+        rejection_clause_ids = []
+    rejection_clause_ids = list(dict.fromkeys(
+        item for raw in rejection_clause_ids if (item := str(raw).strip()).startswith("RC-")
+    ))[:48]
+    rejection_clauses = _normalise_rejection_clauses(payload.get("rejection_clauses", base.get("rejection_clauses")))
+    if rejection_clauses:
+        rejection_clause_ids = [item["clause_id"] for item in rejection_clauses]
+    decision_impact_source = str(payload.get("decision_impact_source", base.get("decision_impact_source")) or "").strip()
+    if decision_impact_source not in {"", "rule_category", "legacy_source_fallback", "rc_ledger"}:
+        decision_impact_source = ""
     verification_target = str(payload.get("verification_target", base.get("verification_target")) or "").strip()
     verifiability = str(payload.get("verifiability", base.get("verifiability")) or "").strip()
     if verifiability not in {"single_bid", "cross_bid", "external_procedure"}:
@@ -3172,6 +3241,12 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
             "check_rule": check_rule,
             "source_page": page if isinstance(page, int) and page > 0 else None,
             "source_unit_ids": list(dict.fromkeys(str(item).strip() for item in source_units if str(item).strip()))[:24],
+            "rejection_clause_ids": list(dict.fromkeys(
+                item for raw in child.get("rejection_clause_ids") or []
+                if (item := str(raw).strip()).startswith("RC-")
+            ))[:48],
+            "rejection_clauses": _normalise_rejection_clauses(child.get("rejection_clauses")),
+            "decision_impact_source": str(child.get("decision_impact_source") or "") if str(child.get("decision_impact_source") or "") in {"", "rule_category", "legacy_source_fallback", "rc_ledger"} else "",
             "evidence_requirements": list(dict.fromkeys(child_requirements)),
             "ocr_required": bool(child.get("ocr_required")),
             "baseline_ocr_mode": child_baseline_ocr_mode,
@@ -3189,6 +3264,9 @@ def _execution_meta_json(payload: dict, *, fallback: dict | None = None) -> str 
         "source_clause_ids": list(dict.fromkeys(clause_ids)),
         "source_fact_ids": list(dict.fromkeys(fact_ids)),
         "source_unit_ids": list(dict.fromkeys(source_unit_ids)),
+        "rejection_clause_ids": rejection_clause_ids,
+        "rejection_clauses": rejection_clauses,
+        "decision_impact_source": decision_impact_source,
         "verification_target": verification_target,
         "verifiability": verifiability,
         "source_locations": normalised_locations,

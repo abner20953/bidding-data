@@ -1413,6 +1413,7 @@ def _source_units_for_text(text: str, *, source_document_key: str) -> list[dict]
     if not pages:
         pages = [str(text or "").strip()] if str(text or "").strip() else []
     units: list[dict] = []
+    active_package_numbers: set[int] = set()
     for page_index, page_text in enumerate(pages, start=1):
         marker = re.match(r"\[第(\d+)页\]\s*", page_text)
         page = int(marker.group(1)) if marker else page_index
@@ -1423,18 +1424,30 @@ def _source_units_for_text(text: str, *, source_document_key: str) -> list[dict]
         ordinal = 0
         for paragraph in paragraphs:
             lines = [line.strip() for line in paragraph.splitlines() if line.strip()]
-            pieces: list[str] = []
+            pieces: list[tuple[str, set[int]]] = []
             current: list[str] = []
             size = 0
             for line in lines:
+                heading = _PACKAGE_HEADING_PATTERN.match(line)
+                if heading:
+                    heading_number = _normalise_package_number(heading.group(0))
+                    if heading_number is not None:
+                        # 新分包标题属于后续条文的结构上下文；先封存上一段，避免同一
+                        # 原文单元同时继承两个包号而让后续 RC 台账无法可靠校验范围。
+                        if current:
+                            pieces.append(("\n".join(current), set(active_package_numbers)))
+                            current, size = [], 0
+                        active_package_numbers = {heading_number}
                 if current and (size + len(line) + 1 > 900 or len(current) >= 8):
-                    pieces.append("\n".join(current))
+                    pieces.append(("\n".join(current), set(active_package_numbers)))
                     current, size = [], 0
                 current.append(line)
                 size += len(line) + 1
             if current:
-                pieces.append("\n".join(current))
-            for piece in pieces or [paragraph]:
+                pieces.append(("\n".join(current), set(active_package_numbers)))
+            if not pieces:
+                pieces = [(paragraph, set(active_package_numbers))]
+            for piece, package_numbers in pieces:
                 value = piece.strip()
                 if not value:
                     continue
@@ -1444,6 +1457,9 @@ def _source_units_for_text(text: str, *, source_document_key: str) -> list[dict]
                     "unit_id": f"SU-{document_key}-P{page}-{ordinal}-{digest}",
                     "page": page,
                     "text": value,
+                    # 仅分包标题的连续上下文才写入范围；正文中提到其他包的字样只作
+                    # 文本内容保留，不能擅自改变本单元所属包。
+                    "package_numbers": sorted(package_numbers),
                 })
     return units
 
@@ -1534,33 +1550,258 @@ _NON_SCORE_VERIFIABILITY = {"single_bid", "cross_bid", "external_procedure"}
 # 这是招投标文件中稳定的法律/程序后果表达，而不是某个项目的业务词表。它只用于
 # 规则类别、重点结论资格和结构化风险传递，不直接根据命中的字面文本作出废标结论。
 _FORMAL_REJECTION_OUTCOME_PATTERN = re.compile(
-    r"(?:投标|响应|磋商|报价|文件).{0,12}(?:无效|被拒绝|予以否决|不通过)"
-    r"|(?:无效(?:投标|响应|磋商|报价|文件)?)"
-    r"|(?:予以否决|否决(?:投标|响应|磋商|报价)?|取消(?:投标|响应|磋商)?资格)"
+    r"(?:投标|响应|磋商|报价|文件).{0,12}(?:作?无效|被拒绝|予以否决|不通过)"
+    r"|(?:(?:否则|一律|均|将|应|按).{0,8}(?:作|为|视为|予以|按).{0,4}(?:无效(?:投标|响应|磋商|报价|文件)?|否决(?:投标|响应|磋商|报价)?|废标处理))"
+    r"|(?:(?:按|作|视为).{0,4}无效(?:投标|响应|磋商|报价|文件)?(?:处理)?)"
+    r"|(?:取消(?:投标|响应|磋商)?资格|不予受理|作废处理)"
     r"|(?:不得再?参加.{0,18}(?:采购|投标|响应|磋商))"
+)
+_NEGATED_REJECTION_OUTCOME_PATTERN = re.compile(
+    r"(?:不作为|不应(?:当)?|并非|不是).{0,16}(?:无效|否决|废标|拒绝|取消资格)"
+    r"|(?:不得(?:仅|因|据|以)?[^。；;\n]{0,12}(?:认定|视为|作)[^。；;\n]{0,8}(?:无效|否决|废标|拒绝|取消资格))"
 )
 
 
 def _has_formal_rejection_consequence(rule: dict) -> bool:
-    """仅从招标原文判断规则是否含明确否决后果，避免相信模型补写的后果。"""
-    return bool(_FORMAL_REJECTION_OUTCOME_PATTERN.search(str(rule.get("source_text") or "")))
+    """仅作存量兼容的高精度后备判断，不代替后续结构化否决条款台账。"""
+    text = str(rule.get("source_text") or "")
+    for sentence in re.split(r"[。；;\n]+", text):
+        if _FORMAL_REJECTION_OUTCOME_PATTERN.search(sentence) and not _NEGATED_REJECTION_OUTCOME_PATTERN.search(sentence):
+            return True
+    return False
+
+
+def _rule_rejection_clause_ids(rule: dict) -> list[str]:
+    values = rule.get("rejection_clause_ids") if isinstance(rule, dict) else None
+    if not isinstance(values, list):
+        return []
+    return list(dict.fromkeys(
+        value for raw in values if (value := str(raw or "").strip()).startswith("RC-")
+    ))[:48]
+
+
+def _rule_decision_impact_info(rule: dict) -> dict:
+    """集中计算规则决策影响及来源，供提取、评审、OCR 与重点结论共享。"""
+    clause_ids = _rule_rejection_clause_ids(rule)
+    if clause_ids:
+        return {"impact": "rejection", "source": "rc_ledger", "rejection_clause_ids": clause_ids}
+    category = str(rule.get("category") or "")
+    explicit_source = str(rule.get("decision_impact_source") or "")
+    if explicit_source == "legacy_source_fallback" and _has_formal_rejection_consequence(rule):
+        return {"impact": "rejection", "source": explicit_source, "rejection_clause_ids": []}
+    if category == "rejection":
+        return {"impact": "rejection", "source": "rule_category", "rejection_clause_ids": []}
+    children = _compiled_child_requirements(rule)
+    for child in children:
+        child_info = _rule_decision_impact_info(child)
+        if child_info["impact"] == "rejection":
+            return child_info
+    if _has_formal_rejection_consequence(rule):
+        return {"impact": "rejection", "source": "legacy_source_fallback", "rejection_clause_ids": []}
+    if category in {"qualification", "compliance", "substantive"}:
+        return {"impact": "material", "source": "rule_category", "rejection_clause_ids": []}
+    return {"impact": "ordinary", "source": "", "rejection_clause_ids": []}
 
 
 def _rule_decision_impact(rule: dict) -> str:
-    """返回规则的结构化决策影响，不依赖页面标题或模型风险措辞。"""
-    category = str(rule.get("category") or "")
-    if category == "rejection" or _has_formal_rejection_consequence(rule):
-        return "rejection"
-    children = _compiled_child_requirements(rule)
-    if any(
-        str(child.get("category") or "") == "rejection"
-        or _has_formal_rejection_consequence(child)
-        for child in children
-    ):
-        return "rejection"
-    if category in {"qualification", "compliance", "substantive"}:
-        return "material"
-    return "ordinary"
+    return _rule_decision_impact_info(rule)["impact"]
+
+
+def _attach_decision_impact_metadata(rules: list[dict]) -> list[dict]:
+    """在落库前保存统一身份来源；不改变规则文本、启用状态或业务结论。"""
+    values: list[dict] = []
+    for item in rules:
+        if not isinstance(item, dict):
+            continue
+        value = dict(item)
+        children = value.get("compiled_child_requirements")
+        if isinstance(children, list):
+            normalised_children = []
+            for child in children:
+                if not isinstance(child, dict):
+                    continue
+                child_value = dict(child)
+                child_info = _rule_decision_impact_info(child_value)
+                child_value["decision_impact"] = child_info["impact"]
+                child_value["decision_impact_source"] = child_info["source"]
+                child_value["rejection_clause_ids"] = child_info["rejection_clause_ids"]
+                normalised_children.append(child_value)
+            value["compiled_child_requirements"] = normalised_children
+        info = _rule_decision_impact_info(value)
+        value["decision_impact"] = info["impact"]
+        value["decision_impact_source"] = info["source"]
+        value["rejection_clause_ids"] = info["rejection_clause_ids"]
+        values.append(value)
+    return values
+
+
+# RC 台账的本地职责仅是高召回候选、来源校验和身份挂接；是否构成正式否决后果
+# 由受约束模型依据原文确认。候选词均为稳定的法律/程序后果结构词，不包含项目业务词。
+_REJECTION_LEDGER_CANDIDATE_PATTERN = re.compile(
+    r"无效|否决|废标|取消.{0,6}资格|不予受理|被拒绝|不得再?参加.{0,24}(?:采购|投标|响应|磋商)"
+)
+_REJECTION_LEDGER_OUTCOME_PATTERN = re.compile(
+    r"无效|否决|废标|取消.{0,6}资格|不予受理|拒绝|不得再?参加"
+)
+
+
+def _rejection_clause_candidate_packets(source_unit_catalog: dict[str, dict], package_number: int | None) -> tuple[list[dict], dict]:
+    """从稳定原文单元高召回收集 RC 候选；超出单次安全预算时显式回退旧链路。"""
+    packets: list[dict] = []
+    for unit_id, unit in source_unit_catalog.items():
+        text = str(unit.get("text") or "").strip()
+        if not text or not _REJECTION_LEDGER_CANDIDATE_PATTERN.search(text):
+            continue
+        unit_packages = {
+            int(value) for value in unit.get("package_numbers") or []
+            if isinstance(value, int) or str(value).isdigit()
+        }
+        if package_number is not None and unit_packages and unit_packages != {package_number}:
+            continue
+        packets.append({
+            "source_unit_ids": [str(unit_id)],
+            "source_page": unit.get("page"),
+            "package_numbers": sorted(unit_packages),
+            "text": text[:1_000],
+        })
+    stats = {"candidate_total": len(packets), "selected_count": len(packets), "overflow": False}
+    # RC 只允许一次紧凑整理调用。不能悄悄截断后部条款、再把不完整台账当作全覆盖；
+    # 候选超出该调用的验证预算时，整条增强路径跳过并回退既有类别/原文后备。
+    if len(packets) > 72:
+        return [], {**stats, "selected_count": 0, "overflow": True}
+    return packets, stats
+
+
+def _rejection_clause_ledger_prompt(app, packets: list[dict], package_scope_instruction: str) -> str:
+    return storage.render_prompt_template(
+        app,
+        "extract_rules_rejection_ledger_user",
+        package_scope=package_scope_instruction,
+        candidates=json.dumps(packets, ensure_ascii=False, separators=(",", ":")),
+    )
+
+
+def _normalise_rejection_clause_ledger(value: object, source_unit_catalog: dict[str, dict], package_number: int | None) -> list[dict]:
+    """校验 RC 输出只能引用原文单元；不允许模型凭摘要生成否决身份。"""
+    rows = value.get("clauses") if isinstance(value, dict) else None
+    if not isinstance(rows, list):
+        return []
+    clauses: list[dict] = []
+    seen: set[str] = set()
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        unit_ids = _normalise_source_unit_ids(raw.get("source_unit_ids"), source_unit_catalog)
+        trigger = _clean_model_text(raw.get("trigger"))[:500]
+        consequence_quote = _clean_model_text(raw.get("consequence_quote"))[:500]
+        consequence = _clean_model_text(raw.get("consequence"))[:500]
+        exceptions = _clean_model_text(raw.get("exceptions"))[:500]
+        if (
+            not unit_ids or not trigger or not consequence or not consequence_quote
+            or not _REJECTION_LEDGER_OUTCOME_PATTERN.search(consequence_quote)
+        ):
+            continue
+        source_text = "\n".join(str(source_unit_catalog[unit_id].get("text") or "") for unit_id in unit_ids)
+        source_scope = {
+            int(number) for unit_id in unit_ids
+            for number in source_unit_catalog[unit_id].get("package_numbers") or []
+            if isinstance(number, int) or str(number).isdigit()
+        }
+        if package_number is not None and source_scope and source_scope != {package_number}:
+            continue
+        quote_identity = storage._normalise_rule_source(consequence_quote)
+        quote_sentence = next((
+            sentence for sentence in re.split(r"[。；;\n]+", source_text)
+            if quote_identity and quote_identity in storage._normalise_rule_source(sentence)
+        ), "")
+        # 原文候选必须实际包含稳定后果标记；否定语境只检查该逐字后果所在句，避免
+        # 相邻条款的“不得认定无效”误伤另一条独立的明确否决条款。
+        if (
+            len(quote_identity) < 4
+            or not quote_sentence
+            or not _REJECTION_LEDGER_CANDIDATE_PATTERN.search(quote_sentence)
+            or _NEGATED_REJECTION_OUTCOME_PATTERN.search(quote_sentence)
+        ):
+            continue
+        # 身份只能由可复核的原文位置和逐字后果短句决定，不能掺入模型的概括措辞。
+        fingerprint = "|".join([*sorted(unit_ids), quote_identity])
+        clause_id = f"RC-{hashlib.sha1(fingerprint.encode('utf-8')).hexdigest()[:12]}"
+        if clause_id in seen:
+            continue
+        seen.add(clause_id)
+        clauses.append({
+            "clause_id": clause_id,
+            "source_unit_ids": unit_ids,
+            "source_pages": sorted({int(source_unit_catalog[unit_id].get("page") or 0) for unit_id in unit_ids if source_unit_catalog[unit_id].get("page")}),
+            "trigger": trigger,
+            "consequence_quote": consequence_quote,
+            "consequence": consequence,
+            "exceptions": exceptions,
+            "scope": "current_package" if package_number is not None and source_scope == {package_number} else "all_packages",
+        })
+    return clauses
+
+
+def _attach_rejection_clause_ledger(rules: list[dict], clauses: list[dict]) -> list[dict]:
+    """以共享 source_unit_ids 挂接 RC 身份；只扩展元数据，不改写规则正文。"""
+    clause_by_unit: dict[str, list[dict]] = {}
+    for clause in clauses:
+        if not isinstance(clause, dict):
+            continue
+        clause_id = str(clause.get("clause_id") or "").strip()
+        if not clause_id.startswith("RC-"):
+            continue
+        for unit_id in clause.get("source_unit_ids") or []:
+            if str(unit_id or "").strip():
+                clause_by_unit.setdefault(str(unit_id), []).append(clause)
+
+    values: list[dict] = []
+    for raw in rules:
+        if not isinstance(raw, dict):
+            continue
+        value = dict(raw)
+        children = value.get("compiled_child_requirements")
+        if isinstance(children, list):
+            value["compiled_child_requirements"] = _attach_rejection_clause_ledger(children, clauses)
+        matched = [
+            clause for unit_id in _rule_source_unit_ids(value)
+            for clause in clause_by_unit.get(unit_id, [])
+        ]
+        child_clauses = [
+            clause for child in value.get("compiled_child_requirements") or [] if isinstance(child, dict)
+            for clause in child.get("rejection_clauses") or [] if isinstance(clause, dict)
+        ]
+        existing_clauses = [clause for clause in value.get("rejection_clauses") or [] if isinstance(clause, dict)]
+        all_clauses = [*existing_clauses, *matched, *child_clauses]
+        clause_records = []
+        seen_ids: set[str] = set()
+        for clause in all_clauses:
+            clause_id = str(clause.get("clause_id") or "").strip()
+            if not clause_id.startswith("RC-") or clause_id in seen_ids:
+                continue
+            seen_ids.add(clause_id)
+            clause_records.append(dict(clause))
+        if clause_records:
+            value["rejection_clauses"] = clause_records
+            value["rejection_clause_ids"] = [str(clause["clause_id"]) for clause in clause_records]
+            value["decision_impact"] = "rejection"
+            value["decision_impact_source"] = "rc_ledger"
+        values.append(value)
+    return values
+
+
+def _unlinked_rejection_clauses(clauses: list[dict], rules: list[dict]) -> list[dict]:
+    """只返回 RC 原文未被任何非评分规则承接的最小补提取集合。"""
+    def iter_clause_ids(rule: dict):
+        yield from _rule_rejection_clause_ids(rule)
+        for child in _compiled_child_requirements(rule):
+            yield from iter_clause_ids(child)
+
+    linked = {
+        clause_id for rule in rules if isinstance(rule, dict) and rule.get("category") not in {"objective", "subjective"}
+        for clause_id in iter_clause_ids(rule)
+    }
+    return [clause for clause in clauses if str(clause.get("clause_id") or "") not in linked][:8]
 
 
 def _normalise_non_score_candidate_contract(rules: list[dict], source_unit_catalog: dict[str, dict] | None) -> list[dict]:
@@ -1584,6 +1825,7 @@ def _normalise_non_score_candidate_contract(rules: list[dict], source_unit_catal
         if category == "other" and _has_formal_rejection_consequence(value):
             category = "rejection"
             value["category"] = category
+            value["decision_impact_source"] = "legacy_source_fallback"
         if category not in _NON_SCORE_CATEGORIES:
             result.append(value)
             continue
@@ -2658,7 +2900,7 @@ def _rule_signature(item: dict) -> tuple[str, str, str]:
     )
 
 
-RULE_EXTRACTION_PIPELINE_VERSION = "obligation-compiler-v3.0"
+RULE_EXTRACTION_PIPELINE_VERSION = "obligation-compiler-v3.1-rc-ledger"
 # 评分表与普通规则分别生成。普通规则先保留全部可追溯的原子候选，再由受约束的
 # “义务编译器”生成最终规则卡；模型只能返回候选 ID 分组，不能改写原文、评分或
 # 业务字段。这样既避免长文件按批次做并集而膨胀，也不恢复旧版全局自由改写。
@@ -3356,6 +3598,9 @@ def _compiled_child_requirement(item: dict) -> dict:
         "check_rule": str(item.get("check_rule") or item.get("title") or "")[:520],
         "source_page": item.get("source_page") if isinstance(item.get("source_page"), int) else None,
         "source_unit_ids": [str(value) for value in item.get("source_unit_ids") or [] if str(value).strip()][:24],
+        "rejection_clause_ids": _rule_rejection_clause_ids(item),
+        "rejection_clauses": [dict(value) for value in item.get("rejection_clauses") or [] if isinstance(value, dict)][:24],
+        "decision_impact_source": str(item.get("decision_impact_source") or ""),
         # 汇总只改变卡片展示，不能抹平叶子项的文字/图片取证边界。
         "evidence_requirements": [str(value) for value in requirements if str(value) in {
             "text", "document", "field", "visual", "cross_bid", "external"
@@ -4026,7 +4271,10 @@ def _extract_rules(app, task: dict) -> dict:
     for label, value, document_key in source_documents:
         units = _source_units_for_text(value, source_document_key=document_key)
         source_unit_catalog.update({
-            str(unit.get("unit_id")): {"page": unit.get("page"), "text": unit.get("text")}
+            str(unit.get("unit_id")): {
+                "page": unit.get("page"), "text": unit.get("text"),
+                "package_numbers": list(unit.get("package_numbers") or []),
+            }
             for unit in units if str(unit.get("unit_id") or "").strip() and str(unit.get("text") or "").strip()
         })
         unit_batches = _source_unit_batches(units, RULE_EXTRACTION_BATCH_CHARS)
@@ -4122,6 +4370,28 @@ def _extract_rules(app, task: dict) -> dict:
     )
     boundary_excluded_rule_count -= len(mapped_candidates)
     mapped_candidates = _attach_source_fact_metadata(mapped_candidates)
+    # RC 台账独立于规则正文提取：候选只做高召回，模型只能确认输入原文单元中的
+    # 明确后果；随后通过 source_unit_ids 挂接到现有候选，不重写整套规则集。
+    rejection_clause_ledger: list[dict] = []
+    rejection_ledger_failure_count = rejection_ledger_supplement_count = rejection_ledger_supplement_failure_count = 0
+    rejection_candidates, rejection_ledger_candidate_stats = _rejection_clause_candidate_packets(source_unit_catalog, package_number)
+    if rejection_candidates:
+        storage.update_task(app, task["task_id"], progress=66, message="正在核验明确否决条款来源")
+        try:
+            ledger_payload = _request_task_json(
+                app, task, profile, "extract_rules_rejection_ledger", system_prompt,
+                _rejection_clause_ledger_prompt(app, rejection_candidates, package_scope_instruction),
+                document_id=tender["document_id"], context_mode="rejection_clause_ledger",
+                max_tokens=_output_token_budget(profile, 3_000), thinking_mode="disabled",
+            )
+            rejection_clause_ledger = _normalise_rejection_clause_ledger(ledger_payload, source_unit_catalog, package_number)
+            mapped_candidates = _attach_rejection_clause_ledger(mapped_candidates, rejection_clause_ledger)
+        except ValueError as exc:
+            # RC 台账是身份增强；异常时继续使用已验证的旧来源后备，不阻断规则提取。
+            rejection_ledger_failure_count = 1
+            storage.update_task(app, task["task_id"], message=f"否决条款来源台账未完成，正在保留兼容规则提取：{exc}")
+    elif rejection_ledger_candidate_stats["overflow"]:
+        storage.update_task(app, task["task_id"], message="明确否决条款候选超出单次台账预算，已保留兼容规则提取")
     # 硬性条款补漏属于候选生成，不属于最终结果补丁。必须在来源台账收口前加入，
     # 让它经历同一套同源去重与文件边界校验，避免同一事实在尾部绕过治理。
     hard_anchor_supplement_count = hard_anchor_supplement_failures = 0
@@ -4160,10 +4430,48 @@ def _extract_rules(app, task: dict) -> dict:
                 *mapped_candidates,
                 *_normalise_non_score_candidate_contract([technical_star_seed], source_unit_catalog),
             ])
+    # 仅在 RC 原文没有被当前候选承接时做最小补提取；不触碰已经有效的规则，也不重跑
+    # 全文件分段。补充候选仍必须经过统一来源、分包和去重门控。
+    rejection_gaps = _unlinked_rejection_clauses(rejection_clause_ledger, mapped_candidates)
+    if rejection_gaps:
+        storage.update_task(app, task["task_id"], message="正在补充未承接的明确否决条款")
+        try:
+            gaps = [{
+                "label": f"明确否决条款 {item['clause_id']}",
+                "terms": [],
+                "context": "\n".join(
+                    str(source_unit_catalog[unit_id].get("text") or "")
+                    for unit_id in item.get("source_unit_ids") or [] if unit_id in source_unit_catalog
+                )[:1_400],
+            } for item in rejection_gaps]
+            supplement = _request_task_json(
+                app, task, profile, "extract_rules_rejection_clause_supplement", system_prompt,
+                _hard_anchor_supplement_prompt(app, gaps, mapped_candidates),
+                document_id=tender["document_id"], context_mode="rejection_clause_supplement",
+                max_tokens=_output_token_budget(profile, 3_000), thinking_mode="disabled",
+            )
+            supplement_rules = supplement.get("rules") if isinstance(supplement, dict) else None
+            if isinstance(supplement_rules, list):
+                kept = _normalise_non_score_candidate_contract(
+                    _filter_rules_for_package([
+                        item for item in supplement_rules if isinstance(item, dict)
+                        and item.get("category") in {"qualification", "compliance", "substantive", "rejection", "other"}
+                    ], package_number), source_unit_catalog,
+                )
+                before = len(_dedupe_rule_candidates(mapped_candidates))
+                mapped_candidates = _attach_rejection_clause_ledger(
+                    _dedupe_rule_candidates([*mapped_candidates, *kept]), rejection_clause_ledger,
+                )
+                rejection_ledger_supplement_count = max(0, len(mapped_candidates) - before)
+        except ValueError as exc:
+            rejection_ledger_supplement_failure_count = 1
+            storage.update_task(app, task["task_id"], message=f"部分否决条款补充未完成：{exc}")
     # 所有批次、资格补漏和硬性条款补漏先进入同一候选池；评分仍只由评分台账组装。
     # 随后使用全局义务编译器收敛为最终卡片。模型只能返回候选 ID 分组，不能自由
     # 改写标题、类别、来源或评分，避免旧版全局改写的截断与漂移问题。
-    candidates, coverage_missing_rules = _dedupe_rule_candidates(mapped_candidates), []
+    candidates, coverage_missing_rules = _attach_rejection_clause_ledger(
+        _dedupe_rule_candidates(mapped_candidates), rejection_clause_ledger,
+    ), []
     compilation_used = False
     compilation_failure_count = 0
     storage.update_task(app, task["task_id"], progress=68, message="正在按原子要求汇总并去重评审规则")
@@ -4327,6 +4635,8 @@ def _extract_rules(app, task: dict) -> dict:
     score_ledger["conflicts"] = final_score_ledger["conflicts"]
     rules = _normalise_visual_rule_policies(rules)
     rules = _attach_source_fact_metadata(rules)
+    rules = _attach_rejection_clause_ledger(rules, rejection_clause_ledger)
+    rules = _attach_decision_impact_metadata(rules)
     final_score_contract = _score_contract_issues(
         rules, score_packets,
         _declared_total_score_from_text(main_text) or _score_sections_declared_total(score_packets),
@@ -4390,6 +4700,13 @@ def _extract_rules(app, task: dict) -> dict:
             "score_summary_excluded_count": score_summary_excluded_count,
             "hard_anchor_supplement_count": hard_anchor_supplement_count,
             "hard_anchor_supplement_failure_count": hard_anchor_supplement_failures,
+            "rejection_ledger_candidate_count": rejection_ledger_candidate_stats["candidate_total"],
+            "rejection_ledger_selected_candidate_count": rejection_ledger_candidate_stats["selected_count"],
+            "rejection_ledger_candidate_overflow": rejection_ledger_candidate_stats["overflow"],
+            "rejection_ledger_clause_count": len(rejection_clause_ledger),
+            "rejection_ledger_failure_count": rejection_ledger_failure_count,
+            "rejection_ledger_supplement_count": rejection_ledger_supplement_count,
+            "rejection_ledger_supplement_failure_count": rejection_ledger_supplement_failure_count,
             "score_structure_repair_count": score_structure_repair_count,
             "score_structure_repair_failure_count": score_structure_repair_failures,
             "score_ledger_merged_count": score_ledger["merged_count"],
@@ -11277,18 +11594,36 @@ class _EvaluationProgress:
         self.completed_units = 0
         self.completed_documents: list[dict] = []
         self.lock = threading.Lock()
+        self.last_persisted_at: float | None = None
+        self.pending_message = ""
+
+    _PERSIST_INTERVAL_SECONDS = 0.4
 
     def _progress(self) -> int:
         return int(self.completed_units * 100 / self.total_units)
 
-    def message(self, message: str) -> None:
+    def _persist(self, message: str, *, force: bool = False, result: dict | None = None) -> None:
+        self.pending_message = str(message or self.pending_message)
+        now = time.monotonic()
+        if (
+            not force
+            and self.last_persisted_at is not None
+            and now - self.last_persisted_at < self._PERSIST_INTERVAL_SECONDS
+        ):
+            return
+        storage.update_task(
+            self.app, self.task["task_id"], progress=self._progress(), message=self.pending_message, result=result,
+        )
+        self.last_persisted_at = now
+
+    def message(self, message: str, *, force: bool = True) -> None:
         with self.lock:
-            storage.update_task(self.app, self.task["task_id"], progress=self._progress(), message=message)
+            self._persist(message, force=force)
 
     def advance(self, message: str, units: int = 1) -> None:
         with self.lock:
             self.completed_units = min(self.total_units, self.completed_units + max(0, units))
-            storage.update_task(self.app, self.task["task_id"], progress=self._progress(), message=message)
+            self._persist(message, force=self._progress() >= 100)
 
     def document_completed(self, document: dict, *, reused: bool = False) -> None:
         bidder_name = document["bidder_name"] or document["original_name"]
@@ -11296,10 +11631,9 @@ class _EvaluationProgress:
             if not any(item["document_id"] == document["document_id"] for item in self.completed_documents):
                 self.completed_documents.append({"document_id": document["document_id"], "bidder_name": bidder_name})
             status = "已复用" if reused else "已完成"
-            storage.update_task(
-                self.app, self.task["task_id"], progress=self._progress(),
-                message=f"{status} {bidder_name} 的综合评审（{len(self.completed_documents)}/{self.document_count}）",
-                result={"partial": True, "completed_documents": list(self.completed_documents)},
+            self._persist(
+                f"{status} {bidder_name} 的综合评审（{len(self.completed_documents)}/{self.document_count}）",
+                force=True, result={"partial": True, "completed_documents": list(self.completed_documents)},
             )
 
 

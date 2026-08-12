@@ -3891,6 +3891,38 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(worker._rule_execution_strategy(saved), "section")
         self.assertFalse(worker._rule_requires_visual_verification(saved))
 
+    def test_rule_execution_metadata_preserves_rejection_identity_source(self):
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "rejection", "title": "禁止参与后果核验", "check_rule": "核验声明是否触发禁止参与后果。",
+            "rejection_clause_ids": ["RC-abc", "not-an-rc", "RC-abc"],
+            "decision_impact_source": "rc_ledger",
+            "rejection_clauses": [{
+                "clause_id": "RC-abc", "source_unit_ids": ["SU-test-P1-1-a"], "source_pages": [1],
+                "trigger": "存在前期服务", "consequence_quote": "不得再参加采购活动，否则为无效响应",
+                "consequence": "无效响应", "exceptions": "", "scope": "current_package",
+            }],
+        })
+        _, rules = storage.list_rules(self.app, self.project["project_id"])
+        saved = next(item for item in rules if item["rule_id"] == rule["rule_id"])
+
+        self.assertEqual(saved["rejection_clause_ids"], ["RC-abc"])
+        self.assertEqual(saved["decision_impact_source"], "rc_ledger")
+        self.assertEqual(saved["rejection_clauses"][0]["consequence_quote"], "不得再参加采购活动，否则为无效响应")
+
+    def test_evaluation_progress_debounces_advances_but_persists_stage_boundaries(self):
+        progress = worker._EvaluationProgress(self.app, {"task_id": "progress-test"}, 10, 1)
+        with patch("dashboard.evaluation_workbench.worker.storage.update_task") as update_task, \
+             patch("dashboard.evaluation_workbench.worker.time.monotonic", side_effect=[1.0, 1.1, 1.2, 1.7]):
+            progress.advance("扫描第 1 组")
+            progress.advance("扫描第 2 组")
+            progress.message("开始规则评审")
+            progress.advance("扫描第 3 组")
+
+        self.assertEqual(update_task.call_count, 3)
+        self.assertEqual(update_task.call_args_list[0].kwargs["progress"], 10)
+        self.assertEqual(update_task.call_args_list[1].kwargs["message"], "开始规则评审")
+        self.assertEqual(update_task.call_args_list[2].kwargs["progress"], 30)
+
     def test_score_section_metadata_is_persisted_for_parent_ledger(self):
         rule = storage.add_rule(self.app, self.project["project_id"], {
             "category": "objective", "title": "报价评分", "check_rule": "按报价公式核验。",
@@ -7866,6 +7898,72 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(candidates[0]["category"], "rejection")
         self.assertEqual(worker._rule_decision_impact(candidates[0]), "rejection")
 
+    def test_formal_rejection_fallback_is_sentence_scoped_and_respects_negation(self):
+        positive = {"source_text": "供应商提供前期整体设计服务的，不得再参加本项目采购活动，否则为无效响应。"}
+        formal = {"source_text": "逾期提交的响应文件不予受理。"}
+        handled = {"source_text": "缺一项或某项达不到要求，按无效文件处理。"}
+        conditional = {"source_text": "除单一来源采购项目外，为采购项目提供整体设计服务的供应商不得再参加本项目采购活动。"}
+        negated = {"source_text": "仅存在格式瑕疵的，不得仅因该情形认定为无效响应。"}
+        explanatory = {"source_text": "术语说明：无效响应是指不满足实质性要求的响应文件。"}
+
+        self.assertTrue(worker._has_formal_rejection_consequence(positive))
+        self.assertTrue(worker._has_formal_rejection_consequence(formal))
+        self.assertTrue(worker._has_formal_rejection_consequence(handled))
+        self.assertTrue(worker._has_formal_rejection_consequence(conditional))
+        self.assertFalse(worker._has_formal_rejection_consequence(negated))
+        self.assertFalse(worker._has_formal_rejection_consequence(explanatory))
+
+    def test_decision_impact_metadata_prefers_rc_ledger_then_explicit_category(self):
+        rules = worker._attach_decision_impact_metadata([
+            {"category": "other", "title": "否决条款", "check_rule": "核验禁止参与事实", "rejection_clause_ids": ["RC-source-1"]},
+            {"category": "qualification", "title": "资格材料", "check_rule": "核验资格材料"},
+            {"category": "other", "title": "兼容后备", "check_rule": "核验前期服务",
+             "source_text": "提供前期服务的供应商不得再参加采购活动，否则为无效响应。"},
+        ])
+
+        self.assertEqual(rules[0]["decision_impact"], "rejection")
+        self.assertEqual(rules[0]["decision_impact_source"], "rc_ledger")
+        self.assertEqual(rules[1]["decision_impact"], "material")
+        self.assertEqual(rules[1]["decision_impact_source"], "rule_category")
+        self.assertEqual(rules[2]["decision_impact"], "rejection")
+        self.assertEqual(rules[2]["decision_impact_source"], "legacy_source_fallback")
+
+    def test_rejection_clause_ledger_requires_source_units_and_attaches_identity(self):
+        catalog = {
+            "SU-a": {"page": 8, "text": "供应商提供整体设计服务的，不得再参加本项目采购活动，否则为无效响应。", "package_numbers": [1]},
+            "SU-b": {"page": 9, "text": "仅存在格式瑕疵的，不得仅因该情形认定为无效响应。"},
+            "SU-c": {"page": 10, "text": "其他采购包报价不予受理。", "package_numbers": [2]},
+        }
+        packets, packet_stats = worker._rejection_clause_candidate_packets(catalog, 1)
+        self.assertEqual({item["source_unit_ids"][0] for item in packets}, {"SU-a", "SU-b"})
+        self.assertEqual(packet_stats["candidate_total"], 2)
+        clauses = worker._normalise_rejection_clause_ledger({"clauses": [
+            {"source_unit_ids": ["SU-a"], "trigger": "存在前期整体设计服务", "consequence_quote": "不得再参加本项目采购活动，否则为无效响应", "consequence": "构成无效响应", "exceptions": "", "scope": "current_package"},
+            {"source_unit_ids": ["SU-a"], "trigger": "模型换一种概括", "consequence_quote": "不得再参加本项目采购活动，否则为无效响应", "consequence": "禁止参与", "exceptions": "", "scope": "current_package"},
+            {"source_unit_ids": ["SU-b"], "trigger": "格式瑕疵", "consequence_quote": "不得仅因该情形认定为无效响应", "consequence": "无效响应", "exceptions": "", "scope": "current_package"},
+            {"source_unit_ids": ["SU-c"], "trigger": "其他包", "consequence_quote": "不予受理", "consequence": "不予受理", "exceptions": "", "scope": "current_package"},
+            {"source_unit_ids": ["unknown"], "trigger": "格式瑕疵", "consequence_quote": "无效响应", "consequence": "无效响应", "exceptions": "", "scope": "current_package"},
+        ]}, catalog, 1)
+
+        self.assertEqual(len(clauses), 1)
+        attached = worker._attach_rejection_clause_ledger([{
+            "category": "other", "title": "前期服务声明", "check_rule": "核验声明", "source_unit_ids": ["SU-a"],
+        }], clauses)
+        self.assertEqual(attached[0]["decision_impact_source"], "rc_ledger")
+        self.assertEqual(attached[0]["rejection_clauses"][0]["consequence_quote"], "不得再参加本项目采购活动，否则为无效响应")
+        self.assertEqual(worker._unlinked_rejection_clauses(clauses, attached), [])
+
+    def test_rejection_ledger_overflow_falls_back_without_silent_truncation(self):
+        catalog = {
+            f"SU-{index}": {"page": index, "text": f"第{index}项不予受理。"}
+            for index in range(1, 74)
+        }
+        packets, stats = worker._rejection_clause_candidate_packets(catalog, None)
+
+        self.assertEqual(packets, [])
+        self.assertTrue(stats["overflow"])
+        self.assertEqual(stats["candidate_total"], 73)
+
     def test_semantic_duplicate_adjudication_merges_only_model_confirmed_candidate_group(self):
         rules = [
             {
@@ -7962,7 +8060,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(finished["result"]["scoring_assembly_mode"], "direct_assembly")
         self.assertFalse(any("统一编译并合并评审规则" in value or "审计规则覆盖范围" in value for value in prompts))
         self.assertFalse(any("规划每条评分原文应归属" in value for value in prompts))
-        self.assertEqual(finished["result"]["source_ledger"]["pipeline_version"], "obligation-compiler-v3.0")
+        self.assertEqual(finished["result"]["source_ledger"]["pipeline_version"], "obligation-compiler-v3.1-rc-ledger")
 
     def test_obligation_compilation_keeps_cross_category_restatements_separate(self):
         rules = [
@@ -8299,6 +8397,18 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         }], catalog)
         self.assertEqual(attached[0]["source_unit_ids"], [units[0]["unit_id"]])
         self.assertEqual(attached[0]["source_page"], 8)
+
+    def test_source_units_keep_nearest_package_heading_for_rc_scope_validation(self):
+        text = """[第8页]
+第1包：教学设备
+供应商不满足要求的，按无效响应处理。
+
+第2包：办公设备
+供应商不满足要求的，按无效响应处理。"""
+        units = worker._source_units_for_text(text, source_document_key="tender-a")
+        outcome_units = [item for item in units if "按无效响应处理" in item["text"]]
+
+        self.assertEqual([item["package_numbers"] for item in outcome_units], [[1], [2]])
 
     def test_same_source_unit_merges_only_when_review_intent_is_equivalent(self):
         unit = "SU-test-P68-1-abcdef01"
