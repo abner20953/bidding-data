@@ -818,9 +818,10 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             "evidence": "第12页承诺书第2项填写“是”。", "reason": "承诺书填写“是”，需复核原页。",
         }], [rule])[0]
 
-        self.assertEqual(result["requirement_relation"], "supports")
-        # 结构化字段与状态自相矛盾时，rejection 规则不能因 supports 误写而放行。
+        # 结构化字段与状态自相矛盾时，rejection 规则不能因 supports 误写而放行，
+        # 也不能把这条不可靠的 supports 保留为已确认事实。
         self.assertEqual(result["status"], "not_satisfied")
+        self.assertEqual(result["requirement_relation"], "uncertain")
 
     def test_prohibitive_obligation_positive_wording_does_not_flip_status(self):
         """禁止性义务的“符合禁止情形”即使规则未被判为 rejection，也不能由
@@ -876,6 +877,49 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(highlights[1]["rule_id"], "c")
         self.assertIn("乙", highlights[1]["basis"])
         self.assertLessEqual(len(highlights[1]["basis"]), 120)
+
+    def test_highlight_swap_reserves_space_for_replaced_clue_note(self):
+        """兜底依据再长，也必须保留被替换线索提示。"""
+        highlights = [{"rule_id": "a", "level": "attention", "keyword": "A", "conclusion": "被替换的重要线索"}]
+        worker._swap_highlight_keep_note(highlights, 0, {
+            "rule_id": "b", "level": "high", "keyword": "B", "conclusion": "直接反证",
+            "basis": "原始依据" * 80,
+        })
+        self.assertLessEqual(len(highlights[0]["basis"]), 120)
+        self.assertIn("另有线索", highlights[0]["basis"])
+        self.assertIn("被替换的重要线索", highlights[0]["basis"])
+
+    def test_full_highlight_panel_keeps_direct_rejection_and_displaced_clue(self):
+        """六条面板已满时，直接否决反证必须进入且不无声吞掉原线索。"""
+        candidates = [{"document_id": "d1", "bidder_name": "甲公司", "candidates": []}]
+        allowed = {
+            ("d1", "r-direct"): {
+                "type": "review", "rule_id": "r-direct", "title": "禁止重复参与",
+                "status": "not_satisfied", "risk_level": "high", "confidence": "high",
+                "evidence_quality": "sufficient", "requirement_relation": "contradicts",
+                "decision_impact": "rejection", "_direct_rejection_contradiction": True,
+                "_rank": (1, 4, 4, 3), "evidence": "第12页第2项填写“是”。",
+                "reason": "与禁止再次参加采购活动的要求直接相反，需原页确认。",
+                "conclusion_summary": "填写内容触碰禁止再次参加条款，需原页确认。",
+            },
+        }
+        raw_highlights = [
+            {"rule_id": f"r-{index}", "level": "attention", "keyword": f"线索{index}",
+             "conclusion": f"原有线索{index}", "basis": "原依据"}
+            for index in range(6)
+        ]
+        for item in raw_highlights:
+            allowed[("d1", item["rule_id"])] = {"_critical_eligible": False}
+
+        values = worker._normalise_evaluation_highlights({"summaries": [{
+            "document_id": "d1", "headline": "存在需复核事项", "highlights": raw_highlights,
+        }]}, candidates, allowed)
+
+        highlights = values[0]["highlights"]
+        direct = next(item for item in highlights if item["rule_id"] == "r-direct")
+        self.assertEqual(len(highlights), 6)
+        self.assertEqual(direct["level"], "high")
+        self.assertIn("另有线索", direct["basis"])
 
     def test_parse_task_reuses_successful_parse_cache(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案：稳定运行。")
@@ -3239,6 +3283,72 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(result["ocr_candidate_pages"], [12, 20])
         self.assertEqual(result["ocr_evidence_pages"], [12])
         self.assertEqual(worker._vision_page_candidates(document, rule, result)[:2], [12, 30])
+
+    def test_single_ocr_supplement_preserves_confirmed_requirement_relation(self):
+        """逐条 OCR 补充不能把文字阶段的直接反证重置为不确定。"""
+        document = {"document_id": "doc", "extension": ".pdf", "page_count": 30,
+                    "original_name": "投标.pdf", "bidder_name": "甲"}
+        rule = {
+            "rule_id": "prior-service", "category": "other", "title": "禁止重复参与",
+            "check_rule": "核验供应商未为本项目提供前期服务。",
+            "source_text": "为本项目提供前期服务的供应商不得再参加采购活动，否则为无效响应。",
+            "vision_trigger": "required", "vision_level": "standard",
+        }
+        original = worker._review_result_from_model({
+            "status": "not_satisfied", "requirement_relation": "contradicts", "risk_level": "high",
+            "confidence": "medium", "evidence_quality": "sufficient", "evidence": "承诺书填写“是”。",
+            "reason": "直接反证，需原页确认。", "summary": "触碰禁止条款。",
+            "visual_page_candidates": [12],
+        }, rule["rule_id"], "not_satisfied")
+        original["visual_page_candidates"] = [12]
+        parsed = {
+            "coverage": "covered", "conclusion_scope": "full", "content_coverage": "covered",
+            "evidence_pages": [12], "status": "not_satisfied", "risk_level": "high",
+            "confidence": "high", "evidence": "第12页第2项填写“是”。", "reason": "OCR 确认填写值。",
+        }
+        with patch("dashboard.evaluation_workbench.worker._ocr_page_texts", return_value=([
+            {"page": 12, "service": local_ocr_gateway.LOCAL_OCR_SERVICE, "text": "第2项：是"},
+        ], "")), patch("dashboard.evaluation_workbench.worker._request_task_json", return_value=parsed):
+            result = worker._run_ocr_supplement(
+                self.app, {"task_id": "task"}, document, "review", rule, original,
+                {"profile_id": "text", "display_name": "文本模型"},
+            )
+
+        self.assertEqual(result["requirement_relation"], "contradicts")
+        self.assertEqual(result["status"], "not_satisfied")
+
+    def test_visual_supplement_preserves_confirmed_requirement_relation(self):
+        """图片补充未显式给出关系时，必须继承文字阶段的直接反证。"""
+        document = {"document_id": "doc", "extension": ".pdf", "page_count": 30,
+                    "original_name": "投标.pdf", "bidder_name": "甲"}
+        rule = {
+            "rule_id": "prior-service", "category": "other", "title": "禁止重复参与",
+            "check_rule": "核验供应商未为本项目提供前期服务。",
+            "source_text": "为本项目提供前期服务的供应商不得再参加采购活动，否则为无效响应。",
+            "vision_trigger": "required", "vision_level": "standard",
+        }
+        original = worker._review_result_from_model({
+            "status": "not_satisfied", "requirement_relation": "contradicts", "risk_level": "high",
+            "confidence": "medium", "evidence_quality": "sufficient", "evidence": "承诺书填写“是”。",
+            "reason": "直接反证，需原页确认。", "summary": "触碰禁止条款。",
+            "visual_page_candidates": [12],
+        }, rule["rule_id"], "not_satisfied")
+        original["visual_page_candidates"] = [12]
+        parsed = {
+            "coverage": "covered", "conclusion_scope": "full", "needs_more_image": False,
+            "evidence_pages": [12], "status": "not_satisfied", "risk_level": "high",
+            "confidence": "high", "evidence": "第12页勾选“是”。", "reason": "图片确认填写值。",
+        }
+        with patch("dashboard.evaluation_workbench.worker._render_vision_images", return_value=[{
+            "page": 12, "type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AA==", "detail": "default"},
+        }]), patch("dashboard.evaluation_workbench.worker._request_task_json", return_value=parsed):
+            result = worker._run_visual_supplement(
+                self.app, {"task_id": "task"}, document, "review", rule, original,
+                {"profile_id": "vision", "display_name": "图片模型"},
+            )
+
+        self.assertEqual(result["requirement_relation"], "contradicts")
+        self.assertEqual(result["status"], "not_satisfied")
 
     def test_partial_local_ocr_failure_cannot_claim_full_rule_coverage(self):
         document = {"document_id": "doc", "extension": ".pdf", "page_count": 50,

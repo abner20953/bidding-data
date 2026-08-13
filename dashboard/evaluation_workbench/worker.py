@@ -4901,11 +4901,14 @@ def _apply_requirement_relation_contract(status: str, item: dict, rule: dict) ->
         # 明确否决规则出现直接相反事实时保留高风险候选，但始终要求人工复核，
         # 不产生自动废标结论。后续来源闭环仍可把无锚点事实回落为待原页确认。
         return "not_satisfied", {**item, "risk_level": "high"}
-    if relation == "supports" and status == "not_satisfied" and explicit and decision_impact != "rejection":
-        # 新协议已明确表达正向事实时，才允许修正模型误填的负向状态；明确否决规则
-        # 不允许模型把 contradicts 误写成 supports 后翻转为满足（与旧模板兼容分支
-        # 同一豁免，防止镜像漏洞）。旧模板继续走下方受限的兼容分支，避免把
-        # “符合禁止情形”误当满足。
+    if relation == "supports" and status == "not_satisfied" and explicit:
+        # 新协议已明确表达正向事实时，才允许修正模型误填的负向状态。明确否决规则
+        # 不得据此放行：状态与 relation 相互矛盾时，不猜测哪一个字段正确，保留
+        # 原始不满足并把关系降为 uncertain，交由来源闭环和人工复核继续收口。
+        # 这样既不会吞掉“符合禁止情形”类反证，也不会把模型误写的 supports 当成
+        # 可进入重点结论的直接反证。
+        if decision_impact == "rejection":
+            return status, {**item, "requirement_relation": "uncertain"}
         return "satisfied", {**item, "risk_level": "low"}
     return _legacy_positive_status_correction(status, item, rule, explicit)
 
@@ -12843,9 +12846,15 @@ def _swap_highlight_keep_note(highlights: list[dict], index: int, fallback: dict
     """面板容量已满时用结构化兜底替换一条，但把被替换线索的结论并入 basis 提示，
     避免被替换的真实线索在重要结论面板中无声消失。"""
     replaced = highlights[index]
-    note = f"（另有线索：{replaced.get('conclusion') or replaced.get('keyword') or '见完整结果'}）"
+    clue = re.sub(r"\s+", " ", _clean_model_text(
+        replaced.get("conclusion") or replaced.get("keyword") or "见完整结果"
+    )).strip()
+    # 提示自身必须有固定的小上限；再为它预留空间，避免原 basis 过长时被末尾截断。
+    clue = f"{clue[:44].rstrip()}…" if len(clue) > 44 else clue
+    note = f"（另有线索：{clue or '见完整结果'}）"
     value = dict(fallback)
-    value["basis"] = f"{value.get('basis') or ''}{note}"[:120]
+    basis = re.sub(r"\s+", " ", _clean_model_text(value.get("basis"))).strip()
+    value["basis"] = f"{basis[:max(0, 120 - len(note))].rstrip()}{note}"
     highlights[index] = value
 
 

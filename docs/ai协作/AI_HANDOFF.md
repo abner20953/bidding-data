@@ -4,16 +4,16 @@
 handoff_schema: 1
 updated_at: 2026-08-13
 module: evaluation-workbench
-status: deployed_validation_pending
+status: ready_for_commit
 base_commit: 4cef0c0
 branch: main
-working_tree: clean
+working_tree: worker.py、tests/test_evaluation_workbench.py、稳定设计与本交接有未提交修正
 remote_github: 4cef0c0
 remote_gitee: 4cef0c0
 production_commit: 4cef0c0
 prompt_version: vision-evidence-contract-v59（评审模板含 requirement_relation 协议）
 database_change: ew_review_results 新增可选 requirement_relation 列（SQLite 兼容迁移）
-user_approval: submitted_pushed_deployed_4cef0c0
+user_approval: 已确认完善本地修正；尚未确认本轮提交、推送或部署
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
@@ -21,7 +21,7 @@ user_approval: submitted_pushed_deployed_4cef0c0
 ## 下一位先做
 
 1. 云端已部署 `4cef0c0`：build-info `commit=4cef0c0`、`runtime_release_commit=4cef0c0`、`version_consistent=true`、`prompt_version=vision-evidence-contract-v59`（2026-08-13 11:32 核验），镜像 `.build-commit` 与宿主机 `.deploy-commit` 一致，`/pingbiao` 与关键 API 正常。
-2. **三原县 A/B 验收（下一步）**：先做 DeepSeek、后做 MiniMax 强制综合评审。验收重点：第 146 页"是"应为高风险重点线索且写明需原页确认；已有授权书空白、范围异常等不得下降；建议分、调用数、OCR 页数不得增加。若任一项退化，单独回退状态收口改动（`4cef0c0` 相对 `5832c9d` 的 diff）。
+2. 本轮本地修正通过后，等待用户确认提交、推送和部署；部署后再做**三原县 A/B 验收**：先 DeepSeek、后 MiniMax 强制综合评审。验收重点：第 146 页“是”应为高风险重点线索且写明需原页确认；已有授权书空白、范围异常等不得下降；建议分、调用数、OCR 页数不得增加。若任一项退化，单独回退状态收口改动（`4cef0c0` 相对 `5832c9d` 的 diff）。
 3. 已停用接口（`compare-signals` PATCH、`review-results/{id}` PATCH、`score-results/{id}` PATCH、`confirm-auto` ×2）仍返回 410；待确认 `rokid_glasses_app` 未调用后再彻底删除路由。事实账本（shadow-v2）仍不参与跨规则结论。
 
 ## 活跃记录（最多 10 条）
@@ -66,7 +66,7 @@ user_approval: submitted_pushed_deployed_4cef0c0
 
 - 根因：旧状态修正器会因理由含“符合/满足”把 `not_satisfied` 改成 `satisfied`；“符合禁止情形”因此被错误降为低风险并从重点结论漏掉，已由三原县 DeepSeek 与 MiniMax 复跑共同证实。
 - 已实施：模型输出和结果表新增 `requirement_relation`；明确否决规则的 `contradicts` 保留不满足/高风险候选，仍要求人工复核；旧模板仅在缺字段时追加短协议；摘要对结构化直接反证做通用保留，不按项目或文本打补丁。
-- **评审后修复（2026-08-13）**：① 镜像漏洞防护——rejection 规则下模型把 contradicts 误写成 supports 时不再翻转为满足（supports 翻转加 `decision_impact != "rejection"` 豁免）；② 禁止性义务结构词（不得/禁止/严禁/不应/不允许/不予）下“符合禁止情形”即使规则未被判为 rejection 也不由关键词翻转；③ OCR 批量/逐条与视觉合并路径未显式给出关系时继承文字阶段已确认的 relation（此前 contradicts 会在 OCR 合并后被重置为 uncertain，导致重点结论直接反证标记失效）；④ 亮点面板容量已满替换线索时把被替换结论并入 basis 提示，不无声消失；⑤ 提示词版本升 v59；⑥ 本地推断与模型显式输出的 relation 来源不可区分已注释说明。
+- **评审后修复（2026-08-13）**：① 镜像漏洞防护——rejection 规则下模型把 contradicts 误写成 supports 时不再翻转为满足；状态与显式 supports 冲突时关系回落为 uncertain，避免结构自相矛盾或误入直接反证候选；② 禁止性义务结构词（不得/禁止/严禁/不应/不允许/不予）下“符合禁止情形”即使规则未被判为 rejection 也不由关键词翻转；③ OCR 批量/逐条与视觉合并路径未显式给出关系时继承文字阶段已确认的 relation（此前 contradicts 会在 OCR 合并后被重置为 uncertain，导致重点结论直接反证标记失效）；④ 亮点面板容量已满替换线索时预留被替换结论提示的空间，不无声消失；⑤ 提示词版本升 v59；⑥ 本地推断与模型显式输出的 relation 来源不可区分已注释说明。
 - 不变契约：不自动废标、不改规则、建议分、全文/OCR/图片策略、并发和已有 API；来源闭环仍可将无锚点高风险回落为待原页确认。
-- 验证：新增镜像漏洞、禁止义务、OCR 合并保留、替换提示 4 项回归（原有 2 项未回归）；完整 `516` 项通过，`git diff --check` 与文档校验通过。
+- 验证：新增镜像漏洞、禁止义务、批量/逐条 OCR 与图片合并保留、满额替换提示等回归；完整 `520` 项通过，文档校验与 `git diff --check` 通过。
 - 主要文件：`worker.py`、`storage.py`、`prompt_templates.py`、测试、稳定设计。
