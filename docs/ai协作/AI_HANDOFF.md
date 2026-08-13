@@ -4,24 +4,24 @@
 handoff_schema: 1
 updated_at: 2026-08-13
 module: evaluation-workbench
-status: ready_for_commit
-base_commit: 5832c9d
+status: deployed_validation_pending
+base_commit: 4cef0c0
 branch: main
-working_tree: local changes（直接反证状态收口+评审后修复，未提交）
-remote_github: 5832c9d
-remote_gitee: 5832c9d
-production_commit: 5832c9d
-prompt_version: vision-evidence-contract-v59（评审模板新增 requirement_relation 协议）
+working_tree: clean
+remote_github: 4cef0c0
+remote_gitee: 4cef0c0
+production_commit: 4cef0c0
+prompt_version: vision-evidence-contract-v59（评审模板含 requirement_relation 协议）
 database_change: ew_review_results 新增可选 requirement_relation 列（SQLite 兼容迁移）
-user_approval: 已批准本轮修改与评审后修复；尚未批准提交、推送或部署
+user_approval: submitted_pushed_deployed_4cef0c0
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
 
 ## 下一位先做
 
-1. 本地已完成“直接反证状态收口”及评审后修复（镜像漏洞防护、禁止性义务检查、OCR/视觉合并保留 relation、亮点替换保留提示、v59）：516 项测试与文档校验通过；未增加模型调用、OCR页数、并发或全文扫描范围。仍需用户确认后提交，再部署并以三原县先做 DeepSeek、后做 MiniMax A/B。
-2. 验收重点：第146页“是”应为高风险重点线索且写明需原页确认；已有授权书空白、范围异常等不得下降；建议分、调用数、OCR页数不得增加。若任一项退化，单独回退本记录的状态收口改动。
+1. 云端已部署 `4cef0c0`：build-info `commit=4cef0c0`、`runtime_release_commit=4cef0c0`、`version_consistent=true`、`prompt_version=vision-evidence-contract-v59`（2026-08-13 11:32 核验），镜像 `.build-commit` 与宿主机 `.deploy-commit` 一致，`/pingbiao` 与关键 API 正常。
+2. **三原县 A/B 验收（下一步）**：先做 DeepSeek、后做 MiniMax 强制综合评审。验收重点：第 146 页"是"应为高风险重点线索且写明需原页确认；已有授权书空白、范围异常等不得下降；建议分、调用数、OCR 页数不得增加。若任一项退化，单独回退状态收口改动（`4cef0c0` 相对 `5832c9d` 的 diff）。
 3. 已停用接口（`compare-signals` PATCH、`review-results/{id}` PATCH、`score-results/{id}` PATCH、`confirm-auto` ×2）仍返回 410；待确认 `rokid_glasses_app` 未调用后再彻底删除路由。事实账本（shadow-v2）仍不参与跨规则结论。
 
 ## 活跃记录（最多 10 条）
