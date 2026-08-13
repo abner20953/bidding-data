@@ -4,26 +4,26 @@
 handoff_schema: 1
 updated_at: 2026-08-13
 module: evaluation-workbench
-status: ready_for_commit
-base_commit: 7a025e2
+status: deployed_validation_pending
+base_commit: 5832c9d
 branch: main
-working_tree: modified（综合评审证据收口与指标修正，未提交）
-remote_github: 418409a
-remote_gitee: 418409a
-production_commit: ffac408
+working_tree: clean
+remote_github: 5832c9d
+remote_gitee: 5832c9d
+production_commit: 5832c9d
 prompt_version: vision-evidence-contract-v58（评审版本未变；规则提取指纹已变化）
 database_change: rule execution metadata 新增可选 RC 否决条款身份，无迁移
-user_approval: submitted_pushed_deployed_7a025e2
+user_approval: submitted_pushed_deployed_5832c9d
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
 
 ## 下一位先做
 
-1. 云端已部署 `7a025e2`：容器内 `/app/.build-commit`、宿主机 `.deploy-commit` 和仓库 HEAD 均为 `7a025e2`，外部 `/pingbiao` 返回 200（2026-08-12 核验）。
-2. **第一阶段加固已部署**：高风险审查结果增加来源闭环——关键填写值无法在解析原文复核时回落为待原页确认；未有相等/上限/禁止正偏离等明示约束的“要求数量/响应数量”正差异不再自动推断为虚假或否决。事实账本升为 shadow-v2，仅改候选质量：表单字段限定结构化行首，数量限定同一行且要求/响应列顺序明确；仍绝不参与模型输入、选页、OCR、风险、建议分或展示。
-3. 本地验证：新增高风险原文锚点、正偏离/明示约束、复合数量不误配、泛化字段/跨行数字误报测试；完整回归 `504` 项通过。待以三原县重新运行一次综合评审，对比关键召回、错误高风险、耗时和 Token；通过前不得将影子事实接入跨规则结论。
-4. 已停用接口（`compare-signals` PATCH、`review-results/{id}` PATCH、`score-results/{id}` PATCH、`confirm-auto` ×2）仍返回 410；待确认 `rokid_glasses_app` 未调用后再彻底删除路由。
+1. 云端已部署 `5832c9d`：build-info `commit=5832c9d`、`runtime_release_commit=5832c9d`、`version_consistent=true`，镜像 `.build-commit` 与宿主机 `.deploy-commit` 一致（2026-08-13 08:32 核验），`/pingbiao` 与项目 API 正常。**首次构建因 modelscope 下载 PP-OCRv5 rec 模型网络中断失败，重跑后成功**——后续构建失败先重试，勿改 Dockerfile。
+2. **三原县 + 太原税务复跑验收（下一步）**：各强制综合评审一次，对比关键问题、错误高风险、建议分、耗时、Token、OCR 引擎耗时（`local_ocr_engine_seconds`）与流程墙钟（`ocr_enhancement_wall_seconds`）。注意区分"高风险守卫主动降级为待原页核验"与"真漏检"两类差异；任一关键质量指标下降则回退 `5832c9d` 记录 5 的改动。
+3. 已停用接口（`compare-signals` PATCH、`review-results/{id}` PATCH、`score-results/{id}` PATCH、`confirm-auto` ×2）仍返回 410；待确认 `rokid_glasses_app` 未调用后再彻底删除路由。
+4. 事实账本（shadow-v2）仍不参与跨规则结论，通过验收前不得接入。
 5. 若继续工作台代码任务，按 `AI_CONTEXT.md` 的任务路由阅读稳定设计。
 
 ## 活跃记录（最多 10 条）
@@ -55,10 +55,11 @@ user_approval: submitted_pushed_deployed_7a025e2
 - 不变契约：事实账本不参与提示词、选页、OCR、风险、评分、重点结论或 API；高风险守卫只降自动确定性，不自动生成废标；无数据库迁移，EvidencePack 只扩展可选 JSON 字段。
 - 验证：新增原文锚点、正偏离/明确约束、复合数量不误配及泛化字段/跨行数字误报测试；完整回归 504 项通过。云端版本已核对为 `7a025e2`，待以三原县复跑核对关键召回、错误高风险、耗时和 Token；通过前不得将影子事实接入跨规则结论。
 
-### 5. 综合评审复合证据与后置层收口（本地完成，待提交/云端 A/B）
+### 5. 综合评审复合证据与后置层收口（已提交、已部署，待云端 A/B）
 
 - 目标：不增加全文扫描、OCR 页数、模型调用或并发的前提下，避免复合规则只覆盖首个子项；防止 OCR/图片后来写入的未复核填写值仍以高风险展示；修正本地 OCR 耗时混入模型归纳与排队的指标问题。
 - 已实施：复合规则先保持父规则直接证据，再在原总上下文预算中按 `evidence_items`/编译子项轮转候选页，并向模型标注“候选已定位/本地未定位”而不把未定位写成未提供；OCR/图片合并完成后只对实际证据页且存在足够解析文字的高风险结论再做同页来源闭环，纯扫描页保持图片事实；评分仅清除与既有建议分冲突的算式或理由，绝不自动改分。重点结论候选补传最终摘要。`local_ocr_seconds` 改为真实 RapidOCR 引擎耗时，另保存增强流程墙钟指标。
 - 不变契约：不改变三原县已验证的直接反证高风险、项目范围全文发现、建议分数值、OCR/图片策略、页数、并发、API 或数据库结构；不针对项目、投标人、页码或具体材料写逻辑。
 - 本地验证：新增复合子项轮转、同页 OCR 填写值纠错/纯扫描页保持高风险、评分算式收口测试；完整 `507` 项通过，文档校验与 `git diff --check` 通过。
-- 下一步：经用户确认后提交部署；云端优先以三原县与太原税务各强制综合评审一次，对比关键问题、错误高风险、建议分、耗时、Token、OCR 引擎耗时与流程墙钟。任一关键质量指标下降则回退本记录改动，不接入 EvidencePack 正式决策层。
+- 云端：`5832c9d` 已部署（首次构建因 modelscope 下载模型网络中断失败，重跑成功），build-info `version_consistent=true`。
+- 下一步：以三原县与太原税务各强制综合评审一次，对比关键问题、错误高风险、建议分、耗时、Token、OCR 引擎耗时与流程墙钟。任一关键质量指标下降则回退本记录改动，不接入 EvidencePack 正式决策层。
