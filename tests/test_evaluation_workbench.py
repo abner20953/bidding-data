@@ -170,6 +170,20 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         refreshed = storage.get_task(self.app, task["task_id"])
         self.assertIn("重试当前分组", refreshed["message"])
 
+    def test_performance_timing_is_observation_only_and_classifies_model_phase(self):
+        task = {}
+        worker._record_task_timing(task, "ocr_render_seconds", 1.2345, count=2)
+        worker._record_task_timing(task, "ocr_render_cache_hit", count=3)
+
+        self.assertEqual(worker._timing_bucket_for_model_phase("evaluate_all_review_ocr_batch"), "model_ocr_summary_seconds")
+        self.assertEqual(worker._timing_bucket_for_model_phase("evaluate_all_review_vision_1"), "model_vision_seconds")
+        self.assertEqual(worker._timing_bucket_for_model_phase("evaluate_all_full_scan"), "model_full_scan_seconds")
+        self.assertEqual(worker._task_performance_metrics(task), {
+            "ocr_render_seconds": 1.234,
+            "ocr_render_seconds_count": 2,
+            "ocr_render_cache_hit_count": 3,
+        })
+
     def test_incomplete_model_envelope_allows_second_backoff_retry(self):
         task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
         profile = {"profile_id": "profile-1", "display_name": "测试模型"}
@@ -3060,6 +3074,10 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(first[0], b"jpeg-ocr-bytes")
         self.assertEqual(first, second)
         open_pdf.assert_called_once()
+        metrics = worker._task_performance_metrics(task)
+        self.assertGreaterEqual(metrics["ocr_render_seconds"], 0)
+        self.assertEqual(metrics["ocr_render_seconds_count"], 1)
+        self.assertEqual(metrics["ocr_render_cache_hit_count"], 1)
 
     def test_local_ocr_caches_empty_page_and_reports_failed_page(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "扫描件候选页")

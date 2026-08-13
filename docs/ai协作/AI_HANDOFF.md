@@ -4,23 +4,23 @@
 handoff_schema: 1
 updated_at: 2026-08-14
 module: evaluation-workbench
-status: deployed_validation_completed
-base_commit: a63a082
+status: local_changes
+base_commit: ec43297
 branch: main
-working_tree: modified_runtime_record
-remote_github: a63a082
+working_tree: performance_observability_ready_for_commit
+remote_github: ec43297
 remote_gitee: a63a082
 production_commit: a63a082
 prompt_version: vision-evidence-contract-v61（已部署；评分结构/故障隔离与 EvidencePack 影子扩展）
 database_change: ew_review_results 新增可选 requirement_relation 列（SQLite 兼容迁移）
-user_approval: cloud_validation_completed_pending_next_change
+user_approval: implementation_and_cloud_test_authorized
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
 
 ## 下一位先做
 
-1. `a63a082` 已推送 GitHub/Gitee 并部署；本地完整回归 `530` 项、文档校验和差异格式校验均通过。三原县 DeepSeek 与 sxyh2 MiniMax M3 云端回归均已完成，正式结果未受影子诊断影响。
+1. 本地新增纯观测 `performance_metrics`：模型按全文扫描/审查/评分/OCR归纳/图片分类计时，并记录 OCR/图片渲染、腾讯 OCR 与页级缓存命中；不参与任何业务结论。本地完整回归 `531` 项、文档校验和差异格式校验通过，待提交部署。
 2. 横向主观分影子尚未验收：当前云端确认规则未出现真实 `execution_strategy=cross_bid` 主观项；不得为了测试修改项目规则。待自然出现此类评分规则时，选择低成本项目单独开启开关 A/B。
 3. 后续若优化性能，先补齐按“渲染/本地 OCR 引擎/模型 OCR 归纳/图片识别”的任务级墙钟诊断；不得仅因某次 OCR 子进程耗时波动而引入常驻本地模型或减少证据页。
 4. 已停用接口（`compare-signals` PATCH、`review-results/{id}` PATCH、`score-results/{id}` PATCH、`confirm-auto` ×2）仍返回 410；待确认 `rokid_glasses_app` 未调用后再彻底删除路由。事实账本（shadow-v2）仍不参与跨规则结论。
@@ -88,4 +88,5 @@ user_approval: cloud_validation_completed_pending_next_change
 - 验证：新增材料相反观察、横向影子关闭零读取、开启后仅返回任务元数据和输出边界测试；完整 `530` 项通过，文档校验与 `git diff --check` 通过。
 - 云端 A/B（2026-08-13）：三原县任务 `5df0e621-e274-4034-ae7d-609d66328040` 使用与基线相同的 DeepSeek 档案，关闭横向影子开关后成功完成；18 分 01 秒、122 次调用、2,912,834 Token、1 次紧凑重试、无失败单元。相对基线 `4fc2a8c7-d2c1-4a37-8c4a-e22eb0baca0d`（21 分 24 秒、177 次、3,156,947 Token、5 次格式问题）未见性能回退。企业关联关系承诺书“是”仍以 `not_satisfied/high/contradicts` 展示并保留人工复核；范围偏离关键结论仍在。
 - MiniMax 回归（2026-08-13）：sxyh2 在相同输入、规则、配置下连续两次强制综合评审：任务 `db77f149-21c6-4ddc-8a6b-142c4efd1d48` 为 8 分33秒、125 次、2,365,817 Token；任务 `9fd43c33-e1c5-4cd8-bd3c-0aa50e4db496` 为 10 分01秒、121 次、2,337,804 Token。两次 152 条审查结果的状态/风险/关系均一致，32 条评分建议也完全一致；均无格式重试、失败单元或遗漏规则。第二次本地 OCR 引擎耗时由132秒波动至260秒，但模型调用与最终结论不变，暂作为按需子进程/候选页缓存波动观察，不能据此破坏 2C2G 的非驻留约束。该轮同样不满足横向影子验收条件：当前项目无 `cross_bid` 主观规则，未开启开关，也不得由此推断功能已验收。
+- 性能观测（本地完成，待云端）：新增 `performance_metrics` 仅扩展任务 JSON；按模型阶段、OCR/图片渲染、腾讯 OCR 和本地页缓存计数拆分墙钟。不得据此减少候选页或启用常驻 OCR；先在太原税务 DeepSeek 重跑中读取指标并与正式结论、Token、OCR页数一起验收。
 - 待办：在存在明确 `cross_bid` 主观规则的低成本真实项目上单独开启影子开关 A/B；连续三项目、三轮满足关键召回/建议分/错误高风险/耗时/Token 门槛前，不得将影子结果接入正式评分。

@@ -210,6 +210,58 @@ def _stable_prompt_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _timing_bucket_for_model_phase(phase: str) -> str:
+    """把模型请求归入稳定的性能类别；只用于观测，不参与任何业务判断。"""
+    value = str(phase or "")
+    if "_vision" in value:
+        return "model_vision_seconds"
+    if "_ocr" in value:
+        return "model_ocr_summary_seconds"
+    if "full_scan" in value:
+        return "model_full_scan_seconds"
+    if "_review" in value:
+        return "model_review_seconds"
+    if "_objective" in value:
+        return "model_objective_seconds"
+    if "_subjective" in value:
+        return "model_subjective_seconds"
+    return "model_other_seconds"
+
+
+def _record_task_timing(task: dict | None, key: str, seconds: float = 0.0, count: int = 0) -> None:
+    """汇总任务内的非业务性能指标，线程安全且不写库、不改变执行路径。"""
+    if not isinstance(task, dict) or not key:
+        return
+    lock = task.get("_performance_metrics_lock")
+    if not hasattr(lock, "acquire") or not hasattr(lock, "release"):
+        lock = threading.Lock()
+        task["_performance_metrics_lock"] = lock
+    with lock:
+        metrics = task.get("_performance_metrics")
+        if not isinstance(metrics, dict):
+            metrics = {}
+            task["_performance_metrics"] = metrics
+        if seconds > 0:
+            metrics[key] = float(metrics.get(key) or 0.0) + float(seconds)
+        if count:
+            count_key = f"{key}_count"
+            metrics[count_key] = int(metrics.get(count_key) or 0) + int(count)
+
+
+def _task_performance_metrics(task: dict | None) -> dict:
+    """返回只读、紧凑的任务性能快照，避免把内部锁和缓存写进任务结果。"""
+    if not isinstance(task, dict):
+        return {}
+    metrics = task.get("_performance_metrics")
+    if not isinstance(metrics, dict):
+        return {}
+    return {
+        str(key): round(float(value), 3) if str(key).endswith("_seconds") else int(value)
+        for key, value in metrics.items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    }
+
+
 def _task_request_profile(profile: dict, phase: str, thinking_mode: str | None = None) -> dict:
     """为小规格工作台给可恢复的综合评审请求设定边界，不改变模型档案的保存值。"""
     effective = {**profile, "thinking_mode": thinking_mode} if thinking_mode else dict(profile)
@@ -243,10 +295,16 @@ def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt
             gate.acquire()
         try:
             try:
-                result = request_json(
-                    effective_profile, system_prompt, user_prompt, usage_callback=record_usage,
-                    response_metadata_callback=record_response_metadata, max_tokens=max_tokens,
-                )
+                request_started_at = time.monotonic()
+                try:
+                    result = request_json(
+                        effective_profile, system_prompt, user_prompt, usage_callback=record_usage,
+                        response_metadata_callback=record_response_metadata, max_tokens=max_tokens,
+                    )
+                finally:
+                    _record_task_timing(
+                        task, _timing_bucket_for_model_phase(phase), time.monotonic() - request_started_at, count=1,
+                    )
                 if gate:
                     gate.record_success()
                 return result
@@ -9057,10 +9115,12 @@ def _render_ocr_page(app, document: dict, page_number: int, service: str, task: 
         with lock:
             cached_content = cache["items"].get(cache_key)
         if cached_content is not None:
+            _record_task_timing(task, "ocr_render_cache_hit", count=1)
             return cached_content, hashlib.sha256(cached_content).hexdigest()
     source = storage.document_path(app, document)
     scale = 2.0 if service in {"accurate", "table", "biz_license"} else 1.5
     quality = 88 if scale >= 2 else 80
+    render_started_at = time.monotonic()
     try:
         with fitz.open(source) as pdf:
             if not 1 <= page_number <= pdf.page_count:
@@ -9083,6 +9143,8 @@ def _render_ocr_page(app, document: dict, page_number: int, service: str, task: 
                 )
     except (OSError, RuntimeError, ValueError):
         return None
+    finally:
+        _record_task_timing(task, "ocr_render_seconds", time.monotonic() - render_started_at, count=1)
     if task_cache and len(content) <= 4 * 1024 * 1024:
         cache, lock = task_cache
         with lock:
@@ -9410,6 +9472,7 @@ def _local_ocr_page_texts(app, document: dict, pages: list[int], *, rule: dict |
             image, image_hash = rendered
             cached = storage.get_ocr_page_cache(app, document["document_id"], page, image_hash, LOCAL_OCR_SERVICE)
             if cached and cached.get("parser_version") == LOCAL_OCR_PARSER_VERSION:
+                _record_task_timing(task, "local_ocr_page_cache_hit", count=1)
                 if str(cached.get("text") or "").strip():
                     values.append({**cached, "page": page, "cached": True})
                 elif cached.get("empty"):
@@ -9421,6 +9484,7 @@ def _local_ocr_page_texts(app, document: dict, pages: list[int], *, rule: dict |
             del image
             pending.append({"page": page, "path": str(path)})
             hashes[page] = image_hash
+            _record_task_timing(task, "local_ocr_page_cache_miss", count=1)
         if not pending:
             message_parts = []
             if failed_pages:
@@ -9527,6 +9591,7 @@ def _tencent_ocr_page_texts(app, task: dict, document: dict, rule: dict, result:
             # 只复用当前解析版本。成功但无文字的页面也缓存为 empty，避免纯图片/空白页
             # 在每次重跑时重复消耗 OCR 额度；它只跳过同一接口，不阻断后续页面和多模态。
             if cached and cached.get("parser_version") == _ocr_parser_version_for_service(service):
+                _record_task_timing(task, "tencent_ocr_page_cache_hit", count=1)
                 if str(cached.get("text") or "").strip():
                     values.append({**cached, "page": page, "cached": True})
                     preferred_service = service
@@ -9536,11 +9601,19 @@ def _tencent_ocr_page_texts(app, task: dict, document: dict, rule: dict, result:
                     failure = "腾讯 OCR 未在候选页识别到文字"
                     page_empty = True
                     break
-            response, error = request_tencent_ocr(app, task, service, image)
+            request_started_at = time.monotonic()
+            try:
+                response, error = request_tencent_ocr(app, task, service, image)
+            finally:
+                _record_task_timing(task, "tencent_ocr_seconds", time.monotonic() - request_started_at, count=1)
             error_info = error if isinstance(error, dict) else {"kind": "unknown", "message": str(error or "")}
             # 临时网络/负载错误只在当前页做一次受控重试；不把整项服务永久排除。
             if response is None and error_info.get("retryable"):
-                response, error = request_tencent_ocr(app, task, service, image)
+                request_started_at = time.monotonic()
+                try:
+                    response, error = request_tencent_ocr(app, task, service, image)
+                finally:
+                    _record_task_timing(task, "tencent_ocr_seconds", time.monotonic() - request_started_at, count=1)
                 error_info = error if isinstance(error, dict) else {"kind": "unknown", "message": str(error or "")}
             if response is not None:
                 text = str(response.get("text") or "").strip()
@@ -11204,17 +11277,21 @@ def _render_vision_images(app, document: dict, pages: list[int], level: str, set
                 with lock:
                     content = cache["items"].get(cache_key)
             if content is None:
-                pixmap = page.get_pixmap(matrix=fitz.Matrix(page_setting["scale"], page_setting["scale"]), alpha=False)
-                content = pixmap.tobytes("jpeg", jpg_quality=page_setting["quality"])
-                # 一张图片控制在约 4MB 内，既低于接口上限，也避免 2GB 小服务器出现大块内存峰值。
-                while len(content) > 4 * 1024 * 1024 and page_setting["scale"] > _VISION_MIN_RENDER_SCALE:
-                    page_setting = {
-                        **page_setting,
-                        "scale": max(_VISION_MIN_RENDER_SCALE, page_setting["scale"] * 0.75),
-                        "quality": max(60, page_setting["quality"] - 8),
-                    }
+                render_started_at = time.monotonic()
+                try:
                     pixmap = page.get_pixmap(matrix=fitz.Matrix(page_setting["scale"], page_setting["scale"]), alpha=False)
                     content = pixmap.tobytes("jpeg", jpg_quality=page_setting["quality"])
+                    # 一张图片控制在约 4MB 内，既低于接口上限，也避免 2GB 小服务器出现大块内存峰值。
+                    while len(content) > 4 * 1024 * 1024 and page_setting["scale"] > _VISION_MIN_RENDER_SCALE:
+                        page_setting = {
+                            **page_setting,
+                            "scale": max(_VISION_MIN_RENDER_SCALE, page_setting["scale"] * 0.75),
+                            "quality": max(60, page_setting["quality"] - 8),
+                        }
+                        pixmap = page.get_pixmap(matrix=fitz.Matrix(page_setting["scale"], page_setting["scale"]), alpha=False)
+                        content = pixmap.tobytes("jpeg", jpg_quality=page_setting["quality"])
+                finally:
+                    _record_task_timing(task, "vision_render_seconds", time.monotonic() - render_started_at, count=1)
                 if task_cache and len(content) <= 4 * 1024 * 1024:
                     cache, lock = task_cache
                     with lock:
@@ -11226,6 +11303,8 @@ def _render_vision_images(app, document: dict, pages: list[int], level: str, set
                         if cache["bytes"] + len(content) <= _VISION_TASK_RENDER_CACHE_BYTES:
                             cache["items"][cache_key] = content
                             cache["bytes"] = int(cache["bytes"]) + len(content)
+            else:
+                _record_task_timing(task, "vision_render_cache_hit", count=1)
             images.append({
                 "page": page_number,
                 "mime_type": "image/jpeg",
@@ -11248,33 +11327,37 @@ def _vision_locator_groups(page_count: int) -> list[list[int]]:
     ]
 
 
-def _render_vision_locator_sheets(app, document: dict, groups: list[list[int]]) -> list[dict]:
+def _render_vision_locator_sheets(app, document: dict, groups: list[list[int]], *, task: dict | None = None) -> list[dict]:
     """将一组连续页压成带页码标记的低清联系表，用于纯扫描件找页。"""
     source = storage.document_path(app, document)
     sheets: list[dict] = []
-    with fitz.open(source) as pdf:
-        for group in groups:
-            contact = fitz.open()
-            try:
-                page = contact.new_page(width=900, height=1180)
-                columns = 3
-                cell_width, cell_height = 280, 280
-                for index, page_number in enumerate(group):
-                    row, column = divmod(index, columns)
-                    left, top = 10 + column * 295, 12 + row * 292
-                    source_page = pdf[page_number - 1]
-                    thumbnail = source_page.get_pixmap(matrix=fitz.Matrix(0.32, 0.32), alpha=False)
-                    rect = fitz.Rect(left, top + 18, left + cell_width, top + cell_height)
-                    page.insert_text((left, top + 12), f"P{page_number}", fontsize=11, color=(0, 0, 0))
-                    page.insert_image(rect, stream=thumbnail.tobytes("jpeg", jpg_quality=62), keep_proportion=True)
-                output = b""
-                for scale, quality in ((0.9, 68), (0.65, 55), (0.45, 45)):
-                    output = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False).tobytes("jpeg", jpg_quality=quality)
-                    if len(output) <= 4 * 1024 * 1024:
-                        break
-            finally:
-                contact.close()
-            sheets.append({"pages": group, "mime_type": "image/jpeg", "image_bytes": output, "detail": "low"})
+    render_started_at = time.monotonic()
+    try:
+        with fitz.open(source) as pdf:
+            for group in groups:
+                contact = fitz.open()
+                try:
+                    page = contact.new_page(width=900, height=1180)
+                    columns = 3
+                    cell_width, cell_height = 280, 280
+                    for index, page_number in enumerate(group):
+                        row, column = divmod(index, columns)
+                        left, top = 10 + column * 295, 12 + row * 292
+                        source_page = pdf[page_number - 1]
+                        thumbnail = source_page.get_pixmap(matrix=fitz.Matrix(0.32, 0.32), alpha=False)
+                        rect = fitz.Rect(left, top + 18, left + cell_width, top + cell_height)
+                        page.insert_text((left, top + 12), f"P{page_number}", fontsize=11, color=(0, 0, 0))
+                        page.insert_image(rect, stream=thumbnail.tobytes("jpeg", jpg_quality=62), keep_proportion=True)
+                    output = b""
+                    for scale, quality in ((0.9, 68), (0.65, 55), (0.45, 45)):
+                        output = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False).tobytes("jpeg", jpg_quality=quality)
+                        if len(output) <= 4 * 1024 * 1024:
+                            break
+                finally:
+                    contact.close()
+                sheets.append({"pages": group, "mime_type": "image/jpeg", "image_bytes": output, "detail": "low"})
+    finally:
+        _record_task_timing(task, "vision_locator_render_seconds", time.monotonic() - render_started_at, count=len(groups))
     return sheets
 
 
@@ -11303,7 +11386,7 @@ def _locate_visual_pages(app, task: dict, document: dict, rule: dict, vision_pro
     groups = _vision_locator_groups(int(document["page_count"]))
     for batch_number, offset in enumerate(range(0, len(groups), _VISION_LOCATOR_SHEETS_PER_REQUEST), start=1):
         batch = groups[offset:offset + _VISION_LOCATOR_SHEETS_PER_REQUEST]
-        sheets = _render_vision_locator_sheets(app, document, batch)
+        sheets = _render_vision_locator_sheets(app, document, batch, task=task)
         if not sheets:
             continue
         prompt = storage.render_prompt_template(
@@ -13753,6 +13836,9 @@ def _evaluate_all(app, task: dict) -> dict:
             "local_ocr_engine_seconds": round(float(task.get("_local_ocr_engine_elapsed_ms") or 0) / 1_000, 2),
             "local_ocr_engine_run_count": int(task.get("_local_ocr_engine_run_count") or 0),
             "ocr_enhancement_wall_seconds": round(local_ocr_seconds, 2),
+            # 仅观测：用于把渲染、OCR 引擎、OCR 归纳和图片模型的墙钟拆开，
+            # 不参与候选页、取证、风险、评分、缓存或任何业务结论。
+            "performance_metrics": _task_performance_metrics(task),
             "enhancement_rule_count": enhancement_rule_count,
             "completion_state": "partial_success" if failed_units else "complete",
             "failed_units": failed_units,
