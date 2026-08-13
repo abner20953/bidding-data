@@ -253,6 +253,61 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn("3×3=9分", reason)
         self.assertNotIn("封顶9分", reason)
 
+    def test_compound_rule_context_rotates_child_evidence_without_expanding_budget(self):
+        rule = {
+            "rule_id": "star-rule", "category": "compliance", "title": "关键条款响应",
+            "check_rule": "核验全部独立证明材料", "source_text": "",
+            "execution_meta_json": json.dumps({"evidence_items": [
+                {"item_id": "star-a", "name": "甲项证明", "requirement": "提供甲项证明材料"},
+                {"item_id": "star-b", "name": "乙项证明", "requirement": "提供乙项证明材料"},
+            ]}, ensure_ascii=False),
+        }
+        scan = {
+            "chunks": [
+                {"chunk_id": "chunk_a", "start_page": 10, "end_page": 10, "text": "甲项证明材料及编号A。"},
+                {"chunk_id": "chunk_b", "start_page": 20, "end_page": 20, "text": "乙项证明材料及编号B。"},
+            ],
+            "findings": [], "failed_chunks": [], "chunk_count": 2,
+            "scope_anomalies": [], "project_scope": {},
+        }
+
+        context = worker._full_scan_review_context(scan, [rule], 8_000)
+
+        self.assertEqual(context["pages"][:2], ["chunk_a", "chunk_b"])
+        self.assertEqual(
+            [item["state"] for item in context["subitem_coverage"]["star-rule"]],
+            ["candidate_found", "candidate_found"],
+        )
+        self.assertLessEqual(len(context["text"]), 8_000)
+
+    def test_post_evidence_guard_only_downgrades_when_same_page_text_can_refute_ocr_value(self):
+        result = {
+            "status": "not_satisfied", "risk_level": "high", "confidence": "high",
+            "evidence_quality": "sufficient", "ocr_evidence_pages": [3],
+            "evidence": "供应商名称为山西聚点未来物科技有限公司，与其他页面不一致。",
+            "reason": "主体名称前后不一致。", "conclusion_summary": "主体名称不一致。",
+        }
+        document = {"document_id": "doc-1"}
+        with patch("dashboard.evaluation_workbench.worker._document_page_texts", return_value={
+            3: "供应商名称：山西聚点未来生物科技有限公司；法定代表人：张三。",
+        }):
+            guarded = worker._post_evidence_review_guard(document, {"rule_id": "r1"}, result)
+        self.assertEqual(guarded["risk_level"], "medium")
+        self.assertEqual(guarded["post_evidence_guard"], "source_unverified")
+
+        with patch("dashboard.evaluation_workbench.worker._document_page_texts", return_value={3: "扫描件"}):
+            retained = worker._post_evidence_review_guard(document, {"rule_id": "r1"}, result)
+        self.assertEqual(retained["risk_level"], "high")
+
+    def test_post_evidence_score_reconcile_keeps_score_and_removes_conflicting_math(self):
+        result = worker._post_evidence_score_reconcile({
+            "suggested_score": 10.0,
+            "reason": "计分过程：高级3×3=9分，中级2×1=2分，合计12分。建议10分。",
+        })
+        self.assertEqual(result["suggested_score"], 10.0)
+        self.assertIn("最终建议分：10分", result["reason"])
+        self.assertNotIn("合计12分", result["reason"])
+
     def test_non_retryable_model_envelope_does_not_repeat_or_reduce_concurrency(self):
         task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
         gate = worker._EvaluationRequestGate(limit=2, max_limit=2)

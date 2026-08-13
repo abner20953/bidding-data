@@ -5214,6 +5214,62 @@ def _unbacked_high_risk_evidence_guard(item: dict, status: str, source_chunks: l
     }
 
 
+def _post_evidence_review_guard(document: dict, rule: dict, result: dict) -> dict:
+    """在 OCR/图片合并后重做一次高风险来源闭环。
+
+    文字首轮已有守卫，但 OCR/图片补充会在其后覆盖 evidence/reason。本守卫只在
+    补充层实际引用的页面仍有足够解析原文时运行；纯扫描件没有可比原文时保持图片
+    结论，避免把有效的视觉反证错误降级。
+    """
+    if str(result.get("risk_level") or "") != "high":
+        return result
+    pages = _normalise_result_pages(result.get("ocr_evidence_pages"))
+    pages.extend(page for page in _normalise_result_pages(result.get("vision_evidence_pages")) if page not in pages)
+    if not pages:
+        return result
+    page_texts = _document_page_texts(document)
+    source_chunks = []
+    for page in pages:
+        text = str(page_texts.get(page) or "")
+        # 只有同页仍保留了足够机器可读内容，才有资格否定后补充层的填写值。
+        if len(_evidence_guard_normalize(text)) >= 24:
+            source_chunks.append({"chunk_id": f"page_{page}", "text": text})
+    guarded = _unbacked_high_risk_evidence_guard(
+        result, str(result.get("status") or "manual"), source_chunks,
+    )
+    if not guarded:
+        return result
+    return {
+        **result,
+        **guarded,
+        "post_evidence_guard": "source_unverified",
+        "review_reason": "后续 OCR/图片层的关键填写值无法与同页解析原文对应，需回看原页确认。",
+        "requires_review": True,
+        "automation_status": "needs_review",
+    }
+
+
+def _post_evidence_score_reconcile(result: dict) -> dict:
+    """只清理由后续取证合并造成的算式/建议分矛盾，不改变建议分。"""
+    suggested = result.get("suggested_score")
+    try:
+        suggested = float(suggested) if suggested is not None else None
+    except (TypeError, ValueError):
+        suggested = None
+    if suggested is None:
+        return result
+    reconciled = _reconcile_score_reason(result.get("reason"), suggested)
+    if reconciled == _clean_model_text(result.get("reason")):
+        return result
+    return {
+        **result,
+        "reason": reconciled,
+        "review_reason": "已统一图片/OCR补充后的计分文字，建议分保持不变，需人工复核。",
+        "requires_review": True,
+        "automation_status": "needs_review",
+    }
+
+
 def _review_result_from_model(item: dict, rule_id: str, status: str, *, scope_rule: bool = False) -> dict:
     confidence = _enum_text(item.get("confidence"), {"high", "medium", "low"}, "medium")
     evidence_quality = _enum_text(
@@ -7646,6 +7702,57 @@ def _build_rule_evidence_ledger(scan: dict, rules: list[dict]) -> dict[str, dict
     return ledger
 
 
+def _compound_rule_text_coverage(chunks: list[dict], rules: list[dict]) -> dict[str, list[dict]]:
+    """为复合规则建立子检查项的文本候选，供全文最终组公平分配既有上下文。
+
+    这不是新的扫描或取证通道：只复用已解析全文和既有本地召回。其唯一目的，是避免
+    父规则标题过宽时第一个子项长期占用所有原文片段；没有子项元数据的存量规则仍
+    完全沿用原规则级选择。
+    """
+    child_rules: list[dict] = []
+    parent_by_child: dict[str, tuple[str, dict]] = {}
+    for rule in rules:
+        parent_id = str(rule.get("rule_id") or "")
+        items = _rule_evidence_items(rule)
+        if len(items) < 2:
+            children = _compiled_child_requirements(rule)
+            items = [{
+                "item_id": f"compiled_{index}",
+                "name": child.get("title") or child.get("verification_target") or "",
+                "requirement": child.get("check_rule") or "",
+                "evidence_requirements": child.get("evidence_requirements") or [],
+            } for index, child in enumerate(children[:12], start=1) if isinstance(child, dict)]
+        if not parent_id or len(items) < 2:
+            continue
+        for index, item in enumerate(items[:12], start=1):
+            item_id = str(item.get("item_id") or f"item_{index}")[:80]
+            child_id = f"{parent_id}::evidence::{item_id}"
+            child = _evidence_item_rule(rule, item)
+            child["rule_id"] = child_id
+            child_rules.append(child)
+            parent_by_child[child_id] = (parent_id, {
+                "item_id": item_id,
+                "name": _clean_model_text(item.get("name") or item.get("requirement"))[:180],
+            })
+    selected = select_rule_chunk_evidence_map(chunks, child_rules, per_rule=1)
+    coverage: dict[str, list[dict]] = {}
+    for child_id, (parent_id, item) in parent_by_child.items():
+        matches = selected.get(child_id) or []
+        match = next((value for value in matches if isinstance(value, dict)), None)
+        value = dict(item)
+        if match:
+            value.update({
+                "state": "candidate_found",
+                "chunk_id": str(match.get("chunk_id") or ""),
+                "offset": max(0, int(match.get("offset") or 0)),
+                "anchor": _clean_model_text(match.get("anchor"))[:80],
+            })
+        else:
+            value["state"] = "not_located"
+        coverage.setdefault(parent_id, []).append(value)
+    return coverage
+
+
 _SCOPE_RULE_MARKERS = (
     "项目范围", "范围无关", "无关内容", "无关信息", "无关技术", "无关项目",
     "项目无关", "范围偏离", "范围一致", "混包", "其他项目",
@@ -8331,6 +8438,7 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
     required_ids: list[str] = []
     ledger = scan.get("evidence_ledger", {}) if isinstance(scan.get("evidence_ledger"), dict) else {}
     fallback_by_rule = select_rule_chunk_evidence_map(scan.get("chunks", []), rules, per_rule=1)
+    subitem_coverage = _compound_rule_text_coverage(scan.get("chunks", []), rules)
     fallback_offsets: dict[str, int] = {}
     # 日期异常页是本规则组的确定性直接证据，先分配原文位置，防止被普通命中页
     # 挤出上下文预算。
@@ -8354,6 +8462,30 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
             rule_evidence.setdefault(chunk_id, []).append(str(finding.get("evidence")))
         if chunk_id not in required_ids:
             required_ids.append(chunk_id)
+    # 父规则先保有既有的一条直接证据；随后让复合规则的子检查项按轮次各获得
+    # 一个机会。总页块上限仍由原上下文预算决定，不增加扫描、OCR 或模型调用。
+    required_slot_limit = max(
+        len(required_ids),
+        min(len(required_ids) + 12, max(len(required_ids), char_limit // 1_600)),
+    )
+    max_depth = max((len(items) for items in subitem_coverage.values()), default=0)
+    for depth in range(max_depth):
+        for rule in rules:
+            if len(required_ids) >= required_slot_limit:
+                break
+            items = subitem_coverage.get(str(rule.get("rule_id") or ""), [])
+            if depth >= len(items):
+                continue
+            item = items[depth]
+            chunk_id = str(item.get("chunk_id") or "")
+            if not chunk_id or chunk_id in required_ids:
+                continue
+            required_ids.append(chunk_id)
+            fallback_offsets.setdefault(chunk_id, max(0, int(item.get("offset") or 0)))
+            if item.get("anchor"):
+                rule_evidence.setdefault(chunk_id, []).append(str(item["anchor"]))
+        if len(required_ids) >= required_slot_limit:
+            break
     ordered_ids = required_ids + [item for item in selected_ids if item not in required_ids]
 
     def source_excerpt(chunk: dict, evidence_values: list[str], budget: int, fallback_offset: int | None = None) -> str:
@@ -8401,6 +8533,7 @@ def _full_scan_review_context(scan: dict, rules: list[dict], char_limit: int, *,
         "pages": included,
         "unmatched_rule_ids": [],
         "form_date_consistency": form_date_packet,
+        "subitem_coverage": subitem_coverage,
     }
 
 
@@ -8982,6 +9115,21 @@ def _evaluation_ocr_enabled(ocr_features_enabled: bool, configuration: dict) -> 
     return bool(_ocr_runtime_enabled(configuration))
 
 
+def _record_task_local_ocr_metrics(task: dict | None, runtime_metrics: dict) -> None:
+    """累计 RapidOCR 引擎真实耗时，不把模型归纳和排队时间伪装成 OCR 耗时。"""
+    if not isinstance(task, dict):
+        return
+    lock = task.get("_local_ocr_metrics_lock")
+    if not hasattr(lock, "acquire") or not hasattr(lock, "release"):
+        lock = threading.Lock()
+        task["_local_ocr_metrics_lock"] = lock
+    with lock:
+        task["_local_ocr_engine_elapsed_ms"] = int(task.get("_local_ocr_engine_elapsed_ms") or 0) + max(
+            0, int(runtime_metrics.get("elapsed_ms") or 0),
+        )
+        task["_local_ocr_engine_run_count"] = int(task.get("_local_ocr_engine_run_count") or 0) + 1
+
+
 def _ocr_parser_version_for_service(service: str) -> int:
     return LOCAL_OCR_PARSER_VERSION if service == LOCAL_OCR_SERVICE else OCR_PARSER_VERSION
 
@@ -9033,6 +9181,7 @@ def _local_ocr_page_texts(app, document: dict, pages: list[int], *, rule: dict |
         runtime_metrics: dict = {}
         with _LOCAL_OCR_REQUEST_GATE:
             local_values, error = request_local_ocr(pending, metrics=runtime_metrics)
+        _record_task_local_ocr_metrics(task, runtime_metrics)
         try:
             storage.record_local_ocr_run(
                 app,
@@ -11356,6 +11505,13 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
                 )[:context_limit],
             }
     unmatched_rule_ids = set(context.get("unmatched_rule_ids") or [])
+    subitem_coverage = context.get("subitem_coverage") if isinstance(context.get("subitem_coverage"), dict) else {}
+    if subitem_coverage:
+        payload = [
+            {**item, "evidence_item_coverage": subitem_coverage.get(item["rule_id"], [])}
+            if subitem_coverage.get(item["rule_id"]) else item
+            for item in payload
+        ]
     if unmatched_rule_ids:
         payload = [{**item, "context_unmatched": item["rule_id"] in unmatched_rule_ids} for item in payload]
     if context["mode"] == "unmatched_rules":
@@ -12341,6 +12497,10 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
                 # 两条图片能力均不可用时，明确保留文字结论。
                 merged = _with_vision_execution(merged, "unavailable", [], {}, "本次未获得可用的 OCR 或多模态模型，未执行图片取证。")
             merged = _apply_document_evidence_guard(document, component, rule, merged)
+            if component == "review":
+                merged = _post_evidence_review_guard(document, rule, merged)
+            else:
+                merged = _post_evidence_score_reconcile(merged)
             completed_results[component][rule["rule_id"]] = merged
             if component == "review" and run:
                 storage.save_review_results(app, run["review_run_id"], document["document_id"], [merged])
@@ -12435,6 +12595,7 @@ def _evaluation_highlight_candidates(app, project_id: str) -> tuple[list[dict], 
             "title": item.get("title"), "check_rule": item.get("check_rule"),
             "status": item.get("status"), "risk_level": item.get("risk_level"),
             "confidence": item.get("confidence"), "evidence_quality": item.get("evidence_quality"),
+            "conclusion_summary": item.get("conclusion_summary"),
             "evidence": str(item.get("evidence") or "")[:360],
             "reason": str(item.get("reason") or "")[:260],
         }
@@ -12474,6 +12635,7 @@ def _evaluation_highlight_candidates(app, project_id: str) -> tuple[list[dict], 
             "type": "score", "rule_id": rule_id, "title": item.get("title"),
             "check_rule": item.get("check_rule"), "suggested_score": suggested_score,
             "max_score": max_score, "confidence": item.get("confidence"),
+            "conclusion_summary": item.get("conclusion_summary"),
             "evidence": str(item.get("evidence") or "")[:300],
             "reason": str(item.get("reason") or "")[:220],
             "_rank": (1, 0, 0), "_critical_eligible": False,
@@ -12890,6 +13052,10 @@ def _evaluate_all(app, task: dict) -> dict:
     full_scan_document_count = full_scan_batch_count = full_scan_failed_chunk_count = 0
     full_scan_recovery_warning_count = 0
     local_ocr_rule_count = local_ocr_skipped_rule_count = enhancement_rule_count = 0
+    # 任务级真实引擎指标由 _local_ocr_page_texts 逐次累积；不含排队、渲染、腾讯
+    # OCR 或后续模型归纳。任务对象只在本次 worker 生命周期内存在。
+    task["_local_ocr_engine_elapsed_ms"] = 0
+    task["_local_ocr_engine_run_count"] = 0
     local_ocr_seconds = 0.0
     groups_per_document = sum(
         len(_evaluation_rule_batches(component, component_rules))
@@ -13006,7 +13172,12 @@ def _evaluate_all(app, task: dict) -> dict:
             "fact_ledger_conflict_count": fact_ledger_conflict_count,
             "local_ocr_rule_count": local_ocr_rule_count,
             "local_ocr_skipped_rule_count": local_ocr_skipped_rule_count,
-            "local_ocr_seconds": round(local_ocr_seconds, 2),
+            # 旧字段修正为实际 RapidOCR 推理耗时；保留原流程墙钟指标为新增字段，
+            # 便于历史调用方平滑迁移且可以解释 OCR 后模型归纳/排队所占时间。
+            "local_ocr_seconds": round(float(task.get("_local_ocr_engine_elapsed_ms") or 0) / 1_000, 2),
+            "local_ocr_engine_seconds": round(float(task.get("_local_ocr_engine_elapsed_ms") or 0) / 1_000, 2),
+            "local_ocr_engine_run_count": int(task.get("_local_ocr_engine_run_count") or 0),
+            "ocr_enhancement_wall_seconds": round(local_ocr_seconds, 2),
             "enhancement_rule_count": enhancement_rule_count,
             "completion_state": "partial_success" if failed_units else "complete",
             "failed_units": failed_units,
