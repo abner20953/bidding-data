@@ -4,27 +4,25 @@
 handoff_schema: 1
 updated_at: 2026-08-13
 module: evaluation-workbench
-status: deployed_validation_pending
+status: ready_for_commit
 base_commit: 5832c9d
 branch: main
-working_tree: clean
+working_tree: local changes（直接反证状态收口+评审后修复，未提交）
 remote_github: 5832c9d
 remote_gitee: 5832c9d
 production_commit: 5832c9d
-prompt_version: vision-evidence-contract-v58（评审版本未变；规则提取指纹已变化）
-database_change: rule execution metadata 新增可选 RC 否决条款身份，无迁移
-user_approval: submitted_pushed_deployed_5832c9d
+prompt_version: vision-evidence-contract-v59（评审模板新增 requirement_relation 协议）
+database_change: ew_review_results 新增可选 requirement_relation 列（SQLite 兼容迁移）
+user_approval: 已批准本轮修改与评审后修复；尚未批准提交、推送或部署
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
 
 ## 下一位先做
 
-1. 云端已部署 `5832c9d`：build-info `commit=5832c9d`、`runtime_release_commit=5832c9d`、`version_consistent=true`，镜像 `.build-commit` 与宿主机 `.deploy-commit` 一致（2026-08-13 08:32 核验），`/pingbiao` 与项目 API 正常。**首次构建因 modelscope 下载 PP-OCRv5 rec 模型网络中断失败，重跑后成功**——后续构建失败先重试，勿改 Dockerfile。
-2. **三原县 + 太原税务复跑验收（下一步）**：各强制综合评审一次，对比关键问题、错误高风险、建议分、耗时、Token、OCR 引擎耗时（`local_ocr_engine_seconds`）与流程墙钟（`ocr_enhancement_wall_seconds`）。注意区分"高风险守卫主动降级为待原页核验"与"真漏检"两类差异；任一关键质量指标下降则回退 `5832c9d` 记录 5 的改动。
-3. 已停用接口（`compare-signals` PATCH、`review-results/{id}` PATCH、`score-results/{id}` PATCH、`confirm-auto` ×2）仍返回 410；待确认 `rokid_glasses_app` 未调用后再彻底删除路由。
-4. 事实账本（shadow-v2）仍不参与跨规则结论，通过验收前不得接入。
-5. 若继续工作台代码任务，按 `AI_CONTEXT.md` 的任务路由阅读稳定设计。
+1. 本地已完成“直接反证状态收口”及评审后修复（镜像漏洞防护、禁止性义务检查、OCR/视觉合并保留 relation、亮点替换保留提示、v59）：516 项测试与文档校验通过；未增加模型调用、OCR页数、并发或全文扫描范围。仍需用户确认后提交，再部署并以三原县先做 DeepSeek、后做 MiniMax A/B。
+2. 验收重点：第146页“是”应为高风险重点线索且写明需原页确认；已有授权书空白、范围异常等不得下降；建议分、调用数、OCR页数不得增加。若任一项退化，单独回退本记录的状态收口改动。
+3. 已停用接口（`compare-signals` PATCH、`review-results/{id}` PATCH、`score-results/{id}` PATCH、`confirm-auto` ×2）仍返回 410；待确认 `rokid_glasses_app` 未调用后再彻底删除路由。事实账本（shadow-v2）仍不参与跨规则结论。
 
 ## 活跃记录（最多 10 条）
 
@@ -63,3 +61,12 @@ user_approval: submitted_pushed_deployed_5832c9d
 - 本地验证：新增复合子项轮转、同页 OCR 填写值纠错/纯扫描页保持高风险、评分算式收口测试；完整 `507` 项通过，文档校验与 `git diff --check` 通过。
 - 云端：`5832c9d` 已部署（首次构建因 modelscope 下载模型网络中断失败，重跑成功），build-info `version_consistent=true`。
 - 下一步：以三原县与太原税务各强制综合评审一次，对比关键问题、错误高风险、建议分、耗时、Token、OCR 引擎耗时与流程墙钟。任一关键质量指标下降则回退本记录改动，不接入 EvidencePack 正式决策层。
+
+### 6. 直接反证状态收口（含评审后修复，待提交与云端 A/B）
+
+- 根因：旧状态修正器会因理由含“符合/满足”把 `not_satisfied` 改成 `satisfied`；“符合禁止情形”因此被错误降为低风险并从重点结论漏掉，已由三原县 DeepSeek 与 MiniMax 复跑共同证实。
+- 已实施：模型输出和结果表新增 `requirement_relation`；明确否决规则的 `contradicts` 保留不满足/高风险候选，仍要求人工复核；旧模板仅在缺字段时追加短协议；摘要对结构化直接反证做通用保留，不按项目或文本打补丁。
+- **评审后修复（2026-08-13）**：① 镜像漏洞防护——rejection 规则下模型把 contradicts 误写成 supports 时不再翻转为满足（supports 翻转加 `decision_impact != "rejection"` 豁免）；② 禁止性义务结构词（不得/禁止/严禁/不应/不允许/不予）下“符合禁止情形”即使规则未被判为 rejection 也不由关键词翻转；③ OCR 批量/逐条与视觉合并路径未显式给出关系时继承文字阶段已确认的 relation（此前 contradicts 会在 OCR 合并后被重置为 uncertain，导致重点结论直接反证标记失效）；④ 亮点面板容量已满替换线索时把被替换结论并入 basis 提示，不无声消失；⑤ 提示词版本升 v59；⑥ 本地推断与模型显式输出的 relation 来源不可区分已注释说明。
+- 不变契约：不自动废标、不改规则、建议分、全文/OCR/图片策略、并发和已有 API；来源闭环仍可将无锚点高风险回落为待原页确认。
+- 验证：新增镜像漏洞、禁止义务、OCR 合并保留、替换提示 4 项回归（原有 2 项未回归）；完整 `516` 项通过，`git diff --check` 与文档校验通过。
+- 主要文件：`worker.py`、`storage.py`、`prompt_templates.py`、测试、稳定设计。

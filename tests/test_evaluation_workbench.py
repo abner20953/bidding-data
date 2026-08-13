@@ -774,6 +774,109 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(result["status"], "not_satisfied")
         self.assertEqual(result["risk_level"], "high")
 
+    def test_direct_rejection_contradiction_is_not_flipped_by_positive_wording(self):
+        """“符合禁止情形”是反证，不能因包含“符合”被改成满足。"""
+        rule = {
+            "rule_id": "prior-service", "category": "other", "title": "禁止重复参与",
+            "check_rule": "核验供应商未为本项目提供前期服务。",
+            "source_text": "为本项目提供前期服务的供应商不得再参加采购活动，否则为无效响应。",
+        }
+        result = worker._normalise_review_results([{
+            "rule_id": "prior-service", "status": "not_satisfied", "risk_level": "low", "confidence": "high",
+            "evidence_quality": "sufficient", "evidence": "第12页承诺书第2项填写“是”。",
+            "reason": "填写“是”，直接符合禁止再次参加采购活动的情形，需复核原页。",
+            "summary": "填写内容触碰禁止再次参加条款，需原页确认。",
+        }], [rule])[0]
+
+        self.assertEqual(result["requirement_relation"], "contradicts")
+        self.assertEqual(result["status"], "not_satisfied")
+        self.assertEqual(result["risk_level"], "high")
+
+    def test_explicit_supports_relation_can_correct_a_negative_status(self):
+        rule = {"rule_id": "joint", "title": "非联合体", "check_rule": "本项目不接受联合体投标。"}
+        result = worker._normalise_review_results([{
+            "rule_id": "joint", "status": "not_satisfied", "requirement_relation": "supports",
+            "risk_level": "medium", "confidence": "high", "evidence_quality": "sufficient",
+            "evidence": "投标人为单一主体，未见联合体协议。", "reason": "投标文件直接支持非联合体要求。",
+        }], [rule])[0]
+
+        self.assertEqual(result["requirement_relation"], "supports")
+        self.assertEqual(result["status"], "satisfied")
+        self.assertEqual(result["risk_level"], "low")
+
+    def test_rejection_rule_supports_miswrite_does_not_flip_negative_status(self):
+        """镜像漏洞防护：明确否决规则下模型把 contradicts 误写成 supports 时，
+        not_satisfied 不得被翻转为满足。"""
+        rule = {
+            "rule_id": "prior-service", "category": "other", "title": "禁止重复参与",
+            "check_rule": "核验供应商未为本项目提供前期服务。",
+            "source_text": "为本项目提供前期服务的供应商不得再参加采购活动，否则为无效响应。",
+        }
+        result = worker._normalise_review_results([{
+            "rule_id": "prior-service", "status": "not_satisfied", "requirement_relation": "supports",
+            "risk_level": "medium", "confidence": "high", "evidence_quality": "sufficient",
+            "evidence": "第12页承诺书第2项填写“是”。", "reason": "承诺书填写“是”，需复核原页。",
+        }], [rule])[0]
+
+        self.assertEqual(result["requirement_relation"], "supports")
+        # 结构化字段与状态自相矛盾时，rejection 规则不能因 supports 误写而放行。
+        self.assertEqual(result["status"], "not_satisfied")
+
+    def test_prohibitive_obligation_positive_wording_does_not_flip_status(self):
+        """禁止性义务的“符合禁止情形”即使规则未被判为 rejection，也不能由
+        “符合”关键词翻转为满足。"""
+        rule = {
+            "rule_id": "prohibited", "category": "compliance", "title": "禁止分包",
+            "check_rule": "本项目不得分包、不得转包，供应商应自行实施。",
+            "source_text": "中标人不得将项目分包或转包。",
+        }
+        result = worker._normalise_review_results([{
+            "rule_id": "prohibited", "status": "not_satisfied", "risk_level": "low", "confidence": "high",
+            "evidence_quality": "sufficient",
+            "evidence": "第8页实施方案载明分包给第三方实施。",
+            "reason": "方案载明分包，符合禁止分包的禁止情形，需复核原页。",
+            "summary": "方案存在分包安排，触碰禁止分包条款。",
+        }], [rule])[0]
+
+        self.assertEqual(result["status"], "not_satisfied")
+
+    def test_ocr_merge_preserves_confirmed_requirement_relation(self):
+        """OCR 补充合并不得把文字阶段已确认的 contradicts 重置为 uncertain。"""
+        rule = {
+            "rule_id": "prior-service", "category": "other", "title": "禁止重复参与",
+            "check_rule": "核验供应商未为本项目提供前期服务。",
+            "source_text": "为本项目提供前期服务的供应商不得再参加采购活动，否则为无效响应。",
+        }
+        working = worker._review_result_from_model({
+            "rule_id": "prior-service", "status": "not_satisfied", "requirement_relation": "contradicts",
+            "risk_level": "high", "confidence": "medium", "evidence": "承诺书填写“是”。",
+            "reason": "直接反证，需原页确认。", "summary": "触碰禁止条款。",
+        }, "prior-service", "not_satisfied")
+        merged = worker._apply_ocr_summary(
+            "review", rule, working,
+            {
+                "evidence": "承诺书第2项填写“是”。", "reason": "OCR 复核确认填写值。",
+                "evidence_pages": [12], "status": "not_satisfied", "risk_level": "high",
+                "confidence": "high", "content_coverage": "covered",
+            },
+            {"pages": [12], "service_labels": "本地OCR", "local_only": True, "failure": None,
+             "incomplete_pages": [], "scope": "full"},
+        )
+        self.assertEqual(merged["requirement_relation"], "contradicts")
+
+    def test_highlight_swap_keeps_replaced_clue_note(self):
+        """面板容量已满时替换线索，须保留被替换结论的提示而不是无声消失。"""
+        highlights = [
+            {"rule_id": "a", "level": "high", "keyword": "A", "conclusion": "甲", "basis": "原依据"},
+            {"rule_id": "b", "level": "attention", "keyword": "B", "conclusion": "乙", "basis": "待复核"},
+        ]
+        worker._swap_highlight_keep_note(highlights, 1, {
+            "rule_id": "c", "level": "high", "keyword": "C", "conclusion": "丙", "basis": "直接反证",
+        })
+        self.assertEqual(highlights[1]["rule_id"], "c")
+        self.assertIn("乙", highlights[1]["basis"])
+        self.assertLessEqual(len(highlights[1]["basis"]), 120)
+
     def test_parse_task_reuses_successful_parse_cache(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案：稳定运行。")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
@@ -2237,6 +2340,29 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(candidates[0]["candidates"][0]["category"], "rejection")
         self.assertEqual(allowed[("d1", "r1")]["decision_impact"], "rejection")
 
+    def test_direct_rejection_contradiction_is_retained_when_highlight_model_omits_it(self):
+        candidates = [{"document_id": "d1", "bidder_name": "甲公司", "candidates": []}]
+        allowed = {
+            ("d1", "r-direct"): {
+                "type": "review", "rule_id": "r-direct", "title": "禁止重复参与",
+                "status": "not_satisfied", "risk_level": "high", "confidence": "high",
+                "evidence_quality": "sufficient", "requirement_relation": "contradicts",
+                "decision_impact": "rejection", "_direct_rejection_contradiction": True,
+                "_rank": (1, 4, 4, 3), "evidence": "第12页第2项填写“是”。",
+                "reason": "与禁止再次参加采购活动的要求直接相反，需原页确认。",
+                "conclusion_summary": "填写内容触碰禁止再次参加条款，需原页确认。",
+            },
+            ("d1", "r-other"): {"_critical_eligible": False},
+        }
+        values = worker._normalise_evaluation_highlights({"summaries": [{
+            "document_id": "d1", "headline": "存在需复核事项",
+            "highlights": [{"rule_id": "r-other", "level": "attention", "keyword": "其他", "conclusion": "一般提示", "basis": "原文"}],
+        }]}, candidates, allowed)
+
+        direct = next(item for item in values[0]["highlights"] if item["rule_id"] == "r-direct")
+        self.assertEqual(direct["level"], "high")
+        self.assertIn("禁止再次参加", direct["conclusion"])
+
     def test_ocr_summary_does_not_override_full_text_rule_conclusion(self):
         rule = {"rule_id": "r1", "title": "项目范围无关内容核验", "check_rule": "全文检查是否出现与本项目无关内容"}
         working = {
@@ -3377,6 +3503,19 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("fact_relation", effective)
         self.assertEqual(listed["content"], effective)
 
+    def test_legacy_review_template_is_completed_with_requirement_relation_contract(self):
+        legacy = "请逐条审查，只返回 JSON：{\"results\":[{\"rule_id\":\"ID\",\"status\":\"状态\",\"evidence\":\"证据\",\"reason\":\"理由\"}]}。规则：{{rules}}；原文：{{text}}；文件：{{document_name}}；投标人：{{bidder_name}}；{{retry_note}}"
+        with storage.connection(self.app) as conn:
+            conn.execute(
+                "INSERT INTO ew_settings(setting_key, setting_value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value, updated_at=excluded.updated_at",
+                (storage.PROMPT_TEMPLATE_SETTING, json.dumps({"evaluate_all_review_user": legacy}, ensure_ascii=False), storage.now_iso()),
+            )
+        effective = storage.prompt_template(self.app, "evaluate_all_review_user")
+
+        self.assertIn("【系统必需输出协议】", effective)
+        self.assertIn("requirement_relation", effective)
+
     def test_global_rules_require_password_and_are_all_imported_with_default_selection(self):
         client = self.app.test_client()
         self.assertEqual(client.get("/api/evaluation-workbench/global-rules").status_code, 200)
@@ -3586,7 +3725,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("表格字段、填写格式", PROMPT_TEMPLATES["extract_rules_obligation_compile_user"]["content"])
         self.assertIn("系统仅能核验已上传文件", PROMPT_TEMPLATES["extract_rules_guidance"]["content"])
         self.assertIn("当一条候选仅概述同一表单、附件或材料的格式", PROMPT_TEMPLATES["extract_rules_dedupe_adjudication_user"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v58")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v59")
 
     def test_scope_chapter_and_text_error_guidance_present(self):
         from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
@@ -3604,7 +3743,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(text_marker, PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("必须点名最具辨识度的偏离对象", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("risk_level 应为 high", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v58")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v59")
 
     def test_ocr_visual_contracts_deduplicated_but_keep_hard_constraints(self):
         from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
@@ -4461,7 +4600,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         review_run = storage.create_review_run(self.app, self.project["project_id"], task["task_id"], None)
         storage.save_review_results(self.app, review_run["review_run_id"], document["document_id"], [{
             "rule_id": rule["rule_id"], "status": "not_satisfied", "risk_level": "high",
-            "confidence": "high", "evidence_quality": "sufficient", "evidence": "未见有效资质",
+            "requirement_relation": "contradicts", "confidence": "high", "evidence_quality": "sufficient", "evidence": "未见有效资质",
         }])
         storage.update_task(self.app, task["task_id"], status="success", result={"highlights": [{
             "document_id": document["document_id"], "bidder_name": "甲公司", "overall_level": "critical",
@@ -4471,8 +4610,13 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         review_run, rows = storage.latest_review_results(self.app, self.project["project_id"])
 
         self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["requirement_relation"], "contradicts")
         self.assertEqual(review_run["highlights"][0]["bidder_name"], "甲公司")
         self.assertEqual(review_run["highlights"][0]["highlights"][0]["keyword"], "明确否决")
+
+    def test_requirement_relation_storage_value_is_enum_safe(self):
+        self.assertEqual(storage._requirement_relation_value({"requirement_relation": "contradicts"}), "contradicts")
+        self.assertEqual(storage._requirement_relation_value({"requirement_relation": "unexpected"}), "uncertain")
 
     def test_highlight_failure_does_not_fail_completed_evaluation(self):
         self._add_pdf("tender.pdf", "tender", "", "投标人未提供有效资质的，作无效投标处理。")
@@ -6450,7 +6594,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不限定行业或采购类型", guidance)
         scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v58")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v59")
 
     def test_full_scan_does_not_reinject_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")

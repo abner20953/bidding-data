@@ -617,6 +617,7 @@ def init_database(app) -> None:
                 document_id TEXT NOT NULL REFERENCES ew_documents(document_id) ON DELETE CASCADE,
                 rule_id TEXT NOT NULL REFERENCES ew_rules(rule_id) ON DELETE CASCADE,
                 status TEXT NOT NULL,
+                requirement_relation TEXT NOT NULL DEFAULT 'uncertain',
                 final_status TEXT,
                 evidence TEXT NOT NULL DEFAULT '',
                 page_hint TEXT,
@@ -700,6 +701,7 @@ def init_database(app) -> None:
             """
         )
         _ensure_column(conn, "ew_review_results", "final_status", "TEXT")
+        _ensure_column(conn, "ew_review_results", "requirement_relation", "TEXT NOT NULL DEFAULT 'uncertain'")
         _ensure_column(conn, "ew_review_results", "confirmed_at", "TEXT")
         _ensure_column(conn, "ew_model_profiles", "api_key_encrypted", "TEXT")
         _ensure_column(conn, "ew_model_profiles", "supports_vision", "INTEGER NOT NULL DEFAULT 0")
@@ -4491,6 +4493,12 @@ def _multimodal_status_value(item: dict) -> str:
     return "not_requested" if legacy.startswith("ocr_") else legacy
 
 
+def _requirement_relation_value(item: dict) -> str:
+    """审查事实关系是枚举契约；历史结果或异常调用统一安全回落。"""
+    value = str(item.get("requirement_relation") or "")
+    return value if value in {"supports", "contradicts", "uncertain"} else "uncertain"
+
+
 def _evidence_layers_json(item: dict) -> str:
     """持久化可展示的证据层；异常输入退化为空数组，不能影响评审主流程。"""
     values = item.get("evidence_layers")
@@ -4566,12 +4574,12 @@ def save_review_results(app, review_run_id: str, document_id: str, results: list
     with connection(app) as conn:
         for item in results:
             conn.execute(
-                """INSERT INTO ew_review_results(review_result_id, review_run_id, document_id, rule_id, status, evidence, page_hint, reason, conclusion_summary, risk_level,
-                   confidence, evidence_quality, coverage_status, automation_status, requires_review, review_reason,
-                   vision_status, ocr_status, multimodal_status, vision_pages_json, vision_evidence_pages_json, evidence_layers_json, vision_model, vision_message, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """INSERT INTO ew_review_results(review_result_id, review_run_id, document_id, rule_id, status, requirement_relation, evidence, page_hint, reason, conclusion_summary, risk_level,
+                    confidence, evidence_quality, coverage_status, automation_status, requires_review, review_reason,
+                    vision_status, ocr_status, multimodal_status, vision_pages_json, vision_evidence_pages_json, evidence_layers_json, vision_model, vision_message, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(review_run_id, document_id, rule_id) DO UPDATE SET
-                status=excluded.status, evidence=excluded.evidence, page_hint=excluded.page_hint, reason=excluded.reason, conclusion_summary=excluded.conclusion_summary,
+                status=excluded.status, requirement_relation=excluded.requirement_relation, evidence=excluded.evidence, page_hint=excluded.page_hint, reason=excluded.reason, conclusion_summary=excluded.conclusion_summary,
                 risk_level=excluded.risk_level, confidence=excluded.confidence, evidence_quality=excluded.evidence_quality, coverage_status=excluded.coverage_status,
                 automation_status=excluded.automation_status, requires_review=excluded.requires_review,
                 review_reason=excluded.review_reason, vision_status=excluded.vision_status,
@@ -4579,7 +4587,7 @@ def save_review_results(app, review_run_id: str, document_id: str, results: list
                 vision_pages_json=excluded.vision_pages_json, vision_evidence_pages_json=excluded.vision_evidence_pages_json,
                 evidence_layers_json=excluded.evidence_layers_json, vision_model=excluded.vision_model,
                 vision_message=excluded.vision_message, created_at=excluded.created_at""",
-                (str(uuid.uuid4()), review_run_id, document_id, item["rule_id"], item["status"], item.get("evidence", ""),
+                (str(uuid.uuid4()), review_run_id, document_id, item["rule_id"], item["status"], _requirement_relation_value(item), item.get("evidence", ""),
                  item.get("page_hint"), item.get("reason", ""), item.get("conclusion_summary", ""), item.get("risk_level", "medium"), item.get("confidence", "medium"),
                  item.get("evidence_quality", "limited"), item.get("coverage_status", "covered"), item.get("automation_status", "needs_review"),
                  1 if item.get("requires_review", True) else 0, item.get("review_reason", ""),

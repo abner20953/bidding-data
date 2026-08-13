@@ -4839,17 +4839,75 @@ def _implicit_ocr_is_only_pending_fact(item: dict) -> bool:
     return status in {"manual", "ocr_required", "not_found"}
 
 
-def _status_conflicts_with_positive_reason(status: str, reason: object) -> bool:
-    """阻止模型把“符合/满足”的理由与“不满足”状态同时保存。"""
-    if status != "not_satisfied":
-        return False
-    text = _clean_model_text(reason)
+_REQUIREMENT_RELATIONS = {"supports", "contradicts", "uncertain"}
+# 禁止性义务的结构词：这类规则下“符合/满足”更可能是“符合禁止情形”这类直接反证，
+# 不能由自然语言关键词翻转为满足。词表是稳定的法律/程序结构词，不随项目膨胀。
+_PROHIBITIVE_OBLIGATION_PATTERN = re.compile(r"不得|禁止|严禁|不应|不允许|不予")
+
+
+def _review_requirement_relation(item: dict, status: str) -> tuple[str, bool]:
+    """读取模型明确给出的“投标事实—规则要求”关系。
+
+    该关系与最终审查状态不是同一概念：例如“符合禁止参加情形”在自然语言中含有
+    “符合”，但其事实关系仍是 ``contradicts``。旧模板没有字段时，只按原始状态做
+    保守兼容推断，绝不再扫描理由关键词后反向改写业务状态。
+    注意：本地推断与模型显式输出共用同一字段，落库后无法区分来源；如后续审计
+    需要区分，可另存 ``relation_source`` 元数据。
+    """
+    explicit = _enum_text(item.get("requirement_relation"), _REQUIREMENT_RELATIONS, "")
+    if explicit:
+        return explicit, True
+    if status == "satisfied":
+        return "supports", False
+    if status == "not_satisfied":
+        return "contradicts", False
+    return "uncertain", False
+
+
+def _legacy_positive_status_correction(status: str, item: dict, rule: dict,
+                                       relation_is_explicit: bool) -> tuple[str, dict]:
+    """兼容旧模板中明显的“正向理由 + 不满足状态”错配。
+
+    旧逻辑把理由中任何“符合”都改成满足，导致“符合禁止情形”类直接反证被吞掉。
+    这里只保留非否决规则的历史兼容；明确否决规则必须等待结构化 relation 或人工
+    复核，不能再由自然语言关键词翻转状态。
+    """
+    if status != "not_satisfied" or relation_is_explicit:
+        return status, item
+    if _rule_decision_impact(rule) == "rejection":
+        return status, item
+    text = _clean_model_text(item.get("reason"))
     if not text:
-        return False
+        return status, item
     negative_markers = ("不符合", "不满足", "未满足", "未提供", "未提交", "缺失", "无效", "不一致", "矛盾", "负偏离", "不响应")
     if any(marker in text for marker in negative_markers):
-        return False
-    return any(marker in text for marker in ("符合", "满足要求", "满足", "未发现"))
+        return status, item
+    if any(marker in text for marker in ("符合", "满足要求", "满足", "未发现")):
+        # 禁止性义务下“符合禁止情形”是直接反证，不是满足；即使 RC/正则未把该
+        # 规则判为 rejection，也不能由关键词翻转（与 rejection 豁免同一语义）。
+        rule_text = " ".join(_clean_model_text(rule.get(key)) for key in ("title", "check_rule", "source_text"))
+        if _PROHIBITIVE_OBLIGATION_PATTERN.search(rule_text):
+            return status, item
+        return "satisfied", {**item, "risk_level": "low", "requirement_relation": "supports"}
+    return status, item
+
+
+def _apply_requirement_relation_contract(status: str, item: dict, rule: dict) -> tuple[str, dict]:
+    """让结构化关系约束结果状态，不根据自然语言措辞猜测业务方向。"""
+    relation, explicit = _review_requirement_relation(item, status)
+    item = {**item, "requirement_relation": relation}
+    decision_impact = _rule_decision_impact(rule)
+    if relation == "contradicts" and decision_impact == "rejection":
+        # 明确否决规则出现直接相反事实时保留高风险候选，但始终要求人工复核，
+        # 不产生自动废标结论。后续来源闭环仍可把无锚点事实回落为待原页确认。
+        return "not_satisfied", {**item, "risk_level": "high"}
+    if relation == "supports" and status == "not_satisfied" and explicit and decision_impact != "rejection":
+        # 新协议已明确表达正向事实时，才允许修正模型误填的负向状态；明确否决规则
+        # 不允许模型把 contradicts 误写成 supports 后翻转为满足（与旧模板兼容分支
+        # 同一豁免，防止镜像漏洞）。旧模板继续走下方受限的兼容分支，避免把
+        # “符合禁止情形”误当满足。
+        return "satisfied", {**item, "risk_level": "low"}
+    return _legacy_positive_status_correction(status, item, rule, explicit)
 
 
 _BOUNDARY_COMPARISON_PATTERN = re.compile(
@@ -4967,9 +5025,9 @@ def _normalise_review_results(output: object, rules: list[dict], tender_baseline
         if not isinstance(status, str) or status not in {"satisfied", "not_satisfied", "partial", "not_found", "manual", "ocr_required"}:
             status = "manual"
         original_status = status
-        if _status_conflicts_with_positive_reason(status, item.get("reason")):
-            status = "satisfied" if any(marker in _clean_model_text(item.get("reason")) for marker in ("符合", "满足")) else "manual"
-            item = {**item, "risk_level": "low"}
+        # 状态只能由模型的结构化事实关系和规则后果收口，不能因理由中出现“符合”
+        # 等自然语言片段而反向改写。这样“符合禁止情形”仍会保留为直接反证。
+        status, item = _apply_requirement_relation_contract(status, item, rule=by_id[rule_id])
         # 边界相等符合“≥/≤”要求。此时不能把这一个比较写成高风险偏离；若该
         # 规则还包含其他参数，保守降为 partial，交由后续证据继续判断。
         boundary_note = _satisfied_boundary_comparison(item)
@@ -5272,6 +5330,7 @@ def _post_evidence_score_reconcile(result: dict) -> dict:
 
 def _review_result_from_model(item: dict, rule_id: str, status: str, *, scope_rule: bool = False) -> dict:
     confidence = _enum_text(item.get("confidence"), {"high", "medium", "low"}, "medium")
+    requirement_relation = _enum_text(item.get("requirement_relation"), _REQUIREMENT_RELATIONS, "uncertain")
     evidence_quality = _enum_text(
         item.get("evidence_quality"), {"sufficient", "limited", "missing"},
         "sufficient" if str(item.get("evidence", "")).strip() else "missing",
@@ -5308,7 +5367,7 @@ def _review_result_from_model(item: dict, rule_id: str, status: str, *, scope_ru
             if risk != "high":
                 risk = "high"
             summary = _enrich_scope_summary(evidence, reason, summary)
-    return {"rule_id": rule_id, "status": status,
+    return {"rule_id": rule_id, "status": status, "requirement_relation": requirement_relation,
             "evidence": evidence,
             "page_hint": _clean_model_text(item.get("page_hint"))[:80] or None,
             "reason": reason,
@@ -9790,6 +9849,12 @@ def _apply_ocr_summary(component: str, rule: dict, working_result: dict, parsed:
             "risk_level": parsed.get("risk_level") if can_apply else working_result.get("risk_level"),
             "confidence": parsed.get("confidence") if can_apply else working_result.get("confidence"),
             "evidence_quality": "sufficient" if can_apply and evidence else working_result.get("evidence_quality"),
+            # 后置层没有显式给出事实关系时，必须继承文字阶段已确认的关系（如
+            # contradicts），否则直接反证会在 OCR 合并后被重置为 uncertain。
+            "requirement_relation": _enum_text(
+                parsed.get("requirement_relation"), _REQUIREMENT_RELATIONS,
+                working_result.get("requirement_relation") or "uncertain",
+            ),
         }, rule["rule_id"], selected_status, scope_rule=_is_scope_consistency_rule(rule))
         merged = {
             **merged,
@@ -10072,6 +10137,12 @@ def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: d
             "risk_level": parsed.get("risk_level") if can_apply_text_conclusion else working_result.get("risk_level"),
             "confidence": parsed.get("confidence") if can_apply_text_conclusion else working_result.get("confidence"),
             "evidence_quality": "sufficient" if can_apply_text_conclusion and evidence else working_result.get("evidence_quality"),
+            # 后置层没有显式给出事实关系时，必须继承文字阶段已确认的关系（如
+            # contradicts），否则直接反证会在 OCR 合并后被重置为 uncertain。
+            "requirement_relation": _enum_text(
+                parsed.get("requirement_relation"), _REQUIREMENT_RELATIONS,
+                working_result.get("requirement_relation") or "uncertain",
+            ),
         }, rule["rule_id"], selected_status, scope_rule=_is_scope_consistency_rule(rule))
         # 标准化审查结果只保留业务字段，这些内部路由元数据需显式带到下一层图片识别。
         merged = {
@@ -11308,6 +11379,12 @@ def _run_visual_supplement(app, task: dict, document: dict, component: str, rule
             "risk_level": parsed.get("risk_level") if conclusion_scope == "full" else result.get("risk_level"),
             "confidence": "low" if has_conflict else (parsed.get("confidence") if conclusion_scope == "full" else result.get("confidence")),
             "evidence_quality": "sufficient" if conclusion_scope == "full" and visual_evidence else result.get("evidence_quality"),
+            # 后置层没有显式给出事实关系时，必须继承文字阶段已确认的关系（如
+            # contradicts），否则直接反证会在图片合并后被重置为 uncertain。
+            "requirement_relation": _enum_text(
+                parsed.get("requirement_relation"), _REQUIREMENT_RELATIONS,
+                result.get("requirement_relation") or "uncertain",
+            ),
         }, rule["rule_id"], status, scope_rule=_is_scope_consistency_rule(rule))
         # 仅在本次任务内供 OCR 影子核对与 EvidencePack 使用；存储层会忽略该临时字段，
         # 因此不会改变现有对外结果 API 或直接改写结论。
@@ -12595,11 +12672,20 @@ def _evaluation_highlight_candidates(app, project_id: str) -> tuple[list[dict], 
             "title": item.get("title"), "check_rule": item.get("check_rule"),
             "status": item.get("status"), "risk_level": item.get("risk_level"),
             "confidence": item.get("confidence"), "evidence_quality": item.get("evidence_quality"),
+            "requirement_relation": _enum_text(item.get("requirement_relation"), _REQUIREMENT_RELATIONS, "uncertain"),
             "conclusion_summary": item.get("conclusion_summary"),
             "evidence": str(item.get("evidence") or "")[:360],
             "reason": str(item.get("reason") or "")[:260],
         }
+        candidate["_direct_rejection_contradiction"] = (
+            candidate["requirement_relation"] == "contradicts"
+            and decision_impact == "rejection"
+            and candidate["status"] in {"not_satisfied", "partial"}
+            and candidate["risk_level"] == "high"
+            and bool(_clean_model_text(candidate["evidence"]))
+        )
         candidate["_rank"] = (
+            1 if candidate["_direct_rejection_contradiction"] else 0,
             review_rank.get(str(item.get("status")), 0),
             category_rank.get(str(effective_category), 0),
             risk_rank.get(str(item.get("risk_level")), 0),
@@ -12638,7 +12724,8 @@ def _evaluation_highlight_candidates(app, project_id: str) -> tuple[list[dict], 
             "conclusion_summary": item.get("conclusion_summary"),
             "evidence": str(item.get("evidence") or "")[:300],
             "reason": str(item.get("reason") or "")[:220],
-            "_rank": (1, 0, 0), "_critical_eligible": False,
+            "_rank": (0, 1, 0, 0), "_critical_eligible": False,
+            "_direct_rejection_contradiction": False,
         }
         group = grouped.setdefault(document_id, {
             "document_id": document_id,
@@ -12691,6 +12778,8 @@ def _highlight_display_candidate(item: dict) -> dict:
             str(item.get("confidence")), str(item.get("confidence") or ""))
         value["evidence_quality_label"] = _HIGHLIGHT_EVIDENCE_LABELS.get(
             str(item.get("evidence_quality")), str(item.get("evidence_quality") or ""))
+        if item.get("_direct_rejection_contradiction"):
+            value["direct_adverse_fact"] = True
     value["evidence"] = _clean_model_text(item.get("evidence"))[:300]
     value["reason"] = _clean_model_text(item.get("reason"))[:220]
     value["conclusion_summary"] = str(item.get("conclusion_summary") or "")[:80]
@@ -12748,6 +12837,44 @@ def _scope_highlight_fallback_candidate(document_id: str, highlights: list[dict]
         "conclusion": conclusion,
         "basis": basis,
     }
+
+
+def _swap_highlight_keep_note(highlights: list[dict], index: int, fallback: dict) -> None:
+    """面板容量已满时用结构化兜底替换一条，但把被替换线索的结论并入 basis 提示，
+    避免被替换的真实线索在重要结论面板中无声消失。"""
+    replaced = highlights[index]
+    note = f"（另有线索：{replaced.get('conclusion') or replaced.get('keyword') or '见完整结果'}）"
+    value = dict(fallback)
+    value["basis"] = f"{value.get('basis') or ''}{note}"[:120]
+    highlights[index] = value
+
+
+def _direct_rejection_highlight_fallback_candidate(document_id: str, highlights: list[dict],
+                                                    allowed: dict[tuple[str, str], dict]) -> dict | None:
+    """保留已有结构化直接反证，避免摘要模型遗漏明确否决候选。
+
+    只消费已落库的 ``decision_impact + requirement_relation``，不从标题、关键词或文本
+    重新猜测否决情形；这是一条结果完整性约束，而非面向某类业务的展示补丁。
+    """
+    existing = {str(item.get("rule_id")): item for item in highlights}
+    candidates = [
+        candidate for (doc_id, _rule_id), candidate in allowed.items()
+        if doc_id == document_id and candidate.get("_direct_rejection_contradiction")
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda candidate: candidate.get("_rank", ()), reverse=True)
+    fallback = candidates[0]
+    rule_id = str(fallback.get("rule_id") or "")
+    existing_item = existing.get(rule_id)
+    if existing_item is not None:
+        if existing_item.get("level") != "high":
+            existing_item["level"] = "high"
+        return None
+    keyword, conclusion, basis = _fallback_highlight_text(fallback)
+    if not keyword or not conclusion:
+        return None
+    return {"rule_id": rule_id, "level": "high", "keyword": keyword, "conclusion": conclusion, "basis": basis}
 
 
 def _fallback_highlight_rank(candidate: dict) -> tuple:
@@ -12907,6 +13034,22 @@ def _normalise_evaluation_highlights(parsed: dict, candidates: list[dict],
                 "rule_id": rule_id, "level": level, "keyword": keyword,
                 "conclusion": conclusion, "basis": basis,
             })
+        # 对已确认的直接否决反证先做结构化完整性校验：模型摘要可以压缩措辞，不能
+        # 漏掉这类已经在底层结果中明确存在的高风险候选。
+        direct_fallback = _direct_rejection_highlight_fallback_candidate(document_id, highlights, allowed)
+        if direct_fallback:
+            if len(highlights) < 6:
+                highlights.append(direct_fallback)
+            else:
+                attention_indexes = [index for index, item in enumerate(highlights) if item.get("level") == "attention"]
+                if attention_indexes:
+                    _swap_highlight_keep_note(highlights, attention_indexes[-1], direct_fallback)
+                else:
+                    # 面板容量已满且全是 high 时，结构化直接否决反证优先于摘要模型
+                    # 任意挑选的一条一般高风险；不替换 critical，避免弱化更强结论。
+                    high_indexes = [index for index, item in enumerate(highlights) if item.get("level") == "high"]
+                    if high_indexes:
+                        _swap_highlight_keep_note(highlights, high_indexes[-1], direct_fallback)
         # 提炼模型可能把“范围偏离”写进 headline 却漏选对应规则；对已确认的高风险
         # 模板混用发现做确定性兜底，保证这类结论一定出现在重要结论面板。
         fallback = _scope_highlight_fallback_candidate(document_id, highlights, allowed)
