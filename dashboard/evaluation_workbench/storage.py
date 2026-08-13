@@ -264,7 +264,7 @@ def task_prompt_template_fingerprint(app, task_type: str) -> str | None:
         "evaluate_all": {
             "evaluate_all", "evaluate_all_guidance", "evaluate_all_highlights", "evaluate_all_scope_profile", "evaluate_all_scope_profile_user",
             "evaluate_all_scope_anomaly_guidance", "evaluate_all_full_scan_user", "evaluate_all_review_user", "evaluate_all_objective_user",
-            "evaluate_all_subjective_user", "evaluate_all_cross_bid_price_user", "evaluate_all_highlights_user",
+            "evaluate_all_subjective_user", "evaluate_all_cross_bid_price_user", "evaluate_all_cross_bid_subjective_shadow_user", "evaluate_all_highlights_user",
             "evaluate_all_visual_user", "evaluate_all_ocr_user", "evaluate_all_visual_contract", "evaluate_all_ocr_contract",
             "evaluate_all_ocr_batch_user",
             "evaluate_all_visual_locator_user",
@@ -4757,6 +4757,33 @@ def save_score_results(app, score_run_id: str, document_id: str, results: list[d
                  _vision_pages_json(item), _vision_evidence_pages_json(item), _evidence_layers_json(item),
                  item.get("vision_model", ""), item.get("vision_message", ""), timestamp, timestamp),
             )
+
+
+def score_results_for_run(app, score_run_id: str) -> list[dict]:
+    """读取指定评分运行的内部快照，供只读影子分析使用。
+
+    不复用或回写评分结论，也不作为页面 API；调用方必须显式标注其
+    ``decision_participation=False``，避免影子机制误入正式评分链。
+    """
+    with connection(app) as conn:
+        rows = conn.execute(
+            """SELECT s.*, d.bidder_name, d.original_name, rule.title, rule.check_rule,
+                      rule.execution_meta_json, rule.scoring_json
+               FROM ew_score_results s JOIN ew_documents d ON d.document_id=s.document_id
+               JOIN ew_rules rule ON rule.rule_id=s.rule_id
+               WHERE s.score_run_id=? ORDER BY d.bidder_name, rule.sort_order""",
+            (score_run_id,),
+        ).fetchall()
+    values: list[dict] = []
+    for row in rows:
+        value = _public_vision_result(dict(row))
+        for field in ("execution_meta_json", "scoring_json"):
+            try:
+                value[field[:-5]] = json.loads(value.pop(field) or "{}")
+            except (TypeError, json.JSONDecodeError):
+                value[field[:-5]] = {}
+        values.append(value)
+    return values
 
 
 _PRICE_RULE_MARKERS = re.compile(r"(?:报价|投标价|评标价|评审价|最高限价|预算金额|总价)")

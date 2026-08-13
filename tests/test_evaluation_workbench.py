@@ -1,4 +1,4 @@
-import io
+﻿import io
 import hashlib
 import json
 import os
@@ -3835,7 +3835,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("表格字段、填写格式", PROMPT_TEMPLATES["extract_rules_obligation_compile_user"]["content"])
         self.assertIn("系统仅能核验已上传文件", PROMPT_TEMPLATES["extract_rules_guidance"]["content"])
         self.assertIn("当一条候选仅概述同一表单、附件或材料的格式", PROMPT_TEMPLATES["extract_rules_dedupe_adjudication_user"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v59")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v61")
 
     def test_scope_chapter_and_text_error_guidance_present(self):
         from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
@@ -3853,7 +3853,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(text_marker, PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("必须点名最具辨识度的偏离对象", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("risk_level 应为 high", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v59")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v61")
 
     def test_ocr_visual_contracts_deduplicated_but_keep_hard_constraints(self):
         from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
@@ -4177,6 +4177,31 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         payload = pack["payload"]
         self.assertTrue(payload["document_fact_ledger"]["decision_participation"] is False)
         self.assertGreater(payload["document_fact_ledger"]["conflict_count"], 0)
+
+    def test_material_consistency_shadow_only_records_opposite_existing_observations(self):
+        """材料一致性影子层不推断事实，也不得改写任一正式结果。"""
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "认证证书材料")
+        task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        rule_a = {"rule_id": "r-a", "title": "认证证书核验", "check_rule": "核验证书材料"}
+        rule_b = {"rule_id": "r-b", "title": "认证证书核验", "check_rule": "核验证书材料"}
+        positive = {"rule_id": "r-a", "status": "satisfied", "requirement_relation": "supports",
+                    "evidence": "第12页证书", "evidence_layers": [{"source": "local_ocr", "evidence_pages": [12]}]}
+        negative = {"rule_id": "r-b", "status": "not_found", "requirement_relation": "contradicts",
+                    "evidence": "未定位", "evidence_layers": []}
+        before_positive, before_negative = dict(positive), dict(negative)
+        packs = [
+            worker._build_shadow_evidence_pack(task, document, "review", rule_a, positive, {}),
+            worker._build_shadow_evidence_pack(task, document, "review", rule_b, negative, {}),
+        ]
+        worker._attach_document_material_consistency_shadow(packs)
+
+        self.assertEqual(positive, before_positive)
+        self.assertEqual(negative, before_negative)
+        diagnostic = packs[0]["payload"]["document_material_consistency"]
+        self.assertTrue(diagnostic["decision_participation"] is False)
+        self.assertEqual(diagnostic["disagreement_count"], 1)
+        self.assertEqual(diagnostic["disagreements"][0]["positive_rule_ids"], ["r-a"])
+        self.assertEqual(diagnostic["disagreements"][0]["negative_rule_ids"], ["r-b"])
 
     def test_shadow_acquisition_plan_is_generic_and_does_not_change_result(self):
         rule = {
@@ -6704,7 +6729,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不限定行业或采购类型", guidance)
         scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v59")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v61")
 
     def test_full_scan_does_not_reinject_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")
@@ -7781,6 +7806,55 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         with patch.dict(os.environ, {"EVALUATION_WORKBENCH_OCR_BATCH": "off"}, clear=True):
             self.assertFalse(worker._ocr_batch_enabled())
 
+    def test_cross_bid_subjective_shadow_defaults_off_and_never_consumes_rows(self):
+        rules = [{"rule_id": "s1", "title": "方案比较", "source_text": "技术方案评分满分10分", "execution_strategy": "cross_bid", "scoring": {"max_score": 10}}]
+        documents = [{"document_id": "a", "bidder_name": "甲"}, {"document_id": "b", "bidder_name": "乙"}]
+        with patch.dict(os.environ, {"EVALUATION_WORKBENCH_CROSS_BID_SUBJECTIVE_SHADOW": ""}, clear=True), \
+             patch.object(storage, "score_results_for_run") as score_rows:
+            result = worker._run_cross_bid_subjective_shadow(
+                self.app, {"task_id": "t"}, {"profile_id": "m"}, documents, rules, "run",
+            )
+        self.assertEqual(result["status"], "disabled")
+        self.assertTrue(result["decision_participation"] is False)
+        score_rows.assert_not_called()
+
+    def test_cross_bid_subjective_shadow_normalises_only_known_bounded_rows(self):
+        rules = [{"rule_id": "s1", "title": "方案比较", "execution_strategy": "cross_bid", "scoring": {"max_score": 10}}]
+        documents = [{"document_id": "a"}, {"document_id": "b"}]
+        values = worker._normalise_cross_bid_subjective_shadow({"comparisons": [{
+            "rule_id": "s1", "summary": "依据自主方案横向比较",
+            "bidders": [
+                {"document_id": "a", "suggested_score": 8, "reason": "方案较完整", "confidence": "high"},
+                {"document_id": "b", "suggested_score": 12, "reason": "超满分", "confidence": "high"},
+                {"document_id": "unknown", "suggested_score": 6, "reason": "非法文件", "confidence": "high"},
+            ],
+        }]}, documents, rules)
+        self.assertEqual(len(values), 1)
+        self.assertEqual(values[0]["bidders"][0]["suggested_score"], 8.0)
+        self.assertIsNone(values[0]["bidders"][1]["suggested_score"])
+
+    def test_cross_bid_subjective_shadow_enabled_only_returns_task_metadata(self):
+        rules = [{"rule_id": "s1", "title": "方案比较", "source_text": "技术方案评分满分10分", "execution_strategy": "cross_bid", "scoring": {"max_score": 10}}]
+        documents = [{"document_id": "a", "bidder_name": "甲"}, {"document_id": "b", "bidder_name": "乙"}]
+        rows = [
+            {"document_id": "a", "rule_id": "s1", "suggested_score": 8, "max_score": 10, "evidence": "第3页方案", "reason": "较完整"},
+            {"document_id": "b", "rule_id": "s1", "suggested_score": 7, "max_score": 10, "evidence": "第4页方案", "reason": "覆盖较少"},
+        ]
+        response = {"comparisons": [{"rule_id": "s1", "summary": "甲方案证据更完整", "bidders": [
+            {"document_id": "a", "suggested_score": 8, "reason": "模块覆盖较完整", "confidence": "high"},
+            {"document_id": "b", "suggested_score": 7, "reason": "模块覆盖较少", "confidence": "medium"},
+        ]}]}
+        with patch.dict(os.environ, {"EVALUATION_WORKBENCH_CROSS_BID_SUBJECTIVE_SHADOW": "1"}, clear=True), \
+             patch.object(storage, "score_results_for_run", return_value=rows), \
+             patch.object(worker, "_request_task_json", return_value=response) as request_json:
+            result = worker._run_cross_bid_subjective_shadow(
+                self.app, {"task_id": "t"}, {"profile_id": "m"}, documents, rules, "run",
+            )
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(result["decision_participation"] is False)
+        self.assertEqual(result["comparisons"][0]["bidders"][0]["suggested_score"], 8.0)
+        self.assertEqual(request_json.call_count, 1)
+
     def test_ocr_batch_supplement_uses_one_model_call_and_merges_per_rule(self):
         """同组件多条规则合并为一次 OCR 归纳调用，并按 rule_id 逐条合并。"""
         document = {"document_id": "doc", "extension": ".pdf", "page_count": 50,
@@ -7849,6 +7923,36 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(request_json.call_count, 2)
         self.assertEqual(results["r1"]["suggested_score"], 2)
         self.assertEqual(results["r2"]["suggested_score"], 1)
+
+    def test_ocr_batch_partitions_more_than_limit_instead_of_global_single_rule_fallback(self):
+        document = {"document_id": "doc", "extension": ".pdf", "page_count": 50,
+                    "original_name": "投标.pdf", "bidder_name": "甲"}
+        rules = [{"rule_id": f"r{index}", "title": f"评分{index}", "check_rule": "材料得1分",
+                  "scoring": {"max_score": 1}} for index in range(1, 8)]
+        bases = [{"rule_id": rule["rule_id"], "suggested_score": 0, "max_score": 1,
+                  "confidence": "low", "evidence": "文字层未见"} for rule in rules]
+
+        def batch_response(*args, **kwargs):
+            if str(args[3]).endswith("_ocr"):
+                return {"coverage": "covered", "conclusion_scope": "full", "evidence_pages": [12],
+                        "suggested_score": 1, "confidence": "high", "evidence": "P12材料可见", "reason": "满足"}
+            prompt = str(args[5])
+            ids = re.findall(r'"rule_id":"(r\d+)"', prompt)
+            return {"results": [{"rule_id": rule_id, "coverage": "covered", "conclusion_scope": "full",
+                                 "evidence_pages": [12], "suggested_score": 1, "confidence": "high",
+                                 "evidence": "P12材料可见", "reason": "满足"} for rule_id in ids]}
+
+        with patch.object(worker, "_ocr_candidate_pages", return_value=[12]), \
+             patch.object(worker, "_ocr_discovery_page_count", return_value=1), \
+             patch.object(worker, "_ocr_page_texts", return_value=([{"page": 12, "service": "accurate", "text": "材料"}], "")), \
+             patch.object(worker, "_request_task_json", side_effect=batch_response) as request_json:
+            results = worker._run_ocr_batch_supplement(
+                self.app, {"task_id": "t"}, document, "objective",
+                [(rule, base, True) for rule, base in zip(rules, bases)], {"profile_id": "m"},
+            )
+
+        self.assertEqual(request_json.call_count, 2)
+        self.assertEqual({item for item, result in results.items() if result["suggested_score"] == 1}, {rule["rule_id"] for rule in rules})
 
     def test_reextract_uses_new_score_rule_identity(self):
         """重新提取只使用本轮评分条款锚点，不继承旧编辑内容。"""
@@ -8261,6 +8365,34 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertTrue(stats["attempted"])
         self.assertTrue(stats["applied"])
         self.assertEqual(worker._score_rules_total(repaired), 10)
+
+    def test_scoring_contract_repair_can_restore_explicit_leaf_total_in_same_clause(self):
+        packets = [{
+            "clause_id": "SC-doc-P27-1", "source_document_key": "doc", "source_page": 27,
+            "text": "人员及技术支持（15分）：驻场人员满足要求得10分；专家技术人员横向比较得5分。",
+            "score_section": {},
+        }]
+        existing = [{
+            "category": "subjective", "title": "驻场人员", "check_rule": "驻场人员得10分",
+            "source_text": "人员及技术支持（15分）：驻场人员满足要求得10分",
+            "source_clause_ids": ["SC-doc-P27-1"], "scoring": {"max_score": 10, "kind": "manual"},
+        }]
+        candidate = [{
+            "category": "subjective", "title": "人员及技术支持", "check_rule": "驻场人员10分；专家技术人员横向比较5分。",
+            "source_text": "人员及技术支持（15分）：驻场人员满足要求得10分；专家技术人员横向比较得5分。",
+            "source_clause_ids": ["SC-doc-P27-1"],
+            "scoring": {"max_score": 15, "kind": "manual", "items": [
+                {"name": "驻场人员", "max_score": 10}, {"name": "专家技术人员", "max_score": 5},
+            ]},
+        }]
+        with patch("dashboard.evaluation_workbench.worker._request_task_json", return_value={"rules": candidate}):
+            repaired, stats = worker._repair_scoring_contract(
+                self.app, {"task_id": "task-score-leaf"}, {"profile_id": "profile-1"}, "system",
+                existing, packets, [packets], declared_total=15, document_id="doc-1",
+            )
+
+        self.assertTrue(stats["applied"])
+        self.assertEqual(repaired[0]["scoring"]["max_score"], 15)
 
     def test_score_contract_attention_covers_omission_duplicate_and_total(self):
         self.assertTrue(worker._score_contract_requires_attention({"missing_clause_ids": ["x"]}))
@@ -8913,6 +9045,59 @@ D、不提供者不得分。
         technical = next(item for item in packets if "技术参数响应" in item["text"])
         self.assertNotIn("方案存在4处", technical["text"])
         self.assertNotIn("\n30", technical["text"])
+
+    def test_score_section_summary_does_not_pollute_later_detail_sections(self):
+        text = """[第27页]
+分值构成
+商务部分（30分）
+技术部分（40分）
+价格部分（30分）
+2.2.2 商务评分
+（30分）
+财务状况良好得6分。
+2.2.2 技术评分
+（40分）
+服务方案横向比较得15分。
+[第28页]
+增值服务横向比较得5分。
+2.2.3 价格评分
+（30分）
+报价得分=（基准价/报价）×30，最高得30分。"""
+
+        packets = worker._score_clause_packets(text)
+        executable = [item for item in packets if not item.get("is_section_summary")]
+        by_text = {next(token for token in ("财务", "服务方案", "增值服务", "报价") if token in item["text"]): item for item in executable}
+
+        self.assertEqual(by_text["财务"]["score_section"]["max_score"], 30)
+        self.assertEqual(by_text["服务方案"]["score_section"]["max_score"], 40)
+        self.assertEqual(by_text["增值服务"]["score_section"]["max_score"], 40)
+        self.assertEqual(by_text["报价"]["score_section"]["max_score"], 30)
+
+    def test_form_date_observation_excludes_business_license_establishment_date(self):
+        chunks = [
+            {"chunk_id": "license", "text": "[第12页] 营业执照\n成立日期：2018年1月30日\n法定代表人：甲"},
+            {"chunk_id": "letter", "text": "[第20页] 投标函\n投标人：甲公司（盖章）\n日期：2026年7月31日"},
+        ]
+
+        observations = worker._response_form_date_observations(chunks)
+
+        self.assertEqual([item["date"] for item in observations], ["2026年7月31日"])
+
+    def test_scope_supports_is_never_promoted_to_high_by_template_keyword(self):
+        result = worker._review_result_from_model({
+            "status": "partial", "requirement_relation": "supports", "risk_level": "high",
+            "confidence": "medium", "evidence_quality": "sufficient",
+            "evidence": "第8页方案说明未见偏离。",
+            "reason": "已结合通用模板说明，整体仍符合本项目范围。",
+        }, "scope", "partial", scope_rule=True)
+
+        self.assertEqual(result["risk_level"], "medium")
+
+    def test_gateway_timeout_524_is_recoverable_with_single_retry_budget(self):
+        error = ValueError("模型请求失败（HTTP 524）：gateway timeout")
+
+        self.assertTrue(worker._is_recoverable_model_error(error))
+        self.assertEqual(worker._model_retry_limit(error), 1)
 
 
 if __name__ == "__main__":

@@ -120,7 +120,8 @@ class _EvaluationRequestGate:
 def _is_rate_limit_error(error: Exception) -> bool:
     message = str(error).lower()
     return any(term in message for term in (
-        "http 408", "http 429", "http 529", "http 502", "http 503", "http 504",
+        "http 408", "http 429", "http 502", "http 503", "http 504", "http 520", "http 521",
+        "http 522", "http 523", "http 524", "http 529",
         "rate limit", "too many requests", "overloaded", "temporarily unavailable", "timeout", "timed out",
     )) or "限流" in str(error) or "接口繁忙" in str(error)
 
@@ -135,6 +136,14 @@ _TRANSIENT_TRANSPORT_MARKERS = (
 )
 _REQUEST_RETRY_BACKOFF_SECONDS = (5, 15, 45)
 _HTTP_STATUS_PATTERN = re.compile(r"(?:http|status(?:\s+code)?)\s*[:=]?\s*(\d{3})", re.I)
+
+
+def _model_retry_limit(error: Exception) -> int:
+    """按瞬时故障类型控制单调用重试，避免网关超时长期占住任务。"""
+    statuses = {int(value) for value in _HTTP_STATUS_PATTERN.findall(str(error))}
+    # 524 通常是上游网关在长等待后断开。一次短重试仍有价值，连续长退避则只会
+    # 拖慢整个项目；后续由规则/文件级隔离保留已完成结果。
+    return 1 if 524 in statuses else len(_REQUEST_RETRY_BACKOFF_SECONDS)
 
 
 def _is_recoverable_model_error(error: Exception) -> bool:
@@ -249,16 +258,17 @@ def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt
                 rate_limited = _is_rate_limit_error(exc)
                 # InvalidJsonResponse(length) 由上层拆分；其余可恢复网络、过载或空包
                 # 故障最多补三次。每次只重试当前调用，不会重发整份投标文件。
-                should_retry = attempt < len(_REQUEST_RETRY_BACKOFF_SECONDS) and _is_recoverable_model_error(exc)
+                retry_limit = _model_retry_limit(exc)
+                should_retry = attempt < retry_limit and _is_recoverable_model_error(exc)
                 if should_retry:
                     # 仅限流/超时才降低并发。响应结构异常、业务错误包与并行度无必然关系。
                     if rate_limited and gate and gate.reduce_after_rate_limit():
                         message = "模型接口限流或暂时繁忙，已自动降低并行度后继续"
                         storage.update_task(app, task["task_id"], message=message)
                     elif envelope_retryable:
-                        storage.update_task(app, task["task_id"], message=f"模型接口返回不完整响应，正在第 {attempt + 1}/{len(_REQUEST_RETRY_BACKOFF_SECONDS)} 次重试当前分组")
+                        storage.update_task(app, task["task_id"], message=f"模型接口返回不完整响应，正在第 {attempt + 1}/{retry_limit} 次重试当前分组")
                     else:
-                        storage.update_task(app, task["task_id"], message=f"模型连接暂时中断，正在第 {attempt + 1}/{len(_REQUEST_RETRY_BACKOFF_SECONDS)} 次重试当前分组")
+                        storage.update_task(app, task["task_id"], message=f"模型连接暂时中断，正在第 {attempt + 1}/{retry_limit} 次重试当前分组")
                     retry_after_failure = True
                 else:
                     raise
@@ -641,6 +651,11 @@ _SCORE_SECTION_PARENT_PATTERN = re.compile(
     r"(?:价格|商务|技术|服务|资格)[^（(:：]{0,16}?(?:部分|评审|评分)[^（(:：]{0,8}?)"
     r"(?:[（(]\s*(\d+(?:\.\d+)?)\s*分\s*[）)]|\s*[：:]\s*(\d+(?:\.\d+)?)\s*分|\s*(\d+(?:\.\d+)?)\s*分)"
 )
+_SCORE_SECTION_TITLE_ONLY_PATTERN = re.compile(
+    r"^\s*(?:(?:第\s*[一二三四五六七八九十\d]+\s*(?:部分|章)|\d+(?:\.\d+){0,3}|[一二三四五六七八九十]+[、.．])\s*)?"
+    r"((?:价格|商务|技术|服务|资格)[^（(:：]{0,16}?(?:部分|评审|评分))\s*$"
+)
+_SCORE_SECTION_SCORE_ONLY_PATTERN = re.compile(r"^\s*[（(]\s*(\d+(?:\.\d+)?)\s*分\s*[）)]\s*$")
 _SCORE_TABLE_BOUNDARY_PATTERN = re.compile(r"条款号|评审因素|评分因素|评审标准|评分标准|分值构成|总分\s*\d+\s*分")
 _SCORE_GRADE_FRAGMENT_PATTERN = re.compile(r"^[A-HＡ-Ｈ甲乙丙丁戊己庚辛][、.．:：]")
 _SCORE_NEGATIVE_FRAGMENT_PATTERN = re.compile(r"^[^。；;]{0,40}(?:未提供|不提供|未附|未按|有(?:保留|否定)|无法表示|缺失|不满足|不符合|未响应).{0,90}(?:得\s*0\s*分|不得分)")
@@ -1166,6 +1181,72 @@ def _score_packet_is_label_only(packet: dict) -> bool:
     return not bool(re.search(r"(?:得|每项|每个|每人|每处|最高|满分|扣)\s*\d", line))
 
 
+def _score_section_descriptor(lines: list[str], index: int, document_key: str, ordinal: int) -> tuple[dict | None, bool]:
+    """识别评分分部，并区分“分值构成摘要”与真正的明细分部标题。
+
+    评分表常先用一张摘要表列出商务/技术/价格总分，再在后续页面开始明细。摘要
+    不能改变 active_section；否则最后一个“价格”会污染后续所有评分条款。明细
+    标题允许“技术评分”与“（40分）”分两行出现。
+    """
+    line = str(lines[index] or "").strip()
+    inline = _SCORE_SECTION_PARENT_PATTERN.match(line)
+    if inline:
+        score = inline.group(2) or inline.group(3) or inline.group(4)
+        trailing = line[inline.end():].strip()
+        # 同一行列出多个分部必然是摘要。单独的“分部 + 分值”既可能是摘要表的一
+        # 行，也可能是真正章节标题；只有后面紧接另一分部时才判为摘要，避免把
+        # “第一部分价格部分（30分）”这样的正式章节标题误丢。
+        section_mentions = re.findall(r"(?:价格|商务|技术|服务|资格)[^（(:：]{0,16}?(?:部分|评审|评分)", line)
+        is_summary = len(section_mentions) > 1
+        if not is_summary and not trailing:
+            for next_index in range(index + 1, min(len(lines), index + 4)):
+                next_line = str(lines[next_index] or "").strip()
+                if not next_line:
+                    continue
+                is_summary = bool(_SCORE_SECTION_PARENT_PATTERN.match(next_line))
+                break
+        page = _score_packet_page(lines, index)
+        descriptor = {
+            "section_id": f"SS-{document_key}-P{page}-{ordinal}" if document_key else f"SS-{page}-{ordinal}",
+            "label": re.sub(r"\s+", "", inline.group(1)),
+            "max_score": float(score),
+            "source_page": page,
+        }
+        return descriptor, is_summary
+
+    title = _SCORE_SECTION_TITLE_ONLY_PATTERN.match(line)
+    if not title:
+        return None, False
+    for next_index in range(index + 1, min(len(lines), index + 4)):
+        next_line = str(lines[next_index] or "").strip()
+        if not next_line:
+            continue
+        score_only = _SCORE_SECTION_SCORE_ONLY_PATTERN.match(next_line)
+        if not score_only:
+            return None, False
+        page = _score_packet_page(lines, index)
+        descriptor = {
+            "section_id": f"SS-{document_key}-P{page}-{ordinal}" if document_key else f"SS-{page}-{ordinal}",
+            "label": re.sub(r"\s+", "", title.group(1)),
+            "max_score": float(score_only.group(1)),
+            "source_page": page,
+        }
+        return descriptor, False
+    return None, False
+
+
+def _is_score_section_score_only_line(lines: list[str], index: int) -> bool:
+    """跳过已经被上一行明细标题消费的独立“（X分）”行。"""
+    if not _SCORE_SECTION_SCORE_ONLY_PATTERN.match(str(lines[index] or "").strip()):
+        return False
+    for previous in range(index - 1, max(-1, index - 4), -1):
+        value = str(lines[previous] or "").strip()
+        if not value:
+            continue
+        return bool(_SCORE_SECTION_TITLE_ONLY_PATTERN.match(value))
+    return False
+
+
 def _score_clause_packets(text: str, limit: int = 240, *, source_document_key: str = "") -> list[dict]:
     """为每个明确计分行构造带分部归属的稳定评分条款台账。
 
@@ -1179,17 +1260,14 @@ def _score_clause_packets(text: str, limit: int = 240, *, source_document_key: s
     active_section: dict | None = None
     section_ordinal = 0
     for index, line in enumerate(lines):
+        descriptor, is_section_summary = _score_section_descriptor(lines, index, document_key, section_ordinal + 1)
         section_match = _SCORE_SECTION_PARENT_PATTERN.match(line)
-        if section_match:
-            page = _score_packet_page(lines, index)
+        if descriptor:
             section_ordinal += 1
-            section_score = section_match.group(2) or section_match.group(3) or section_match.group(4)
-            active_section = {
-                "section_id": f"SS-{document_key}-P{page}-{section_ordinal}" if document_key else f"SS-{page}-{section_ordinal}",
-                "label": re.sub(r"\s+", "", section_match.group(1)),
-                "max_score": float(section_score),
-                "source_page": page,
-            }
+            if not is_section_summary:
+                active_section = descriptor
+        if _is_score_section_score_only_line(lines, index):
+            continue
         # PDF 评分表在分页处常把同一评分项拆为“标题及前两个子项”与
         # “（1.5分）、其余子项”。后者不是新的计分事实，应续接到前一个完整
         # 评分包，防止模型生成错误标题的重复评分规则。
@@ -1246,10 +1324,15 @@ def _score_clause_packets(text: str, limit: int = 240, *, source_document_key: s
                 "score_line": line[:360],
                 "source_page": page,
                 "source_pages": [page] if page else [],
-                "score_section": dict(active_section) if active_section else None,
+                "score_section": dict(descriptor) if is_section_summary and descriptor else (dict(active_section) if active_section else None),
                 # 保留父项包只为兼容既有分页/续行解析与审计；进入模型评分覆盖
                 # 和最终规则台账前会单独滤除，绝不把它当成可执行叶子评分项。
-                "is_section_summary": bool(section_match and not line[section_match.end():].strip()),
+                # 纯分部标题本身不可执行，但仍必须以一条台账记录保存声明分值并
+                # 阻止后续明细被当作该标题的续行。这里沿用历史字段名兼容下游。
+                "is_section_summary": bool(
+                    is_section_summary
+                    or (descriptor and section_match and not line[section_match.end():].strip())
+                ),
                 "package_numbers": sorted(_score_packet_package_numbers(lines, index)),
             })
         if len(packets) >= limit:
@@ -2445,6 +2528,7 @@ def _score_contract_candidate_preserves_anchors(candidate: list[dict], existing:
         for clause_id in _score_rule_clause_ids(rule):
             by_clause.setdefault(clause_id, []).append(rule)
     known_ids = {_score_packet_id(packet) for packet in score_packets if _score_packet_id(packet)}
+    packets_by_id = {_score_packet_id(packet): packet for packet in score_packets if _score_packet_id(packet)}
     existing_ids = set(by_clause)
     for rule in candidate:
         if not isinstance(rule, dict):
@@ -2464,8 +2548,19 @@ def _score_contract_candidate_preserves_anchors(candidate: list[dict], existing:
         }
         anchor_scores.discard(None)
         anchor_categories = {str(anchor.get("category") or "") for anchor in anchors}
-        if max_score is None or max_score not in anchor_scores:
+        if max_score is None:
             return False
+        if max_score not in anchor_scores:
+            # 一个原文条款可包含“父项 15 分 = 子项 10 分 + 5 分”等完整叶子结构。
+            # 初次组装漏掉某个叶子时，定向重组允许纠正该条规则的满分，但仅限新满
+            # 分逐字出现在同一来源条款、模型仍保留直接原文摘录且总分已恢复守恒。
+            source = storage._normalise_rule_source(rule.get("source_text"))
+            packet_text = " ".join(_score_packet_text(packets_by_id[clause_id]) for clause_id in clause_ids if clause_id in packets_by_id)
+            compact_packet = storage._normalise_rule_source(packet_text)
+            score_token = f"{float(max_score):g}分"
+            direct_source = len(source) >= 8 and source in compact_packet
+            if not (direct_source and score_token in compact_packet):
+                return False
         if str(rule.get("category") or "") not in anchor_categories:
             return False
     return True
@@ -5361,14 +5456,19 @@ def _review_result_from_model(item: dict, rule_id: str, status: str, *, scope_ru
         summary = ""
         if status == "satisfied":
             status = "partial"
-    # 范围类规则整章模板混用属于需要重点复核的高风险发现：模型可能按保守习惯
-    # 给 medium，导致被重要结论面板挤出；这里按规则口径强制校准定级，并让摘要
-    # 点名对象与页码，避免“部分内容为通用模板”式空泛表述。
+    # 项目范围词表只负责召回候选，不能绕过模型结构化关系直接把结果升为高风险。
+    # 正向 supports 可能只是“文件提到了通用能力但最终仍与项目相符”，不应被一句
+    # “模板混用待核验”反向改成高风险；确认的直接相反事实才可进入重点结论。
     if scope_rule and status in {"partial", "not_satisfied"}:
         combined = f"{reason} {evidence}"
-        if _SCOPE_TEMPLATE_MIXING_PATTERN.search(combined):
-            if risk != "high":
-                risk = "high"
+        confirmed = _scope_template_mixing_confirmed(combined)
+        if requirement_relation == "supports":
+            # “支持要求”与范围高风险在语义上互相冲突。保留待核验状态，但不把
+            # 这种内部冲突渲染成否决级线索。
+            if risk == "high":
+                risk = "medium"
+        elif confirmed and requirement_relation in {"contradicts", "uncertain"}:
+            risk = "high"
             summary = _enrich_scope_summary(evidence, reason, summary)
     return {"rule_id": rule_id, "status": status, "requirement_relation": requirement_relation,
             "evidence": evidence,
@@ -7670,6 +7770,7 @@ def _build_shadow_evidence_pack(task: dict, document: dict, component: str, rule
         "status": result.get("status"), "suggested_score": result.get("suggested_score"),
         "max_score": result.get("max_score"), "risk_level": result.get("risk_level"),
         "confidence": result.get("confidence"), "vision_status": result.get("vision_status"),
+        "requirement_relation": _enum_text(result.get("requirement_relation"), _REQUIREMENT_RELATIONS, "uncertain"),
         "page_hint": result.get("page_hint"), "evidence": _clean_model_text(result.get("evidence"))[:900],
         "reason": _clean_model_text(result.get("reason"))[:700],
     }
@@ -7703,6 +7804,87 @@ def _attach_document_fact_ledger_shadow(packs: list[dict], scan_index: dict | No
         "observation_count": int(fact_ledger.get("observation_count") or 0),
         "conflict_count": int(fact_ledger.get("conflict_count") or 0),
         "conflicts": [item for item in fact_ledger.get("conflicts", []) if isinstance(item, dict)][:24],
+        "storage_scope": "one_pack_per_document",
+    }
+
+
+def _shadow_material_presence_disagreements(packs: list[dict]) -> list[dict]:
+    """记录同一材料在并列规则中的相反观察，供后续一致性 A/B 使用。
+
+    这不是新的事实判定器：只比较本轮已经落下的结构化状态与证据页，既不改写
+    任何正式结果，也不把“未覆盖”推断为“材料缺失”。这样可以先度量跨规则不
+    一致的真实规模，再决定是否让 EvidencePack 进入正式决策链。
+    """
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for pack in packs:
+        if not isinstance(pack, dict):
+            continue
+        payload = pack.get("payload")
+        material_key = str(pack.get("material_key") or "")
+        component = str(pack.get("component") or "")
+        if not material_key or component not in {"review", "objective", "subjective"} or not isinstance(payload, dict):
+            continue
+        groups.setdefault((component, material_key), []).append(pack)
+
+    values: list[dict] = []
+    for (component, material_key), group in groups.items():
+        if len(group) < 2:
+            continue
+        positives: list[str] = []
+        negatives: list[str] = []
+        for pack in group:
+            payload = pack.get("payload") or {}
+            snapshot = payload.get("result_snapshot") if isinstance(payload, dict) else {}
+            snapshot = snapshot if isinstance(snapshot, dict) else {}
+            rule_id = str(pack.get("rule_id") or "")
+            if not rule_id:
+                continue
+            evidence_pages = _shadow_pages(snapshot.get("vision_evidence_pages"))
+            if not evidence_pages:
+                evidence_pages = _shadow_pages(payload.get("ocr_evidence_pages"))
+            # result_snapshot 保留摘要层字段；实际图片/OCR 页在 findings 内，不能为了
+            # 影子诊断再解析或猜测原文，只以已明确保存的 evidence_pages 为正向锚点。
+            if not evidence_pages:
+                for key in ("ocr_findings", "vision_findings"):
+                    for finding in payload.get(key, []) if isinstance(payload.get(key), list) else []:
+                        if isinstance(finding, dict):
+                            evidence_pages.extend(_shadow_pages(finding.get("evidence_pages")))
+            status = str(snapshot.get("status") or "")
+            relation = _enum_text(snapshot.get("requirement_relation"), _REQUIREMENT_RELATIONS, "uncertain")
+            if component == "review":
+                if status in {"satisfied", "partial"} and relation == "supports" and evidence_pages:
+                    positives.append(rule_id)
+                elif status in {"not_satisfied", "not_found"} and relation == "contradicts" and not evidence_pages:
+                    negatives.append(rule_id)
+            elif status in {"satisfied", "partial"} and evidence_pages:
+                positives.append(rule_id)
+            elif status in {"not_found", "not_satisfied"} and not evidence_pages:
+                negatives.append(rule_id)
+        if positives and negatives:
+            values.append({
+                "component": component,
+                "material_key": material_key,
+                "positive_rule_ids": sorted(set(positives)),
+                "negative_rule_ids": sorted(set(negatives)),
+                "decision_participation": False,
+                "note": "同一材料在并列规则中出现存在/未找到的已落库观察，需以原页和规则条件人工复核。",
+            })
+    return values[:24]
+
+
+def _attach_document_material_consistency_shadow(packs: list[dict]) -> None:
+    """将跨规则材料观察集中保存到单个影子包，避免重复写入。"""
+    if not packs:
+        return
+    payload = packs[0].get("payload") if isinstance(packs[0], dict) else None
+    if not isinstance(payload, dict):
+        return
+    disagreements = _shadow_material_presence_disagreements(packs)
+    payload["document_material_consistency"] = {
+        "version": "shadow-v1",
+        "decision_participation": False,
+        "disagreement_count": len(disagreements),
+        "disagreements": disagreements,
         "storage_scope": "one_pack_per_document",
     }
 
@@ -7856,12 +8038,13 @@ _RESPONSE_FORM_DATE_HEADINGS = re.compile(
     r"承诺函|声明函|开标一览表|报价表"
 )
 _RESPONSE_FORM_DATE_LABEL = re.compile(r"日期|落款|投标人|供应商|法定代表人|授权代表|签字|签章|盖章")
+_RESPONSE_FORM_DATE_DIRECT_LABEL = re.compile(r"(?:填表)?日期|落款|签署日期")
 _RESPONSE_FORM_DATE_VALUE = re.compile(
     r"(?<![A-Za-z0-9])((?:(?:19|20)\d{2}|[〇○零一二三四五六七八九]{4})"
     r"(?:\s*(?:年|[./-])\s*\d{1,2}(?:\s*(?:月|[./-])\s*\d{1,2}\s*日?)?|\s*年))"
 )
 _FORM_DATE_EXCLUSION = re.compile(
-    r"GB(?:/T)?\s*[-－]?\d|标准|规范|出生|成立时间|经营期限|毕业|任职|履历|业绩|合同|"
+    r"GB(?:/T)?\s*[-－]?\d|标准|规范|出生|成立(?:时间|日期)|经营期限|毕业|任职|履历|业绩|合同|"
     r"生产日期|出厂日期|设备|仪器",
     re.IGNORECASE,
 )
@@ -8095,11 +8278,15 @@ def _response_form_date_observations(chunks: list[dict], *, limit: int = 16) -> 
             continue
         form_kind = _form_date_kind(body)
         for match in _RESPONSE_FORM_DATE_VALUE.finditer(body):
-            local_start = max(0, match.start() - 180)
-            local_end = min(len(body), match.end() + 180)
+            local_start = max(0, match.start() - 90)
+            local_end = min(len(body), match.end() + 90)
             context = body[local_start:local_end]
-            # 仅收集签署/落款邻域中的填写日期，避免一张表内列举的历史项目日期混入。
-            if not _RESPONSE_FORM_DATE_LABEL.search(context) or _FORM_DATE_EXCLUSION.search(context):
+            before_date = body[max(0, match.start() - 48):match.start()]
+            # 仅收集“日期：2026…”等直接字段邻域中的填写日期。表单页里出现投标人、
+            # 签章并不代表页上所有年份都是落款；营业执照成立日期、合同日期等必须
+            # 排除，避免把历史字段扩散进项目范围等无关规则。
+            if (not _RESPONSE_FORM_DATE_DIRECT_LABEL.search(before_date)
+                    or _FORM_DATE_EXCLUSION.search(context)):
                 continue
             value = re.sub(r"\s+", "", match.group(1))
             year = _response_date_year(value)
@@ -8175,8 +8362,10 @@ def _apply_form_date_consistency_guard(results: list[dict], rules: list[dict], p
     consistency_ids = {
         str(rule.get("rule_id") or "") for rule in rules
         if _rule_execution_strategy(rule) == "consistency"
+        # 日期线索只能进入明确要求日期/时点核验的规则。“范围是否一致”“参数是否
+        # 一致”中的一致不是日期规则，不能被本地日期候选污染。
         and any(token in " ".join(str(rule.get(key) or "") for key in ("title", "check_rule"))
-                for token in ("日期", "时点", "关键要素", "一致"))
+                for token in ("日期", "时点", "落款", "填写时间"))
     }
     if not consistency_ids:
         return results
@@ -9957,10 +10146,34 @@ def _run_ocr_batch_supplement(app, task, document, component, entries, profile, 
             batch_items.append((rule, payload))
     if not batch_items:
         return results
-    if len(batch_items) < 2 or len(batch_items) > _OCR_BATCH_MAX_RULES or sum(len(p["ocr_text"]) for _, p in batch_items) > _OCR_BATCH_MAX_CHARS:
-        for rule, payload in batch_items:
+    # 原实现把“超过 6 条”整体退化为逐条归纳，规则多时反而制造几十次模型调用。
+    # 这里仅按既有 2-6 条/4 万字符上限分片；提取、覆盖和单条回退语义不变。
+    batches: list[list[tuple[dict, dict]]] = []
+    current: list[tuple[dict, dict]] = []
+    current_chars = 0
+    for rule, payload in batch_items:
+        payload_chars = len(payload["ocr_text"])
+        if current and (len(current) >= _OCR_BATCH_MAX_RULES or current_chars + payload_chars > _OCR_BATCH_MAX_CHARS):
+            batches.append(current)
+            current, current_chars = [], 0
+        current.append((rule, payload))
+        current_chars += payload_chars
+    if current:
+        batches.append(current)
+    for batch in batches:
+        if len(batch) == 1:
+            rule, payload = batch[0]
             results[rule["rule_id"]] = _run_ocr_summarize(app, task, document, component, rule, payload, profile)
-        return results
+            continue
+        _merge_ocr_batch_supplement(
+            app, task, document, component, entries, profile, batch, results,
+            locator_profile=locator_profile,
+        )
+    return results
+
+
+def _merge_ocr_batch_supplement(app, task, document, component, entries, profile, batch_items, results, *, locator_profile=None) -> None:
+    """执行一个受限 OCR 归纳批次；未采纳条目仍只回退自身。"""
     items = [{
         "rule_id": rule["rule_id"],
         "rule": _visual_rule_packet(rule),
@@ -10000,16 +10213,17 @@ def _run_ocr_batch_supplement(app, task, document, component, entries, profile, 
             if item is not None and _ocr_response_coverage(item) == "covered":
                 results[rule["rule_id"]] = _apply_ocr_summary(component, rule, payload["working_result"], item, payload)
         if all(rule["rule_id"] in results for rule, _ in batch_items):
-            return results
+            return
     # 仅对未采纳批量结果的规则逐条回退（含重新提取），保持证据链语义一致。
-    for rule, result, allow_tencent in entries:
+    entry_by_id = {str(rule["rule_id"]): (rule, result, allow_tencent) for rule, result, allow_tencent in entries}
+    for rule, _ in batch_items:
         if rule["rule_id"] in results:
             continue
+        _, result, allow_tencent = entry_by_id[rule["rule_id"]]
         results[rule["rule_id"]] = _run_ocr_supplement(
             app, task, document, component, rule, result, profile,
             locator_profile=locator_profile, baseline=True, allow_tencent=allow_tencent,
         )
-    return results
 
 
 def _run_ocr_supplement(app, task: dict, document: dict, component: str, rule: dict, result: dict,
@@ -12179,6 +12393,152 @@ def _run_cross_bid_price_scoring(app, task: dict, profile: dict, documents: list
             "missing_count": len(missing)}
 
 
+def _cross_bid_subjective_shadow_enabled() -> bool:
+    """横向主观分影子比较默认关闭，避免未验收能力额外消耗模型额度。"""
+    return str(os.environ.get("EVALUATION_WORKBENCH_CROSS_BID_SUBJECTIVE_SHADOW") or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _cross_bid_subjective_rules(rules: list[dict]) -> list[dict]:
+    """仅收集提取阶段已明确声明横向比较的主观评分规则。"""
+    return [rule for rule in rules if _rule_execution_strategy(rule) == "cross_bid"]
+
+
+def _cross_bid_subjective_shadow_context(documents: list[dict], rules: list[dict], rows: list[dict]) -> str:
+    """构造稳定、紧凑的横向评分影子证据包，不发送全文或 OCR 原文。"""
+    rule_ids = {str(rule.get("rule_id") or "") for rule in rules}
+    rows_by_key = {
+        (str(row.get("document_id") or ""), str(row.get("rule_id") or "")): row
+        for row in rows if str(row.get("rule_id") or "") in rule_ids
+    }
+    packets: list[dict] = []
+    for document in documents:
+        entries: list[dict] = []
+        for rule in rules:
+            row = rows_by_key.get((str(document.get("document_id") or ""), str(rule.get("rule_id") or "")))
+            if not isinstance(row, dict):
+                continue
+            entries.append({
+                "rule_id": str(rule.get("rule_id") or ""),
+                "current_suggested_score": row.get("suggested_score"),
+                "max_score": row.get("max_score"),
+                "confidence": str(row.get("confidence") or ""),
+                "summary": _clean_model_text(row.get("conclusion_summary"))[:160],
+                "evidence": _clean_model_text(row.get("evidence"))[:360],
+                "reason": _clean_model_text(row.get("reason"))[:220],
+            })
+        packets.append({
+            "document_id": str(document.get("document_id") or ""),
+            "bidder_name": str(document.get("bidder_name") or document.get("original_name") or "未命名投标人"),
+            "results": entries,
+        })
+    return json.dumps(packets, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _normalise_cross_bid_subjective_shadow(raw: object, documents: list[dict], rules: list[dict]) -> list[dict]:
+    """只接收严格的文档/规则键，影子分永不回写正式评分结果。"""
+    if not isinstance(raw, dict) or not isinstance(raw.get("comparisons"), list):
+        return []
+    rules_by_id = {str(rule.get("rule_id") or ""): rule for rule in rules}
+    document_ids = {str(document.get("document_id") or "") for document in documents}
+    values: list[dict] = []
+    seen_rules: set[str] = set()
+    for comparison in raw["comparisons"]:
+        if not isinstance(comparison, dict):
+            continue
+        rule_id = str(comparison.get("rule_id") or "")
+        rule = rules_by_id.get(rule_id)
+        if not rule or rule_id in seen_rules or not isinstance(comparison.get("bidders"), list):
+            continue
+        seen_rules.add(rule_id)
+        try:
+            max_score = float(_rule_scoring(rule).get("max_score") or 0)
+        except (TypeError, ValueError):
+            max_score = 0.0
+        bidders: list[dict] = []
+        seen_documents: set[str] = set()
+        for item in comparison["bidders"]:
+            if not isinstance(item, dict):
+                continue
+            document_id = str(item.get("document_id") or "")
+            if document_id not in document_ids or document_id in seen_documents:
+                continue
+            seen_documents.add(document_id)
+            suggested = item.get("suggested_score")
+            if isinstance(suggested, bool):
+                suggested = None
+            try:
+                suggested = float(suggested) if suggested is not None else None
+            except (TypeError, ValueError):
+                suggested = None
+            if suggested is not None and (suggested < 0 or (max_score > 0 and suggested > max_score)):
+                suggested = None
+            bidders.append({
+                "document_id": document_id,
+                "suggested_score": suggested,
+                "reason": _clean_model_text(item.get("reason"))[:220],
+                "confidence": _enum_text(item.get("confidence"), {"high", "medium", "low"}, "low"),
+            })
+        if bidders:
+            values.append({
+                "rule_id": rule_id,
+                "title": str(rule.get("title") or "")[:180],
+                "max_score": max_score,
+                "summary": _clean_model_text(comparison.get("summary"))[:260],
+                "bidders": bidders,
+            })
+    return values
+
+
+def _run_cross_bid_subjective_shadow(app, task: dict, profile: dict, documents: list[dict], rules: list[dict],
+                                     score_run_id: str) -> dict:
+    """受控生成横向主观分影子对照，绝不改变正式建议分或页面结果。
+
+    开关默认关闭。启用后只在文件都已完成独立评分后发起一次紧凑比较，用于与
+    现有结果 A/B；服务异常、格式异常或缺少数据一律显式记录并保留正式结果。
+    """
+    cross_bid_rules = _cross_bid_subjective_rules(rules)
+    base = {
+        "decision_participation": False,
+        "candidate_rule_count": len(cross_bid_rules),
+        "comparison_count": 0,
+        "status": "not_applicable",
+    }
+    if len(documents) < 2 or not cross_bid_rules:
+        return base
+    if not _cross_bid_subjective_shadow_enabled():
+        return {**base, "status": "disabled"}
+    rows = storage.score_results_for_run(app, score_run_id)
+    context = _cross_bid_subjective_shadow_context(documents, cross_bid_rules, rows)
+    if not context or context == "[]":
+        return {**base, "status": "unavailable", "reason": "未取得本轮主观评分结果，未运行影子横向比较。"}
+    payload = _score_payload(cross_bid_rules)
+    prompt = storage.render_prompt_template(
+        app, "evaluate_all_cross_bid_subjective_shadow_user",
+        rules=json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+        documents=context,
+    )
+    try:
+        raw = _request_task_json(
+            app, task, profile, "evaluate_all_cross_bid_subjective_shadow", _system_prompt(app, "evaluate_all"), prompt,
+            context_mode="cross_bid_subjective_shadow",
+            max_tokens=_output_token_budget(profile, min(4_000, 900 + len(documents) * len(cross_bid_rules) * 300)),
+            thinking_mode="disabled",
+        )
+    except (ValueError, InvalidJsonResponse) as exc:
+        return {**base, "status": "unavailable", "reason": f"影子横向比较未完成：{str(exc)[:180]}"}
+    comparisons = _normalise_cross_bid_subjective_shadow(raw, documents, cross_bid_rules)
+    if not comparisons:
+        return {**base, "status": "format_unavailable", "reason": "影子横向比较未返回可校验的文档/规则对应结果。"}
+    return {
+        **base,
+        "status": "completed",
+        "comparison_count": len(comparisons),
+        "comparisons": comparisons,
+    }
+
+
 class _EvaluationProgress:
     """汇总并行文件的进度，并在整份文件完成后发布可展示的部分结果。"""
 
@@ -12456,6 +12816,20 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
         ("objective", objective_rules, objective_run),
         ("subjective", subjective_rules, subjective_run),
     )
+
+    def isolate_evidence_failure(component: str, rule: dict, result: dict, stage: str, exc: Exception) -> dict:
+        """图片增强是后置层；单条失败必须保留文字阶段并允许其他规则继续。"""
+        values["failed_units"].append({
+            "document_id": document["document_id"], "bidder_name": bidder_name,
+            "component": component, "rule_ids": [rule["rule_id"]],
+            "reason": f"{stage}: {str(exc)[:200]}",
+        })
+        status = "ocr_failed" if stage == "OCR" else "unavailable"
+        return _set_result_coverage(_with_vision_execution(
+            result, status, [], {},
+            f"{stage} 本次未完成，已保留文字阶段结论；可仅重跑该规则。",
+        ), "partial")
+
     # OCR 与多模态是独立总开关：本地 OCR 不依赖多模态档案；腾讯关闭或不可用时
     # 仍可完成纯文字 OCR；多模态档案只决定是否额外执行图片外观事实核验。
     ocr_configuration = storage.ocr_configuration(app)
@@ -12486,9 +12860,13 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
             if len(batch_entries) >= 2:
                 progress.message(f"正在批量 OCR 识别：{bidder_name} · {component}")
                 ocr_started_at = time.monotonic()
-                ocr_batch_results = _run_ocr_batch_supplement(
-                    app, task, document, component, batch_entries, profile, locator_profile=vision_profile,
-                )
+                try:
+                    ocr_batch_results = _run_ocr_batch_supplement(
+                        app, task, document, component, batch_entries, profile, locator_profile=vision_profile,
+                    )
+                except ValueError as exc:
+                    # 批量提取异常不让同组件全部归零；逐条阶段仍会各自尝试并隔离。
+                    storage.update_task(app, task["task_id"], message=f"{bidder_name} · {component} 批量 OCR 未完成，正在保留逐条处理")
                 values["local_ocr_seconds"] += max(0.0, time.monotonic() - ocr_started_at)
                 values["local_ocr_rule_count"] += len(batch_entries)
                 values["batch_count"] += 1
@@ -12529,12 +12907,15 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
                     merged = ocr_batch_results[rule["rule_id"]]
                 else:
                     ocr_started_at = time.monotonic()
-                    merged = _run_ocr_supplement(
-                        app, task, document, component, rule, merged, profile,
-                        # 高强度纯扫描件在文字锚点失效时，可借助已配置的多模态模型
-                        # 做一次低清找页；即使专家模式仅选择腾讯 OCR，也不丢失旧能力。
-                        locator_profile=vision_profile, baseline=True, allow_tencent=tencent_upgrade_requested,
-                    )
+                    try:
+                        merged = _run_ocr_supplement(
+                            app, task, document, component, rule, merged, profile,
+                            # 高强度纯扫描件在文字锚点失效时，可借助已配置的多模态模型
+                            # 做一次低清找页；即使专家模式仅选择腾讯 OCR，也不丢失旧能力。
+                            locator_profile=vision_profile, baseline=True, allow_tencent=tencent_upgrade_requested,
+                        )
+                    except ValueError as exc:
+                        merged = isolate_evidence_failure(component, rule, merged, "OCR", exc)
                     values["local_ocr_seconds"] += max(0.0, time.monotonic() - ocr_started_at)
                     values["local_ocr_rule_count"] += 1
                     values["batch_count"] += 1
@@ -12543,7 +12924,10 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
             should_run_vision = _should_run_vision_for_rule(image_mode, image_strategy, trigger, rule, merged)
             if allow_vision and vision_profile and not skip_note and should_run_vision:
                 progress.message(f"正在图片识别：{bidder_name} · {label}")
-                merged = _run_visual_supplement(app, task, document, component, rule, merged, vision_profile)
+                try:
+                    merged = _run_visual_supplement(app, task, document, component, rule, merged, vision_profile)
+                except ValueError as exc:
+                    merged = isolate_evidence_failure(component, rule, merged, "图片识别", exc)
                 values["batch_count"] += 1
             elif skip_note:
                 # 保留 OCR 已采纳的状态与页码，仅补充说明未调用图片模型的原因。
@@ -12608,6 +12992,7 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
                     traceback.print_exc()
         if shadow_packs:
             _attach_document_fact_ledger_shadow(shadow_packs, scan_index)
+            _attach_document_material_consistency_shadow(shadow_packs)
             storage.save_evidence_packs(
                 app, task["project_id"], task["task_id"], document["document_id"],
                 str(document.get("sha256") or ""), shadow_packs,
@@ -13250,12 +13635,31 @@ def _evaluate_all(app, task: dict) -> dict:
     # 模型请求默认两路、稳定后按档案动态升档，触发服务商限流后会自动逐级降路重试。
     document_results: list[dict] = []
     if len(documents) == 1:
-        document_results.append(run_document(documents[0]))
+        try:
+            document_results.append(run_document(documents[0]))
+        except Exception as exc:
+            # 最外层只负责隔离意外文件级异常。正常的模型调用、规则组和 OCR 已在
+            # 更小单元恢复；这里不伪造结果，只让其他投标文件继续完成。
+            failed_units.append({
+                "document_id": documents[0]["document_id"],
+                "bidder_name": documents[0].get("bidder_name") or documents[0].get("original_name"),
+                "component": "document", "rule_ids": [], "reason": str(exc)[:240],
+            })
+            storage.update_task(app, task["task_id"], message="一份投标文件执行异常，其他已完成结果已保留，可仅重跑失败文件")
     else:
         with ThreadPoolExecutor(max_workers=parallel_limit, thread_name_prefix="evaluation-bid") as executor:
-            futures = [executor.submit(run_document, document) for document in documents]
+            futures = {executor.submit(run_document, document): document for document in documents}
             for future in as_completed(futures):
-                document_results.append(future.result())
+                document = futures[future]
+                try:
+                    document_results.append(future.result())
+                except Exception as exc:
+                    failed_units.append({
+                        "document_id": document["document_id"],
+                        "bidder_name": document.get("bidder_name") or document.get("original_name"),
+                        "component": "document", "rule_ids": [], "reason": str(exc)[:240],
+                    })
+                    storage.update_task(app, task["task_id"], message=f"{document.get('bidder_name') or document.get('original_name')} 执行异常，其他投标文件继续完成")
     for value in document_results:
         reused_document_count += value.get("reused_document_count", 0)
         compact_retry_count += value.get("compact_retry_count", 0)
@@ -13289,6 +13693,24 @@ def _evaluate_all(app, task: dict) -> dict:
                 app, review_run["review_run_id"], objective_run["score_run_id"],
             )
         progress.advance("已完成全部投标人的报价比较与价格评分")
+    # 横向主观分仍处于受控影子阶段：默认不调用模型，显式启用后也只把对照结果
+    # 写入任务元数据，绝不回写 score_run 或改变页面中的正式建议分。
+    cross_bid_subjective_shadow = {
+        "decision_participation": False, "candidate_rule_count": 0,
+        "comparison_count": 0, "status": "not_applicable",
+    }
+    if subjective_run:
+        try:
+            cross_bid_subjective_shadow = _run_cross_bid_subjective_shadow(
+                app, task, profile, documents, subjective_rules, subjective_run["score_run_id"],
+            )
+        except Exception as exc:
+            # 影子比较不可反向破坏任何已完成评分；记录原因留待 A/B 审计。
+            cross_bid_subjective_shadow = {
+                "decision_participation": False,
+                "candidate_rule_count": len(_cross_bid_subjective_rules(subjective_rules)),
+                "comparison_count": 0, "status": "unavailable", "reason": str(exc)[:180],
+            }
     highlight_failure_count = 0
     try:
         highlights = _summarise_evaluation_highlights(app, task, profile)
@@ -13316,6 +13738,7 @@ def _evaluate_all(app, task: dict) -> dict:
             "full_scan_batch_count": full_scan_batch_count, "full_scan_failed_chunk_count": full_scan_failed_chunk_count,
             "full_scan_recovery_warning_count": full_scan_recovery_warning_count,
             "cross_bid_price": cross_bid_price,
+            "cross_bid_subjective_shadow": cross_bid_subjective_shadow,
             "price_review_reconciled_count": price_review_reconciled_count,
             "evidence_ledger_rule_count": evidence_ledger_rule_count,
             "evidence_ledger_empty_rule_count": evidence_ledger_empty_rule_count,
