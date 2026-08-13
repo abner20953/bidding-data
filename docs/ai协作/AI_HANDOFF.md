@@ -2,27 +2,27 @@
 
 ```yaml
 handoff_schema: 1
-updated_at: 2026-08-13
+updated_at: 2026-08-14
 module: evaluation-workbench
-status: local_changes
-base_commit: d5b7cc7
+status: deployed_validation_completed
+base_commit: a63a082
 branch: main
-working_tree: modified_uncommitted
-remote_github: d5b7cc7
-remote_gitee: d5b7cc7
-production_commit: d5b7cc7
-prompt_version: vision-evidence-contract-v61（本地未部署；评分结构/故障隔离与 EvidencePack 影子扩展）
+working_tree: modified_runtime_record
+remote_github: a63a082
+remote_gitee: a63a082
+production_commit: a63a082
+prompt_version: vision-evidence-contract-v61（已部署；评分结构/故障隔离与 EvidencePack 影子扩展）
 database_change: ew_review_results 新增可选 requirement_relation 列（SQLite 兼容迁移）
-user_approval: implementation_only_pending_review
+user_approval: cloud_validation_completed_pending_next_change
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
 
 ## 下一位先做
 
-1. 本地有未提交的结构正确性与故障隔离修改，以及仅影子参与的材料一致性/横向主观分对照；完整回归待本轮最终执行，尚未云端验证、提交或部署。
-2. 先以 sxyh2 重新提取规则验收评分分部/总分：商务 30、技术 40、价格 30、合计 100；确认“分值构成”不再污染叶子分部，父子评分项不漏失。随后再做一次完整综合评审。
-3. 再以三原县综合评审回归：第 146 页“是”仍为高风险重点线索且写明需原页确认；范围类 `supports` 不得被候选关键词误升高风险。比较耗时、Token、OCR 页数及失败单元。
+1. `a63a082` 已推送 GitHub/Gitee 并部署；本地完整回归 `530` 项、文档校验和差异格式校验均通过。三原县 DeepSeek 与 sxyh2 MiniMax M3 云端回归均已完成，正式结果未受影子诊断影响。
+2. 横向主观分影子尚未验收：当前云端确认规则未出现真实 `execution_strategy=cross_bid` 主观项；不得为了测试修改项目规则。待自然出现此类评分规则时，选择低成本项目单独开启开关 A/B。
+3. 后续若优化性能，先补齐按“渲染/本地 OCR 引擎/模型 OCR 归纳/图片识别”的任务级墙钟诊断；不得仅因某次 OCR 子进程耗时波动而引入常驻本地模型或减少证据页。
 4. 已停用接口（`compare-signals` PATCH、`review-results/{id}` PATCH、`score-results/{id}` PATCH、`confirm-auto` ×2）仍返回 410；待确认 `rokid_glasses_app` 未调用后再彻底删除路由。事实账本（shadow-v2）仍不参与跨规则结论。
 
 ## 活跃记录（最多 10 条）
@@ -86,4 +86,6 @@ user_approval: implementation_only_pending_review
 - 已实施：同一文件、同一材料键、同一组件中，只有已有结果同时出现“有实际证据页的正向观察”与“无证据页的明确反向观察”时才记录影子不一致提示；不从“未覆盖”推断缺失。对已标注 `execution_strategy=cross_bid` 的主观规则，提供环境开关 `EVALUATION_WORKBENCH_CROSS_BID_SUBJECTIVE_SHADOW=1` 的一次紧凑横向对照；默认关闭，启用后只把校验过的对照结果写入任务元数据，绝不回写 `ew_score_results` 或页面建议分。
 - 不变契约：不增加默认模型调用、Token、OCR/图片页数或并发；不改变全文扫描、正式评分、重点结论、API 或数据库结构。影子调用失败只记录 `unavailable`，不影响任务完成。
 - 验证：新增材料相反观察、横向影子关闭零读取、开启后仅返回任务元数据和输出边界测试；完整 `530` 项通过，文档校验与 `git diff --check` 通过。
-- 待办：云端先以三原县或太原税务在开关关闭状态做一次常规回归，再只选一个存在横向主观评分的低成本项目开启开关 A/B。连续三项目、三轮满足关键召回/建议分/错误高风险/耗时/Token 门槛前，不得将影子结果接入正式评分。
+- 云端 A/B（2026-08-13）：三原县任务 `5df0e621-e274-4034-ae7d-609d66328040` 使用与基线相同的 DeepSeek 档案，关闭横向影子开关后成功完成；18 分 01 秒、122 次调用、2,912,834 Token、1 次紧凑重试、无失败单元。相对基线 `4fc2a8c7-d2c1-4a37-8c4a-e22eb0baca0d`（21 分 24 秒、177 次、3,156,947 Token、5 次格式问题）未见性能回退。企业关联关系承诺书“是”仍以 `not_satisfied/high/contradicts` 展示并保留人工复核；范围偏离关键结论仍在。
+- MiniMax 回归（2026-08-13）：sxyh2 在相同输入、规则、配置下连续两次强制综合评审：任务 `db77f149-21c6-4ddc-8a6b-142c4efd1d48` 为 8 分33秒、125 次、2,365,817 Token；任务 `9fd43c33-e1c5-4cd8-bd3c-0aa50e4db496` 为 10 分01秒、121 次、2,337,804 Token。两次 152 条审查结果的状态/风险/关系均一致，32 条评分建议也完全一致；均无格式重试、失败单元或遗漏规则。第二次本地 OCR 引擎耗时由132秒波动至260秒，但模型调用与最终结论不变，暂作为按需子进程/候选页缓存波动观察，不能据此破坏 2C2G 的非驻留约束。该轮同样不满足横向影子验收条件：当前项目无 `cross_bid` 主观规则，未开启开关，也不得由此推断功能已验收。
+- 待办：在存在明确 `cross_bid` 主观规则的低成本真实项目上单独开启影子开关 A/B；连续三项目、三轮满足关键召回/建议分/错误高风险/耗时/Token 门槛前，不得将影子结果接入正式评分。
