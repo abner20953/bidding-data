@@ -184,6 +184,36 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             "ocr_render_cache_hit_count": 3,
         })
 
+    def test_evidence_context_shadow_only_reports_anonymous_cross_group_reuse(self):
+        task = {}
+        worker._record_evidence_context_shadow(task, "document-a", "review", ["chunk-1", "chunk-2", "chunk-1"], 7_000)
+        worker._record_evidence_context_shadow(task, "document-a", "review", ["chunk-2", "chunk-3"], 6_000)
+        worker._record_evidence_context_shadow(task, "document-a", "objective", ["chunk-1"], 3_000)
+        worker._record_evidence_context_shadow(task, "document-b", "subjective", [], 800)
+
+        shadow = worker._task_evidence_context_shadow(task)
+
+        self.assertEqual(shadow["version"], 1)
+        self.assertEqual(shadow["group_count"], 4)
+        self.assertEqual(shadow["groups_with_evidence"], 3)
+        self.assertEqual(shadow["chunk_references"], 5)
+        self.assertEqual(shadow["unique_chunks"], 3)
+        self.assertEqual(shadow["duplicate_chunk_references"], 2)
+        self.assertEqual(shadow["duplicate_reference_rate"], 0.4)
+        self.assertEqual(shadow["component_scoped_unique_chunks"], 4)
+        self.assertEqual(shadow["same_component_duplicate_chunk_references"], 1)
+        self.assertEqual(shadow["same_component_duplicate_reference_rate"], 0.2)
+        self.assertEqual(shadow["evidence_context_chars"], 16_000)
+        self.assertEqual(shadow["components"]["review"], {
+            "group_count": 2, "groups_with_evidence": 2, "chunk_references": 4,
+            "unique_chunks": 3, "duplicate_chunk_references": 1,
+            "duplicate_reference_rate": 0.25, "evidence_context_chars": 13_000,
+        })
+        self.assertEqual(shadow["components"]["subjective"]["groups_with_evidence"], 0)
+        encoded = json.dumps(shadow, ensure_ascii=False)
+        self.assertNotIn("document-a", encoded)
+        self.assertNotIn("chunk-1", encoded)
+
     def test_incomplete_model_envelope_allows_second_backoff_retry(self):
         task = storage.create_task(self.app, self.project["project_id"], "extract_rules")
         profile = {"profile_id": "profile-1", "display_name": "测试模型"}

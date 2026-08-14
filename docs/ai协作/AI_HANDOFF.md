@@ -4,12 +4,12 @@
 handoff_schema: 1
 updated_at: 2026-08-14
 module: evaluation-workbench
-status: deployed_validation_pending
-base_commit: e53ae8b
+status: ready_for_commit
+base_commit: 6ad19b9
 branch: main
-working_tree: clean_after_diagnostic_tool_deploy
-remote_github: e53ae8b
-remote_gitee: e53ae8b
+working_tree: uncommitted（跨规则组证据重复影子统计，已完成本地回归）
+remote_github: 6ad19b9
+remote_gitee: 6ad19b9
 production_commit: e53ae8b
 prompt_version: vision-evidence-contract-v61（已部署；评分结构/故障隔离与 EvidencePack 影子扩展）
 database_change: ew_review_results 新增可选 requirement_relation 列（SQLite 兼容迁移）
@@ -95,4 +95,4 @@ user_approval: implementation_and_cloud_test_authorized
 ### 10. 综合评审成本诊断：扫描目录剪枝暂不作为优先方案（附只读工具）
 
 - 新增 `scripts/evaluation_scan_diagnostics.py`：纯标准库、SQLite 只读，可按 `--task-id` 或 `--project-id` 锁定实际评审任务、规则集和模型调用账本，输出各阶段 Token、输入和缓存命中率；禁止把全库其他项目的最新规则混入统计。工具不 import worker、不重建生产规则目录、不写数据库、不保存提示词或正文，并有独立回归测试。
-- 当前结论：扫描目录逐块重复，但属于可被服务商缓存的稳定前缀；按页块剪枝会改变规则召回边界并破坏前缀一致性，收益未证实前不实施。真实可回收量以目标任务的 `cache_hit_tokens` 和固定输入 A/B 为准。下一步只观察最终 judge 规则组的稳定/动态分层潜力；管线重叠和组内共享页去重保留为候选，不修改生产请求。
+- 当前结论：扫描目录逐块重复，但属于可被服务商缓存的稳定前缀；按页块剪枝会改变规则召回边界并破坏前缀一致性，收益未证实前不实施。已在本地加入 `evidence_context_shadow` 匿名统计首次规则组跨组页块重复，尚待云端自然任务读取；真实可回收量仍以目标任务的 `cache_hit_tokens` 和固定输入 A/B 为准。管线重叠和页面中心化共享上下文均保留为候选，不修改生产请求。

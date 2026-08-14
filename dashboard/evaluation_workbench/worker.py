@@ -262,6 +262,97 @@ def _task_performance_metrics(task: dict | None) -> dict:
     }
 
 
+def _record_evidence_context_shadow(task: dict | None, document_id: object, component: object,
+                                    chunk_ids: object, context_chars: int = 0) -> None:
+    """影子统计初次规则组实际携带的页块，不参与任何业务决策。"""
+    if not isinstance(task, dict):
+        return
+    values = chunk_ids if isinstance(chunk_ids, (list, tuple, set)) else []
+    unique_ids = list(dict.fromkeys(
+        str(value).strip() for value in values if str(value).strip()
+    ))
+    name = str(component or "unknown").strip() or "unknown"
+    # 页块只在同一投标文件内有意义；内部集合仅用于计数，任务结果不会暴露文件或页块标识。
+    document_key = str(document_id or "unknown").strip() or "unknown"
+    lock = task.get("_evidence_context_shadow_lock")
+    if not hasattr(lock, "acquire") or not hasattr(lock, "release"):
+        lock = threading.Lock()
+        task["_evidence_context_shadow_lock"] = lock
+    with lock:
+        shadow = task.get("_evidence_context_shadow")
+        if not isinstance(shadow, dict):
+            shadow = {"components": {}}
+            task["_evidence_context_shadow"] = shadow
+        bucket = shadow.setdefault("components", {}).setdefault(name, {"seen_chunks": set()})
+        seen_chunks = bucket.setdefault("seen_chunks", set())
+        if not isinstance(seen_chunks, set):
+            seen_chunks = set()
+            bucket["seen_chunks"] = seen_chunks
+        bucket["group_count"] = int(bucket.get("group_count") or 0) + 1
+        if not unique_ids:
+            return
+        bucket["groups_with_evidence"] = int(bucket.get("groups_with_evidence") or 0) + 1
+        bucket["chunk_references"] = int(bucket.get("chunk_references") or 0) + len(unique_ids)
+        bucket["evidence_context_chars"] = int(bucket.get("evidence_context_chars") or 0) + max(0, int(context_chars or 0))
+        seen_chunks.update(f"{document_key}:{chunk_id}" for chunk_id in unique_ids)
+
+
+def _task_evidence_context_shadow(task: dict | None) -> dict:
+    """返回匿名聚合的跨规则组证据重复指标；绝不影响任务执行或结果。"""
+    if not isinstance(task, dict):
+        return {"version": 1, "component_count": 0, "group_count": 0, "groups_with_evidence": 0,
+                "chunk_references": 0, "unique_chunks": 0, "duplicate_chunk_references": 0,
+                "duplicate_reference_rate": 0.0, "component_scoped_unique_chunks": 0,
+                "same_component_duplicate_chunk_references": 0,
+                "same_component_duplicate_reference_rate": 0.0,
+                "evidence_context_chars": 0, "components": {}}
+    shadow = task.get("_evidence_context_shadow")
+    buckets = shadow.get("components") if isinstance(shadow, dict) else {}
+    if not isinstance(buckets, dict):
+        buckets = {}
+    components: dict[str, dict] = {}
+    totals = {"group_count": 0, "groups_with_evidence": 0, "chunk_references": 0,
+              "component_scoped_unique_chunks": 0, "evidence_context_chars": 0}
+    all_seen_chunks: set[str] = set()
+    for name in sorted(buckets):
+        bucket = buckets[name] if isinstance(buckets[name], dict) else {}
+        references = max(0, int(bucket.get("chunk_references") or 0))
+        unique_count = len(bucket.get("seen_chunks") or set())
+        duplicates = max(0, references - unique_count)
+        value = {
+            "group_count": max(0, int(bucket.get("group_count") or 0)),
+            "groups_with_evidence": max(0, int(bucket.get("groups_with_evidence") or 0)),
+            "chunk_references": references,
+            "unique_chunks": unique_count,
+            "duplicate_chunk_references": duplicates,
+            "duplicate_reference_rate": round(duplicates / references, 4) if references else 0.0,
+            "evidence_context_chars": max(0, int(bucket.get("evidence_context_chars") or 0)),
+        }
+        components[str(name)] = value
+        totals["group_count"] += value["group_count"]
+        totals["groups_with_evidence"] += value["groups_with_evidence"]
+        totals["chunk_references"] += value["chunk_references"]
+        totals["component_scoped_unique_chunks"] += value["unique_chunks"]
+        totals["evidence_context_chars"] += value["evidence_context_chars"]
+        all_seen_chunks.update(bucket.get("seen_chunks") or set())
+    unique_total = len(all_seen_chunks)
+    duplicate_total = max(0, totals["chunk_references"] - unique_total)
+    same_component_duplicates = max(0, totals["chunk_references"] - totals["component_scoped_unique_chunks"])
+    return {
+        "version": 1,
+        "component_count": len(components),
+        **totals,
+        "unique_chunks": unique_total,
+        "duplicate_chunk_references": duplicate_total,
+        "duplicate_reference_rate": round(duplicate_total / totals["chunk_references"], 4)
+        if totals["chunk_references"] else 0.0,
+        "same_component_duplicate_chunk_references": same_component_duplicates,
+        "same_component_duplicate_reference_rate": round(same_component_duplicates / totals["chunk_references"], 4)
+        if totals["chunk_references"] else 0.0,
+        "components": components,
+    }
+
+
 def _task_request_profile(profile: dict, phase: str, thinking_mode: str | None = None) -> dict:
     """为小规格工作台给可恢复的综合评审请求设定边界，不改变模型档案的保存值。"""
     effective = {**profile, "thinking_mode": thinking_mode} if thinking_mode else dict(profile)
@@ -11891,6 +11982,12 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
         ]
     if unmatched_rule_ids:
         payload = [{**item, "context_unmatched": item["rule_id"] in unmatched_rule_ids} for item in payload]
+    # 只记录首轮规则组实际送入的页块，用于判断跨组是否值得进一步做共享上下文优化。
+    # 拆分、紧凑和缺失补评会重复同一证据，属于恢复链路，不能混入正常组的重复率。
+    if depth == 0 and not targeted_retry and not compact_retry:
+        _record_evidence_context_shadow(
+            task, document.get("document_id"), component, context.get("pages"), len(str(context.get("text") or "")),
+        )
     if context["mode"] == "unmatched_rules":
         reason = "本地页级检索未定位到该规则的直接证据，未发送无关全文；请结合投标文件人工核验。"
         return _combined_manual_results(component, rules, payload, reason), 0, 0, len(rules), context["mode"]
@@ -13839,6 +13936,9 @@ def _evaluate_all(app, task: dict) -> dict:
             # 仅观测：用于把渲染、OCR 引擎、OCR 归纳和图片模型的墙钟拆开，
             # 不参与候选页、取证、风险、评分、缓存或任何业务结论。
             "performance_metrics": _task_performance_metrics(task),
+            # 仅统计首次规则组中实际随上下文发送的匿名页块重复，不保留页码或正文，
+            # 不参与规则分组、提示词、模型调用、OCR、缓存或任何结果判断。
+            "evidence_context_shadow": _task_evidence_context_shadow(task),
             "enhancement_rule_count": enhancement_rule_count,
             "completion_state": "partial_success" if failed_units else "complete",
             "failed_units": failed_units,
