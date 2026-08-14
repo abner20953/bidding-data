@@ -45,7 +45,7 @@ MAX_PARSE_PAGES = MAX_PDF_PAGES
 MAX_PARSED_CHARS = 2_500_000
 MAX_DOCX_XML_BYTES = 50 * 1024 * 1024
 PROMPT_VERSION = EVALUATION_PROMPT_VERSION
-COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v4"
+COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v5"
 # 单条线索的证据包虽小，但查重往往同时命中多种维度；以较小批次起步，并在
 # 截断时继续局部拆分，避免某一批过长导致整批线索都只能降级为人工核验。
 COMPARE_AI_BATCH_SIZE = 8
@@ -655,47 +655,187 @@ def _compare_evidence_packet(signal: dict) -> dict:
         "signal_id": signal["signal_id"], "bidders": [signal.get("bidder_a"), signal.get("bidder_b")],
         "fixed_rule": signal.get("dimension_label"), "basis": str(signal.get("basis", ""))[:420],
         "evidence": evidence, "counter_evidence": [str(item)[:220] for item in signal.get("counter_evidence", [])[:2]],
-        **({"assessment_scope": "project_entity_cluster"} if signal.get("project_entity_cluster") else {}),
+        **({"assessment_scope": signal["assessment_scope"]} if signal.get("assessment_scope") else {}),
     }
 
 
-def _compare_entity_value(signal: dict) -> str:
-    """实体簇只按已被本地严格提取的实体值归并，不从正文猜测。"""
-    evidence = signal.get("evidence") or []
-    first = evidence[0] if evidence and isinstance(evidence[0], dict) else {}
-    return str(first.get("text_a") or first.get("value") or "").strip().casefold()
+_COMPARE_ENTITY_DIMENSIONS = {"contact", "email", "person_name", "person_identity", "address"}
+
+
+def _compare_fact_text(value: object) -> str:
+    """为项目级事实归并生成稳定键；仅整理空白和大小写，不从正文推断新事实。"""
+    return re.sub(r"\s+", "", str(value or "")).casefold()
+
+
+def _compare_fact_digest(dimension: str, fact_key: str) -> str:
+    return hashlib.sha256(f"{dimension}|{fact_key}".encode("utf-8")).hexdigest()[:16]
+
+
+def _compare_atomic_facts(signal: dict) -> list[dict]:
+    """将一条文件对信号拆成可独立判断的实体或共同改动事实。
+
+    原始文件对仍是展示和追溯单位；拆分只用于避免多电话号码、多处共同改动共用一条
+    AI 结论。没有稳定原子事实的维度保持原样，不扩大候选召回范围。
+    """
+    dimension = str(signal.get("dimension") or "")
+    evidence = [item for item in signal.get("evidence") or [] if isinstance(item, dict)]
+    atoms: dict[str, dict] = {}
+
+    if dimension in _COMPARE_ENTITY_DIMENSIONS:
+        for item in evidence:
+            value = str(item.get("text_a") or item.get("value") or "").strip()
+            key = _compare_fact_text(value)
+            if not key:
+                continue
+            atom = atoms.setdefault(key, {"key": key, "label": value, "evidence": []})
+            atom["evidence"].append(dict(item))
+    elif dimension == "tender_common_edit":
+        for item in evidence:
+            for change in item.get("shared_edits") or []:
+                if not isinstance(change, dict):
+                    continue
+                original = str(change.get("original") or "").strip()
+                modified = str(change.get("modified") or "").strip()
+                key = f"{_compare_fact_text(original)}→{_compare_fact_text(modified)}"
+                if not key or key == "→":
+                    continue
+                atom = atoms.setdefault(key, {
+                    "key": key,
+                    "label": f"{original or '（空）'} → {modified or '（删除）'}",
+                    "evidence": [],
+                })
+                copied = dict(item)
+                copied["shared_edits"] = [{"original": original, "modified": modified}]
+                atom["evidence"].append(copied)
+
+    if not atoms:
+        return [{"key": "", "label": "", "subject": signal}]
+
+    facts = []
+    for atom in atoms.values():
+        subject = dict(signal)
+        digest = _compare_fact_digest(dimension, atom["key"])
+        subject["signal_id"] = f"atomic-{signal['signal_id']}-{digest}"
+        subject["evidence"] = atom["evidence"]
+        subject["basis"] = f"{str(signal.get('basis') or '')[:360]}；本次仅复核其中事实：{atom['label']}。"
+        subject["atomic_fact"] = {"key": atom["key"], "label": atom["label"]}
+        facts.append({"key": atom["key"], "label": atom["label"], "subject": subject})
+    return facts
 
 
 def _compare_assessment_subjects(signals: list[dict]) -> list[dict]:
-    """将三家以上投标人共享的同一实体合并为一次 AI 复核，保持映射结果一致。"""
-    entity_dimensions = {"contact", "email", "person_name", "person_identity", "address"}
-    groups: dict[tuple[str, str], list[dict]] = {}
+    """按单个可核验事实聚合 AI 复核，结果再回填到原始文件对线索。
+
+    三家以上出现的同一实体或同一共同改动只复核一次；多事实信号不会再以第一项
+    证据替代其余事实。其余维度保持原有的一条信号一次复核语义。
+    """
+    entries = []
+    facts_by_signal: dict[str, list[dict]] = {}
     for signal in signals:
-        if signal.get("dimension") not in entity_dimensions:
-            continue
-        value = _compare_entity_value(signal)
-        if value:
-            groups.setdefault((str(signal.get("dimension")), value), []).append(signal)
-    grouped_ids = set()
+        atoms = _compare_atomic_facts(signal)
+        facts_by_signal[signal["signal_id"]] = atoms
+        for atom in atoms:
+            entries.append({"signal": signal, **atom})
+
+    clusterable = _COMPARE_ENTITY_DIMENSIONS | {"tender_common_edit"}
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for entry in entries:
+        dimension = str(entry["signal"].get("dimension") or "")
+        if dimension in clusterable and entry["key"]:
+            groups.setdefault((dimension, entry["key"]), []).append(entry)
+
+    grouped_fact_keys: set[tuple[str, str]] = set()
     subjects = []
-    for (dimension, value), items in groups.items():
-        bidders = {item.get("bidder_a") for item in items} | {item.get("bidder_b") for item in items}
+    for (dimension, fact_key), items in groups.items():
+        bidders = {item["signal"].get("bidder_a") for item in items} | {item["signal"].get("bidder_b") for item in items}
         if len(items) < 2 or len(bidders) < 3:
             continue
-        digest = hashlib.sha256(f"{dimension}|{value}".encode("utf-8")).hexdigest()[:16]
-        prototype = dict(items[0])
-        prototype["signal_id"] = f"entity-cluster-{digest}"
+        digest = _compare_fact_digest(dimension, fact_key)
+        prototype = dict(items[0]["subject"])
+        prototype["signal_id"] = f"project-fact-{digest}"
         prototype["bidder_a"] = "、".join(sorted(str(item) for item in bidders if item))
         prototype["bidder_b"] = ""
-        prototype["basis"] = f"{len(bidders)} 家投标文件均出现同一{prototype.get('dimension_label')}，已按项目级实体簇统一复核。"
-        prototype["evidence"] = [evidence for item in items for evidence in (item.get("evidence") or [])]
-        prototype["project_entity_cluster"] = True
-        subjects.append({"subject": prototype, "signals": items})
-        grouped_ids.update(item["signal_id"] for item in items)
+        prototype["basis"] = (
+            f"{len(bidders)} 家投标文件出现同一{prototype.get('dimension_label')}事实"
+            f"（{items[0]['label']}），已按项目级事实簇统一复核。"
+        )
+        prototype["evidence"] = [evidence for item in items for evidence in (item["subject"].get("evidence") or [])]
+        prototype["assessment_scope"] = "project_fact_cluster"
+        subjects.append({
+            "subject": prototype,
+            "bindings": items,
+            "signals": list(dict.fromkeys(item["signal"]["signal_id"] for item in items)),
+        })
+        grouped_fact_keys.add((dimension, fact_key))
+
+    # 未进入项目级事实簇的部分仍保留为原有“文件对短证据包”，避免一条含多项
+    # 普通证据的线索被机械拆成多次模型调用。只有已聚合的事实从残余包中移除。
     for signal in signals:
-        if signal["signal_id"] not in grouped_ids:
-            subjects.append({"subject": signal, "signals": [signal]})
+        dimension = str(signal.get("dimension") or "")
+        atoms = facts_by_signal[signal["signal_id"]]
+        atom_keys = {atom["key"] for atom in atoms if atom["key"]}
+        clustered_keys = {key for key in atom_keys if (dimension, key) in grouped_fact_keys}
+        if not clustered_keys:
+            subjects.append({"subject": signal, "bindings": [{"signal": signal, "label": ""}], "signals": [signal["signal_id"]]})
+            continue
+        remaining_keys = atom_keys - clustered_keys
+        if not remaining_keys:
+            continue
+        residual = dict(signal)
+        residual["signal_id"] = f"residual-{signal['signal_id']}"
+        residual_evidence = []
+        for item in signal.get("evidence") or []:
+            if not isinstance(item, dict):
+                continue
+            if dimension in _COMPARE_ENTITY_DIMENSIONS:
+                value_key = _compare_fact_text(item.get("text_a") or item.get("value"))
+                if value_key in remaining_keys:
+                    residual_evidence.append(dict(item))
+            elif dimension == "tender_common_edit":
+                changes = []
+                for change in item.get("shared_edits") or []:
+                    if not isinstance(change, dict):
+                        continue
+                    key = f"{_compare_fact_text(change.get('original'))}→{_compare_fact_text(change.get('modified'))}"
+                    if key in remaining_keys:
+                        changes.append(dict(change))
+                if changes:
+                    copied = dict(item)
+                    copied["shared_edits"] = changes
+                    residual_evidence.append(copied)
+        if residual_evidence:
+            residual["evidence"] = residual_evidence
+            residual["basis"] = f"{str(signal.get('basis') or '')[:360]}；以下为未进入项目级事实簇的其余证据。"
+            subjects.append({"subject": residual, "bindings": [{"signal": signal, "label": ""}], "signals": [signal["signal_id"]]})
     return subjects
+
+
+def _compare_assessment_is_complete(assessment: dict) -> bool:
+    """正向线索必须具备可执行的人工复核建议；缺失时只重试当前原子事实。"""
+    if assessment.get("decision") not in {"confirmed_clue", "suspected_clue"}:
+        return True
+    return bool(str(assessment.get("reason") or "").strip()) and bool(str(assessment.get("suggested_check") or "").strip())
+
+
+def _compare_assessment_rank(assessment: dict) -> tuple[int, int, int, int]:
+    return (
+        {"confirmed_clue": 4, "suspected_clue": 3, "unassessable": 2, "excluded": 1}.get(assessment.get("decision"), 0),
+        {"high": 3, "medium": 2, "low": 1}.get(assessment.get("risk_level"), 0),
+        1 if assessment.get("materiality") == "substantive" else 0,
+        {"high": 3, "medium": 2, "low": 1}.get(assessment.get("confidence"), 0),
+    )
+
+
+def _compare_display_group(assessment: dict) -> str:
+    """区分已排除、背景辅助和主线索；展示分层绝不改变底层证据。"""
+    if assessment.get("decision") == "excluded":
+        return "low_value"
+    source_class = assessment.get("source_class")
+    if source_class in {"third_party_common", "public_template", "placeholder_or_extraction"}:
+        if assessment.get("decision") in {"confirmed_clue", "suspected_clue"} and assessment.get("materiality") == "substantive":
+            return "contextual"
+        return "low_value"
+    return "main"
 
 
 def _output_token_budget(profile: dict, target: int) -> int | None:
@@ -720,6 +860,7 @@ def _assess_compare_signals_with_ai(app, task: dict, analysis: dict) -> None:
     subjects = _compare_assessment_subjects(signals)
     by_id = {item["subject"]["signal_id"]: item for item in subjects}
     completed_ids, completed_signal_ids, failures = set(), set(), []
+    atomic_results: dict[str, list[dict]] = {}
     system_prompt = _system_prompt(app, "compare_ai_assessment")
 
     def apply_assessments(values: object, batch: list[dict]) -> None:
@@ -746,12 +887,17 @@ def _assess_compare_signals_with_ai(app, task: dict, analysis: dict) -> None:
                 "source_class": source_class,
                 "materiality": materiality,
             }
+            if not _compare_assessment_is_complete(assessment):
+                # 正向线索缺少复核建议时，不以结构合法掩盖语义不完整；保留为当前
+                # 原子事实的遗漏项，后续只重试这一项。
+                continue
             subject = by_id[value["signal_id"]]
-            for signal in subject["signals"]:
-                signal["ai_assessment"] = dict(assessment)
-                if source_class in {"third_party_common", "public_template", "placeholder_or_extraction"}:
-                    signal["display_group"] = "low_value"
-                completed_signal_ids.add(signal["signal_id"])
+            for binding in subject["bindings"]:
+                signal = binding["signal"]
+                atomic_results.setdefault(signal["signal_id"], []).append({
+                    "fact": binding.get("label") or "",
+                    "assessment": dict(assessment),
+                })
             completed_ids.add(value["signal_id"])
 
     def assess_batch(batch: list[dict], *, depth: int = 0, leaf_retry: bool = False,
@@ -809,7 +955,20 @@ def _assess_compare_signals_with_ai(app, task: dict, analysis: dict) -> None:
         if not assess_batch(subjects[start:start + COMPARE_AI_BATCH_SIZE]):
             break
     for signal in signals:
-        signal.setdefault("ai_assessment", {"decision": "unassessable", "risk_level": "medium", "confidence": "low", "reason": "AI 未返回该线索的可用判定。", "suggested_check": "请结合原始文件人工核验。"})
+        fact_results = atomic_results.get(signal["signal_id"], [])
+        if fact_results:
+            fact_results.sort(key=lambda item: _compare_assessment_rank(item["assessment"]), reverse=True)
+            signal["ai_assessment"] = dict(fact_results[0]["assessment"])
+            if len(fact_results) > 1:
+                signal["atomic_assessments"] = fact_results
+            completed_signal_ids.add(signal["signal_id"])
+        else:
+            signal["ai_assessment"] = {
+                "decision": "unassessable", "risk_level": "medium", "confidence": "low",
+                "reason": "AI 未返回该线索的可用判定。", "suggested_check": "请结合原始文件人工核验。",
+                "source_class": "unknown", "materiality": "unknown",
+            }
+        signal["display_group"] = _compare_display_group(signal["ai_assessment"])
     for summary in analysis.get("pair_summaries", []):
         pair_ids = {summary.get("document_a_id"), summary.get("document_b_id")}
         pair_signals = [
@@ -843,7 +1002,7 @@ def _assess_compare_signals_with_ai(app, task: dict, analysis: dict) -> None:
                 or risk == "low"
                 or confidence == "low"
                 or signal.get("voice_adaptation_only")
-                or signal.get("display_group") == "low_value"
+                or signal.get("display_group") != "main"
             ):
                 continue
             reportable_signals.append(signal)

@@ -1314,8 +1314,134 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         subjects = worker._compare_assessment_subjects(signals)
 
         self.assertEqual(len(subjects), 1)
-        self.assertTrue(subjects[0]["subject"]["project_entity_cluster"])
+        self.assertEqual(subjects[0]["subject"]["assessment_scope"], "project_fact_cluster")
         self.assertEqual(len(subjects[0]["signals"]), 3)
+
+    def test_compare_entity_cluster_splits_multiple_values_before_project_grouping(self):
+        pairs = [("a", "b"), ("a", "c"), ("b", "c")]
+        signals = [{
+            "signal_id": f"signal-{index}", "document_a_id": left, "document_b_id": right,
+            "bidder_a": left, "bidder_b": right, "dimension": "contact", "dimension_label": "共同联系电话",
+            "basis": "共同号码", "evidence": [
+                {"text_a": "13800138000", "text_b": "13800138000", "page_a": index, "page_b": index + 1},
+                {"text_a": "13900139000", "text_b": "13900139000", "page_a": index + 10, "page_b": index + 11},
+            ],
+        } for index, (left, right) in enumerate(pairs, start=1)]
+
+        subjects = worker._compare_assessment_subjects(signals)
+
+        self.assertEqual(len(subjects), 2)
+        self.assertTrue(all(item["subject"]["assessment_scope"] == "project_fact_cluster" for item in subjects))
+        self.assertTrue(all(len(item["bindings"]) == 3 for item in subjects))
+        self.assertEqual({item["subject"]["evidence"][0]["text_a"] for item in subjects}, {"13800138000", "13900139000"})
+        self.assertTrue(all(len({row["text_a"] for row in item["subject"]["evidence"]}) == 1 for item in subjects))
+
+    def test_compare_common_edit_cluster_assesses_three_bidder_fact_once(self):
+        pairs = [("a", "b"), ("a", "c"), ("b", "c")]
+        signals = [{
+            "signal_id": f"signal-{index}", "document_a_id": left, "document_b_id": right,
+            "bidder_a": left, "bidder_b": right, "dimension": "tender_common_edit", "dimension_label": "招标原文共同改动",
+            "basis": "共同改动", "evidence": [{
+                "text_a": "修改后条款", "text_b": "修改后条款", "page_a": index, "page_b": index + 1,
+                "shared_edits": [{"original": "原条款", "modified": "修改后条款"}],
+            }],
+        } for index, (left, right) in enumerate(pairs, start=1)]
+
+        subjects = worker._compare_assessment_subjects(signals)
+
+        self.assertEqual(len(subjects), 1)
+        self.assertEqual(subjects[0]["subject"]["assessment_scope"], "project_fact_cluster")
+        self.assertEqual(len(subjects[0]["bindings"]), 3)
+
+    def test_compare_non_clustered_multi_fact_signal_keeps_single_ai_subject(self):
+        signal = {
+            "signal_id": "signal-1", "document_a_id": "a", "document_b_id": "b", "bidder_a": "甲", "bidder_b": "乙",
+            "dimension": "tender_common_edit", "dimension_label": "招标原文共同改动", "basis": "两项共同改动",
+            "evidence": [{"shared_edits": [
+                {"original": "原要求一", "modified": "改动一"},
+                {"original": "原要求二", "modified": "改动二"},
+            ]}],
+        }
+
+        subjects = worker._compare_assessment_subjects([signal])
+
+        self.assertEqual(len(subjects), 1)
+        self.assertEqual(subjects[0]["subject"]["signal_id"], "signal-1")
+        self.assertEqual(len(subjects[0]["subject"]["evidence"][0]["shared_edits"]), 2)
+
+    def test_compare_ai_retries_positive_assessment_without_suggested_check(self):
+        task = storage.create_task(self.app, self.project["project_id"], "compare_documents")
+        signal = {
+            "signal_id": "signal-1", "document_a_id": "a", "document_b_id": "b", "bidder_a": "甲", "bidder_b": "乙",
+            "dimension": "tender_common_edit", "dimension_label": "共同改动", "basis": "共同实质改动",
+            "evidence": [{"shared_edits": [{"original": "2", "modified": "8"}]}],
+        }
+        incomplete = {"assessments": [{
+            "signal_id": next(item["subject"]["signal_id"] for item in worker._compare_assessment_subjects([signal])),
+            "decision": "suspected_clue", "risk_level": "medium", "confidence": "medium",
+            "reason": "共同提高关键参数", "suggested_check": "",
+        }]}
+        complete = {"assessments": [{
+            "signal_id": incomplete["assessments"][0]["signal_id"],
+            "decision": "suspected_clue", "risk_level": "medium", "confidence": "medium",
+            "reason": "共同提高关键参数", "suggested_check": "核对是否存在统一澄清文件",
+        }]}
+        analysis = {"signals": [signal], "pair_summaries": []}
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[incomplete, complete]) as request_json:
+            worker._assess_compare_signals_with_ai(self.app, task, analysis)
+
+        self.assertEqual(request_json.call_count, 2)
+        self.assertEqual(signal["ai_assessment"]["suggested_check"], "核对是否存在统一澄清文件")
+
+    def test_compare_ai_maps_each_clustered_fact_back_to_multi_value_signal(self):
+        task = storage.create_task(self.app, self.project["project_id"], "compare_documents")
+        pairs = [("a", "b"), ("a", "c"), ("b", "c")]
+        signals = [{
+            "signal_id": f"signal-{index}", "document_a_id": left, "document_b_id": right,
+            "bidder_a": left, "bidder_b": right, "dimension": "contact", "dimension_label": "共同联系电话",
+            "basis": "共同号码", "evidence": [
+                {"text_a": "13800138000", "text_b": "13800138000"},
+                {"text_a": "13900139000", "text_b": "13900139000"},
+            ],
+        } for index, (left, right) in enumerate(pairs, start=1)]
+        subjects = worker._compare_assessment_subjects(signals)
+        response = {"assessments": [
+            {"signal_id": item["subject"]["signal_id"], "decision": "suspected_clue", "risk_level": "medium",
+             "confidence": "medium", "source_class": "third_party_common", "materiality": "substantive",
+             "reason": f"共同号码 {item['subject']['evidence'][0]['text_a']}", "suggested_check": "核查号码归属"}
+            for item in subjects
+        ]}
+        analysis = {"signals": signals, "pair_summaries": []}
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value=response):
+            worker._assess_compare_signals_with_ai(self.app, task, analysis)
+
+        self.assertTrue(all(len(signal["atomic_assessments"]) == 2 for signal in signals))
+        self.assertTrue(all(signal["display_group"] == "contextual" for signal in signals))
+
+    def test_compare_display_groups_excluded_and_contextual_signals_without_priority(self):
+        task = storage.create_task(self.app, self.project["project_id"], "compare_documents")
+        signals = [
+            {"signal_id": "excluded", "document_a_id": "a", "document_b_id": "b", "bidder_a": "甲", "bidder_b": "乙", "dimension": "metadata", "dimension_label": "相同属性", "basis": "生成工具", "evidence": []},
+            {"signal_id": "context", "document_a_id": "a", "document_b_id": "b", "bidder_a": "甲", "bidder_b": "乙", "dimension": "contact", "dimension_label": "共同联系电话", "basis": "共同联系人", "evidence": []},
+        ]
+        analysis = {"signals": signals, "pair_summaries": [{
+            "document_a_id": "a", "document_b_id": "b", "bidder_a": "甲", "bidder_b": "乙",
+            "independent_dimension_count": 2, "signal_count": 2, "dimensions": ["metadata", "contact"],
+            "dimension_labels": ["相同属性", "共同联系电话"], "review_priority": "normal",
+        }]}
+        response = {"assessments": [
+            {"signal_id": "excluded", "decision": "excluded", "risk_level": "low", "confidence": "high", "reason": "常见工具", "suggested_check": "无需优先核查", "source_class": "unknown", "materiality": "formatting"},
+            {"signal_id": "context", "decision": "suspected_clue", "risk_level": "medium", "confidence": "medium", "reason": "共同第三方联系人", "suggested_check": "核查授权关系", "source_class": "third_party_common", "materiality": "substantive"},
+        ]}
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value=response):
+            worker._assess_compare_signals_with_ai(self.app, task, analysis)
+
+        self.assertEqual(signals[0]["display_group"], "low_value")
+        self.assertEqual(signals[1]["display_group"], "contextual")
+        self.assertEqual(analysis["pair_summaries"][0]["review_priority"], "none")
 
     def test_compare_result_marks_complete_pipeline_as_current_and_legacy_as_historical(self):
         fingerprint = storage.task_input_fingerprint(
