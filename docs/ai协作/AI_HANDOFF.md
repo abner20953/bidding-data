@@ -4,13 +4,13 @@
 handoff_schema: 1
 updated_at: 2026-08-14
 module: evaluation-workbench
-status: repository_synced_cloud_unverified
-base_commit: 74818fa
+status: deployed_validation_pending
+base_commit: edb09b5
 branch: main
-working_tree: clean（纯文字查重版本身份、覆盖标注、来源分层与实体簇复核，已完成本地回归）
-remote_github: 74818fa
-remote_gitee: 74818fa
-production_commit: 74b6597
+working_tree: uncommitted（部署后交接状态更新）
+remote_github: edb09b5
+remote_gitee: edb09b5
+production_commit: edb09b5
 prompt_version: vision-evidence-contract-v61（已部署；评分结构/故障隔离与 EvidencePack 影子扩展）
 database_change: ew_review_results 新增可选 requirement_relation 列（SQLite 兼容迁移）
 user_approval: implementation_authorized；提交、推送、部署待用户确认
@@ -97,4 +97,4 @@ user_approval: implementation_authorized；提交、推送、部署待用户确�
 - 目标：保持查重不使用 OCR/图片识别，同时解决“v4/v10 不能代表当前代码”、扫描件结果易被误读、公共来源疑似线索挤占主结果及三家以上共同实体重复判定的问题。
 - 已实施：结果保存比较器/信号版本、提示词指纹、模型公开配置、运行代码/部署和输入指纹构成的查重链路身份；读取时与当前链路核对，旧结果明确标为历史。所有文件对保存纯文字覆盖状态；AI 输出增加来源属性和实质性，公共/第三方/占位或提取伪影线索折叠且不提高优先级；共同实体跨三家时合并为一次 AI 判定并回填各文件对；同样三段证据预算下优先不同页对，保留共同改动原文/改写和实体字段语境。
 - 不变契约：不调用任何 OCR 或图片模型；不发送完整文件对；不改变 `/bijiao`、综合评审、评分、文件解析或既有 API 字段；不自动认定串标、废标或扣分。
-- 验证：新增扫描覆盖、链路身份、低价值来源不升级、实体簇、证据多样性及旧自定义提示词协议补齐测试；前端语法、完整工作台/AI 网关 `538` 项回归、文档校验与差异格式校验均通过。待云端以 `test3`、`云时代`、`sxyh` 验收。主要文件：`storage.py`、`worker.py`、`collusion_signals.py`、`comparator.py`、查重提示词与前端。
+- 验证：新增扫描覆盖、链路身份、低价值来源不升级、实体簇、证据多样性及旧自定义提示词协议补齐测试；前端语法、完整工作台/AI 网关 `538` 项回归、文档校验与差异格式校验均通过。云端 Git、镜像、容器环境及 `/api/evaluation-workbench/build-info` 均核对为 `edb09b5`，`version_consistent=true`；待云端以 `test3`、`云时代`、`sxyh` 重新查重验收。主要文件：`storage.py`、`worker.py`、`collusion_signals.py`、`comparator.py`、查重提示词与前端。
