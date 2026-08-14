@@ -4,12 +4,12 @@
 handoff_schema: 1
 updated_at: 2026-08-14
 module: evaluation-workbench
-status: local_changes
-base_commit: 74b6597
+status: repository_synced_cloud_unverified
+base_commit: 74818fa
 branch: main
-working_tree: uncommitted（纯文字查重版本身份、覆盖标注、来源分层与实体簇复核，待完整回归）
-remote_github: unknown
-remote_gitee: unknown
+working_tree: clean（纯文字查重版本身份、覆盖标注、来源分层与实体簇复核，已完成本地回归）
+remote_github: 74818fa
+remote_gitee: 74818fa
 production_commit: 74b6597
 prompt_version: vision-evidence-contract-v61（已部署；评分结构/故障隔离与 EvidencePack 影子扩展）
 database_change: ew_review_results 新增可选 requirement_relation 列（SQLite 兼容迁移）
