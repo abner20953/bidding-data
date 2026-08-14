@@ -5,12 +5,12 @@ handoff_schema: 1
 updated_at: 2026-08-14
 module: evaluation-workbench
 status: deployed_validation_pending
-base_commit: b1446e2
+base_commit: e53ae8b
 branch: main
-working_tree: uncommitted（只读诊断工具、测试及稳定链路冻结约束）
-remote_github: b1446e2
-remote_gitee: b1446e2
-production_commit: b6b9583
+working_tree: clean_after_diagnostic_tool_deploy
+remote_github: e53ae8b
+remote_gitee: e53ae8b
+production_commit: e53ae8b
 prompt_version: vision-evidence-contract-v61（已部署；评分结构/故障隔离与 EvidencePack 影子扩展）
 database_change: ew_review_results 新增可选 requirement_relation 列（SQLite 兼容迁移）
 user_approval: implementation_and_cloud_test_authorized
