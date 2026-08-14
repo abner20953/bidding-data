@@ -5,11 +5,11 @@ handoff_schema: 1
 updated_at: 2026-08-14
 module: evaluation-workbench
 status: deployed_validation_pending
-base_commit: b6b9583
+base_commit: b1446e2
 branch: main
-working_tree: clean_after_performance_observability_validation
-remote_github: b6b9583
-remote_gitee: b6b9583
+working_tree: uncommitted（只读诊断工具、测试及稳定链路冻结约束）
+remote_github: b1446e2
+remote_gitee: b1446e2
 production_commit: b6b9583
 prompt_version: vision-evidence-contract-v61（已部署；评分结构/故障隔离与 EvidencePack 影子扩展）
 database_change: ew_review_results 新增可选 requirement_relation 列（SQLite 兼容迁移）
@@ -26,7 +26,6 @@ user_approval: implementation_and_cloud_test_authorized
 4. 已停用接口（`compare-signals` PATCH、`review-results/{id}` PATCH、`score-results/{id}` PATCH、`confirm-auto` ×2）仍返回 410；待确认 `rokid_glasses_app` 未调用后再彻底删除路由。事实账本（shadow-v2）仍不参与跨规则结论。
 
 ## 活跃记录（最多 10 条）
-
 ### 1. 评分结构、日期事实与后置取证隔离（本地完成，待云端验收）
 
 - 目标：修正评分表“分值构成”摘要污染后续分部、历史日期误写入无关规则，以及 524/OCR/图片异常中止长任务的问题；减少规则较多时 OCR 归纳退化为逐条调用。
@@ -49,11 +48,6 @@ user_approval: implementation_and_cloud_test_authorized
 
 - 云端 `6d74e4d` 已核验版本一致；三原县最近强制综合评审成功，约 25 分钟，3 份文件、55 条规则，DeepSeek V4 Flash 主审 + 当前图片配置；“企业关联关系承诺书”P146 的“是”可作为高风险重点线索展示，仍明确需原页人工确认。
 - 基线仅用于验收，不得作为生产特例或补丁来源；动态调用和 Token 明细应从任务实际结果重新读取。
-
-### 4. 后续受控路线（未实施）
-
-- 客观分 OCR 反证只进入结构化事实并触发同规则重算，未完成图片确认不得自动扣分；主观分只补理由与页码。
-- EvidencePack 保持影子记录；三原县、太原税务和 sxyh 连续三轮达到关键召回、建议分、错误高风险、失败率、耗时和 Token 门槛后，才可在高价值规则试点正式输入。
 
 ### 5. 文档事实账本影子层与高风险证据闭环（已部署，待三原县验收）
 
@@ -90,3 +84,15 @@ user_approval: implementation_and_cloud_test_authorized
 - MiniMax 回归（2026-08-13）：sxyh2 在相同输入、规则、配置下连续两次强制综合评审：任务 `db77f149-21c6-4ddc-8a6b-142c4efd1d48` 为 8 分33秒、125 次、2,365,817 Token；任务 `9fd43c33-e1c5-4cd8-bd3c-0aa50e4db496` 为 10 分01秒、121 次、2,337,804 Token。两次 152 条审查结果的状态/风险/关系均一致，32 条评分建议也完全一致；均无格式重试、失败单元或遗漏规则。第二次本地 OCR 引擎耗时由132秒波动至260秒，但模型调用与最终结论不变，暂作为按需子进程/候选页缓存波动观察，不能据此破坏 2C2G 的非驻留约束。该轮同样不满足横向影子验收条件：当前项目无 `cross_bid` 主观规则，未开启开关，也不得由此推断功能已验收。
 - 性能观测（已部署验证）：`performance_metrics` 仅扩展任务 JSON；按模型阶段、OCR/图片渲染、腾讯 OCR 和本地页缓存计数拆分墙钟。太原税务 DeepSeek 强制评审成功（22 分15 秒、151 次调用、3,859,923 Token、无失败单元）；聚合模型墙钟以并发请求累加，不能与任务总时长直接相加。不得据此减少候选页或启用常驻 OCR；若继续优化，先在固定输入/规则/模型/提示词的 A/B 中比较。
 - 待办：在存在明确 `cross_bid` 主观规则的低成本真实项目上单独开启影子开关 A/B；连续三项目、三轮满足关键召回/建议分/错误高风险/耗时/Token 门槛前，不得将影子结果接入正式评分。
+
+### 9. 当前稳定生产基线与前缀缓存观察（保留作回溯）
+
+- 稳定基线：生产业务代码 `b6b9583`，提示词版本 `vision-evidence-contract-v61`。该版本已完成三原县、sxyh2 和太原税务的云端复测；规则提取、全文扫描、分组评审、评分、OCR 补证及格式异常定向恢复已形成可用闭环。后续核心链路改动必须以此为回退点，优先补测试和影子观测，不因单次模型波动修改生产判断。
+- 太原税务 DeepSeek 强制评审任务 `d2279522-c68e-43bf-a5e9-06e6fc8eba23`：22 分15秒、151 次调用、输入 Token 3,442,231、缓存命中 1,238,912（约36%），无失败单元。全文扫描命中约64.9%，项目画像与跨投标人价格接近100%；最终审查/评分规则组约8%–12%，是仍有观察价值的区域。
+- 已有稳定措施：系统提示词固定前置、结构化 JSON 固定键序、全文扫描按“固定范围原则/项目画像/规则目录/可变页块”组装，文本模型请求不发送工具定义，因此不存在工具定义中途变化问题。用户修改提示词、模型、规则或输入后缓存失效属于正确行为，禁止跨指纹复用。
+- 后续只允许受控试验：保持全文扫描不变；可将最终规则组中的稳定规则定义与每家投标人的 `context_unmatched`、子项覆盖等动态字段分层组装，先以默认关闭的影子方式比较实际请求前缀和缓存命中，再做固定输入 A/B。未证明关键结论、建议分、失败率、耗时和 Token 均不劣于本基线前，不进入正式链路。
+
+### 10. 综合评审成本诊断：扫描目录剪枝暂不作为优先方案（附只读工具）
+
+- 新增 `scripts/evaluation_scan_diagnostics.py`：纯标准库、SQLite 只读，可按 `--task-id` 或 `--project-id` 锁定实际评审任务、规则集和模型调用账本，输出各阶段 Token、输入和缓存命中率；禁止把全库其他项目的最新规则混入统计。工具不 import worker、不重建生产规则目录、不写数据库、不保存提示词或正文，并有独立回归测试。
+- 当前结论：扫描目录逐块重复，但属于可被服务商缓存的稳定前缀；按页块剪枝会改变规则召回边界并破坏前缀一致性，收益未证实前不实施。真实可回收量以目标任务的 `cache_hit_tokens` 和固定输入 A/B 为准。下一步只观察最终 judge 规则组的稳定/动态分层潜力；管线重叠和组内共享页去重保留为候选，不修改生产请求。
