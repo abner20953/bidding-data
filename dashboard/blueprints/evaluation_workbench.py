@@ -729,6 +729,12 @@ def tasks_api(project_id):
             payload["input_fingerprint"] = storage.task_input_fingerprint(
                 current_app, project_id, task_type, requested_profile_id, TASK_PROMPT_VERSION,
             )
+            if task_type == "compare_documents":
+                # 供排队任务与运行结果追溯；worker 会再保存实际运行时指纹，避免
+                # 排队期间部署切换后把旧提交号误标成执行代码。
+                payload["compare_pipeline"] = storage.compare_pipeline_metadata(
+                    current_app, requested_profile_id, payload["input_fingerprint"],
+                )
             if not force_rerun and not retry_failed_task_id:
                 reusable = storage.find_reusable_task(current_app, project_id, task_type, payload["input_fingerprint"])
                 if reusable:

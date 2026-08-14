@@ -164,6 +164,49 @@ def runtime_code_fingerprint() -> str:
     return _RUNTIME_CODE_CACHE
 
 
+def compare_pipeline_metadata(app, profile_id: str | None = None, input_fingerprint: str = "") -> dict:
+    """返回纯文字查重的可复现身份，不包含正文、密钥或 OCR 配置。"""
+    # 延迟导入避免 storage 初始化时与 worker/collusion_signals 形成循环引用。
+    from dashboard.evaluation_workbench.collusion_signals import ANALYSIS_VERSION
+    from dashboard.utils.comparator import ALGORITHM_VERSION
+
+    profile = get_model_profile(app, profile_id, "deepseek-v4-flash")
+    source_digest = hashlib.sha256()
+    root = _runtime_project_root()
+    for relative in (
+        "dashboard/utils/comparator.py",
+        "dashboard/evaluation_workbench/collusion_signals.py",
+        "dashboard/evaluation_workbench/worker.py",
+        "dashboard/evaluation_workbench/prompt_templates.py",
+    ):
+        source_digest.update(relative.encode("utf-8"))
+        try:
+            source_digest.update((root / relative).read_bytes())
+        except OSError:
+            source_digest.update(b"missing")
+    value = {
+        "analysis_version": ANALYSIS_VERSION,
+        "comparator_version": ALGORITHM_VERSION,
+        "runtime_release": runtime_release_fingerprint(),
+        "compare_source": source_digest.hexdigest(),
+        "prompt_templates": task_prompt_template_fingerprint(app, "compare_documents"),
+        "model": {
+            "profile_id": profile.get("profile_id"),
+            "model_name": profile.get("model_name"),
+            "base_url": profile.get("base_url"),
+            "updated_at": profile.get("updated_at"),
+            "json_mode": profile.get("json_mode"),
+            "thinking_mode": profile.get("thinking_mode"),
+        },
+        "input_fingerprint": str(input_fingerprint or ""),
+        "text_only": True,
+    }
+    value["fingerprint"] = hashlib.sha256(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return value
+
+
 def _validate_api_key_characters(api_key: str) -> None:
     """API Key 会被放入 HTTP Header，必须是可安全编码的单行 ASCII 文本。"""
     if any(not (0x21 <= ord(character) <= 0x7E) for character in api_key):
@@ -1520,8 +1563,9 @@ def task_input_fingerprint(app, project_id: str, task_type: str, profile_id: str
         "rule_set": (rule_set or {}).get("rule_set_id") if uses_rules else None,
         "rule_set_updated_at": (rule_set or {}).get("updated_at") if uses_rules else None,
         "profile": (profile.get("profile_id"), profile.get("model_name"), profile.get("base_url"), profile.get("updated_at"), profile.get("json_mode"), profile.get("thinking_mode")),
-        # 共同删改的分段伪删除校验与编辑簇降权改变了查重结论，不能复用旧版本结果。
-        "comparison_version": "cross-bid-signals-v4" if task_type == "compare_documents" else None,
+        # 查重结果必须同时绑定比较器、线索规则、AI 提示词与模型公开配置；不能只靠
+        # 一个手工版本号判断结果是否仍对应当前链路。
+        "comparison_pipeline": compare_pipeline_metadata(app, profile_id) if task_type == "compare_documents" else None,
         "ocr_feature_configuration": ocr_feature_configuration(app) if task_type == "evaluate_all" else None,
         # 仅记录会改变实际取证路径的公开配置，不记录凭据或随每次调用变化的额度余额。
         "ocr_execution_configuration": {
@@ -2366,7 +2410,40 @@ def compare_analysis(app, task_id: str) -> dict | None:
     仅返回任务中保存的 AI 判定与线索本身；历史表数据保留可读但不再参与。"""
     task = get_task(app, task_id)
     analysis = (task or {}).get("result", {}).get("cross_bid_analysis")
-    return analysis if isinstance(analysis, dict) else None
+    if not isinstance(analysis, dict):
+        return None
+    # 不改写历史任务结果；仅在读取时补充“当前运行链路是否仍一致”的诊断信息。
+    value = dict(analysis)
+    payload = (task or {}).get("payload") or {}
+    stored = value.get("pipeline")
+    if not isinstance(stored, dict) or not stored.get("fingerprint"):
+        value["pipeline_status"] = {
+            "current": False,
+            "reason": "历史结果未记录完整查重链路指纹，请重新运行后再作当前版本判断。",
+        }
+        return value
+    try:
+        current_input = task_input_fingerprint(
+            app,
+            str(task.get("project_id") or ""),
+            "compare_documents",
+            payload.get("profile_id"),
+            str(payload.get("prompt_version") or ""),
+        )
+        current = compare_pipeline_metadata(app, payload.get("profile_id"), current_input)
+        is_current = current.get("fingerprint") == stored.get("fingerprint")
+        value["pipeline_status"] = {
+            "current": is_current,
+            "reason": "当前版本结果" if is_current else "文件、模型、提示词或查重代码已变化；该结果仅供历史参考，建议重新运行。",
+            "stored_fingerprint": str(stored.get("fingerprint"))[:12],
+            "current_fingerprint": str(current.get("fingerprint"))[:12],
+        }
+    except (ValueError, TypeError):
+        value["pipeline_status"] = {
+            "current": False,
+            "reason": "无法核对当前查重链路身份，请重新运行后再作当前版本判断。",
+        }
+    return value
 
 
 def latest_compare_results(app, project_id: str) -> tuple[dict | None, list[dict]]:

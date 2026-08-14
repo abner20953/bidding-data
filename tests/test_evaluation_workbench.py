@@ -1082,6 +1082,22 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(len(metadata["evidence"]), 2)
         self.assertIn("45.0%", metadata["evidence"][1]["value"])
         self.assertIn("正文查重覆盖有限", metadata["basis"])
+        self.assertEqual(analysis["text_coverage"]["status"], "limited")
+        self.assertTrue(analysis["methodology"]["text_only"])
+
+    def test_cross_bid_text_coverage_marks_severely_scanned_documents_without_ocr(self):
+        left = {"document_id": "a", "bidder_name": "甲公司", "original_name": "a.pdf"}
+        right = {"document_id": "b", "bidder_name": "乙公司", "original_name": "b.pdf"}
+        result = {"paragraphs": [], "metadata": {"text_stats": {
+            "file_a": {"total_pages": 10, "suspected_scan_pages": 10, "scan_ratio": 1.0, "chinese_chars": 0},
+            "file_b": {"total_pages": 10, "suspected_scan_pages": 0, "scan_ratio": 0.0, "chinese_chars": 1000},
+        }}}
+
+        analysis = build_cross_bid_analysis("task-1", [(left, right, result)], tender_loaded=True)
+
+        self.assertEqual(analysis["text_coverage"]["status"], "severely_limited")
+        self.assertEqual(analysis["pair_summaries"][0]["text_coverage"]["status"], "severely_limited")
+        self.assertIn("不调用 OCR", analysis["text_coverage"]["note"])
 
     def test_cross_bid_analysis_separates_common_name_email_and_address(self):
         left = {"document_id": "a", "bidder_name": "甲公司", "original_name": "a.pdf"}
@@ -1177,6 +1193,22 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertLessEqual(len(packet["evidence"][0]["text_a"]), 280)
         self.assertNotIn("投标文件全文", str(packet))
 
+    def test_compare_ai_packet_diversifies_pages_and_keeps_structured_edits(self):
+        packet = worker._compare_evidence_packet({
+            "signal_id": "signal-1", "bidder_a": "甲公司", "bidder_b": "乙公司", "dimension_label": "共同改动",
+            "basis": "共同编辑", "evidence": [
+                {"page_a": 1, "page_b": 2, "text_a": "重复页一", "text_b": "重复页一"},
+                {"page_a": 1, "page_b": 2, "text_a": "同页第二段", "text_b": "同页第二段"},
+                {"page_a": 5, "page_b": 8, "text_a": "不同页", "text_b": "不同页",
+                 "shared_edits": [{"original": "原要求", "modified": "共同改写"}]},
+            ],
+        })
+
+        self.assertEqual(len(packet["evidence"]), 3)
+        self.assertEqual(packet["evidence"][0]["page_a"], "5")
+        self.assertEqual(packet["evidence"][0]["shared_edits"][0]["original"], "原要求")
+        self.assertGreaterEqual(len({(item.get("page_a"), item.get("page_b")) for item in packet["evidence"]}), 2)
+
     def test_compare_ai_recovers_complete_assessments_then_retries_only_missing_signals(self):
         task = storage.create_task(self.app, self.project["project_id"], "compare_documents")
         signals = [
@@ -1249,6 +1281,60 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(summary["signal_count"], 1)
         self.assertEqual(summary["independent_dimension_count"], 1)
         self.assertEqual(summary["review_priority"], "normal")
+
+    def test_compare_ai_public_or_placeholder_source_moves_signal_out_of_effective_priority(self):
+        task = storage.create_task(self.app, self.project["project_id"], "compare_documents")
+        signal = {
+            "signal_id": "contact", "document_a_id": "a", "document_b_id": "b", "bidder_a": "甲", "bidder_b": "乙",
+            "dimension": "contact", "dimension_label": "共同联系电话", "basis": "共同号码", "evidence": [],
+        }
+        analysis = {"signals": [signal], "pair_summaries": [{
+            "document_a_id": "a", "document_b_id": "b", "bidder_a": "甲", "bidder_b": "乙",
+            "independent_dimension_count": 1, "signal_count": 1, "dimensions": ["contact"], "dimension_labels": ["共同联系电话"], "review_priority": "normal",
+        }]}
+        response = {"assessments": [{
+            "signal_id": "contact", "decision": "suspected_clue", "risk_level": "medium", "confidence": "medium",
+            "source_class": "placeholder_or_extraction", "materiality": "formatting", "reason": "疑似占位号码", "suggested_check": "核对字段来源",
+        }]}
+
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value=response):
+            worker._assess_compare_signals_with_ai(self.app, task, analysis)
+
+        self.assertEqual(signal["display_group"], "low_value")
+        self.assertEqual(analysis["pair_summaries"][0]["review_priority"], "none")
+
+    def test_compare_entity_cluster_assesses_three_bidder_shared_entity_once(self):
+        pairs = [("a", "b"), ("a", "c"), ("b", "c")]
+        signals = [{
+            "signal_id": f"signal-{index}", "document_a_id": left, "document_b_id": right,
+            "bidder_a": left, "bidder_b": right, "dimension": "contact", "dimension_label": "共同联系电话",
+            "basis": "共同号码", "evidence": [{"text_a": "13800138000", "text_b": "13800138000", "page_a": index, "page_b": index + 1}],
+        } for index, (left, right) in enumerate(pairs, start=1)]
+
+        subjects = worker._compare_assessment_subjects(signals)
+
+        self.assertEqual(len(subjects), 1)
+        self.assertTrue(subjects[0]["subject"]["project_entity_cluster"])
+        self.assertEqual(len(subjects[0]["signals"]), 3)
+
+    def test_compare_result_marks_complete_pipeline_as_current_and_legacy_as_historical(self):
+        fingerprint = storage.task_input_fingerprint(
+            self.app, self.project["project_id"], "compare_documents", None, worker.PROMPT_VERSION,
+        )
+        pipeline = storage.compare_pipeline_metadata(self.app, None, fingerprint)
+        task = storage.create_task(self.app, self.project["project_id"], "compare_documents", {
+            "profile_id": None, "prompt_version": worker.PROMPT_VERSION, "input_fingerprint": fingerprint,
+        })
+        storage.update_task(self.app, task["task_id"], status="success", result={"cross_bid_analysis": {"pipeline": pipeline}})
+
+        current = storage.compare_analysis(self.app, task["task_id"])
+        self.assertTrue(current["pipeline_status"]["current"])
+
+        legacy = storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        storage.update_task(self.app, legacy["task_id"], status="success", result={"cross_bid_analysis": {}})
+        historical = storage.compare_analysis(self.app, legacy["task_id"])
+        self.assertFalse(historical["pipeline_status"]["current"])
+        self.assertIn("历史结果", historical["pipeline_status"]["reason"])
 
     def test_compare_ai_retries_single_missing_signal_once_then_uses_fallback(self):
         task = storage.create_task(self.app, self.project["project_id"], "compare_documents")
@@ -3673,6 +3759,21 @@ class EvaluationWorkbenchTests(unittest.TestCase):
 
         self.assertIn("【系统必需输出协议】", effective)
         self.assertIn("requirement_relation", effective)
+
+    def test_legacy_compare_template_is_completed_with_source_contract(self):
+        legacy = "只返回 JSON：{\"assessments\":[{\"signal_id\":\"ID\",\"decision\":\"状态\",\"risk_level\":\"风险\",\"confidence\":\"置信度\"}]}。证据：{{packets}}"
+        with storage.connection(self.app) as conn:
+            conn.execute(
+                "INSERT INTO ew_settings(setting_key, setting_value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value, updated_at=excluded.updated_at",
+                (storage.PROMPT_TEMPLATE_SETTING, json.dumps({"compare_ai_assessment_user": legacy}, ensure_ascii=False), storage.now_iso()),
+            )
+
+        effective = storage.prompt_template(self.app, "compare_ai_assessment_user")
+
+        self.assertIn("【系统必需输出协议】", effective)
+        self.assertIn("source_class", effective)
+        self.assertIn("materiality", effective)
 
     def test_global_rules_require_password_and_are_all_imported_with_default_selection(self):
         client = self.app.test_client()

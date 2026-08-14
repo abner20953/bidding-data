@@ -25,7 +25,7 @@ from dashboard.evaluation_workbench.ai_gateway import (
     InvalidJsonResponse, ModelResponseEnvelopeError, _recover_complete_json_array, build_vision_user_content,
     model_capabilities, request_json,
 )
-from dashboard.evaluation_workbench.collusion_signals import build_cross_bid_analysis
+from dashboard.evaluation_workbench.collusion_signals import ANALYSIS_VERSION, build_cross_bid_analysis
 from dashboard.evaluation_workbench.ocr_gateway import OCR_PARSER_VERSION, request_tencent_ocr
 from dashboard.evaluation_workbench.local_ocr_gateway import (
     LOCAL_OCR_PARSER_VERSION, LOCAL_OCR_SERVICE, local_ocr_max_workers, request_local_ocr,
@@ -36,7 +36,7 @@ from dashboard.evaluation_workbench.prompt_context import (
 )
 from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION
 from dashboard.blueprints.evaluation_workbench import create_worker_app
-from dashboard.utils.comparator import CollusionDetector, ComparisonLimitError, MAX_PDF_PAGES
+from dashboard.utils.comparator import ALGORITHM_VERSION, CollusionDetector, ComparisonLimitError, MAX_PDF_PAGES
 
 
 # 解析、综合评审与查重共用同一单文件 PDF 页数上限，避免某一环节接受后
@@ -45,7 +45,7 @@ MAX_PARSE_PAGES = MAX_PDF_PAGES
 MAX_PARSED_CHARS = 2_500_000
 MAX_DOCX_XML_BYTES = 50 * 1024 * 1024
 PROMPT_VERSION = EVALUATION_PROMPT_VERSION
-COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v3"
+COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v4"
 # 单条线索的证据包虽小，但查重往往同时命中多种维度；以较小批次起步，并在
 # 截断时继续局部拆分，避免某一批过长导致整批线索都只能降级为人工核验。
 COMPARE_AI_BATCH_SIZE = 8
@@ -586,26 +586,116 @@ def _compare_documents(app, task: dict) -> dict:
             "summary": result.get("summary", {}),
         })
     analysis = build_cross_bid_analysis(task["task_id"], analyzed_pairs, tender_loaded=bool(tender))
+    # 查重结果的版本身份独立保存：历史 v10/v4 不能再被误当作当前算法结果。
+    analysis["pipeline"] = storage.compare_pipeline_metadata(
+        app,
+        task.get("payload", {}).get("profile_id"),
+        str(task.get("payload", {}).get("input_fingerprint") or ""),
+    )
+    analysis["pipeline"]["compare_prompt_version"] = COMPARE_AI_PROMPT_VERSION
+    analysis["pipeline"]["analysis_version"] = ANALYSIS_VERSION
+    analysis["pipeline"]["comparator_version"] = ALGORITHM_VERSION
     _assess_compare_signals_with_ai(app, task, analysis)
     return {"pair_count": len(pairs), "pairs": summaries, "cross_bid_analysis": analysis}
 
 
 def _compare_evidence_packet(signal: dict) -> dict:
-    """只向模型传递固定规则已命中的短证据，不传完整投标文件。"""
+    """只向模型传递固定规则已命中的短证据，不传完整投标文件。
+
+    同一预算内优先选择不同页对，避免三段证据只是同一段正文的重复截取。
+    """
+    source = list(signal.get("evidence") or [])
+    selected, selected_pages = [], set()
+    # 共同编辑和实体字段具有更明确的可核验语境，优先保留；其余仍保持原检测顺序。
+    ordered = sorted(
+        enumerate(source),
+        key=lambda pair: (
+            0 if pair[1].get("shared_edits") or pair[1].get("entity_kind") or pair[1].get("field") else 1,
+            pair[0],
+        ),
+    )
+    for _, item in ordered:
+        page_key = (item.get("page_a"), item.get("page_b"))
+        if page_key in selected_pages:
+            continue
+        selected.append(item)
+        selected_pages.add(page_key)
+        if len(selected) == 3:
+            break
+    if len(selected) < 3:
+        for _, item in ordered:
+            if item in selected:
+                continue
+            selected.append(item)
+            if len(selected) == 3:
+                break
+
     evidence = []
-    for item in signal.get("evidence", [])[:3]:
-        evidence.append({key: str(value)[:280] for key, value in item.items()
-                         if key in {
-                             "page_a", "page_b", "text_a", "text_b", "similarity",
-                             "tender_similarity", "tender_coverage_a",
-                             "tender_coverage_b", "segment_count", "shared_edits",
-                             "error_kind", "entity_kind", "field", "value", "strength",
-                         }})
+    for item in selected:
+        packet_item = {
+            key: str(value)[:280] for key, value in item.items()
+            if key in {
+                "page_a", "page_b", "text_a", "text_b", "similarity",
+                "tender_similarity", "tender_coverage_a", "tender_coverage_b",
+                "segment_count", "error_kind", "entity_kind", "field", "value",
+                "strength", "context_a", "context_b",
+            }
+        }
+        edits = item.get("shared_edits")
+        if isinstance(edits, list):
+            packet_item["shared_edits"] = [
+                {
+                    "original": str(change.get("original") or "")[:90],
+                    "modified": str(change.get("modified") or "")[:90],
+                }
+                for change in edits[:3] if isinstance(change, dict)
+            ]
+        evidence.append(packet_item)
     return {
         "signal_id": signal["signal_id"], "bidders": [signal.get("bidder_a"), signal.get("bidder_b")],
         "fixed_rule": signal.get("dimension_label"), "basis": str(signal.get("basis", ""))[:420],
         "evidence": evidence, "counter_evidence": [str(item)[:220] for item in signal.get("counter_evidence", [])[:2]],
+        **({"assessment_scope": "project_entity_cluster"} if signal.get("project_entity_cluster") else {}),
     }
+
+
+def _compare_entity_value(signal: dict) -> str:
+    """实体簇只按已被本地严格提取的实体值归并，不从正文猜测。"""
+    evidence = signal.get("evidence") or []
+    first = evidence[0] if evidence and isinstance(evidence[0], dict) else {}
+    return str(first.get("text_a") or first.get("value") or "").strip().casefold()
+
+
+def _compare_assessment_subjects(signals: list[dict]) -> list[dict]:
+    """将三家以上投标人共享的同一实体合并为一次 AI 复核，保持映射结果一致。"""
+    entity_dimensions = {"contact", "email", "person_name", "person_identity", "address"}
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for signal in signals:
+        if signal.get("dimension") not in entity_dimensions:
+            continue
+        value = _compare_entity_value(signal)
+        if value:
+            groups.setdefault((str(signal.get("dimension")), value), []).append(signal)
+    grouped_ids = set()
+    subjects = []
+    for (dimension, value), items in groups.items():
+        bidders = {item.get("bidder_a") for item in items} | {item.get("bidder_b") for item in items}
+        if len(items) < 2 or len(bidders) < 3:
+            continue
+        digest = hashlib.sha256(f"{dimension}|{value}".encode("utf-8")).hexdigest()[:16]
+        prototype = dict(items[0])
+        prototype["signal_id"] = f"entity-cluster-{digest}"
+        prototype["bidder_a"] = "、".join(sorted(str(item) for item in bidders if item))
+        prototype["bidder_b"] = ""
+        prototype["basis"] = f"{len(bidders)} 家投标文件均出现同一{prototype.get('dimension_label')}，已按项目级实体簇统一复核。"
+        prototype["evidence"] = [evidence for item in items for evidence in (item.get("evidence") or [])]
+        prototype["project_entity_cluster"] = True
+        subjects.append({"subject": prototype, "signals": items})
+        grouped_ids.update(item["signal_id"] for item in items)
+    for signal in signals:
+        if signal["signal_id"] not in grouped_ids:
+            subjects.append({"subject": signal, "signals": [signal]})
+    return subjects
 
 
 def _output_token_budget(profile: dict, target: int) -> int | None:
@@ -627,27 +717,41 @@ def _assess_compare_signals_with_ai(app, task: dict, analysis: dict) -> None:
     except ValueError as exc:
         analysis["ai_assessment"] = {"status": "unavailable", "reason": f"AI 判定未执行：{exc}", "prompt_version": COMPARE_AI_PROMPT_VERSION}
         return
-    by_id = {item["signal_id"]: item for item in signals}
-    completed_ids, failures = set(), []
+    subjects = _compare_assessment_subjects(signals)
+    by_id = {item["subject"]["signal_id"]: item for item in subjects}
+    completed_ids, completed_signal_ids, failures = set(), set(), []
     system_prompt = _system_prompt(app, "compare_ai_assessment")
 
     def apply_assessments(values: object, batch: list[dict]) -> None:
         """只接收当前批次内、字段完整的结论，模型漏回的 ID 留给局部重试。"""
-        allowed_ids = {item["signal_id"] for item in batch}
+        allowed_ids = {item["subject"]["signal_id"] for item in batch}
         for value in values if isinstance(values, list) else []:
             if not isinstance(value, dict) or not isinstance(value.get("signal_id"), str) or value.get("signal_id") not in allowed_ids:
                 continue
             decision = value.get("decision")
             if not isinstance(decision, str) or decision not in {"confirmed_clue", "suspected_clue", "excluded", "unassessable"}:
                 decision = "unassessable"
-            signal = by_id[value["signal_id"]]
-            signal["ai_assessment"] = {
+            source_class = _enum_text(
+                value.get("source_class"),
+                {"bidder_specific", "third_party_common", "public_template", "placeholder_or_extraction", "unknown"},
+                "unknown",
+            )
+            materiality = _enum_text(value.get("materiality"), {"substantive", "formatting", "unknown"}, "unknown")
+            assessment = {
                 "decision": decision,
                 "risk_level": _enum_text(value.get("risk_level"), {"low", "medium", "high"}, "medium"),
                 "confidence": _enum_text(value.get("confidence"), {"high", "medium", "low"}, "medium"),
                 "reason": str(value.get("reason", ""))[:1000],
                 "suggested_check": str(value.get("suggested_check", ""))[:700],
+                "source_class": source_class,
+                "materiality": materiality,
             }
+            subject = by_id[value["signal_id"]]
+            for signal in subject["signals"]:
+                signal["ai_assessment"] = dict(assessment)
+                if source_class in {"third_party_common", "public_template", "placeholder_or_extraction"}:
+                    signal["display_group"] = "low_value"
+                completed_signal_ids.add(signal["signal_id"])
             completed_ids.add(value["signal_id"])
 
     def assess_batch(batch: list[dict], *, depth: int = 0, leaf_retry: bool = False,
@@ -655,7 +759,7 @@ def _assess_compare_signals_with_ai(app, task: dict, analysis: dict) -> None:
         """截断时先回收完整对象，再仅对剩余 ID 二分；绝不重发成功线索。"""
         if not batch:
             return True
-        packets = [_compare_evidence_packet(item) for item in batch]
+        packets = [_compare_evidence_packet(item["subject"]) for item in batch]
         user_prompt = storage.render_prompt_template(app, "compare_ai_assessment_user", packets=json.dumps(packets, ensure_ascii=False, separators=(",", ":")))
         try:
             parsed = _request_task_json(app, task, profile, "compare_ai_assessment", system_prompt, user_prompt,
@@ -682,7 +786,7 @@ def _assess_compare_signals_with_ai(app, task: dict, analysis: dict) -> None:
             if "鉴权失败" in message or "尚未配置 API Key" in message or "HTTP 4" in message:
                 return False
             return True
-        missing = [item for item in batch if item["signal_id"] not in completed_ids]
+        missing = [item for item in batch if item["subject"]["signal_id"] not in completed_ids]
         if not missing:
             return True
         # 本批已回收部分结论时，先把“仅缺失 ID”作为一个更小批次再试一次；它通常
@@ -701,8 +805,8 @@ def _assess_compare_signals_with_ai(app, task: dict, analysis: dict) -> None:
         storage.update_task(app, task["task_id"], message=f"查重 AI 输出不完整，正在仅拆分 {len(missing)} 条未返回线索重试")
         return assess_batch(missing[:midpoint], depth=depth + 1) and assess_batch(missing[midpoint:], depth=depth + 1)
 
-    for start in range(0, len(signals), COMPARE_AI_BATCH_SIZE):
-        if not assess_batch(signals[start:start + COMPARE_AI_BATCH_SIZE]):
+    for start in range(0, len(subjects), COMPARE_AI_BATCH_SIZE):
+        if not assess_batch(subjects[start:start + COMPARE_AI_BATCH_SIZE]):
             break
     for signal in signals:
         signal.setdefault("ai_assessment", {"decision": "unassessable", "risk_level": "medium", "confidence": "low", "reason": "AI 未返回该线索的可用判定。", "suggested_check": "请结合原始文件人工核验。"})
@@ -739,6 +843,7 @@ def _assess_compare_signals_with_ai(app, task: dict, analysis: dict) -> None:
                 or risk == "low"
                 or confidence == "low"
                 or signal.get("voice_adaptation_only")
+                or signal.get("display_group") == "low_value"
             ):
                 continue
             reportable_signals.append(signal)
@@ -777,7 +882,7 @@ def _assess_compare_signals_with_ai(app, task: dict, analysis: dict) -> None:
         key=lambda item: (-int(item.get("independent_dimension_count") or 0), item.get("bidder_a") or "", item.get("bidder_b") or ""),
     )
     analysis["ai_assessment"] = {
-        "status": "partial" if failures else "success", "assessed_count": len(completed_ids), "signal_count": len(signals),
+        "status": "partial" if failures else "success", "assessed_count": len(completed_signal_ids), "signal_count": len(signals),
         "failure_count": len(failures), "reason": "；".join(failures), "profile": profile["display_name"],
         "prompt_version": COMPARE_AI_PROMPT_VERSION, "input_mode": "fixed_rule_evidence_packets_only",
     }

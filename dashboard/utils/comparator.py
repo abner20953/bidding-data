@@ -13,7 +13,7 @@ import fitz  # PyMuPDF
 
 # 共同删改的全文锚点校验与义务主体改写簇识别已改变查重结论；同步失效旧解析
 # 缓存，避免历史结果与当前算法混用。
-ALGORITHM_VERSION = 10
+ALGORITHM_VERSION = 11
 MIN_EXACT_LENGTH = 9
 MIN_EXACT_DISPLAY_LENGTH = 30
 MAX_EXACT_BLOCK_LENGTH = 1200
@@ -1901,6 +1901,18 @@ class CollusionDetector:
                 typed.add(("address", value))
         return typed
 
+    @classmethod
+    def _entity_context(cls, text, entity, limit=180):
+        """返回带字段标签的原始行，帮助复核共同实体的实际业务归属。"""
+        normalized_entity = cls.normalize(entity)
+        if not normalized_entity:
+            return ""
+        for line in (text or "").splitlines():
+            if normalized_entity in cls.normalize(line):
+                value = re.sub(r"\s+", " ", line).strip()
+                return value[:limit] + ("…" if len(value) > limit else "")
+        return ""
+
     @staticmethod
     def _scan_warning(label, stats):
         if not stats:
@@ -2249,19 +2261,23 @@ class CollusionDetector:
         if check_entity:
             entities_a = set()
             entity_pages_a = {}
+            entity_contexts_a = {}
             for page_number, raw_text, _ in pages_a:
                 page_entities = self.extract_typed_entities(raw_text)
                 entities_a.update(page_entities)
                 for entity in page_entities:
                     entity_pages_a.setdefault(entity, page_number)
+                    entity_contexts_a.setdefault(entity, self._entity_context(raw_text, entity[1]))
 
             entities_b = set()
             entity_pages_b = {}
+            entity_contexts_b = {}
             for page_number, raw_text, _ in pages_b:
                 page_entities = self.extract_typed_entities(raw_text)
                 entities_b.update(page_entities)
                 for entity in page_entities:
                     entity_pages_b.setdefault(entity, page_number)
+                    entity_contexts_b.setdefault(entity, self._entity_context(raw_text, entity[1]))
 
             for entity_kind, entity in sorted((entities_a & entities_b) - self.tender_entities):
                 collisions.append(
@@ -2272,6 +2288,8 @@ class CollusionDetector:
                         "text_b": entity,
                         "page_a": entity_pages_a.get((entity_kind, entity), 0),
                         "page_b": entity_pages_b.get((entity_kind, entity), 0),
+                        "context_a": entity_contexts_a.get((entity_kind, entity), ""),
+                        "context_b": entity_contexts_b.get((entity_kind, entity), ""),
                         "badges": ["敏感实体"],
                         "desc": f"发现相同的{entity_kind}实体信息: {entity}",
                     }

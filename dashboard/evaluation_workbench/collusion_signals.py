@@ -10,7 +10,7 @@ import re
 import uuid
 
 
-ANALYSIS_VERSION = "cross-bid-signals-v4"
+ANALYSIS_VERSION = "cross-bid-signals-v5"
 DECISION_BOUNDARY = (
     "本结果仅表示投标文件之间存在需要复核的横向异常线索，不构成串通投标认定、"
     "法定情形认定、废标依据或自动扣分依据。最终结论须由评标委员会结合原件、"
@@ -80,7 +80,48 @@ def _page_evidence(item: dict) -> dict:
         evidence["error_kind"] = item["error_kind"]
     if item.get("entity_kind"):
         evidence["entity_kind"] = item["entity_kind"]
+    if item.get("context_a"):
+        evidence["context_a"] = _clip(item["context_a"])
+    if item.get("context_b"):
+        evidence["context_b"] = _clip(item["context_b"])
     return evidence
+
+
+def _text_coverage(stats: dict | None) -> dict:
+    """仅说明纯文字查重的可读范围，不把扫描比例当作异常证据。"""
+    stats = stats if isinstance(stats, dict) else {}
+    total = int(stats.get("total_pages") or 0)
+    scan_pages = int(stats.get("suspected_scan_pages") or 0)
+    chars = stats.get("chinese_chars")
+    raw_ratio = stats.get("scan_ratio")
+    if not total and not isinstance(raw_ratio, (int, float)):
+        return {"status": "unknown", "scan_ratio": None, "message": "未取得页级文字覆盖统计"}
+    ratio = float(raw_ratio or 0)
+    if (isinstance(chars, (int, float)) and chars < 100) or ratio >= 0.75:
+        status = "severely_limited"
+        message = f"可读文字覆盖严重不足（疑似扫描页 {scan_pages}/{total}）" if total else f"可读文字覆盖严重不足（疑似扫描页比例 {ratio:.1%}）"
+    elif ratio >= 0.25:
+        status = "limited"
+        message = f"可读文字覆盖有限（疑似扫描页 {scan_pages}/{total}）" if total else f"可读文字覆盖有限（疑似扫描页比例 {ratio:.1%}）"
+    else:
+        status = "complete"
+        message = f"可读文字覆盖基本充分（疑似扫描页 {scan_pages}/{total}）" if total else f"可读文字覆盖基本充分（疑似扫描页比例 {ratio:.1%}）"
+    return {
+        "status": status,
+        "scan_ratio": round(ratio, 4),
+        "total_pages": total,
+        "suspected_scan_pages": scan_pages,
+        "message": message,
+    }
+
+
+def _pair_text_coverage(result: dict) -> dict:
+    text_stats = ((result.get("metadata") or {}).get("text_stats") or {})
+    left = _text_coverage(text_stats.get("file_a"))
+    right = _text_coverage(text_stats.get("file_b"))
+    rank = {"complete": 0, "limited": 1, "severely_limited": 2, "unknown": 3}
+    status = max((left.get("status"), right.get("status")), key=lambda value: rank.get(value, 3))
+    return {"status": status, "documents": [left, right]}
 
 
 _FORM_TEMPLATE_MARKERS = (
@@ -288,9 +329,17 @@ def analyze_pair(task_id: str, left: dict, right: dict, result: dict, *, tender_
 def build_cross_bid_analysis(task_id: str, pairs: list[tuple[dict, dict, dict]], *, tender_loaded: bool) -> dict:
     signals = []
     pair_summaries = []
+    document_coverages: dict[str, dict] = {}
     for left, right, result in pairs:
         pair_signals = analyze_pair(task_id, left, right, result, tender_loaded=tender_loaded)
         signals.extend(pair_signals)
+        pair_coverage = _pair_text_coverage(result)
+        for document, coverage in zip((left, right), pair_coverage["documents"]):
+            document_coverages.setdefault(document["document_id"], {
+                "document_id": document["document_id"],
+                "bidder_name": document.get("bidder_name") or document.get("original_name") or "投标文件",
+                **coverage,
+            })
         # 纯第一人称改写的共同改动信号仅作展示，不抬高配对复核优先级；
         # 其他维度（含混合实质改动的 tender_common_edit）计数逻辑不变。
         dimensions = sorted({
@@ -316,8 +365,16 @@ def build_cross_bid_analysis(task_id: str, pairs: list[tuple[dict, dict, dict]],
             "dimension_labels": [DIMENSION_LABELS[item] for item in dimensions],
             "review_priority": priority,
             "assessment_result": "pending_human_review" if pair_signals else "no_signal_detected",
+            "text_coverage": pair_coverage,
         })
     pair_summaries.sort(key=lambda item: (-item["independent_dimension_count"], item["bidder_a"] or "", item["bidder_b"] or ""))
+    coverage_rank = {"complete": 0, "limited": 1, "severely_limited": 2, "unknown": 3}
+    coverage_documents = list(document_coverages.values())
+    coverage_status = max(
+        (item.get("status") for item in coverage_documents),
+        key=lambda value: coverage_rank.get(value, 3),
+        default="unknown",
+    )
     return {
         "analysis_version": ANALYSIS_VERSION,
         "decision_boundary": DECISION_BOUNDARY,
@@ -325,6 +382,7 @@ def build_cross_bid_analysis(task_id: str, pairs: list[tuple[dict, dict, dict]],
         "statutory_collusion_condition": "not_assessed",
         "methodology": {
             "pairwise": True,
+            "text_only": True,
             "tender_source_excluded": bool(tender_loaded),
             "public_template_removed": False,
             "builtin_form_filter_applied": True,
@@ -339,6 +397,11 @@ def build_cross_bid_analysis(task_id: str, pairs: list[tuple[dict, dict, dict]],
         "executed_dimensions": [{"dimension": key, "label": label} for key, label in DIMENSION_LABELS.items()],
         "not_executed_dimensions": NOT_EXECUTED_DIMENSIONS,
         "pair_summaries": pair_summaries,
+        "text_coverage": {
+            "status": coverage_status,
+            "documents": coverage_documents,
+            "note": "本次仅比较 PDF 可提取文字，不调用 OCR 或图片识别；扫描页中的内容未参与文本查重。",
+        },
         "signals": signals,
         "signal_count": len(signals),
     }

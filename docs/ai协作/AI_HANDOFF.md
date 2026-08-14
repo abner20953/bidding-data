@@ -4,16 +4,16 @@
 handoff_schema: 1
 updated_at: 2026-08-14
 module: evaluation-workbench
-status: ready_for_commit
-base_commit: 6ad19b9
+status: local_changes
+base_commit: 74b6597
 branch: main
-working_tree: uncommitted（跨规则组证据重复影子统计，已完成本地回归）
-remote_github: 6ad19b9
-remote_gitee: 6ad19b9
-production_commit: e53ae8b
+working_tree: uncommitted（纯文字查重版本身份、覆盖标注、来源分层与实体簇复核，待完整回归）
+remote_github: unknown
+remote_gitee: unknown
+production_commit: 74b6597
 prompt_version: vision-evidence-contract-v61（已部署；评分结构/故障隔离与 EvidencePack 影子扩展）
 database_change: ew_review_results 新增可选 requirement_relation 列（SQLite 兼容迁移）
-user_approval: implementation_and_cloud_test_authorized
+user_approval: implementation_authorized；提交、推送、部署待用户确认
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
@@ -64,7 +64,6 @@ user_approval: implementation_and_cloud_test_authorized
 - 本地验证：新增复合子项轮转、同页 OCR 填写值纠错/纯扫描页保持高风险、评分算式收口测试；完整 `507` 项通过，文档校验与 `git diff --check` 通过。
 - 云端：`5832c9d` 已部署（首次构建因 modelscope 下载模型网络中断失败，重跑成功），build-info `version_consistent=true`。
 - 下一步：以三原县与太原税务各强制综合评审一次，对比关键问题、错误高风险、建议分、耗时、Token、OCR 引擎耗时与流程墙钟。任一关键质量指标下降则回退本记录改动，不接入 EvidencePack 正式决策层。
-
 ### 7. 直接反证状态收口（含评审后修复，待提交与云端 A/B）
 
 - 根因：旧状态修正器会因理由含“符合/满足”把 `not_satisfied` 改成 `satisfied`；“符合禁止情形”因此被错误降为低风险并从重点结论漏掉，已由三原县 DeepSeek 与 MiniMax 复跑共同证实。
@@ -73,7 +72,6 @@ user_approval: implementation_and_cloud_test_authorized
 - 不变契约：不自动废标、不改规则、建议分、全文/OCR/图片策略、并发和已有 API；来源闭环仍可将无锚点高风险回落为待原页确认。
 - 验证：新增镜像漏洞、禁止义务、批量/逐条 OCR 与图片合并保留、满额替换提示等回归；完整 `520` 项通过，文档校验与 `git diff --check` 通过。
 - 主要文件：`worker.py`、`storage.py`、`prompt_templates.py`、测试、稳定设计。
-
 ### 8. EvidencePack 一致性与横向主观分影子扩展（本地完成，待 A/B）
 
 - 目标：在不改写任何正式审查/评分结果的前提下，补足下一阶段所需的跨规则材料观察与横向主观评分对照数据；OCR 批量归纳仍默认关闭。
@@ -84,15 +82,19 @@ user_approval: implementation_and_cloud_test_authorized
 - MiniMax 回归（2026-08-13）：sxyh2 在相同输入、规则、配置下连续两次强制综合评审：任务 `db77f149-21c6-4ddc-8a6b-142c4efd1d48` 为 8 分33秒、125 次、2,365,817 Token；任务 `9fd43c33-e1c5-4cd8-bd3c-0aa50e4db496` 为 10 分01秒、121 次、2,337,804 Token。两次 152 条审查结果的状态/风险/关系均一致，32 条评分建议也完全一致；均无格式重试、失败单元或遗漏规则。第二次本地 OCR 引擎耗时由132秒波动至260秒，但模型调用与最终结论不变，暂作为按需子进程/候选页缓存波动观察，不能据此破坏 2C2G 的非驻留约束。该轮同样不满足横向影子验收条件：当前项目无 `cross_bid` 主观规则，未开启开关，也不得由此推断功能已验收。
 - 性能观测（已部署验证）：`performance_metrics` 仅扩展任务 JSON；按模型阶段、OCR/图片渲染、腾讯 OCR 和本地页缓存计数拆分墙钟。太原税务 DeepSeek 强制评审成功（22 分15 秒、151 次调用、3,859,923 Token、无失败单元）；聚合模型墙钟以并发请求累加，不能与任务总时长直接相加。不得据此减少候选页或启用常驻 OCR；若继续优化，先在固定输入/规则/模型/提示词的 A/B 中比较。
 - 待办：在存在明确 `cross_bid` 主观规则的低成本真实项目上单独开启影子开关 A/B；连续三项目、三轮满足关键召回/建议分/错误高风险/耗时/Token 门槛前，不得将影子结果接入正式评分。
-
 ### 9. 当前稳定生产基线与前缀缓存观察（保留作回溯）
 
 - 稳定基线：生产业务代码 `b6b9583`，提示词版本 `vision-evidence-contract-v61`。该版本已完成三原县、sxyh2 和太原税务的云端复测；规则提取、全文扫描、分组评审、评分、OCR 补证及格式异常定向恢复已形成可用闭环。后续核心链路改动必须以此为回退点，优先补测试和影子观测，不因单次模型波动修改生产判断。
 - 太原税务 DeepSeek 强制评审任务 `d2279522-c68e-43bf-a5e9-06e6fc8eba23`：22 分15秒、151 次调用、输入 Token 3,442,231、缓存命中 1,238,912（约36%），无失败单元。全文扫描命中约64.9%，项目画像与跨投标人价格接近100%；最终审查/评分规则组约8%–12%，是仍有观察价值的区域。
 - 已有稳定措施：系统提示词固定前置、结构化 JSON 固定键序、全文扫描按“固定范围原则/项目画像/规则目录/可变页块”组装，文本模型请求不发送工具定义，因此不存在工具定义中途变化问题。用户修改提示词、模型、规则或输入后缓存失效属于正确行为，禁止跨指纹复用。
 - 后续只允许受控试验：保持全文扫描不变；可将最终规则组中的稳定规则定义与每家投标人的 `context_unmatched`、子项覆盖等动态字段分层组装，先以默认关闭的影子方式比较实际请求前缀和缓存命中，再做固定输入 A/B。未证明关键结论、建议分、失败率、耗时和 Token 均不劣于本基线前，不进入正式链路。
-
 ### 10. 综合评审成本诊断：扫描目录剪枝暂不作为优先方案（附只读工具）
 
 - 新增 `scripts/evaluation_scan_diagnostics.py`：纯标准库、SQLite 只读，可按 `--task-id` 或 `--project-id` 锁定实际评审任务、规则集和模型调用账本，输出各阶段 Token、输入和缓存命中率；禁止把全库其他项目的最新规则混入统计。工具不 import worker、不重建生产规则目录、不写数据库、不保存提示词或正文，并有独立回归测试。
 - 当前结论：扫描目录逐块重复，但属于可被服务商缓存的稳定前缀；按页块剪枝会改变规则召回边界并破坏前缀一致性，收益未证实前不实施。已在本地加入 `evidence_context_shadow` 匿名统计首次规则组跨组页块重复，尚待云端自然任务读取；真实可回收量仍以目标任务的 `cache_hit_tokens` 和固定输入 A/B 为准。管线重叠和页面中心化共享上下文均保留为候选，不修改生产请求。
+### 11. 纯文字查重结果可信标识与低价值线索分层（本地完成，待完整回归）
+
+- 目标：保持查重不使用 OCR/图片识别，同时解决“v4/v10 不能代表当前代码”、扫描件结果易被误读、公共来源疑似线索挤占主结果及三家以上共同实体重复判定的问题。
+- 已实施：结果保存比较器/信号版本、提示词指纹、模型公开配置、运行代码/部署和输入指纹构成的查重链路身份；读取时与当前链路核对，旧结果明确标为历史。所有文件对保存纯文字覆盖状态；AI 输出增加来源属性和实质性，公共/第三方/占位或提取伪影线索折叠且不提高优先级；共同实体跨三家时合并为一次 AI 判定并回填各文件对；同样三段证据预算下优先不同页对，保留共同改动原文/改写和实体字段语境。
+- 不变契约：不调用任何 OCR 或图片模型；不发送完整文件对；不改变 `/bijiao`、综合评审、评分、文件解析或既有 API 字段；不自动认定串标、废标或扣分。
+- 验证：新增扫描覆盖、链路身份、低价值来源不升级、实体簇、证据多样性及旧自定义提示词协议补齐测试；前端语法、完整工作台/AI 网关 `538` 项回归、文档校验与差异格式校验均通过。待云端以 `test3`、`云时代`、`sxyh` 验收。主要文件：`storage.py`、`worker.py`、`collusion_signals.py`、`comparator.py`、查重提示词与前端。
