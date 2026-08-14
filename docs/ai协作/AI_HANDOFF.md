@@ -4,24 +4,23 @@
 handoff_schema: 1
 updated_at: 2026-08-14
 module: evaluation-workbench
-status: ready_for_commit
-base_commit: ee79cc9
+status: deployed_validation_pending
+base_commit: c9e00e0
 branch: main
-working_tree: 5 个未提交文件（纯文字查重原子事实复核与展示分层）
-remote_github: ee79cc9
-remote_gitee: ee79cc9
-production_commit: ee79cc9
-prompt_version: compare-evidence-ai-v5（本地待提交；生产仍为 v4）
+working_tree: clean
+remote_github: c9e00e0
+remote_gitee: c9e00e0
+production_commit: c9e00e0
+prompt_version: compare-evidence-ai-v5（已部署；查重旧结果需重跑）
 database_change: 无
-user_approval: 已授权实施；提交、推送、部署待用户确认
+user_approval: 已授权实施、提交、推送和部署
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
 
 ## 下一位先做
 
-1. 用户确认提交部署后，先提交当前工作树，再按既有 GitHub、Gitee、腾讯云流程部署；部署后用任务运行时版本核验。
-2. 云端优先重跑 `sxyh2`（多共同联系电话）与 `jc`（多投标人相同共同改动）的查重，比较：每个事实是否独立给出核验建议、同一改动是否统一分类、主/辅助/低价值三层是否正确、调用数和 Token 是否不无故上升。
+1. 云端优先重跑 `sxyh2`（多共同联系电话）与 `jc`（多投标人相同共同改动）的查重，比较：每个事实是否独立给出核验建议、同一改动是否统一分类、主/辅助/低价值三层是否正确、调用数和 Token 是否不无故上升。
 3. 纯文字查重仍不使用 OCR、腾讯 OCR 或多模态；扫描页覆盖不足只标注范围，不改变链路。
 4. 综合评审主链维持冻结，除非有明确缺陷或固定输入 A/B 证明收益；当前查重改动不得触及全文扫描、OCR/图片、评分或既有 API。
 
@@ -30,7 +29,7 @@ user_approval: 已授权实施；提交、推送、部署待用户确认
 ### 1. 纯文字查重原子事实复核与结果分层（本地完成，待云端验收）
 
 - 根因：旧项目级实体簇只取每条文件对信号的第一项证据，多电话号码/邮箱等会共用第一项 AI 结论；同一共同改动仍按文件对多次判断，导致不同配对出现来源分类漂移；已排除的低风险属性线索偶尔仍进入主表。
-- 已实施：三家以上共同的敏感实体或“原文→改写”事实先按单个原子事实聚合，一次 AI 复核后回填文件对；未形成项目簇的多项证据保留原单包，避免调用膨胀。正向 AI 结论缺少核验建议时只重试当前原子事实。展示分为主线索、背景辅助线索、已排除/低价值三层，后二者不提高文件对优先级。
+- 已实施：三家以上共同的敏感实体或“原文→改写”事实先按单个原子事实聚合，一次 AI 复核后回填文件对；未形成项目簇的多项证据保留原单包，避免调用膨胀。正向 AI 结论缺少核验建议时只重试当前原子事实。展示分为主线索、背景辅助线索、已排除/低价值三层，后二者不提高文件对优先级。云端已部署 `c9e00e0`，build-info `version_consistent=true`，`/pingbiao` 返回 200。
 - 不变契约：仅比较 PDF 可提取文字；不发送完整文件对、不调用任何 OCR/图片模型、不自动认定串标/废标/扣分；不改变综合评审、规则提取、评分、解析或现有 API。
 - 验证：新增多实体拆分、共同改动簇、非簇多事实不拆调用、正向结论定向重试、原子结果回填及展示分层回归；完整工作台与 AI 网关 544 项通过，前端语法、文档校验与 `git diff --check` 通过。
 - 风险/验收：提示词版本升级会使旧查重结果正确地标为历史，需重跑；优先以 `sxyh2`、`jc` 云端结果检查质量和 Token。主要文件：`worker.py`、`prompt_templates.py`、`app.js`、查重测试与稳定设计。
