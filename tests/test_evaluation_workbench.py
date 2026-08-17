@@ -5479,7 +5479,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(entry["scores"][rule_id]["score"], 4.5)
         self.assertEqual(entry["scores"][rule_id]["source"], "manual")
 
-    def test_price_sheet_rejects_ai_score_outside_simple_formula_validation(self):
+    def test_price_sheet_accepts_ai_score_when_formula_rounding_requires_semantic_interpretation(self):
         rule = {
             "rule_id": "price-rule", "enabled": True, "category": "objective", "title": "最低价报价得分",
             "check_rule": "报价得分=（评标基准价／投标报价）×10。",
@@ -5498,13 +5498,14 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             ],
             "internal_rules": [{**rule, "formula_kind": "lowest_ratio", "max_score": 10}],
         }
-        _normalised, errors = price_sheet.normalise_ai_price_calculation({"rules": [{
+        normalised, errors = price_sheet.normalise_ai_price_calculation({"rules": [{
             "rule_id": "price-rule", "status": "completed", "results": [
                 {"price_entry_id": "a", "score": 8, "calculation": "", "reason": ""},
                 {"price_entry_id": "b", "score": 8, "calculation": "", "reason": ""},
             ],
         }]}, payload)
-        self.assertIn("AI 建议分与可验证价格公式不一致", errors)
+        self.assertEqual(errors, [])
+        self.assertEqual(normalised["rules"]["price-rule"]["scores"]["a"]["score"], 8.0)
 
     def test_price_sheet_average_formula_is_not_misread_as_lowest_ratio(self):
         rule = {

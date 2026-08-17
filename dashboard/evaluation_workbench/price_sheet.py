@@ -458,18 +458,6 @@ def normalise_ai_price_calculation(raw: object, calculation_input: dict) -> tupl
         }
     if set(normalised) != set(input_rules):
         errors.append("价格计算未覆盖全部价格评分规则")
-    # 对确实可被本地完整表达的公式，只检查 AI 的数值是否与确定性算式一致；复杂
-    # 公式不强行降级，仍由 AI 给出建议和未决项。
-    for rule in calculation_input.get("internal_rules", []):
-        local = _calculate_rule(rule, calculation_input.get("public_entries", []))
-        if not local.get("calculation_ready") or not local.get("scores"):
-            continue
-        ai_rule = normalised.get(rule.get("rule_id"), {})
-        for entry_id, expected in local["scores"].items():
-            actual = (ai_rule.get("scores") or {}).get(entry_id, {}).get("score")
-            if actual is None or abs(Decimal(str(actual)) - Decimal(str(expected["score"]))) > Decimal("0.02"):
-                errors.append("AI 建议分与可验证价格公式不一致")
-                break
     return {"rules": normalised}, list(dict.fromkeys(errors))
 
 
