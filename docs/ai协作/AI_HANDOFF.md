@@ -4,13 +4,13 @@
 handoff_schema: 1
 updated_at: 2026-08-17
 module: evaluation-workbench
-status: local_changes
-base_commit: 19c03be
+status: deployed_validation_pending
+base_commit: 42ad0ff
 branch: main
-working_tree: deterministic_price_math_pending_commit
-remote_github: 19c03be
-remote_gitee: 19c03be
-production_commit: 6e851e6
+working_tree: clean_after_deterministic_price_math_deploy
+remote_github: 42ad0ff
+remote_gitee: 42ad0ff
+production_commit: 42ad0ff
 prompt_version: vision-evidence-contract-v62（已部署；价格分自洽性契约）
 database_change: ew_price_rule_sets、ew_price_score_runs 和 ew_projects.price_profile_id 已按 SQLite 兼容迁移部署；本轮无数据库变更
 user_approval: 已授权实施、提交、推送和部署
@@ -20,9 +20,7 @@ user_approval: 已授权实施、提交、推送和部署
 
 ## 下一位先做
 
-1. 云端实际版本 `6e851e6` 的新任务仍暴露模型算术错误：sxyh2 基准价和四条分数错误；test3 把“平均值×97%”算错，且分数字段与 calculation 矛盾。`score/final_score` 只能校验字段一致，不能证明算术正确。
-2. 本地已改为“AI 理解规则、Decimal 执行明确算式”：修复平均值系数贪婪匹配（97% 被后续偏差率 100% 覆盖）、区分去高低家数的取整方式，并支持偏差率先四舍五入。已完整编译的公式强制采用本地精确复算；无法编译的复杂公式仍保留 AI 建议与 v62 自洽校验。
-3. 527 项工作台完整回归通过。获用户同意提交部署后，只需重跑 sxyh2 与 test3 的价格分：按当前报价，sxyh2 四家均应为 30 分；test3 基准价应为 1791992.55，四家分数依当前计分价分别为 42.99、42.60、38.43、37.58（仍须确认不同税率是否已人工换算）。
+1. 云端已部署 `42ad0ff`（确定性算术）。本地用 sxyh2 真实数据复算验证：编译器识别"差值百分比四舍五入"与去高低取整方式，基准价 1053828.25，四家均 30 分。**请重跑 sxyh2/test3 的 AI 价格分计算核对**（sxyh2 应为 4×30；test3 预期基准价 1791992.55、分数 42.99/42.60/38.43/37.58，仍须确认不同税率是否已人工换算）。完整编译公式将直接显示 `formula_verified` 程序复算结果，复杂公式仍走 AI 建议。
 
 ## 活跃记录（最多 10 条）
 
