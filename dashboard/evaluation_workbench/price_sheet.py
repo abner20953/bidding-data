@@ -16,12 +16,12 @@ from pathlib import Path
 from dashboard.evaluation_workbench import storage
 
 
-PRICE_SHEET_VERSION = "price-sheet-v1"
+PRICE_SHEET_VERSION = "price-sheet-v2"
 
 _PRICE_RULE_PATTERN = re.compile(
     r"最低(?:投标)?价|评审价|评标价|基准价|价格分|报价得分|投标报价[^，。；]{0,20}得分"
 )
-_QUOTE_FIELD_PATTERN = re.compile(r"(?:投标|响应|磋商)?(?:总)?报价")
+_QUOTE_FIELD_PATTERN = re.compile(r"(?:投标|响应|磋商)?(?:总)?报价(?!\s*(?:表|栏|一览))")
 _TOTAL_QUOTE_LABEL_PATTERN = re.compile(r"(?:投标|响应|磋商)?(?:总)?报价|开标一览表")
 _AMOUNT_WITH_UNIT_PATTERN = re.compile(
     r"(?:￥|¥|人民币)?\s*[:：]?\s*"
@@ -32,9 +32,10 @@ _CURRENCY_AMOUNT_PATTERN = re.compile(
     r"(?:￥|¥|人民币)\s*[:：]?\s*"
     r"(?P<amount>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d{4,}(?:\.\d+)?)"
 )
-_PLAIN_AMOUNT_PATTERN = re.compile(r"(?<![0-9A-Za-z])(?P<amount>\d{4,}(?:\.\d+)?)(?![0-9A-Za-z])")
+_PLAIN_AMOUNT_PATTERN = re.compile(r"(?<![0-9A-Za-z])(?P<amount>\d{5,}(?:\.\d+)?)(?![0-9A-Za-z])")
 _IDENTIFIER_PREFIX_PATTERN = re.compile(r"(?:统一社会信用代码|信用代码|项目编号|采购编号|招标编号|合同编号|编号|税号)\s*[:：]?\s*$")
 _COMPACT_DATE_PATTERN = re.compile(r"(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])$")
+_YEAR_PATTERN = re.compile(r"(?:19|20)\d{2}$")
 
 
 def _decimal(value: object, *, allow_zero: bool = False) -> Decimal | None:
@@ -58,7 +59,7 @@ def _decimal_text(value: Decimal | None) -> str | None:
 def _plain_amount_is_safe(tail: str, match: re.Match) -> bool:
     """无单位金额仅作保守兜底，排除常见编号和紧凑日期。"""
     raw = match.group("amount")
-    if _COMPACT_DATE_PATTERN.fullmatch(raw):
+    if _COMPACT_DATE_PATTERN.fullmatch(raw) or _YEAR_PATTERN.fullmatch(raw):
         return False
     prefix = tail[max(0, match.start() - 36):match.start()]
     return not _IDENTIFIER_PREFIX_PATTERN.search(prefix)
@@ -208,6 +209,7 @@ def _price_rules(app, project_id: str) -> tuple[dict | None, list[dict]]:
         values.append({
             "rule_id": rule["rule_id"], "title": str(rule.get("title") or "价格评分"),
             "check_rule": str(rule.get("check_rule") or ""),
+            "source_text": str(rule.get("source_text") or ""),
             "max_score": float(max_score) if max_score is not None else None,
             "formula_kind": _price_formula_kind(rule), "_rule": rule,
         })
@@ -286,6 +288,12 @@ def _public_entry(entry: dict) -> dict:
         manual_scores = {}
     if not isinstance(manual_scores, dict):
         manual_scores = {}
+    try:
+        adjustment = json.loads(entry.get("adjustment_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        adjustment = {}
+    if not isinstance(adjustment, dict):
+        adjustment = {}
     extracted = _decimal(entry.get("extracted_quote"))
     manual = _decimal(entry.get("manual_quote"))
     effective = manual if manual is not None else extracted
@@ -299,6 +307,7 @@ def _public_entry(entry: dict) -> dict:
         "included": bool(entry.get("included")), "exclusion_reason": entry.get("exclusion_reason") or "",
         "quote_source": entry.get("quote_source") or "", "quote_excerpt": entry.get("quote_excerpt") or "",
         "extraction_status": entry.get("extraction_status") or "pending", "manual_scores": manual_scores,
+        "adjustment": adjustment,
     }
 
 
@@ -376,6 +385,113 @@ def _validated_optional_price(value: object, label: str) -> str | None:
     if parsed is None:
         raise ValueError(f"{label}必须是大于 0 的数字")
     return _decimal_text(parsed)
+
+
+def _validated_rate(value: object, label: str) -> Decimal:
+    rate = _decimal(value, allow_zero=True)
+    if rate is None or rate > Decimal("100"):
+        raise ValueError(f"{label}必须是 0 到 100 之间的数字")
+    return rate
+
+
+def _normalise_adjustment(value: object, quote: Decimal | None, evaluation_value: object) -> tuple[str | None, str]:
+    """将人工选择的价格调整确定性地换算为最终计分价。"""
+    raw = value if isinstance(value, dict) else {}
+    mode = str(raw.get("mode") or "none")
+    if mode not in {"none", "discount", "tax_excluded", "manual"}:
+        raise ValueError("不支持的价格调整方式")
+    note = str(raw.get("note") or "").strip()[:300]
+    if mode == "none":
+        return None, json.dumps({"mode": "none", "note": note}, ensure_ascii=False, separators=(",", ":"))
+    if quote is None:
+        raise ValueError("使用价格调整前必须先填写确认投标报价")
+    if mode == "manual":
+        evaluation = _decimal(evaluation_value)
+        if evaluation is None:
+            raise ValueError("手工计分价必须是大于 0 的数字")
+        return _decimal_text(evaluation), json.dumps({"mode": mode, "note": note}, ensure_ascii=False, separators=(",", ":"))
+    base = _decimal(raw.get("base_amount")) or quote
+    if base > quote:
+        raise ValueError("调整基数不能高于确认投标报价")
+    rate = _validated_rate(raw.get("rate_percent"), "调整比例或税率")
+    if mode == "discount":
+        evaluation = quote - base * rate / Decimal("100")
+    else:
+        if rate == 0:
+            raise ValueError("去税换算的税率必须大于 0")
+        evaluation = quote - base + base / (Decimal("1") + rate / Decimal("100"))
+    if evaluation <= 0:
+        raise ValueError("调整后的计分价必须大于 0")
+    return _decimal_text(evaluation.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)), json.dumps({
+        "mode": mode, "base_amount": _decimal_text(base), "rate_percent": _decimal_text(rate), "note": note,
+    }, ensure_ascii=False, separators=(",", ":"))
+
+
+def _updated_manual_scores(app, project_id: str, entry: dict, payload: dict) -> str:
+    scores = dict(entry.get("manual_scores") or {})
+    rule_id = str(payload.get("manual_score_rule_id") or "").strip()
+    if not rule_id:
+        return json.dumps(scores, ensure_ascii=False, separators=(",", ":"))
+    _, rules = _price_rules(app, project_id)
+    rule = next((item for item in rules if item["rule_id"] == rule_id), None)
+    maximum = _decimal(rule.get("max_score")) if rule else None
+    raw_score = payload.get("manual_score")
+    if raw_score is None or str(raw_score).strip() == "":
+        scores.pop(rule_id, None)
+    else:
+        score = _decimal(raw_score, allow_zero=True)
+        if score is None or not rule or maximum is None or score > maximum:
+            raise ValueError("手工价格分必须在当前规则满分范围内")
+        scores[rule_id] = _decimal_text(score)
+    return json.dumps(scores, ensure_ascii=False, separators=(",", ":"))
+
+
+def _batch_entry(app, project_id: str, entry: dict, payload: dict) -> dict:
+    manual_quote = _validated_optional_price(payload.get("manual_quote"), "确认投标报价")
+    quote = _decimal(manual_quote)
+    if quote is None:
+        # 清空人工报价即恢复自动报价；不能继续使用保存前的 effective_quote，
+        # 否则存在人工报价时会把旧值误作为优惠或去税的计算基数。
+        quote = _decimal(entry.get("extracted_quote")) or _decimal(entry.get("effective_quote"))
+    evaluation, adjustment_json = _normalise_adjustment(payload.get("adjustment"), quote, payload.get("evaluation_price"))
+    return {
+        "price_entry_id": entry.get("price_entry_id"),
+        "bidder_name": str(payload.get("bidder_name") or entry.get("bidder_name") or "").strip(),
+        "manual_quote": manual_quote,
+        "evaluation_price": evaluation,
+        "included": payload.get("included") is True,
+        "exclusion_reason": str(payload.get("exclusion_reason") or "").strip()[:300],
+        "manual_scores_json": _updated_manual_scores(app, project_id, entry, payload),
+        "adjustment_json": adjustment_json,
+    }
+
+
+def apply_batch(app, project_id: str, payload: dict) -> dict:
+    """批量保存人工价格调整并统一重算，避免逐行请求和逐行计算。"""
+    if _task_active(app, project_id):
+        raise ValueError("项目任务运行中，请等待完成后再保存价格调整")
+    current_entries = {item["price_entry_id"]: _public_entry(item) for item in storage.list_price_entries(app, project_id)}
+    raw_updates = payload.get("entries") if isinstance(payload.get("entries"), list) else []
+    raw_new = payload.get("new_entries") if isinstance(payload.get("new_entries"), list) else []
+    deleted = payload.get("delete_manual_entry_ids") if isinstance(payload.get("delete_manual_entry_ids"), list) else []
+    updates = []
+    for raw in raw_updates:
+        if not isinstance(raw, dict):
+            raise ValueError("价格修改格式不正确")
+        entry = current_entries.get(str(raw.get("price_entry_id") or ""))
+        if not entry:
+            raise ValueError("价格工作表中的投标人不存在")
+        updates.append(_batch_entry(app, project_id, entry, raw))
+    new_entries = []
+    for raw in raw_new:
+        if not isinstance(raw, dict):
+            raise ValueError("新增投标人格式不正确")
+        new_entries.append(_batch_entry(app, project_id, {"manual_scores": {}}, raw))
+    storage.apply_price_entry_batch(
+        app, project_id, updates=updates, new_entries=new_entries,
+        delete_manual_entry_ids=[str(item) for item in deleted],
+    )
+    return build_price_sheet(app, project_id)
 
 
 def update_entry(app, project_id: str, price_entry_id: str, payload: dict) -> dict:

@@ -694,6 +694,19 @@ def refresh_price_sheet_api(project_id):
     return jsonify({"price_sheet": price_sheet.refresh_price_sheet(current_app, project_id, force_refresh=force_refresh)})
 
 
+@evaluation_workbench_bp.route("/api/evaluation-workbench/projects/<project_id>/price-sheet/batch", methods=["POST"])
+def price_sheet_batch_api(project_id):
+    """批量保存人工报价调整后统一试算；保留旧逐行接口用于外部兼容。"""
+    _init()
+    _, error = _project_or_404(project_id)
+    if error:
+        return error
+    try:
+        return jsonify({"price_sheet": price_sheet.apply_batch(current_app, project_id, _json_body())})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
 @evaluation_workbench_bp.route(
     "/api/evaluation-workbench/projects/<project_id>/price-sheet/entries/<price_entry_id>",
     methods=["PATCH", "DELETE"],

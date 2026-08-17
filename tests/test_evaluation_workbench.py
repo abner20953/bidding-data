@@ -5337,6 +5337,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         for lines in (
             ["投标报价：统一社会信用代码：91110108"],
             ["响应总报价：20260817"],
+            ["投标报价表 项目名称：某项目2026年维保服务项"],
         ):
             value, _excerpt, status = price_sheet._quote_from_lines(lines)
             self.assertIsNone(value)
@@ -5344,6 +5345,51 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         value, _excerpt, status = price_sheet._quote_from_lines(["投标报价：100000"])
         self.assertEqual(value, Decimal("100000"))
         self.assertEqual(status, "found")
+
+    def test_price_sheet_batch_adjusts_prices_without_task_or_model_calls(self):
+        bid_a = self._add_pdf("batch-a.pdf", "bid", "甲公司", "占位")
+        bid_b = self._add_pdf("batch-b.pdf", "bid", "乙公司", "占位")
+        parsed_a = self.temp_dir / "batch-price-a.txt"
+        parsed_b = self.temp_dir / "batch-price-b.txt"
+        parsed_a.write_text("投标总报价：100000元。", encoding="utf-8")
+        parsed_b.write_text("投标总报价：120000元。", encoding="utf-8")
+        with storage.connection(self.app) as conn:
+            conn.execute("UPDATE ew_documents SET parse_status='success', parsed_path=? WHERE document_id=?",
+                         (str(parsed_a), bid_a["document_id"]))
+            conn.execute("UPDATE ew_documents SET parse_status='success', parsed_path=? WHERE document_id=?",
+                         (str(parsed_b), bid_b["document_id"]))
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "最低价报价得分",
+            "check_rule": "最低报价为基准价，报价得分=（评标基准价／投标报价）×10。",
+            "source_text": "最低评审价得10分", "scoring": {"kind": "manual", "max_score": 10},
+        })
+        client = self.app.test_client()
+        path = f"/api/evaluation-workbench/projects/{self.project['project_id']}/price-sheet"
+        sheet = client.post(f"{path}/refresh").get_json()["price_sheet"]
+        entries = {item["bidder_name"]: item for item in sheet["entries"]}
+
+        response = client.post(f"{path}/batch", json={
+            "entries": [
+                {"price_entry_id": entries["甲公司"]["price_entry_id"], "manual_quote": "100000", "included": True,
+                 "exclusion_reason": "", "adjustment": {"mode": "discount", "base_amount": "100000", "rate_percent": "10", "note": "小微企业价格扣除"}},
+                {"price_entry_id": entries["乙公司"]["price_entry_id"], "manual_quote": "", "included": True,
+                 "exclusion_reason": "", "adjustment": {"mode": "tax_excluded", "base_amount": "120000", "rate_percent": "13", "note": "不同税率换算"}},
+            ],
+            "new_entries": [{"bidder_name": "丙公司", "manual_quote": "90000", "included": False,
+                             "exclusion_reason": "已否决", "adjustment": {"mode": "none", "note": ""}}],
+            "delete_manual_entry_ids": [],
+        })
+
+        self.assertEqual(response.status_code, 200)
+        updated = {item["bidder_name"]: item for item in response.get_json()["price_sheet"]["entries"]}
+        self.assertEqual(updated["甲公司"]["evaluation_price"], "90000")
+        self.assertEqual(updated["乙公司"]["evaluation_price"], "106194.69")
+        self.assertEqual(updated["甲公司"]["adjustment"]["mode"], "discount")
+        self.assertFalse(updated["丙公司"]["included"])
+        self.assertEqual(updated["甲公司"]["scores"][rule["rule_id"]]["score"], 10.0)
+        with storage.connection(self.app) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM ew_tasks").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM ew_model_calls").fetchone()[0], 0)
 
     def test_price_sheet_defers_file_scan_while_project_task_is_active(self):
         bid = self._add_pdf("deferred-price.pdf", "bid", "甲公司", "占位")

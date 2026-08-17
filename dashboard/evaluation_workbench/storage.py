@@ -442,6 +442,7 @@ def init_database(app) -> None:
                     CHECK(extraction_status IN ('pending', 'found', 'ambiguous', 'missing', 'unavailable')),
                 extraction_fingerprint TEXT NOT NULL DEFAULT '',
                 manual_scores_json TEXT NOT NULL DEFAULT '{}',
+                adjustment_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -808,6 +809,7 @@ def init_database(app) -> None:
         _ensure_column(conn, "ew_rules", "execution_meta_json", "TEXT")
         _ensure_column(conn, "ew_global_rules", "execution_meta_json", "TEXT")
         _ensure_column(conn, "ew_evidence_packs", "material_key", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "ew_price_entries", "adjustment_json", "TEXT NOT NULL DEFAULT '{}'")
         # 旧数据库先补列，再建索引；把索引放在 CREATE TABLE 脚本里会导致升级时
         # 因旧表尚无 material_key 而中断整个初始化。
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ew_evidence_packs_material ON ew_evidence_packs(document_id, material_key, updated_at)")
@@ -1556,6 +1558,89 @@ def delete_manual_price_entry(app, project_id: str, price_entry_id: str) -> None
             "DELETE FROM ew_price_entries WHERE project_id=? AND price_entry_id=?",
             (project_id, price_entry_id),
         )
+
+
+def apply_price_entry_batch(
+    app, project_id: str, *, updates: list[dict], new_entries: list[dict], delete_manual_entry_ids: list[str],
+) -> None:
+    """一次事务保存价格工作表；不计算评审得分，也不触发任务。"""
+    timestamp = now_iso()
+    with connection(app, immediate=True) as conn:
+        existing = {
+            row["price_entry_id"]: dict(row)
+            for row in conn.execute("SELECT * FROM ew_price_entries WHERE project_id=?", (project_id,)).fetchall()
+        }
+        deleted = {str(value) for value in delete_manual_entry_ids}
+        if len(deleted) != len(delete_manual_entry_ids):
+            raise ValueError("删除列表中存在重复投标人")
+        for entry_id in deleted:
+            entry = existing.get(entry_id)
+            if not entry:
+                raise ValueError("价格工作表中的投标人不存在")
+            if entry.get("source_type") != "manual":
+                raise ValueError("已上传投标人只能移出价格计算，不能删除")
+        update_ids = [str(item.get("price_entry_id") or "") for item in updates]
+        if len(set(update_ids)) != len(update_ids) or any(not value for value in update_ids):
+            raise ValueError("每条价格修改必须对应唯一投标人")
+        for entry_id in update_ids:
+            if entry_id not in existing or entry_id in deleted:
+                raise ValueError("价格工作表中的投标人不存在")
+
+        # 删除手工行后按最终名称统一校验，允许同批“删除旧行、补录同名行”或
+        # 两条手工行互换名称，且不允许与已上传投标人重名。
+        update_map = {str(item["price_entry_id"]): item for item in updates}
+        final_names = []
+        for entry_id, item in existing.items():
+            if entry_id in deleted:
+                continue
+            update = update_map.get(entry_id) or {}
+            raw_name = update.get("bidder_name") if item.get("source_type") == "manual" and "bidder_name" in update else item.get("bidder_name")
+            name = str(raw_name or "").strip()
+            if not name:
+                raise ValueError("未上传投标人名称不能为空")
+            final_names.append(name.casefold())
+        for item in new_entries:
+            name = str(item.get("bidder_name") or "").strip()
+            if not name:
+                raise ValueError("请填写未上传文件投标人的名称")
+            final_names.append(name.casefold())
+        if len(set(final_names)) != len(final_names):
+            raise ValueError("价格工作表中已存在同名投标人")
+
+        for entry_id in deleted:
+            conn.execute("DELETE FROM ew_price_entries WHERE project_id=? AND price_entry_id=?", (project_id, entry_id))
+        for entry_id, item in update_map.items():
+            entry = existing[entry_id]
+            assignments = {
+                "manual_quote": item.get("manual_quote"),
+                "evaluation_price": item.get("evaluation_price"),
+                "included": 1 if item.get("included") else 0,
+                "exclusion_reason": str(item.get("exclusion_reason") or "")[:300],
+                "manual_scores_json": str(item.get("manual_scores_json") or "{}"),
+                "adjustment_json": str(item.get("adjustment_json") or "{}"),
+                "updated_at": timestamp,
+            }
+            if entry.get("source_type") == "manual":
+                assignments["bidder_name"] = str(item.get("bidder_name") or "").strip()[:200]
+            sql = ", ".join(f"{key}=?" for key in assignments)
+            conn.execute(
+                f"UPDATE ew_price_entries SET {sql} WHERE project_id=? AND price_entry_id=?",
+                [*assignments.values(), project_id, entry_id],
+            )
+        for item in new_entries:
+            conn.execute(
+                """INSERT INTO ew_price_entries(
+                       price_entry_id, project_id, document_id, bidder_name, source_type,
+                       manual_quote, evaluation_price, included, exclusion_reason,
+                       extraction_status, manual_scores_json, adjustment_json, created_at, updated_at)
+                   VALUES (?, ?, NULL, ?, 'manual', ?, ?, ?, ?, 'unavailable', ?, ?, ?, ?)""",
+                (
+                    str(uuid.uuid4()), project_id, str(item.get("bidder_name") or "").strip()[:200],
+                    item.get("manual_quote"), item.get("evaluation_price"), 1 if item.get("included") else 0,
+                    str(item.get("exclusion_reason") or "")[:300], str(item.get("manual_scores_json") or "{}"),
+                    str(item.get("adjustment_json") or "{}"), timestamp, timestamp,
+                ),
+            )
 
 
 def document_path(app, document: dict) -> Path:

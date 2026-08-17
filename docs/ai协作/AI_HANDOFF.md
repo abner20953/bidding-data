@@ -4,10 +4,10 @@
 handoff_schema: 1
 updated_at: 2026-08-17
 module: evaluation-workbench
-status: deployed_validation_pending
-base_commit: 2337cc6
+status: local_changes
+base_commit: 73d3ea5
 branch: main
-working_tree: clean_after_price_sheet_deploy
+working_tree: price_sheet_modal_batch_pending_commit
 remote_github: 2337cc6
 remote_gitee: 2337cc6
 production_commit: 2337cc6
@@ -33,6 +33,13 @@ user_approval: 已授权实施、提交、推送和部署
 - 验证：新增最低价比例重算、手工投标人、移出恢复、禁止删除上传投标人、复杂公式手工分、GET 零写入、报价数字误识别、运行时延迟扫描及零任务/零模型调用测试；完整工作台与 AI 网关 549 项通过，前端语法、文档与差异校验通过。
 - 主要文件：`storage.py`、`price_sheet.py`、工作台 blueprint、文件中心 HTML/CSS/JS、测试与稳定设计。
 
-### 2. 已有稳定核心与后续门槛
+### 2. 报价误识别修复与批量弹窗（本地完成，待提交部署）
+
+- 已实施：报价字段排除“报价表/报价栏/一览表”等标题；无单位金额最低五位且排除年份、日期和常见编号，避免把章节标题后的年份写入报价台账。
+- 交互：文件中心收敛为“报价与价格分”入口；大弹窗中集中编辑、一次保存并重算，旧逐行 API 保留兼容。报价分规则以折叠明细展示，不占用表格空间。
+- 人工调整：支持价格优惠扣除、剔除税率部分和直接填写计分价；所有政策资格、适用金额、比例和说明均由人工输入，后端用 `Decimal` 确定性换算，不调用任务、模型或 OCR。
+- 验证：定向报价测试和完整工作台/AI 网关 550 项通过；前端语法、文档和差异校验通过。待提交后在云端刷新 sxyh2，确认年份不再被识别为报价，并人工验收弹窗批量保存。
+
+### 3. 已有稳定核心与后续门槛
 
 - 综合评审、OCR/图片路由、规则提取、查重和评分主链当前不在本轮范围内；受保护边界、黄金项目和 EvidencePack/缓存影子门槛以 `评标工作台设计.md` 为准。
