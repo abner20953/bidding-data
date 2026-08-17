@@ -1,4 +1,4 @@
-﻿import io
+import io
 import hashlib
 import json
 import os
@@ -5228,7 +5228,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertTrue(price_sheet.is_price_scoring_rule(rule))
         self.assertEqual(price_sheet._price_formula_kind(rule), "lowest_ratio")
 
-    def test_independent_price_sheet_extracts_adds_excludes_and_recalculates_without_tasks(self):
+    def test_independent_price_sheet_requires_fresh_ai_result_after_price_changes(self):
         bid_a = self._add_pdf("price-a.pdf", "bid", "甲公司", "占位")
         bid_b = self._add_pdf("price-b.pdf", "bid", "乙公司", "占位")
         parsed_a = self.temp_dir / "price-sheet-a.txt"
@@ -5263,6 +5263,16 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         entries = {item["bidder_name"]: item for item in sheet["entries"]}
         self.assertEqual(entries["甲公司"]["effective_quote"], "100000")
         self.assertEqual(entries["乙公司"]["effective_quote"], "120000")
+        self.assertIsNone(entries["甲公司"]["scores"][rule["rule_id"]])
+        calculation_input = price_sheet.price_calculation_input(self.app, self.project["project_id"])
+        storage.save_price_score_run(self.app, self.project["project_id"], None, "test-profile", calculation_input["fingerprint"], {
+            "rules": {rule["rule_id"]: {"status": "completed", "benchmark_price": "100000", "scores": {
+                item["price_entry_id"]: {"score": 10.0 if item["bidder_name"] == "甲公司" else 8.33, "source": "ai", "calculation": "测试", "reason": ""}
+                for item in calculation_input["entries"]
+            }}}
+        })
+        sheet = client.get(path).get_json()["price_sheet"]
+        entries = {item["bidder_name"]: item for item in sheet["entries"]}
         self.assertEqual(entries["甲公司"]["scores"][rule["rule_id"]]["score"], 10.0)
         self.assertEqual(entries["乙公司"]["scores"][rule["rule_id"]]["score"], 8.33)
         with storage.connection(self.app) as conn:
@@ -5281,8 +5291,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         sheet = response.get_json()["price_sheet"]
         entries = {item["bidder_name"]: item for item in sheet["entries"]}
-        self.assertEqual(entries["丙公司"]["scores"][rule["rule_id"]]["score"], 10.0)
-        self.assertEqual(entries["甲公司"]["scores"][rule["rule_id"]]["score"], 9.0)
+        self.assertIsNone(entries["丙公司"]["scores"][rule["rule_id"]])
+        self.assertIsNone(entries["甲公司"]["scores"][rule["rule_id"]])
         manual_id = entries["丙公司"]["price_entry_id"]
 
         response = client.patch(f"{path}/entries/{manual_id}", json={
@@ -5293,8 +5303,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         sheet = response.get_json()["price_sheet"]
         entries = {item["bidder_name"]: item for item in sheet["entries"]}
         self.assertFalse(entries["丙公司"]["included"])
-        self.assertEqual(entries["甲公司"]["scores"][rule["rule_id"]]["score"], 10.0)
-        self.assertEqual(entries["乙公司"]["scores"][rule["rule_id"]]["score"], 8.33)
+        self.assertIsNone(entries["甲公司"]["scores"][rule["rule_id"]])
+        self.assertIsNone(entries["乙公司"]["scores"][rule["rule_id"]])
 
         uploaded_id = entries["甲公司"]["price_entry_id"]
         self.assertEqual(client.delete(f"{path}/entries/{uploaded_id}").status_code, 400)
@@ -5347,7 +5357,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(value, Decimal("1052530.00"))
         self.assertEqual(status, "found")
 
-    def test_price_sheet_batch_adjusts_prices_without_task_or_model_calls(self):
+    def test_price_sheet_batch_saves_then_ai_calculates_without_full_text(self):
         bid_a = self._add_pdf("batch-a.pdf", "bid", "甲公司", "占位")
         bid_b = self._add_pdf("batch-b.pdf", "bid", "乙公司", "占位")
         parsed_a = self.temp_dir / "batch-price-a.txt"
@@ -5387,10 +5397,45 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(updated["乙公司"]["evaluation_price"], "106194.69")
         self.assertEqual(updated["甲公司"]["adjustment"]["mode"], "discount")
         self.assertFalse(updated["丙公司"]["included"])
-        self.assertEqual(updated["甲公司"]["scores"][rule["rule_id"]]["score"], 10.0)
+        # V5：批量保存只整理输入；分数来自独立 AI 价格分计算任务，保存本身不得
+        # 立即出分，也不得产生模型调用。
+        self.assertIsNone(updated["甲公司"]["scores"][rule["rule_id"]])
         with storage.connection(self.app) as conn:
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM ew_tasks").fetchone()[0], 0)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM ew_model_calls").fetchone()[0], 0)
+
+        # 入队 AI 价格分计算：任务只发送紧凑结构化台账，不发送投标文件全文。
+        storage.create_task(self.app, self.project["project_id"], "calculate_price_scores", {
+            "profile_id": None, "prompt_version": worker.PROMPT_VERSION, "force_rerun": True,
+        })
+        ids = {item["bidder_name"]: item["price_entry_id"] for item in updated.values()}
+        # 最低价比例法：基准价 = min(90000, 106194.69) = 90000 → 甲 10 分、乙 8.47 分。
+        ai_result = {"rules": [{
+            "rule_id": rule["rule_id"], "benchmark_price": 90000, "status": "completed",
+            "reason": "按最低价比例计算",
+            "results": [
+                {"price_entry_id": ids["甲公司"], "score": 10.0, "calculation": "90000/90000×10=10", "reason": ""},
+                {"price_entry_id": ids["乙公司"], "score": 8.47, "calculation": "90000/106194.69×10=8.47", "reason": ""},
+            ],
+        }]}
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value=ai_result) as request_json:
+            finished = self._run_next_task()
+
+        self.assertEqual(finished["status"], "success")
+        self.assertEqual(finished["result"]["mode"], "ai_price_calculation")
+        self.assertEqual(request_json.call_count, 1)
+        prompt_text = str(request_json.call_args.args[2])
+        self.assertNotIn("投标总报价", prompt_text)
+        self.assertIn("rule_id", prompt_text)
+        self.assertIn("calculation_price", prompt_text)
+
+        sheet = client.get(path).get_json()["price_sheet"]
+        by_name = {item["bidder_name"]: item for item in sheet["entries"]}
+        self.assertTrue(sheet["calculation_ready"])
+        self.assertEqual(by_name["甲公司"]["scores"][rule["rule_id"]]["score"], 10.0)
+        self.assertEqual(by_name["乙公司"]["scores"][rule["rule_id"]]["score"], 8.47)
+        self.assertIsNone(by_name["丙公司"]["scores"][rule["rule_id"]])
+        with storage.connection(self.app) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM ew_model_calls").fetchone()[0], 1)
 
     def test_price_sheet_defers_file_scan_while_project_task_is_active(self):
         bid = self._add_pdf("deferred-price.pdf", "bid", "甲公司", "占位")
@@ -5433,6 +5478,33 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertFalse(sheet["rules"][0]["automatic"])
         self.assertEqual(entry["scores"][rule_id]["score"], 4.5)
         self.assertEqual(entry["scores"][rule_id]["source"], "manual")
+
+    def test_price_sheet_rejects_ai_score_outside_simple_formula_validation(self):
+        rule = {
+            "rule_id": "price-rule", "enabled": True, "category": "objective", "title": "最低价报价得分",
+            "check_rule": "报价得分=（评标基准价／投标报价）×10。",
+            "source_text": "最低投标报价作为评标基准价，最低评审价得10分",
+            "scoring": {"kind": "manual", "max_score": 10},
+        }
+        payload = {
+            "rules": [{key: rule[key] for key in ("rule_id", "title", "check_rule", "source_text") } | {"max_score": 10}],
+            "entries": [
+                {"price_entry_id": "a", "bidder_name": "甲", "included": True, "calculation_price": "100", "adjustment": {}, "exclusion_reason": ""},
+                {"price_entry_id": "b", "bidder_name": "乙", "included": True, "calculation_price": "200", "adjustment": {}, "exclusion_reason": ""},
+            ],
+            "public_entries": [
+                {"price_entry_id": "a", "bidder_name": "甲", "included": True, "calculation_price": "100", "manual_scores": {}},
+                {"price_entry_id": "b", "bidder_name": "乙", "included": True, "calculation_price": "200", "manual_scores": {}},
+            ],
+            "internal_rules": [{**rule, "formula_kind": "lowest_ratio", "max_score": 10}],
+        }
+        _normalised, errors = price_sheet.normalise_ai_price_calculation({"rules": [{
+            "rule_id": "price-rule", "status": "completed", "results": [
+                {"price_entry_id": "a", "score": 8, "calculation": "", "reason": ""},
+                {"price_entry_id": "b", "score": 8, "calculation": "", "reason": ""},
+            ],
+        }]}, payload)
+        self.assertIn("AI 建议分与可验证价格公式不一致", errors)
 
     def test_price_sheet_average_formula_is_not_misread_as_lowest_ratio(self):
         rule = {

@@ -1,7 +1,7 @@
-"""项目级报价与价格分试算。
+"""项目级报价台账与价格分计算输入。
 
-本模块只读取已解析文字和既有 OCR 缓存，不启动任务、不调用模型，也不读写
-综合评审或评分结果。它是文件中心的独立人工试算层。
+报价识别始终只读取已解析文字和既有 OCR 缓存；价格分由独立后台 AI 任务计算，
+本模块仅负责整理输入、校验可确定的算式和展示已验证的任务结果。
 """
 
 from __future__ import annotations
@@ -395,6 +395,84 @@ def _calculate_rule(rule: dict, entries: list[dict]) -> dict:
     }
 
 
+def price_calculation_input(app, project_id: str) -> dict:
+    """构造稳定、紧凑的 AI 价格计算输入；不含投标文件全文。"""
+    rule_set, rules = _price_rules(app, project_id)
+    entries = [_public_entry(item) for item in storage.list_price_entries(app, project_id)]
+    payload_rules = [{
+        "rule_id": rule["rule_id"], "title": rule["title"], "check_rule": rule["check_rule"],
+        "source_text": rule["source_text"], "max_score": rule["max_score"],
+    } for rule in rules]
+    payload_entries = [{
+        "price_entry_id": entry["price_entry_id"], "bidder_name": entry["bidder_name"],
+        "included": bool(entry["included"]), "calculation_price": entry["calculation_price"],
+        "adjustment": entry.get("adjustment") or {}, "exclusion_reason": entry.get("exclusion_reason") or "",
+    } for entry in entries]
+    stable = {"rule_set_id": (rule_set or {}).get("rule_set_id"), "rules": payload_rules, "entries": payload_entries}
+    fingerprint = hashlib.sha256(json.dumps(stable, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return {**stable, "fingerprint": fingerprint, "public_entries": entries, "internal_rules": rules}
+
+
+def normalise_ai_price_calculation(raw: object, calculation_input: dict) -> tuple[dict, list[str]]:
+    """校验 AI 计算结果的身份、范围与简单算式，不把模型文本直接当作分数。"""
+    value = raw if isinstance(raw, dict) else {}
+    input_rules = {item["rule_id"]: item for item in calculation_input.get("rules", []) if isinstance(item, dict)}
+    entries = {item["price_entry_id"]: item for item in calculation_input.get("entries", []) if isinstance(item, dict)}
+    expected_entries = {key for key, item in entries.items() if item.get("included")}
+    normalised: dict[str, dict] = {}
+    errors: list[str] = []
+    raw_rules = value.get("rules") if isinstance(value.get("rules"), list) else []
+    for item in raw_rules:
+        if not isinstance(item, dict):
+            continue
+        rule_id = str(item.get("rule_id") or "")
+        rule = input_rules.get(rule_id)
+        if not rule or rule_id in normalised:
+            errors.append("返回了未知或重复的价格规则")
+            continue
+        max_score = _decimal(rule.get("max_score"), allow_zero=True)
+        rows: dict[str, dict] = {}
+        raw_results = item.get("results") if isinstance(item.get("results"), list) else []
+        for result in raw_results:
+            if not isinstance(result, dict):
+                continue
+            entry_id = str(result.get("price_entry_id") or "")
+            if entry_id not in expected_entries or entry_id in rows:
+                errors.append("返回了未知、未参与或重复的投标人")
+                continue
+            score = _decimal(result.get("score"), allow_zero=True)
+            if score is not None and max_score is not None and score > max_score:
+                errors.append("建议价格分超过规则满分")
+                continue
+            rows[entry_id] = {
+                "score": float(score) if score is not None else None,
+                "source": "ai", "calculation": str(result.get("calculation") or "").strip()[:500],
+                "reason": str(result.get("reason") or "").strip()[:500],
+            }
+        if set(rows) != expected_entries:
+            errors.append("价格计算未覆盖全部参与计算的投标人")
+        normalised[rule_id] = {
+            "benchmark_price": _decimal_text(_decimal(item.get("benchmark_price"), allow_zero=True)),
+            "status": str(item.get("status") or "needs_review"),
+            "reason": str(item.get("reason") or "").strip()[:500], "scores": rows,
+        }
+    if set(normalised) != set(input_rules):
+        errors.append("价格计算未覆盖全部价格评分规则")
+    # 对确实可被本地完整表达的公式，只检查 AI 的数值是否与确定性算式一致；复杂
+    # 公式不强行降级，仍由 AI 给出建议和未决项。
+    for rule in calculation_input.get("internal_rules", []):
+        local = _calculate_rule(rule, calculation_input.get("public_entries", []))
+        if not local.get("calculation_ready") or not local.get("scores"):
+            continue
+        ai_rule = normalised.get(rule.get("rule_id"), {})
+        for entry_id, expected in local["scores"].items():
+            actual = (ai_rule.get("scores") or {}).get(entry_id, {}).get("score")
+            if actual is None or abs(Decimal(str(actual)) - Decimal(str(expected["score"]))) > Decimal("0.02"):
+                errors.append("AI 建议分与可验证价格公式不一致")
+                break
+    return {"rules": normalised}, list(dict.fromkeys(errors))
+
+
 def _public_entry(entry: dict) -> dict:
     try:
         manual_scores = json.loads(entry.get("manual_scores_json") or "{}")
@@ -425,8 +503,11 @@ def _public_entry(entry: dict) -> dict:
     }
 
 
-def _task_active(app, project_id: str) -> bool:
-    return any(item.get("status") in {"queued", "running"} for item in storage.list_tasks(app, project_id))
+def _task_active(app, project_id: str, *, ignore_task_id: str | None = None) -> bool:
+    return any(
+        item.get("status") in {"queued", "running"} and item.get("task_id") != ignore_task_id
+        for item in storage.list_tasks(app, project_id)
+    )
 
 
 def _refresh_needed(app, project_id: str, entries: list[dict]) -> bool:
@@ -445,9 +526,25 @@ def build_price_sheet(app, project_id: str) -> dict:
     entries = storage.list_price_entries(app, project_id)
     task_active = _task_active(app, project_id)
     needs_refresh = not task_active and _refresh_needed(app, project_id, entries)
-    public_entries = [_public_entry(item) for item in entries]
+    calculation_input = price_calculation_input(app, project_id)
+    public_entries = calculation_input["public_entries"]
     rule_set, rules = _price_rules(app, project_id)
-    calculated_rules = [_calculate_rule(rule, public_entries) for rule in rules]
+    stored_run = storage.current_price_score_run(app, project_id, calculation_input["fingerprint"])
+    ai_rules = (stored_run or {}).get("result", {}).get("rules", {})
+    calculated_rules = []
+    for rule in rules:
+        local = _calculate_rule(rule, public_entries)
+        ai = ai_rules.get(rule["rule_id"], {}) if isinstance(ai_rules, dict) else {}
+        # 已发布的旧接口仍可能保存人工分；页面不再提供该入口，但历史记录保持可读。
+        # 本地可计算公式仅用于校验 AI，不作为新的最终展示分。
+        local["scores"] = ai.get("scores", {}) if ai else {
+            entry_id: score for entry_id, score in local["scores"].items() if score.get("source") == "manual"
+        }
+        local["benchmark_price"] = ai.get("benchmark_price") if ai else None
+        local["calculation_ready"] = bool(ai) and not task_active
+        local["calculation_status"] = ai.get("status", "待 AI 计算") if ai else "待 AI 计算"
+        local["calculation_reason"] = ai.get("reason", "") if ai else ""
+        calculated_rules.append(local)
     for entry in public_entries:
         entry["scores"] = {
             rule["rule_id"]: rule["scores"].get(entry["price_entry_id"])
@@ -461,21 +558,25 @@ def build_price_sheet(app, project_id: str) -> dict:
         "entries": public_entries,
         "deferred": task_active,
         "needs_refresh": needs_refresh,
+        "calculation_ready": bool(stored_run),
+        "calculation_input_fingerprint": calculation_input["fingerprint"],
+        "calculation_profile_id": (stored_run or {}).get("profile_id"),
         "notice": (
             "项目任务运行中，报价自动识别已暂缓；当前仅显示缓存和人工数据。"
-            if task_active else "价格工作表为独立试算，不覆盖综合评审的 AI 建议得分。"
+            if task_active else "报价由本地文字识别；价格分由所选 AI 模型计算，程序只校验可确定的公式。"
         ),
     }
 
 
-def refresh_price_sheet(app, project_id: str, *, force_refresh: bool = False) -> dict:
+def refresh_price_sheet(app, project_id: str, *, force_refresh: bool = False,
+                        ignore_task_id: str | None = None) -> dict:
     """明确刷新时才允许写入台账及报价缓存。"""
-    if _task_active(app, project_id):
+    if _task_active(app, project_id, ignore_task_id=ignore_task_id):
         return build_price_sheet(app, project_id)
     entries = storage.sync_price_document_entries(app, project_id)
     # 报价试算不属于任务主链。主任务运行时只读已经缓存的价格，不扫描大文件，
     # 避免在 2 核 2 GB 服务器上与规则提取或综合评审争用 CPU、磁盘和 SQLite。
-    if _task_active(app, project_id):
+    if _task_active(app, project_id, ignore_task_id=ignore_task_id):
         return build_price_sheet(app, project_id)
     for entry in entries:
         if entry.get("source_type") != "document":

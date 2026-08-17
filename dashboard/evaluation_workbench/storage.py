@@ -305,6 +305,7 @@ def task_prompt_template_fingerprint(app, task_type: str) -> str | None:
             "extract_rules", "extract_rules_guidance", "extract_rules_scoring_assembly_user",
             "extract_rules_scoring_supplement_user", "json_repair", "json_repair_user",
         },
+        "calculate_price_scores": {"price_score_calculation", "price_score_calculation_user", "json_repair", "json_repair_user"},
         "review_documents": {"review_documents", "review_documents_user", "json_repair", "json_repair_user"},
         "score_objective": {"score_objective", "score_objective_user", "json_repair", "json_repair_user"},
         "score_subjective": {"score_subjective", "score_subjective_user", "json_repair", "json_repair_user"},
@@ -465,6 +466,18 @@ def init_database(app) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_ew_price_rule_sets_project
                 ON ew_price_rule_sets(project_id, updated_at DESC);
+            CREATE TABLE IF NOT EXISTS ew_price_score_runs (
+                price_score_run_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES ew_projects(project_id) ON DELETE CASCADE,
+                task_id TEXT REFERENCES ew_tasks(task_id) ON DELETE SET NULL,
+                profile_id TEXT,
+                input_fingerprint TEXT NOT NULL,
+                result_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ew_price_score_runs_project
+                ON ew_price_score_runs(project_id, updated_at DESC);
             CREATE TABLE IF NOT EXISTS ew_tasks (
                 task_id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL REFERENCES ew_projects(project_id) ON DELETE CASCADE,
@@ -825,6 +838,7 @@ def init_database(app) -> None:
         _ensure_column(conn, "ew_global_rules", "execution_meta_json", "TEXT")
         _ensure_column(conn, "ew_evidence_packs", "material_key", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "ew_price_entries", "adjustment_json", "TEXT NOT NULL DEFAULT '{}'")
+        _ensure_column(conn, "ew_projects", "price_profile_id", "TEXT")
         # 旧数据库先补列，再建索引；把索引放在 CREATE TABLE 脚本里会导致升级时
         # 因旧表尚无 material_key 而中断整个初始化。
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ew_evidence_packs_material ON ew_evidence_packs(document_id, material_key, updated_at)")
@@ -1437,6 +1451,15 @@ def get_project(app, project_id: str) -> dict | None:
     return dict(row) if row else None
 
 
+def set_project_price_profile(app, project_id: str, profile_id: str | None) -> None:
+    """记住用户最后明确选择的价格计算模型，不保存密钥也不影响其他任务模型。"""
+    with connection(app) as conn:
+        conn.execute(
+            "UPDATE ew_projects SET price_profile_id=?, updated_at=? WHERE project_id=?",
+            (profile_id or None, now_iso(), project_id),
+        )
+
+
 def list_projects(app) -> list[dict]:
     with connection(app) as conn:
         rows = conn.execute(
@@ -1493,7 +1516,7 @@ def save_price_rule_set(app, project_id: str, task_id: str | None, profile_id: s
 def current_price_rule_set(app, project_id: str) -> dict | None:
     with connection(app) as conn:
         row = conn.execute(
-            "SELECT * FROM ew_price_rule_sets WHERE project_id=? ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+            "SELECT * FROM ew_price_rule_sets WHERE project_id=? ORDER BY updated_at DESC, created_at DESC, rowid DESC LIMIT 1",
             (project_id,),
         ).fetchone()
     if not row:
@@ -1504,6 +1527,43 @@ def current_price_rule_set(app, project_id: str) -> dict | None:
     except (TypeError, json.JSONDecodeError):
         rules = []
     value["rules"] = [item for item in rules if isinstance(item, dict)]
+    return value
+
+
+def save_price_score_run(app, project_id: str, task_id: str | None, profile_id: str | None,
+                         input_fingerprint: str, result: dict) -> dict:
+    """保存一次 AI 价格分计算；旧结果保留，以便输入变化后自然失效而非覆盖历史。"""
+    timestamp = now_iso()
+    with connection(app) as conn:
+        conn.execute(
+            """INSERT INTO ew_price_score_runs(
+                   price_score_run_id, project_id, task_id, profile_id, input_fingerprint,
+                   result_json, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (str(uuid.uuid4()), project_id, task_id or None, profile_id or None, input_fingerprint,
+             json.dumps(result, ensure_ascii=False, separators=(",", ":")), timestamp, timestamp),
+        )
+    return current_price_score_run(app, project_id, input_fingerprint) or {}
+
+
+def current_price_score_run(app, project_id: str, input_fingerprint: str | None = None) -> dict | None:
+    """返回指定输入版本的最新 AI 计算，避免旧报价或旧规则的分数混入当前页面。"""
+    query = "SELECT * FROM ew_price_score_runs WHERE project_id=?"
+    values: list[object] = [project_id]
+    if input_fingerprint:
+        query += " AND input_fingerprint=?"
+        values.append(input_fingerprint)
+    query += " ORDER BY updated_at DESC, created_at DESC, rowid DESC LIMIT 1"
+    with connection(app) as conn:
+        row = conn.execute(query, values).fetchone()
+    if not row:
+        return None
+    value = dict(row)
+    try:
+        result = json.loads(value.get("result_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        result = {}
+    value["result"] = result if isinstance(result, dict) else {}
     return value
 
 
@@ -1817,6 +1877,7 @@ def task_input_fingerprint(app, project_id: str, task_type: str, profile_id: str
         "compare_documents": {"tender", "bid"},
         "extract_rules": {"tender", "tender_attachment"},
         "extract_price_rules": {"tender", "tender_attachment"},
+        "calculate_price_scores": {"bid"},
         "review_documents": {"bid"},
         "score_objective": {"bid"},
         "score_subjective": {"bid"},
@@ -1876,7 +1937,7 @@ def get_task(app, task_id: str) -> dict | None:
 
 def list_tasks(app, project_id: str) -> list[dict]:
     with connection(app) as conn:
-        rows = conn.execute("SELECT * FROM ew_tasks WHERE project_id = ? ORDER BY created_at DESC LIMIT 50", (project_id,)).fetchall()
+        rows = conn.execute("SELECT * FROM ew_tasks WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 50", (project_id,)).fetchall()
     return [task_to_dict(row) for row in rows]
 
 
@@ -1886,7 +1947,7 @@ def list_task_summaries(app, project_id: str) -> list[dict]:
         rows = conn.execute(
             """SELECT task_id, project_id, task_type, status, progress, message, error, created_at, started_at, finished_at, updated_at,
                       CASE WHEN task_type = 'evaluate_all' OR status = 'running' THEN result_json ELSE NULL END AS result_json
-               FROM ew_tasks WHERE project_id = ? ORDER BY created_at DESC LIMIT 50""",
+               FROM ew_tasks WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 50""",
             (project_id,),
         ).fetchall()
     values = []

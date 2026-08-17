@@ -762,7 +762,7 @@ def tasks_api(project_id):
         return error
     data = _json_body()
     task_type = str(data.get("task_type", ""))
-    if task_type not in {"parse_documents", "compare_documents", "extract_rules", "extract_price_rules", "review_documents", "score_objective", "score_subjective", "evaluate_all"}:
+    if task_type not in {"parse_documents", "compare_documents", "extract_rules", "extract_price_rules", "calculate_price_scores", "review_documents", "score_objective", "score_subjective", "evaluate_all"}:
         return jsonify({"error": "不支持的工作台任务"}), 400
     if task_type == "compare_documents":
         documents = storage.list_documents(current_app, project_id)
@@ -796,6 +796,10 @@ def tasks_api(project_id):
         # 判断但没有可用图片模型的规则会在 worker 内逐条标记，不能拖垮整任务。
     try:
         requested_profile_id = data.get("profile_id") or storage.default_model_profile_id(current_app)
+        if task_type in {"extract_price_rules", "calculate_price_scores"}:
+            # 价格页的模型选择是独立偏好；综合评审后联动价格计算时复用它，而不是
+            # 偷换成综合评审模型。配置失效仍由任务实际取档案时给出明确错误。
+            storage.set_project_price_profile(current_app, project_id, requested_profile_id)
         retry_failed_task_id = str(data.get("retry_failed_task_id") or "").strip()
         if retry_failed_task_id:
             if task_type != "evaluate_all":
@@ -809,7 +813,7 @@ def tasks_api(project_id):
         # 规则提取本身就是“生成新规则集”，不允许命中旧任务复用。force_rerun
         # 也必须随综合评审进入后台：仅在 API 层跳过整任务复用还不够，内部还有
         # 按投标文件复用的增量缓存。
-        force_rerun = task_type in {"extract_rules", "extract_price_rules"} or data.get("force_rerun") is True
+        force_rerun = task_type in {"extract_rules", "extract_price_rules", "calculate_price_scores"} or data.get("force_rerun") is True
         if task_type == "evaluate_all" and force_rerun and not retry_failed_task_id:
             storage.clear_evaluation_results(current_app, project_id)
         payload = {
@@ -820,7 +824,7 @@ def tasks_api(project_id):
         }
         if retry_failed_task_id:
             payload["retry_failed_task_id"] = retry_failed_task_id
-        if task_type in {"compare_documents", "extract_rules", "extract_price_rules", "review_documents", "score_objective", "score_subjective", "evaluate_all"}:
+        if task_type in {"compare_documents", "extract_rules", "extract_price_rules", "calculate_price_scores", "review_documents", "score_objective", "score_subjective", "evaluate_all"}:
             payload["input_fingerprint"] = storage.task_input_fingerprint(
                 current_app, project_id, task_type, requested_profile_id, TASK_PROMPT_VERSION,
             )

@@ -4,15 +4,15 @@
 handoff_schema: 1
 updated_at: 2026-08-17
 module: evaluation-workbench
-status: deployed_validation_pending
+status: local_changes
 base_commit: bb7883c
 branch: main
-working_tree: clean_after_price_sheet_v4_deploy
+working_tree: price_ai_calculation_and_refresh_fix_uncommitted
 remote_github: bb7883c
 remote_gitee: bb7883c
 production_commit: bb7883c
 prompt_version: compare-evidence-ai-v5（本轮未修改）
-database_change: 新增 ew_price_rule_sets 独立价格规则集表（已提交待部署；SQLite 兼容迁移）
+database_change: 新增 ew_price_rule_sets、ew_price_score_runs 和 ew_projects.price_profile_id；SQLite 兼容迁移，尚未提交部署
 user_approval: 已授权实施、提交、推送和部署
 ```
 
@@ -20,10 +20,9 @@ user_approval: 已授权实施、提交、推送和部署
 
 ## 下一位先做
 
-1. 云端已部署 `bb7883c` 并验证：price-sheet-v4 生效；sxyh2 价格规则编译为 `average_factor_deviation`（auto=True，满分30，此前'需手工计分'）；4 家报价全部提取成功（金额前置版式修复生效，此前全部 missing）。剩余动作：页面核对 4 家报价与自动价格分、基准价（去高低20%后算术平均）是否符合预期；另以最低价比例项目验收。
-2. 新增独立价格规则任务：查重与价格规则提取均支持选择模型；价格规则任务只读取评分原文台账并写入 `ew_price_rule_sets`，不会改写完整规则集或综合评审结果。综合评审结束后会以最佳努力刷新报价台账并确定性计算价格分，刷新失败不影响已完成评审。
-3. 价格公式编译补充“评标基准价计算方法→去高低说明→算术平均”的受控结构锚点，并以含取整数说明的完整长条款回归；不再因该类说明超过短邻域而把可计算公式误判为手工核算。
-2. 综合评审、规则提取、OCR/图片、查重主链仍受保护；本轮只将价格评分规则从综合评审和客观分展示中隔离，不改变其他审查规则。
+1. 云端已部署 `bb7883c`；本地继续在其基础上实现独立 AI 价格分计算，尚未提交或部署，云端结果不可用作本轮验收。
+2. 已新增 `calculate_price_scores`：价格规则提取完成后自动串行计算；用户保存报价/参与范围/调整后也以价格页所选模型重算。请求仅含独立规则与结构化报价台账，AI 结果按输入指纹保存到 `ew_price_score_runs`；可完整表达的本地公式只做校验，不替代 AI 建议。
+3. 前端价格页改为按最新成功价格任务 ID 刷新，修复任务在两次轮询之间完成时需切换标签才显示新报价/规则的问题。综合评审、规则提取、OCR/图片和查重主链未改动。
 
 ## 活跃记录（最多 10 条）
 

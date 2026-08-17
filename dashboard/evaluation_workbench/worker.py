@@ -4802,6 +4802,56 @@ def _extract_price_rules(app, task: dict) -> dict:
     return {"rule_count": len(price_rules), "source_clause_count": len(candidates), "mode": "price_only", "assembly": stats}
 
 
+def _calculate_price_scores(app, task: dict) -> dict:
+    """使用所选模型计算独立价格分；不触及综合评审结果或投标文件全文。"""
+    # 当前任务本身不应阻塞报价刷新；队列中的其他项目任务仍会保持隔离。
+    price_sheet.refresh_price_sheet(app, task["project_id"], force_refresh=False, ignore_task_id=task["task_id"])
+    calculation_input = price_sheet.price_calculation_input(app, task["project_id"])
+    rules = calculation_input.get("rules", [])
+    entries = calculation_input.get("entries", [])
+    if not rules:
+        return {"rule_count": 0, "entry_count": len(entries), "message": "未提取到价格评分规则，未调用模型"}
+    if not any(item.get("included") for item in entries):
+        return {"rule_count": len(rules), "entry_count": 0, "message": "没有参与计算的投标人，未调用模型"}
+    profile = storage.get_model_profile(app, task.get("payload", {}).get("profile_id"), "deepseek-v4-flash")
+    task["_evaluation_request_gate"] = _EvaluationRequestGate(limit=1, max_limit=1)
+    storage.update_task(app, task["task_id"], progress=25, message="正在使用所选模型计算价格分")
+    prompt = storage.render_prompt_template(
+        app, "price_score_calculation_user",
+        rules=json.dumps(rules, ensure_ascii=False, separators=(",", ":")),
+        entries=json.dumps(entries, ensure_ascii=False, separators=(",", ":")),
+    )
+    system_prompt = _system_prompt(app, "price_score_calculation")
+    try:
+        raw = _request_task_json(
+            app, task, profile, "price_score_calculation", system_prompt, prompt,
+            context_mode="structured_price_sheet", max_tokens=_output_token_budget(profile, 4_000),
+            thinking_mode="disabled",
+        )
+    except InvalidJsonResponse as error:
+        raw = _repair_invalid_json(app, task, profile, "price_score_calculation_json_repair", error, "rules")
+    normalised, errors = price_sheet.normalise_ai_price_calculation(raw, calculation_input)
+    if errors:
+        # 只重发紧凑结构化台账与明确校验错误，不重发招标或投标文件正文。
+        retry_prompt = f"{prompt}\n\n系统校验未通过：{'；'.join(errors)}。请严格按原 ID、范围和满分重新计算。"
+        raw = _request_task_json(
+            app, task, profile, "price_score_calculation_retry", system_prompt, retry_prompt,
+            context_mode="structured_price_sheet_retry", max_tokens=_output_token_budget(profile, 4_000),
+            thinking_mode="disabled",
+        )
+        normalised, errors = price_sheet.normalise_ai_price_calculation(raw, calculation_input)
+    if errors:
+        raise ValueError(f"AI 价格分结果未通过结构或公式校验：{'；'.join(errors)}")
+    storage.save_price_score_run(
+        app, task["project_id"], task["task_id"], profile["profile_id"],
+        calculation_input["fingerprint"], normalised,
+    )
+    return {
+        "rule_count": len(rules), "entry_count": len(entries), "mode": "ai_price_calculation",
+        "input_fingerprint": calculation_input["fingerprint"],
+    }
+
+
 def _extract_rules(app, task: dict) -> dict:
     project = storage.get_project(app, task["project_id"])
     if not project:
@@ -13998,6 +14048,8 @@ def run_task(app, task: dict) -> None:
             result = _extract_rules(app, task)
         elif task["task_type"] == "extract_price_rules":
             result = _extract_price_rules(app, task)
+        elif task["task_type"] == "calculate_price_scores":
+            result = _calculate_price_scores(app, task)
         elif task["task_type"] == "review_documents":
             result = _review_documents(app, task)
         elif task["task_type"] == "score_objective":
@@ -14022,6 +14074,23 @@ def run_task(app, task: dict) -> None:
             except Exception:
                 # 报价工作表是综合评审后的独立便利操作，任何刷新异常都不得反向把
                 # 已完成的评审任务改为失败。
+                pass
+        # 价格规则提取完成后，或用户从综合评审明确要求联动时，再串行入队 AI
+        # 价格分计算。它使用独立台账，不读取或改写综合评审、客观分结果。
+        should_calculate_price = task["task_type"] == "extract_price_rules" or (
+            task["task_type"] == "evaluate_all" and bool((task.get("payload") or {}).get("calculate_price"))
+        )
+        if should_calculate_price:
+            try:
+                project = storage.get_project(app, task["project_id"]) or {}
+                storage.create_task(app, task["project_id"], "calculate_price_scores", {
+                    "profile_id": project.get("price_profile_id") or (task.get("payload") or {}).get("profile_id"),
+                    "prompt_version": PROMPT_VERSION,
+                    "force_rerun": True,
+                })
+            except ValueError:
+                # 没有价格规则或已有同类计算排队时，不应影响已完成的主任务；计算
+                # 任务会自行显示“无规则/无参与投标人”，无需预先复制业务判断。
                 pass
     except (ComparisonLimitError, ValueError) as exc:
         storage.update_task(app, task["task_id"], status="error", error=str(exc), message="任务失败")
