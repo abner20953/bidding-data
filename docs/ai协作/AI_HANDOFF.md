@@ -5,12 +5,12 @@ handoff_schema: 1
 updated_at: 2026-08-17
 module: evaluation-workbench
 status: deployed_validation_pending
-base_commit: 2fd6959
+base_commit: f838c14
 branch: main
-working_tree: clean_after_trim_classification_fix_deploy
-remote_github: 2fd6959
-remote_gitee: 2fd6959
-production_commit: 2fd6959
+working_tree: clean_after_price_adjustment_display_fix_deploy
+remote_github: f838c14
+remote_gitee: f838c14
+production_commit: f838c14
 prompt_version: vision-evidence-contract-v62（已部署；价格分自洽性契约）
 database_change: ew_price_rule_sets、ew_price_score_runs 和 ew_projects.price_profile_id 已按 SQLite 兼容迁移部署；本轮无数据库变更
 user_approval: 已授权实施、提交、推送和部署
@@ -20,7 +20,7 @@ user_approval: 已授权实施、提交、推送和部署
 
 ## 下一位先做
 
-1. 云端已部署 `2fd6959`（修剪判定修复）。**请重跑 test3 的 AI 价格分计算**：预期基准价 1791992.55、四家 42.99/42.60/38.43/37.58（sxyh2 复跑应仍为 4×30）。旧分数结果因输入指纹未变不会自动失效，需重新触发"保存全部修改并由 AI 重算"覆盖；不同税率换算仍须人工确认。
+1. 云端已部署 `f838c14`（价格表调整字段回显修复）。jc 核验：古人云 15% 扣除（7800940→6630799）计算正确并成为最低基准价（35 分），其余 7 家按基准价/报价×35 全部吻合；回显修复后刷新 jc 价格页应显示优惠金额/比例。test3 修剪修复（`2fd6959`）待重跑核对：预期基准价 1791992.55、42.99/42.60/38.43/37.58；sxyh2 复跑应为 4×30。
 
 ## 活跃记录（最多 10 条）
 
