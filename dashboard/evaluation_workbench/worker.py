@@ -500,67 +500,77 @@ def _parse_document(app, task: dict) -> dict:
         or not item.get("parsed_path")
         or not Path(item["parsed_path"]).is_file()
     ]
-    if not pending_documents:
-        storage.update_task(app, task["task_id"], progress=100, message="全部文件已有有效解析缓存")
-        return {"document_count": len(documents), "parsed_count": 0, "skipped_count": len(documents)}
-    total = len(pending_documents)
     parsed = 0
     errors = []
-    for document in pending_documents:
-        source = storage.document_path(app, document)
-        storage.update_task(app, task["task_id"], progress=int(parsed * 100 / total), message=f"正在解析：{document['original_name']}")
+    if not pending_documents:
+        storage.update_task(app, task["task_id"], progress=40, message="解析缓存已存在，正在核对文件报价缓存…")
+    else:
+        total = len(pending_documents)
+        for document in pending_documents:
+            source = storage.document_path(app, document)
+            storage.update_task(app, task["task_id"], progress=int(parsed * 100 / total), message=f"正在解析：{document['original_name']}")
+            try:
+                if document["extension"] == ".pdf":
+                    with fitz.open(source) as pdf:
+                        if pdf.page_count > MAX_PARSE_PAGES:
+                            raise ValueError(f"PDF 页数超过 {MAX_PARSE_PAGES} 页限制")
+                        pages = []
+                        text_length = 0
+                        for page_number, page in enumerate(pdf, start=1):
+                            page_text = page.get_text("text", sort=True)
+                            page_text = f"[第{page_number}页]\n{page_text}"
+                            text_length += len(page_text)
+                            if text_length > MAX_PARSED_CHARS:
+                                raise ValueError("文件可提取文本过长，超过低资源解析限制")
+                            pages.append(page_text)
+                        page_count = pdf.page_count
+                    text = "\n\n".join(pages)
+                else:
+                    text = _extract_docx_text(source)
+                    page_count = None
+                if not text.strip():
+                    raise ValueError("未提取到可检索文本；扫描件暂不支持 OCR")
+                parsed_path = storage.project_dir(app, task["project_id"]) / "parsed" / f"{document['document_id']}.txt"
+                parsed_path.write_text(text, encoding="utf-8")
+                with storage.connection(app) as conn:
+                    conn.execute(
+                        "UPDATE ew_documents SET page_count=?, text_length=?, parse_status='success', parse_error=NULL, parsed_path=?, updated_at=? WHERE document_id=?",
+                        (page_count, len(text), str(parsed_path), storage.now_iso(), document["document_id"]),
+                    )
+            except Exception as exc:
+                errors.append(f"{document['original_name']}：{exc}")
+                with storage.connection(app) as conn:
+                    conn.execute(
+                        "UPDATE ew_documents SET parse_status='error', parse_error=?, updated_at=? WHERE document_id=?",
+                        (str(exc), storage.now_iso(), document["document_id"]),
+                    )
+            parsed += 1
+        if errors:
+            raise ValueError("；".join(errors[:5]))
+    # 报价缓存补全：对全部已解析的投标文件统一提取（缺失或过期的才重扫），
+    # 旧文件（升级前已解析）也在此补上缓存，保证“解析全部文件”后文件清单
+    # 即可显示报价。提取失败不影响解析主流程，价格工作表刷新时会再尝试。
+    documents = storage.list_documents(app, task["project_id"])
+    quote_checked = 0
+    for document in documents:
+        if document.get("role") != "bid" or document.get("parse_status") != "success":
+            continue
+        if not price_sheet.document_quote_cache_stale(document):
+            continue
         try:
-            if document["extension"] == ".pdf":
-                with fitz.open(source) as pdf:
-                    if pdf.page_count > MAX_PARSE_PAGES:
-                        raise ValueError(f"PDF 页数超过 {MAX_PARSE_PAGES} 页限制")
-                    pages = []
-                    text_length = 0
-                    for page_number, page in enumerate(pdf, start=1):
-                        page_text = page.get_text("text", sort=True)
-                        page_text = f"[第{page_number}页]\n{page_text}"
-                        text_length += len(page_text)
-                        if text_length > MAX_PARSED_CHARS:
-                            raise ValueError("文件可提取文本过长，超过低资源解析限制")
-                        pages.append(page_text)
-                    page_count = pdf.page_count
-                text = "\n\n".join(pages)
-            else:
-                text = _extract_docx_text(source)
-                page_count = None
-            if not text.strip():
-                raise ValueError("未提取到可检索文本；扫描件暂不支持 OCR")
-            parsed_path = storage.project_dir(app, task["project_id"]) / "parsed" / f"{document['document_id']}.txt"
-            parsed_path.write_text(text, encoding="utf-8")
-            with storage.connection(app) as conn:
-                conn.execute(
-                    "UPDATE ew_documents SET page_count=?, text_length=?, parse_status='success', parse_error=NULL, parsed_path=?, updated_at=? WHERE document_id=?",
-                    (page_count, len(text), str(parsed_path), storage.now_iso(), document["document_id"]),
-                )
-            # 投标文件解析完成时同步提取报价并落库到文件清单；价格工作表复用
-            # 同一缓存，避免同一份文件被扫描两次。提取失败不影响解析主流程，
-            # 价格工作表刷新时会再尝试。
-            if document["role"] == "bid":
-                try:
-                    merged = {**document, "parsed_path": str(parsed_path), "parse_status": "success"}
-                    quote_fields = price_sheet.extract_document_quote(app, merged)
-                    storage.update_document_quote(app, document["document_id"], quote_fields)
-                except Exception:
-                    pass
-        except Exception as exc:
-            errors.append(f"{document['original_name']}：{exc}")
-            with storage.connection(app) as conn:
-                conn.execute(
-                    "UPDATE ew_documents SET parse_status='error', parse_error=?, updated_at=? WHERE document_id=?",
-                    (str(exc), storage.now_iso(), document["document_id"]),
-                )
-        parsed += 1
-    if errors:
-        raise ValueError("；".join(errors[:5]))
+            quote_fields = price_sheet.extract_document_quote(app, document)
+            storage.update_document_quote(app, document["document_id"], quote_fields)
+            quote_checked += 1
+        except Exception:
+            pass
+    if quote_checked:
+        storage.update_task(app, task["task_id"], progress=90, message=f"已核对 {quote_checked} 份投标文件的报价缓存")
+    storage.update_task(app, task["task_id"], progress=100, message="任务完成")
     return {
         "document_count": len(documents),
         "parsed_count": parsed,
         "skipped_count": len(documents) - len(pending_documents),
+        "quote_checked_count": quote_checked,
     }
 
 

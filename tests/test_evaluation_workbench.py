@@ -116,6 +116,30 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(documents["tender"]["quote_status"], "pending")
         self.assertIsNone(documents["tender"]["quote_value"])
 
+    def test_parse_task_backfills_quote_cache_for_already_parsed_documents(self):
+        bid = self._add_pdf("old-bid.pdf", "bid", "甲公司", "占位")
+        parsed = self.temp_dir / "old-bid.txt"
+        parsed.write_text("投标总报价：130000元。", encoding="utf-8")
+        with storage.connection(self.app) as conn:
+            conn.execute("UPDATE ew_documents SET parse_status='success', parsed_path=? WHERE document_id=?",
+                         (str(parsed), bid["document_id"]))
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+
+        finished = self._run_next_task()
+
+        # 升级前已解析的文件没有报价缓存：解析任务必须补提取，不能只跳过。
+        self.assertEqual(finished["status"], "success")
+        self.assertEqual(finished["result"]["parsed_count"], 0)
+        self.assertEqual(finished["result"]["quote_checked_count"], 1)
+        document = next(item for item in storage.list_documents(self.app, self.project["project_id"])
+                        if item["document_id"] == bid["document_id"])
+        self.assertEqual(document["quote_value"], "130000")
+        self.assertEqual(document["quote_status"], "found")
+        # 缓存已新鲜：再次解析不得重复扫描。
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        second = self._run_next_task()
+        self.assertEqual(second["result"]["quote_checked_count"], 0)
+
     def test_parse_and_comparison_share_2500_page_limit(self):
         self.assertEqual(worker.MAX_PARSE_PAGES, 2500)
         self.assertEqual(worker.MAX_PARSE_PAGES, MAX_PDF_PAGES)

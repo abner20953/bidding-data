@@ -670,6 +670,19 @@ def build_price_sheet(app, project_id: str) -> dict:
     }
 
 
+def document_quote_cache_stale(document: dict) -> bool:
+    """文件清单报价缓存是否缺失或过期（解析任务与价格表刷新共用同一判定）。
+
+    文件未变且已缓存过明确结果（含"未识别/歧义/不可用"等负结果）视为新鲜，
+    不再重复扫描；只有从未提取过或输入指纹变化时才需要重新提取。
+    """
+    merged = {**document, "document_sha256": str(document.get("sha256") or "")}
+    return not (
+        document.get("quote_fingerprint") == _extraction_fingerprint(merged)
+        and document.get("quote_status") in {"found", "ambiguous", "missing", "unavailable"}
+    )
+
+
 def extract_document_quote(app, document: dict) -> dict:
     """唯一报价提取入口：文件清单解析完成与价格工作表刷新共用。
 
@@ -707,8 +720,7 @@ def refresh_price_sheet(app, project_id: str, *, force_refresh: bool = False,
         fingerprint = _extraction_fingerprint({**entry, **document})
         # 文件清单已提取过且文件未变：直接复用，避免二次扫描；缺失或过期时
         # 才提取，并把结果回写到文件清单，保证两种视图始终同源。
-        if not force_refresh and document.get("quote_fingerprint") == fingerprint \
-                and document.get("quote_status") in {"found", "ambiguous", "missing", "unavailable"}:
+        if not force_refresh and not document_quote_cache_stale(document):
             quote_fields = {
                 "quote_value": document.get("quote_value"),
                 "quote_source": document.get("quote_source") or "",
