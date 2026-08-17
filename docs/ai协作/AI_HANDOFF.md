@@ -5,14 +5,14 @@ handoff_schema: 1
 updated_at: 2026-08-17
 module: evaluation-workbench
 status: deployed_validation_pending
-base_commit: 7d18ac7
+base_commit: 809cff9
 branch: main
-working_tree: clean_after_v63_prompt_deploy
-remote_github: 7d18ac7
-remote_gitee: 7d18ac7
-production_commit: 7d18ac7
+working_tree: clean_after_parse_quote_backfill_deploy
+remote_github: 809cff9
+remote_gitee: 809cff9
+production_commit: 809cff9
 prompt_version: vision-evidence-contract-v63（已部署；未填调整不套用规则优惠）
-database_change: ew_price_rule_sets、ew_price_score_runs 和 ew_projects.price_profile_id 已按 SQLite 兼容迁移部署；本轮无数据库变更
+database_change: ew_documents 新增 quote_value/quote_source/quote_excerpt/quote_status/quote_fingerprint 报价缓存列（SQLite 兼容迁移，已部署）；ew_price_rule_sets、ew_price_score_runs、ew_projects.price_profile_id 此前已部署
 user_approval: 已授权实施、提交、推送和部署
 ```
 
@@ -20,17 +20,16 @@ user_approval: 已授权实施、提交、推送和部署
 
 ## 下一位先做
 
-1. 云端 sxyh2 复现"重新解析后文件清单仍显示待解析后识别"：根因是解析任务对已有解析缓存的文件直接跳过、报价提取只挂在本次真正解析的文件上（升级前已解析的旧文件无报价缓存）。通用修复已完成待提交部署：解析任务结束后对全部已解析投标文件统一补全报价缓存（`document_quote_cache_stale` 共享判定，缺失/过期才重扫），`quote_checked_count` 计入任务结果；新增 1 项回填测试。
-2. 已部署 `4100742`（文件清单报价缓存 v1）：build-info `version_consistent=true`、`prompt_version=vision-evidence-contract-v63`。云端已解析的旧项目需触发一次"解析全部文件"或价格页刷新即可显示报价。
-2. 云端已部署 `76c31e0`（空专用集回退完整集）：test3 恢复正确（基准价 1652677.4737、43.63/44.13/36.14/37.01）；jc 回显修复已生效；sxyh2 复跑应为 4×30（待重跑核对）。
+1. 报价缓存补全修复已部署 `809cff9`（build-info `version_consistent=true`）：解析任务结束后对全部已解析投标文件统一补全报价缓存（`document_quote_cache_stale` 共享判定，缺失/过期才重扫），`quote_checked_count` 计入任务结果。云端已对所有项目调用价格页刷新完成回填，32 条台账与文件清单报价零不一致；sxyh2 复跑验证 4×30 分（报价 1054783/1054191/1052530/1053809）。太原税务项目"泽宇"提取到 1050（偏小，疑似局部金额，待人工核对）。
+2. 建议验收：各项目文件中心应显示报价（万元，悬停精确元）；重新上传/解析文件后报价自动出现；价格页"重新识别文件报价"与文件清单始终同源。sxyh 旧项目 2 家 ambiguous、1 家 missing 为既有提取结果，页面会标注待核对。
 
 ## 活跃记录（最多 10 条）
 
-### 5. 文件清单报价缓存（已部署 4100742；补全修复待提交部署）
+### 5. 文件清单报价缓存（已部署 4100742 + 补全修复 809cff9，云端已验证）
 
 - 报价提取收敛为唯一入口 `extract_document_quote`：解析任务对投标文件提取并落库到 `ew_documents`（quote_value/source/excerpt/status/fingerprint，SQLite 兼容迁移）；价格工作表 refresh 复用该缓存，仅指纹过期或强制"重新识别"才重扫并回写，两种视图同源、不二次扫描同一份文件。
 - 文件清单新增"报价（万元）"列（悬停显示精确元与来源），报告文件清单同步显示；通用机制，不针对具体项目。
-- 云端 sxyh2 复现"重新解析后仍显示待解析后识别"：解析任务对"已有解析缓存"的文件直接跳过，报价提取只挂在本次真正解析的文件上。已通用修复：解析任务结束后对**全部已解析投标文件**统一补全报价缓存（`document_quote_cache_stale` 共享判定，缺失/过期才重扫），`quote_checked_count` 计入任务结果。
+- 云端 sxyh2 复现"重新解析后仍显示待解析后识别"：解析任务对"已有解析缓存"的文件直接跳过，报价提取只挂在本次真正解析的文件上。已通用修复：解析任务结束后对**全部已解析投标文件**统一补全报价缓存（`document_quote_cache_stale` 共享判定，缺失/过期才重扫），`quote_checked_count` 计入任务结果。云端全项目回填完成：32 条台账与文件清单报价零不一致；sxyh2 4×30 分验证通过。
 
 ### 1. 独立报价与价格分 V3（已部署，持续验收）
 
