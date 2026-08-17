@@ -4,9 +4,10 @@ from __future__ import annotations
 
 
 PROMPT_TEMPLATE_SETTING = "evaluation_workbench_prompt_templates"
+# v62：独立价格分要求完整输入下仍给出建议分，并以 final_score 校验模型自身输出一致性。
 # v60：评分定向重组明确父项与叶子分值守恒，避免总分异常时只恢复其中一个子项。
 # v59 的 requirement_relation 结构化协议（supports/contradicts/uncertain）继续保留。
-EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v61"
+EVALUATION_PROMPT_VERSION = "vision-evidence-contract-v62"
 
 
 def _template(name: str, description: str, content: str, *placeholders: str) -> dict:
@@ -14,8 +15,8 @@ def _template(name: str, description: str, content: str, *placeholders: str) -> 
 
 
 PROMPT_TEMPLATES = {
-    "price_score_calculation": _template("报价与价格分 · AI 计算", "独立价格分计算的系统约束。", "你是招投标评审辅助系统中的价格分计算助手。只能依据输入的价格评分规则、已确认计分价、参与范围及人工价格调整计算建议分；不得自行改变投标人是否参与、报价、计分价、优惠或规则含义。复杂、条件不完整或需要人工判断的公式必须明确标记为 needs_review，而不是编造结果。所有结论供人工复核。"),
-    "price_score_calculation_user": _template("报价与价格分 · AI 计算", "根据结构化规则和报价台账计算价格分。", "请计算以下每条价格评分规则中每个参与计算投标人的 AI 建议价格分。只返回合法 JSON：\n{\"rules\":[{\"rule_id\":\"规则ID\",\"benchmark_price\":数字或null,\"status\":\"completed|needs_review|cannot_calculate\",\"reason\":\"简短说明\",\"results\":[{\"price_entry_id\":\"投标人ID\",\"score\":数字或null,\"calculation\":\"简短计算过程\",\"reason\":\"必要的未决事项或依据\"}]}]}\n严格要求：1. 规则、投标人和计分价均以输入为准，不得新增、删除或改写 ID；每条规则必须覆盖所有 included=true 的投标人各一次。2. score 必须在该规则 0 到 max_score 之间；若规则条件、参与范围或计分价不完整，score 为 null 且 status=needs_review/cannot_calculate。3. 优惠、扣除税率、剔除报价等已体现在 calculation_price；不得再次调整。4. calculation 只保留必要公式、基准价、分数和封顶信息，不复述规则。5. 不得输出 Markdown 或 JSON 外说明。\n\n价格评分规则：\n{{rules}}\n\n报价与参与范围：\n{{entries}}", "rules", "entries"),
+    "price_score_calculation": _template("报价与价格分 · AI 计算", "独立价格分计算的系统约束。", "你是招投标评审辅助系统中的价格分计算助手。只能依据输入的价格评分规则、已确认计分价、参与范围及人工价格调整计算建议分；不得自行改变投标人是否参与、报价、计分价、优惠或规则含义。只要规则、参与范围和计分价完整，即使存在取整、去高低、条件分支或需人工复核的口径，也必须按最合理的原文解释给出建议分；可同时标记 needs_review 并简述待复核的口径，不能因此留空分数。只有输入事实缺失或规则确实无法形成分数时，才可使用 score=null。所有结论供人工复核。"),
+    "price_score_calculation_user": _template("报价与价格分 · AI 计算", "根据结构化规则和报价台账计算价格分。", "请计算以下每条价格评分规则中每个参与计算投标人的 AI 建议价格分。只返回合法 JSON：\n{\"rules\":[{\"rule_id\":\"规则ID\",\"benchmark_price\":数字或null,\"status\":\"completed|needs_review|cannot_calculate\",\"reason\":\"简短说明\",\"results\":[{\"price_entry_id\":\"投标人ID\",\"score\":数字或null,\"final_score\":数字或null,\"calculation\":\"简短计算过程\",\"reason\":\"必要的未决事项或依据\"}]}]}\n严格要求：1. 规则、投标人和计分价均以输入为准，不得新增、删除或改写 ID；每条规则必须覆盖所有 included=true 的投标人各一次。2. score 与 final_score 必须相同，且在该规则 0 到 max_score 之间；只要输入规则、参与范围和计分价完整，二者都必须填写数字。存在取整、去高低、条件分支或需人工复核的口径时，仍先按最合理的原文解释计算数字，可用 status=needs_review 标记待核验点；不得仅因需要复核而留空。只有输入事实缺失或规则确实无法形成分数时，score 与 final_score 才同时为 null 且 status=needs_review/cannot_calculate。3. 优惠、扣除税率、剔除报价等已体现在 calculation_price；不得再次调整。4. calculation 只保留必要公式、基准价、最终分数和封顶信息，不复述规则。5. 不得输出 Markdown 或 JSON 外说明。\n\n价格评分规则：\n{{rules}}\n\n报价与参与范围：\n{{entries}}", "rules", "entries"),
     "model_connection_test": _template("模型连接测试 · 任务", "模型配置页的最小连通性测试请求。", "请仅返回 JSON 对象：{\"message\":\"连接成功\"}"),
     "compare_ai_assessment": _template("文件查重 · 通用业务指令", "查重证据复核的角色与边界。", "你是招投标文件横向异常线索复核助手。所有结果均由人工审核，应积极列出固定规则证据支持的异常、疑点、替代解释和复核重点；证据不完整时可以输出 suspected_clue 并说明推断。必须逐条独立判断当前信号，不得因同一文件对还有其他候选信号而提高本条风险；候选数量多也不等于存在多个独立异常。招标原文、技术响应表、法定固定表单、通用产品规格、公开厂商彩页和行业标准参数通常属于公共来源：除非证据包含双方共同出现且无法由公共来源解释的独有长段、罕见实质错误、异常删改或主体信息，否则应判为 excluded 或低风险疑似。PDF 双栏/表格抽取造成的重复、交错、断句和行尾标点不属于原文件共同错误。相同作者、创建软件或生成工具只能作为辅助线索；双方扫描页比例较高仅说明文本查重覆盖有限，不得把“图片多”单独视为串通证据。本链路只比较可提取文字，不调用 OCR 或图片识别；扫描页未覆盖只能说明结论范围有限。不得编造证据，不得直接认定串通投标、废标或作出法律结论。"),
     "compare_ai_assessment_user": _template("文件查重 AI 复核 · 任务", "压缩证据包及 JSON 输出要求。", "请按固定规则复核以下压缩证据包，只返回 JSON：\n{\"assessments\":[{\"signal_id\":\"ID\",\"decision\":\"confirmed_clue|suspected_clue|excluded|unassessable\",\"risk_level\":\"low|medium|high\",\"confidence\":\"high|medium|low\",\"source_class\":\"bidder_specific|third_party_common|public_template|placeholder_or_extraction|unknown\",\"materiality\":\"substantive|formatting|unknown\",\"reason\":\"简洁理由\",\"suggested_check\":\"建议核验事项\"}]}\n\n判定含义：confirmed_clue 仅表示当前信号本身有较充分证据；suspected_clue 表示仍有合理替代解释；excluded 表示更可能为招标原文、固定表单、公开产品资料、行业通用参数或 PDF 提取伪差异；unassessable 表示证据不足。source_class 必须说明线索来源属性：投标人独有、共同第三方资料、公共模板、占位/提取伪影或无法判断；materiality 区分实质内容与纯格式。公共模板、共同第三方资料、占位值或提取伪影即使暂列疑似，也不得作为提高文件对优先级的依据。basis 中的数量是底层候选数，不可直接当作独立异常数量。必须只依据当前 signal_id 的证据独立判断，禁止引用“其他维度叠加”“同组另有线索”来提高风险。技术参数相似本身通常不足以判高风险；只有共同的非公共独有内容、可验证罕见错误或实质异常改动才可升高。assessment_scope=project_fact_cluster 时表示同一原子事实在三家以上投标文件出现：只判断该事实的业务归属，不得因出现次数本身抬高风险。必须按输入顺序覆盖每个 signal_id，且每个 ID 恰好返回一次，不得新增 ID。对 confirmed_clue 或 suspected_clue，reason 和 suggested_check 均不得为空。reason 最多120字，点明真正有判别力的事实或公共来源解释；suggested_check 最多80字；避免复述整段证据。不得输出串标成立、废标或扣分结论。\n证据包：{{packets}}", "packets"),
@@ -398,6 +399,13 @@ PROMPT_TEMPLATES["compare_ai_assessment_user"]["required_literals"] = (
     '"source_class"', '"materiality"',
 )
 PROMPT_TEMPLATES["compare_ai_assessment_user"]["system_required_suffix"] = _COMPARE_SOURCE_CONTRACT
+_PRICE_SCORE_OUTPUT_CONTRACT = (
+    "每个 results 项还必须返回 final_score。输入规则、参与范围与 calculation_price 均完整时，"
+    "score 和 final_score 必须同时为相同数字；需要复核取整、去高低或条件口径时仍须先给建议分，"
+    "并可用 needs_review 说明待复核点。只有输入事实缺失或规则确实无法计算时，两者才同时为 null。"
+)
+PROMPT_TEMPLATES["price_score_calculation_user"]["required_literals"] = ('\"final_score\"',)
+PROMPT_TEMPLATES["price_score_calculation_user"]["system_required_suffix"] = _PRICE_SCORE_OUTPUT_CONTRACT
 PROMPT_TEMPLATES["evaluate_all_visual_locator_user"] = _template(
     "综合评审 · 扫描件图片找页",
     "仅在精细识图且文字流程未定位证据页时，先从低清联系表定位可能相关的页面。",

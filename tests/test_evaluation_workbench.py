@@ -4109,7 +4109,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("表格字段、填写格式", PROMPT_TEMPLATES["extract_rules_obligation_compile_user"]["content"])
         self.assertIn("系统仅能核验已上传文件", PROMPT_TEMPLATES["extract_rules_guidance"]["content"])
         self.assertIn("当一条候选仅概述同一表单、附件或材料的格式", PROMPT_TEMPLATES["extract_rules_dedupe_adjudication_user"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v61")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v62")
 
     def test_scope_chapter_and_text_error_guidance_present(self):
         from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
@@ -4127,7 +4127,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(text_marker, PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("必须点名最具辨识度的偏离对象", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("risk_level 应为 high", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v61")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v62")
 
     def test_ocr_visual_contracts_deduplicated_but_keep_hard_constraints(self):
         from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
@@ -5413,8 +5413,8 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             "rule_id": rule["rule_id"], "benchmark_price": 90000, "status": "completed",
             "reason": "按最低价比例计算",
             "results": [
-                {"price_entry_id": ids["甲公司"], "score": 10.0, "calculation": "90000/90000×10=10", "reason": ""},
-                {"price_entry_id": ids["乙公司"], "score": 8.47, "calculation": "90000/106194.69×10=8.47", "reason": ""},
+                {"price_entry_id": ids["甲公司"], "score": 10.0, "final_score": 10.0, "calculation": "90000/90000×10=10", "reason": ""},
+                {"price_entry_id": ids["乙公司"], "score": 8.47, "final_score": 8.47, "calculation": "90000/106194.69×10=8.47", "reason": ""},
             ],
         }]}
         with patch("dashboard.evaluation_workbench.worker.request_json", return_value=ai_result) as request_json:
@@ -5500,12 +5500,58 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         }
         normalised, errors = price_sheet.normalise_ai_price_calculation({"rules": [{
             "rule_id": "price-rule", "status": "completed", "results": [
-                {"price_entry_id": "a", "score": 8, "calculation": "", "reason": ""},
-                {"price_entry_id": "b", "score": 8, "calculation": "", "reason": ""},
+                {"price_entry_id": "a", "score": 8, "final_score": 8, "calculation": "", "reason": ""},
+                {"price_entry_id": "b", "score": 8, "final_score": 8, "calculation": "", "reason": ""},
             ],
         }]}, payload)
         self.assertEqual(errors, [])
         self.assertEqual(normalised["rules"]["price-rule"]["scores"]["a"]["score"], 8.0)
+
+    def test_price_sheet_rejects_blank_or_self_inconsistent_ai_score_when_inputs_complete(self):
+        payload = {
+            "rules": [{"rule_id": "price-rule", "title": "价格评分", "check_rule": "按报价计算", "source_text": "",
+                       "max_score": 10}],
+            "entries": [
+                {"price_entry_id": "a", "bidder_name": "甲", "included": True, "calculation_price": "100", "adjustment": {}, "exclusion_reason": ""},
+                {"price_entry_id": "b", "bidder_name": "乙", "included": True, "calculation_price": "200", "adjustment": {}, "exclusion_reason": ""},
+            ],
+        }
+
+        _normalised, blank_errors = price_sheet.normalise_ai_price_calculation({"rules": [{
+            "rule_id": "price-rule", "status": "needs_review", "results": [
+                {"price_entry_id": "a", "score": None, "final_score": None},
+                {"price_entry_id": "b", "score": None, "final_score": None},
+            ],
+        }]}, payload)
+        _normalised, inconsistent_errors = price_sheet.normalise_ai_price_calculation({"rules": [{
+            "rule_id": "price-rule", "status": "completed", "results": [
+                {"price_entry_id": "a", "score": 10, "final_score": 9.5},
+                {"price_entry_id": "b", "score": 8, "final_score": 8},
+            ],
+        }]}, payload)
+
+        self.assertIn("计分输入完整时不得留空 AI 建议分", blank_errors)
+        self.assertIn("AI 建议分与其申明的最终分不一致", inconsistent_errors)
+
+    def test_price_sheet_allows_blank_ai_score_only_when_calculation_input_is_incomplete(self):
+        payload = {
+            "rules": [{"rule_id": "price-rule", "title": "价格评分", "check_rule": "按报价计算", "source_text": "",
+                       "max_score": 10}],
+            "entries": [
+                {"price_entry_id": "a", "bidder_name": "甲", "included": True, "calculation_price": "100", "adjustment": {}, "exclusion_reason": ""},
+                {"price_entry_id": "b", "bidder_name": "乙", "included": True, "calculation_price": None, "adjustment": {}, "exclusion_reason": ""},
+            ],
+        }
+
+        normalised, errors = price_sheet.normalise_ai_price_calculation({"rules": [{
+            "rule_id": "price-rule", "status": "needs_review", "results": [
+                {"price_entry_id": "a", "score": None, "final_score": None},
+                {"price_entry_id": "b", "score": None, "final_score": None},
+            ],
+        }]}, payload)
+
+        self.assertEqual(errors, [])
+        self.assertIsNone(normalised["rules"]["price-rule"]["scores"]["a"]["score"])
 
     def test_price_sheet_average_formula_is_not_misread_as_lowest_ratio(self):
         rule = {
@@ -7167,7 +7213,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不限定行业或采购类型", guidance)
         scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v61")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v62")
 
     def test_full_scan_does_not_reinject_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")

@@ -414,7 +414,11 @@ def price_calculation_input(app, project_id: str) -> dict:
 
 
 def normalise_ai_price_calculation(raw: object, calculation_input: dict) -> tuple[dict, list[str]]:
-    """校验 AI 计算结果的身份、范围与简单算式，不把模型文本直接当作分数。"""
+    """校验 AI 计算结果的身份、覆盖与自身数值一致性。
+
+    不以本地公式替代或否决模型对复杂取整、分支条件的业务解释；但当输入价格完整时，
+    模型必须给出可展示的建议分，并保证其 JSON 中的最终分与自身申明的最终分一致。
+    """
     value = raw if isinstance(raw, dict) else {}
     input_rules = {item["rule_id"]: item for item in calculation_input.get("rules", []) if isinstance(item, dict)}
     entries = {item["price_entry_id"]: item for item in calculation_input.get("entries", []) if isinstance(item, dict)}
@@ -431,6 +435,11 @@ def normalise_ai_price_calculation(raw: object, calculation_input: dict) -> tupl
             errors.append("返回了未知或重复的价格规则")
             continue
         max_score = _decimal(rule.get("max_score"), allow_zero=True)
+        requires_numeric_score = bool(
+            expected_entries
+            and max_score is not None
+            and all(_decimal(entries[entry_id].get("calculation_price")) is not None for entry_id in expected_entries)
+        )
         rows: dict[str, dict] = {}
         raw_results = item.get("results") if isinstance(item.get("results"), list) else []
         for result in raw_results:
@@ -441,8 +450,21 @@ def normalise_ai_price_calculation(raw: object, calculation_input: dict) -> tupl
                 errors.append("返回了未知、未参与或重复的投标人")
                 continue
             score = _decimal(result.get("score"), allow_zero=True)
+            final_score = _decimal(result.get("final_score"), allow_zero=True)
             if score is not None and max_score is not None and score > max_score:
                 errors.append("建议价格分超过规则满分")
+                continue
+            if requires_numeric_score and score is None:
+                errors.append("计分输入完整时不得留空 AI 建议分")
+                continue
+            if score is not None and final_score is None:
+                errors.append("AI 价格分结果缺少最终分校验字段")
+                continue
+            if score is not None and final_score != score:
+                errors.append("AI 建议分与其申明的最终分不一致")
+                continue
+            if score is None and final_score is not None:
+                errors.append("AI 最终分与建议分字段不一致")
                 continue
             rows[entry_id] = {
                 "score": float(score) if score is not None else None,

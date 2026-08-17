@@ -4,40 +4,40 @@
 handoff_schema: 1
 updated_at: 2026-08-17
 module: evaluation-workbench
-status: deployed_validation_pending
-base_commit: 908037d
+status: local_changes
+base_commit: 30674c2
 branch: main
-working_tree: clean_after_price_ai_calculation_deploy
-remote_github: 908037d
-remote_gitee: 908037d
-production_commit: 908037d
-prompt_version: compare-evidence-ai-v5（本轮未修改）
-database_change: 新增 ew_price_rule_sets、ew_price_score_runs 和 ew_projects.price_profile_id；SQLite 兼容迁移，尚未提交部署
-user_approval: 已授权实施、提交、推送和部署
+working_tree: price_score_output_contract_pending_commit
+remote_github: 30674c2
+remote_gitee: 30674c2
+production_commit: 30674c2
+prompt_version: local=vision-evidence-contract-v62; production=vision-evidence-contract-v61
+database_change: ew_price_rule_sets、ew_price_score_runs 和 ew_projects.price_profile_id 已按 SQLite 兼容迁移部署；本轮无数据库变更
+user_approval: 已授权本轮代码修改；尚未授权提交、推送或部署
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
 
 ## 下一位先做
 
-1. 云端已部署 `908037d` 并验证：价格页按 V5 契约显示"待 AI 计算"（calculation_ready=false、输入指纹已生成、4 家计分价就绪）。剩余动作：页面点"保存全部修改并由 AI 重算"（或综合评审联动）触发 `calculate_price_scores`，核对 AI 分数、基准价与本地公式一致性；查重/规则页按钮高度修复已随部署生效。
-2. 已新增 `calculate_price_scores`：价格规则提取完成后自动串行计算；用户保存报价/参与范围/调整后也以价格页所选模型重算。请求仅含独立规则与结构化报价台账，AI 结果按输入指纹保存到 `ew_price_score_runs`；本地只校验 ID、参与范围、分值范围和完整覆盖，不再以本地公式否决 AI 建议。
-3. 前端价格页改为按最新成功价格任务 ID 刷新，修复任务在两次轮询之间完成时需切换标签才显示新报价/规则的问题。综合评审、规则提取、OCR/图片和查重主链未改动。
+1. 云端实际版本为 `30674c2`。已核对 sxyh2、三原县、jc、test3 的最新 AI 价格分任务；sxyh2 因模型把全部 `score` 留空而无数值，test3 有 JSON 分数与自身 calculation 不一致。三原县、jc 已有数值。
+2. 本地待提交修改：完整规则、参与范围及计分价时，模型不得因 `needs_review` 留空；新增 `final_score` 作为模型自身最终分的结构化回读字段，代码只校验 `score/final_score` 一致、ID、覆盖和满分，不重启本地公式否决。云端旧自定义提示词也会由系统必需协议补齐该字段。
+3. 已通过 6 项定向价格/提示词回归、`py_compile`、文档校验和差异校验。获用户同意提交部署后，仅重跑 sxyh2 和 test3 的“AI 价格分计算”：前者应出数值，后者若模型再次自相矛盾将触发一次紧凑重试而不保存错误分数。
 
 ## 活跃记录（最多 10 条）
 
-### 1. 独立报价与价格分 V3（本地完成，待提交部署）
+### 1. 独立报价与价格分 V3（已部署，持续验收）
 
 - 已实施：报价从文件中心弹窗迁为同级“报价与价格分”页面；规则草稿或已确认规则出现后即可读取、补录、调整和统一计算，切换页面保留未保存草稿。修正“参与计算”复选框错位，并仅在移出时展示不参与原因。
 - 公式与数据边界：新增严格公式编译器，支持明确的最低价比例法和完整的平均值偏差扣分法；均值/偏差条款绝不误判为最低价比例法。任一参与人缺少计分价时阻止基准价和自动计分，复杂/不完整公式回退手工分。
 - 链路隔离：价格评分规则不再进入综合评审或单独客观评分模型调用，旧结果以新增 `price_managed_by_sheet` 标识兼容隐藏；报价合规等非评分审查规则保持原链。报告、CSV 从独立工作表输出价格分。
 - 已清理旧链路：删除无调用方的跨投标人模型价格评分、公式复算、结果回写及对应提示词/测试；保留任务结果中的 `cross_bid_price` 空元数据仅为既有调用方兼容，保留本地报价事实提取供非评分报价审查使用。
-- 验证：定向价格公式/报价覆盖测试、完整工作台与 AI 网关回归、前端语法、文档和差异校验均通过；尚未部署。
+- 验证：定向价格公式/报价覆盖测试、完整工作台与 AI 网关回归、前端语法、文档和差异校验均通过；核心版本已部署至 `30674c2`。
 
-### 4. sxyh2 价格分误拦截修复（本地完成，待验证）
+### 4. 价格分输出完整性（本地完成，待提交部署）
 
-- 云端任务 `68899199` 显示结构与模型调用均正常；失败来自本地公式校验忽略“差值百分比四舍五入”口径，把 AI 结果误判为不一致。
-- 已移除该数值否决，只保留结构与分值边界校验；该修改适用于所有含取整、去高低或条件分支的价格规则，不针对具体项目。
+- 云端 sxyh2 最新成功任务证明：模型可给出完整 calculation 却把 score 全部写为 null；test3 证明模型可能让 JSON score 与同一条 calculation 的最终分矛盾。二者属于模型输出契约缺口，不是某项目公式特例。
+- 已要求完整输入时始终给出建议分；`needs_review` 仅表达待复核口径。新增 `final_score` 对模型自身输出作无公式语义的完整性校验；不重新引入本地公式复算或修改综合评审链路。
 
 ### 2. 报价误识别修复（已部署 6b6449a，云端已验证）
 
