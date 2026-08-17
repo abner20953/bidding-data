@@ -358,7 +358,13 @@
     renderPriceSheetPane(); updatePriceSheetFooter();
   }
   function draftFieldHtml(entry, field, label, extra = '') {
-    return `<label>${label}<input class="price-draft-field" data-key="${escapeHtml(entry.draft_id)}" data-field="${field}" ${extra} value="${escapeHtml(entry[field] ?? '')}"></label>`;
+    // 调整类字段（优惠适用金额/比例/说明）保存在 entry.adjustment 内层；
+    // 若读取扁平键会导致已保存的数值渲染为空。
+    let value = entry[field] ?? '';
+    if (field.startsWith('adjustment_')) {
+      value = entry.adjustment?.[field.replace('adjustment_', '')] ?? '';
+    }
+    return `<label>${label}<input class="price-draft-field" data-key="${escapeHtml(entry.draft_id)}" data-field="${field}" ${extra} value="${escapeHtml(value)}"></label>`;
   }
   function adjustmentControlHtml(entry) {
     const adjustment = entry.adjustment || {mode:'none'}; const mode = adjustment.mode || 'none';
