@@ -5,12 +5,12 @@ handoff_schema: 1
 updated_at: 2026-08-17
 module: evaluation-workbench
 status: deployed_validation_pending
-base_commit: f838c14
+base_commit: 76c31e0
 branch: main
-working_tree: clean_after_price_adjustment_display_fix_deploy
-remote_github: f838c14
-remote_gitee: f838c14
-production_commit: f838c14
+working_tree: clean_after_empty_price_rule_set_fix_deploy
+remote_github: 76c31e0
+remote_gitee: 76c31e0
+production_commit: 76c31e0
 prompt_version: vision-evidence-contract-v62（已部署；价格分自洽性契约）
 database_change: ew_price_rule_sets、ew_price_score_runs 和 ew_projects.price_profile_id 已按 SQLite 兼容迁移部署；本轮无数据库变更
 user_approval: 已授权实施、提交、推送和部署
@@ -20,7 +20,7 @@ user_approval: 已授权实施、提交、推送和部署
 
 ## 下一位先做
 
-1. 云端已部署 `f838c14`。test3"AI 计算没结果"已定位：08:50 提取价格规则产出 0 条并保存空专用集，遮蔽完整规则集价格规则（c5fd9e45）。本地已修：空专用集回退完整集、零结果提取不覆盖既有专用集（+2 回归，559 项通过）。待部署后重跑 test3 计算（计分价已为 4 家去税价，基准价≈1652677.47）；jc 回显修复后应显示优惠金额/比例；sxyh2 复跑应为 4×30。
+1. 云端已部署 `76c31e0`（空专用集回退完整集）并验证：test3 恢复使用完整规则集价格规则，基准价 1652677.4737、四家 43.63/44.13/36.14/37.01（与手算一致）。jc 回显修复（`f838c14`）已生效；sxyh2 复跑应为 4×30（待重跑核对）。test3 提取价格规则零结果是否为模型偶发——如再提取仍为 0 需进一步查组装输出。
 
 ## 活跃记录（最多 10 条）
 
