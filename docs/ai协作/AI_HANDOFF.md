@@ -4,13 +4,13 @@
 handoff_schema: 1
 updated_at: 2026-08-17
 module: evaluation-workbench
-status: local_changes
-base_commit: bb7883c
+status: deployed_validation_pending
+base_commit: 908037d
 branch: main
-working_tree: price_ai_calculation_and_refresh_fix_uncommitted
-remote_github: bb7883c
-remote_gitee: bb7883c
-production_commit: bb7883c
+working_tree: clean_after_price_ai_calculation_deploy
+remote_github: 908037d
+remote_gitee: 908037d
+production_commit: 908037d
 prompt_version: compare-evidence-ai-v5（本轮未修改）
 database_change: 新增 ew_price_rule_sets、ew_price_score_runs 和 ew_projects.price_profile_id；SQLite 兼容迁移，尚未提交部署
 user_approval: 已授权实施、提交、推送和部署
@@ -20,7 +20,7 @@ user_approval: 已授权实施、提交、推送和部署
 
 ## 下一位先做
 
-1. 云端已部署 `bb7883c`；本地继续在其基础上实现独立 AI 价格分计算，尚未提交或部署，云端结果不可用作本轮验收。
+1. 云端已部署 `908037d` 并验证：价格页按 V5 契约显示"待 AI 计算"（calculation_ready=false、输入指纹已生成、4 家计分价就绪）。剩余动作：页面点"保存全部修改并由 AI 重算"（或综合评审联动）触发 `calculate_price_scores`，核对 AI 分数、基准价与本地公式一致性；查重/规则页按钮高度修复已随部署生效。
 2. 已新增 `calculate_price_scores`：价格规则提取完成后自动串行计算；用户保存报价/参与范围/调整后也以价格页所选模型重算。请求仅含独立规则与结构化报价台账，AI 结果按输入指纹保存到 `ew_price_score_runs`；可完整表达的本地公式只做校验，不替代 AI 建议。
 3. 前端价格页改为按最新成功价格任务 ID 刷新，修复任务在两次轮询之间完成时需切换标签才显示新报价/规则的问题。综合评审、规则提取、OCR/图片和查重主链未改动。
 
