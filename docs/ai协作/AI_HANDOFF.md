@@ -4,13 +4,13 @@
 handoff_schema: 1
 updated_at: 2026-08-17
 module: evaluation-workbench
-status: local_changes
-base_commit: 77c7d09
+status: deployed_validation_pending
+base_commit: bb7883c
 branch: main
-working_tree: price_sheet_followup_uncommitted
-remote_github: 77c7d09
-remote_gitee: 77c7d09
-production_commit: 77c7d09
+working_tree: clean_after_price_sheet_v4_deploy
+remote_github: bb7883c
+remote_gitee: bb7883c
+production_commit: bb7883c
 prompt_version: compare-evidence-ai-v5（本轮未修改）
 database_change: 新增 ew_price_rule_sets 独立价格规则集表（已提交待部署；SQLite 兼容迁移）
 user_approval: 已授权实施、提交、推送和部署
@@ -20,7 +20,7 @@ user_approval: 已授权实施、提交、推送和部署
 
 ## 下一位先做
 
-1. 当前本地待提交：报价页修正为固定列宽，移除逐投标人手工价格分输入；项目切换时防止旧项目异步响应覆盖当前项目。sxyh2 云端核查发现：价格规则已提取，四家投标文件均为“金额在投标总报价字段之前”的常见版式，旧定位器因此漏取；规则使用“每增加/每减少1%”表达偏离扣分，旧编译器未识别。两处均已做通用修复并补测试；报价识别指纹已升至 V4，部署后会自动进入刷新判定，待在 sxyh2 验收四家报价与自动计算结果。
+1. 云端已部署 `bb7883c` 并验证：price-sheet-v4 生效；sxyh2 价格规则编译为 `average_factor_deviation`（auto=True，满分30，此前'需手工计分'）；4 家报价全部提取成功（金额前置版式修复生效，此前全部 missing）。剩余动作：页面核对 4 家报价与自动价格分、基准价（去高低20%后算术平均）是否符合预期；另以最低价比例项目验收。
 2. 新增独立价格规则任务：查重与价格规则提取均支持选择模型；价格规则任务只读取评分原文台账并写入 `ew_price_rule_sets`，不会改写完整规则集或综合评审结果。综合评审结束后会以最佳努力刷新报价台账并确定性计算价格分，刷新失败不影响已完成评审。
 3. 价格公式编译补充“评标基准价计算方法→去高低说明→算术平均”的受控结构锚点，并以含取整数说明的完整长条款回归；不再因该类说明超过短邻域而把可计算公式误判为手工核算。
 2. 综合评审、规则提取、OCR/图片、查重主链仍受保护；本轮只将价格评分规则从综合评审和客观分展示中隔离，不改变其他审查规则。
