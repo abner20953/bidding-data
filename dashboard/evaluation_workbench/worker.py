@@ -4739,6 +4739,69 @@ def _normalise_visual_rule_policies(rules: list[dict]) -> list[dict]:
     return result
 
 
+def _extract_price_rules(app, task: dict) -> dict:
+    """只从评分原文台账提取价格规则，不改写完整评审规则集。"""
+    project = storage.get_project(app, task["project_id"])
+    if not project:
+        raise ValueError("评标项目不存在")
+    package_number, package_scope_instruction = _project_package_scope_instruction(app, project)
+    documents = storage.list_documents(app, task["project_id"])
+    source_documents = [
+        item for item in documents
+        if item["role"] in {"tender", "tender_attachment"}
+        and item.get("parse_status") == "success" and item.get("parsed_path")
+    ]
+    if not any(item["role"] == "tender" for item in source_documents):
+        raise ValueError("请先上传并成功解析主招标文件")
+    profile = storage.get_model_profile(app, task.get("payload", {}).get("profile_id"), "deepseek-v4-flash")
+    packets: list[dict] = []
+    for document in source_documents:
+        text = Path(document["parsed_path"]).read_text(encoding="utf-8", errors="ignore").strip()
+        if text:
+            packets.extend(_score_clause_packets(text, limit=400 - len(packets), source_document_key=document["document_id"]))
+        if len(packets) >= 400:
+            break
+    packets = _filter_score_packets_for_package(
+        [packet for packet in packets if not packet.get("is_section_summary")], package_number,
+    )
+    # 先用评分台账和分部归属高召回定位价格段；命中某分部时连同该分部全部条款交给
+    # AI，避免公式行本身没有“报价”字样而漏失。该模型调用不触及完整规则集。
+    price_sections = {
+        str((packet.get("score_section") or {}).get("section_id") or "")
+        for packet in packets
+        if price_sheet._PRICE_RULE_PATTERN.search(_score_packet_text(packet))
+        or price_sheet._PRICE_RULE_PATTERN.search(str((packet.get("score_section") or {}).get("label") or ""))
+    }
+    candidates = [
+        packet for packet in packets
+        if str((packet.get("score_section") or {}).get("section_id") or "") in price_sections
+        or price_sheet._PRICE_RULE_PATTERN.search(_score_packet_text(packet))
+    ]
+    storage.update_task(app, task["task_id"], progress=20, message="正在定位价格评分原文")
+    if not candidates:
+        storage.save_price_rule_set(app, task["project_id"], task["task_id"], profile["profile_id"], [])
+        return {"rule_count": 0, "mode": "price_only", "message": "未在评分原文中定位到价格评分条款"}
+    system_prompt = f"{_system_prompt(app, 'extract_rules')}\n\n【当前项目分包范围】\n{package_scope_instruction}"
+    task["_evaluation_request_gate"] = _EvaluationRequestGate(
+        limit=1, max_limit=_profile_parallel_limit(profile, len(candidates)),
+    )
+    storage.update_task(app, task["task_id"], progress=35, message="正在使用所选模型组装价格评分规则")
+    rules, stats = _extract_scoring_rules_from_ledger(
+        app, task, profile, system_prompt, candidates,
+        document_id=source_documents[0]["document_id"], declared_total=None,
+    )
+    price_rules = []
+    for index, item in enumerate(rules, start=1):
+        if not price_sheet.is_price_scoring_rule(item):
+            continue
+        value = dict(item)
+        value["rule_id"] = f"price-only-{task['task_id']}-{index}"
+        value["enabled"] = True
+        price_rules.append(value)
+    storage.save_price_rule_set(app, task["project_id"], task["task_id"], profile["profile_id"], price_rules)
+    return {"rule_count": len(price_rules), "source_clause_count": len(candidates), "mode": "price_only", "assembly": stats}
+
+
 def _extract_rules(app, task: dict) -> dict:
     project = storage.get_project(app, task["project_id"])
     if not project:
@@ -13881,6 +13944,7 @@ def _evaluate_all(app, task: dict) -> dict:
             "subjective_run_id": subjective_run["score_run_id"] if subjective_run else None, "document_count": len(documents),
             "reused_document_count": reused_document_count, "model_document_count": len(documents) - reused_document_count,
             "rule_count": len(all_rules), "profile": profile["display_name"],
+            "price_sheet_refresh": "after_task_completion",
             "vision_profile": vision_profile.get("display_name") if vision_profile and visual_rule_count else None,
             "vision_rule_count": visual_rule_count,
             # format_recovery_count 保留旧任务结果的统计语义；其余字段按真实调用路径拆分，
@@ -13932,6 +13996,8 @@ def run_task(app, task: dict) -> None:
             result = _compare_documents(app, task)
         elif task["task_type"] == "extract_rules":
             result = _extract_rules(app, task)
+        elif task["task_type"] == "extract_price_rules":
+            result = _extract_price_rules(app, task)
         elif task["task_type"] == "review_documents":
             result = _review_documents(app, task)
         elif task["task_type"] == "score_objective":
@@ -13948,6 +14014,15 @@ def run_task(app, task: dict) -> None:
             message=(result.get("completion_message") or "任务部分完成，可仅重跑失败项") if partial else "任务完成",
             status="success", result=result,
         )
+        if task["task_type"] == "evaluate_all":
+            # 必须在任务状态切为 success 后才刷新；刷新器在运行任务存在时会主动
+            # 只读返回，以避免 2 核服务器和主任务争用资源。
+            try:
+                price_sheet.refresh_price_sheet(app, task["project_id"])
+            except Exception:
+                # 报价工作表是综合评审后的独立便利操作，任何刷新异常都不得反向把
+                # 已完成的评审任务改为失败。
+                pass
     except (ComparisonLimitError, ValueError) as exc:
         storage.update_task(app, task["task_id"], status="error", error=str(exc), message="任务失败")
     except Exception as exc:

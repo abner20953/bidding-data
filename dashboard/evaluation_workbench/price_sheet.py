@@ -16,7 +16,9 @@ from pathlib import Path
 from dashboard.evaluation_workbench import storage
 
 
-PRICE_SHEET_VERSION = "price-sheet-v3"
+# 报价定位算法变更时递增此版本，使已落库的旧识别结果自动进入刷新判定，
+# 避免历史项目继续沿用旧定位器留下的空报价或误识别结果。
+PRICE_SHEET_VERSION = "price-sheet-v4"
 
 _PRICE_RULE_PATTERN = re.compile(
     r"最低(?:投标)?价|评审价|评标价|基准价|价格分|报价得分|投标报价[^，。；]{0,20}得分"
@@ -65,42 +67,51 @@ def _plain_amount_is_safe(tail: str, match: re.Match) -> bool:
     return not _IDENTIFIER_PREFIX_PATTERN.search(prefix)
 
 
-def _amounts_after_quote_label(window: str) -> list[Decimal]:
+def _amounts_near_quote_label(window: str) -> list[Decimal]:
+    """从明确报价字段的最近邻域提取金额。
+
+    常见投标函会写成“人民币 X 元的投标总报价”，金额位于字段之前；报价表又常把
+    金额放在字段之后。两种版式都只接受字段前后有限邻域中最近的金额，避免把同页
+    的年份、税率、编号或分项金额混入。
+    """
     quote_field = _QUOTE_FIELD_PATTERN.search(window)
     label = quote_field or _TOTAL_QUOTE_LABEL_PATTERN.search(window)
     if not label:
         return []
-    # 只读取标签后的短邻域，避免同一页的预算、日期、税率或分项价混入总报价。
-    tail = window[label.end():label.end() + 180]
-    values: list[Decimal] = []
-    occupied: list[tuple[int, int]] = []
-    for match in _AMOUNT_WITH_UNIT_PATTERN.finditer(tail):
-        value = _decimal(match.group("amount"))
-        if value is None:
-            continue
-        if match.group("unit") == "万元":
-            value *= Decimal("10000")
-        values.append(value)
-        occupied.append(match.span())
-    if values:
-        return values
-    patterns = [_CURRENCY_AMOUNT_PATTERN]
-    # 无单位、无币种符号的长数字只有紧随明确“报价”字段时才采纳；单凭
-    # “开标一览表”标题不足以区分报价、项目编号、日期或其他表格数字。
-    if quote_field:
-        patterns.append(_PLAIN_AMOUNT_PATTERN)
-    for pattern in patterns:
-        for match in pattern.finditer(tail):
-            if any(start <= match.start() < end for start, end in occupied):
-                continue
-            if pattern is _PLAIN_AMOUNT_PATTERN and not _plain_amount_is_safe(tail, match):
+    start = max(0, label.start() - (180 if quote_field else 0))
+    end = min(len(window), label.end() + 180)
+    context = window[start:end]
+    label_start, label_end = label.start() - start, label.end() - start
+    candidates: list[tuple[int, Decimal]] = []
+
+    def distance(match: re.Match) -> int:
+        if match.end() <= label_start:
+            return label_start - match.end()
+        if match.start() >= label_end:
+            return match.start() - label_end
+        return 0
+
+    def collect(pattern: re.Pattern, *, allow_plain: bool = False) -> None:
+        for match in pattern.finditer(context):
+            if allow_plain and not _plain_amount_is_safe(context, match):
                 continue
             value = _decimal(match.group("amount"))
-            if value is not None:
-                values.append(value)
-        if values:
-            break
-    return values
+            if value is None:
+                continue
+            if pattern is _AMOUNT_WITH_UNIT_PATTERN and match.group("unit") == "万元":
+                value *= Decimal("10000")
+            candidates.append((distance(match), value))
+
+    collect(_AMOUNT_WITH_UNIT_PATTERN)
+    collect(_CURRENCY_AMOUNT_PATTERN)
+    # 无单位数字只能紧邻明确报价字段采纳；“开标一览表”标题本身不足以判定其后的
+    # 数字就是总报价。
+    if quote_field:
+        collect(_PLAIN_AMOUNT_PATTERN, allow_plain=True)
+    if not candidates:
+        return []
+    nearest = min(item[0] for item in candidates)
+    return [value for item_distance, value in candidates if item_distance == nearest]
 
 
 def _quote_from_lines(lines) -> tuple[Decimal | None, str, str]:
@@ -111,7 +122,7 @@ def _quote_from_lines(lines) -> tuple[Decimal | None, str, str]:
         if not values or not _TOTAL_QUOTE_LABEL_PATTERN.search(values[0]):
             return
         window = " ".join(values)
-        candidates.extend((amount, window[:260]) for amount in _amounts_after_quote_label(window))
+        candidates.extend((amount, window[:260]) for amount in _amounts_near_quote_label(window))
 
     for raw in lines:
         buffer.append(str(raw or "").strip())
@@ -167,6 +178,9 @@ def _extraction_fingerprint(entry: dict) -> str:
 
 
 def _rule_scoring(rule: dict) -> dict:
+    direct = rule.get("scoring") if isinstance(rule, dict) else None
+    if isinstance(direct, dict):
+        return direct
     try:
         value = json.loads(rule.get("scoring_json") or "{}")
     except (TypeError, json.JSONDecodeError):
@@ -218,6 +232,10 @@ def _compile_price_formula(rule: dict) -> dict:
 
     average_base = re.search(
         r"(?:算术)?平均(?:值|价)?.{0,48}(?:为|作为|确定为).{0,24}(?:评标|评审)?基准价"
+        # “基准价的计算方法”后的去高低价、取整数和适用家数说明常很长，不能用
+        # 普通的短邻域误判为缺公式。这里保留明确的“基准价计算方法→算术平均”
+        # 结构和单句边界，不以单纯扩大任意关键词距离来放宽识别。
+        r"|(?:评标|评审)?基准价(?:的)?计算方法[:：]?[^。；;]{0,220}?(?:算术)?平均(?:值|价)?"
         r"|(?:评标|评审)?基准价.{0,48}(?:算术)?平均(?:值|价)?",
         text,
     )
@@ -225,8 +243,21 @@ def _compile_price_formula(rule: dict) -> dict:
     factor = _decimal_factor(factor_match.group(1)) if factor_match else Decimal("1")
     # 不跨句寻找高低偏差项，且“每高/每低”必须与对应方向绑定；否则一条规则里
     # 的低于基准价扣分可能被贪婪地误读为高于基准价扣分。
-    high = re.search(r"高于[^。；;]{0,28}?基准价[^。；;]{0,28}?每(?:高于|高)?\s*1%?.{0,18}?扣\s*(\d+(?:\.\d+)?)\s*分", text)
-    low = re.search(r"低于[^。；;]{0,28}?基准价[^。；;]{0,28}?每(?:低于|低)?\s*1%?.{0,18}?扣\s*(\d+(?:\.\d+)?)\s*分", text)
+    # 评分表既会写“高于/低于基准价”，也会先写“报价比基准价每增加/减少”。
+    # 两者都是明确的价格偏离方向；仍限定在同一句的“基准价 + 每 1% + 扣分”结构，
+    # 不把普通数量递增条款误当作价格公式。
+    high = re.search(
+        r"(?:高于[^。；;]{0,28}?基准价[^。；;]{0,28}?每(?:高于|高)?\s*1%?"
+        r"|(?:报价|价格|价)[^。；;]{0,32}?基准价[^。；;]{0,32}?每(?:增加|高于|高)\s*1%?)"
+        r".{0,18}?扣\s*(\d+(?:\.\d+)?)\s*分",
+        text,
+    )
+    low = re.search(
+        r"(?:低于[^。；;]{0,28}?基准价[^。；;]{0,28}?每(?:低于|低)?\s*1%?"
+        r"|(?:报价|价格|价)[^。；;]{0,32}?基准价[^。；;]{0,32}?每(?:减少|低于|低)\s*1%?)"
+        r".{0,18}?扣\s*(\d+(?:\.\d+)?)\s*分",
+        text,
+    )
     if not (average_terms and average_base and factor and high and low):
         return {"kind": None, "reason": "公式要素不完整，需手工计分"}
 
@@ -263,9 +294,18 @@ def is_price_scoring_rule(rule: dict) -> bool:
 
 def _price_rules(app, project_id: str) -> tuple[dict | None, list[dict]]:
     rule_set, rules = storage.list_rules(app, project_id)
+    dedicated = storage.current_price_rule_set(app, project_id)
+    # 用户在价格页主动提取的规则仅服务价格试算；若它晚于完整规则集，就优先采用，
+    # 既不会污染综合评审，也不会让完整规则集的旧价格条款覆盖用户的明确操作。
+    if dedicated and (not rule_set or str(dedicated.get("updated_at") or "") >= str(rule_set.get("updated_at") or "")):
+        rule_set = {
+            "rule_set_id": dedicated.get("price_rule_set_id"), "status": "price_only",
+            "version": "独立价格规则", "source": "price_only",
+        }
+        rules = dedicated.get("rules") or []
     values = []
     for rule in rules:
-        if not rule.get("enabled") or not is_price_scoring_rule(rule):
+        if rule.get("enabled") is False or not is_price_scoring_rule(rule):
             continue
         scoring = _rule_scoring(rule)
         max_score = _decimal(scoring.get("max_score"))

@@ -5311,6 +5311,21 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIsNone(value)
         self.assertEqual(status, "missing")
 
+    def test_price_sheet_uses_newer_independent_price_rule_without_changing_full_rule_set(self):
+        full_rule_set, _ = storage.list_rules(self.app, self.project["project_id"])
+        storage.save_price_rule_set(self.app, self.project["project_id"], None, "profile", [{
+            "rule_id": "price-only-1", "enabled": True, "category": "objective",
+            "title": "报价得分", "check_rule": "最低报价为基准价，报价得分=（评标基准价／投标报价）×10。",
+            "source_text": "价格分满分10分", "scoring": {"kind": "manual", "max_score": 10},
+        }])
+
+        sheet = price_sheet.build_price_sheet(self.app, self.project["project_id"])
+
+        self.assertEqual(sheet["rule_set"]["status"], "price_only")
+        self.assertEqual(sheet["rules"][0]["rule_id"], "price-only-1")
+        self.assertIsNone(full_rule_set)
+        self.assertIsNone(storage.list_rules(self.app, self.project["project_id"])[0])
+
     def test_price_sheet_does_not_treat_identifier_or_date_as_unqualified_quote(self):
         for lines in (
             ["投标报价：统一社会信用代码：91110108"],
@@ -5322,6 +5337,14 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             self.assertEqual(status, "missing")
         value, _excerpt, status = price_sheet._quote_from_lines(["投标报价：100000"])
         self.assertEqual(value, Decimal("100000"))
+        self.assertEqual(status, "found")
+
+    def test_price_sheet_finds_currency_amount_before_explicit_total_quote_field(self):
+        value, _excerpt, status = price_sheet._quote_from_lines([
+            "人民币壹佰零伍万贰仟伍佰叁拾元整（¥1,052,530.00）的投标总报价（其中增值税税率为13%）。",
+        ])
+
+        self.assertEqual(value, Decimal("1052530.00"))
         self.assertEqual(status, "found")
 
     def test_price_sheet_batch_adjusts_prices_without_task_or_model_calls(self):
@@ -5431,6 +5454,44 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(compiled["kind"], "average_factor_deviation")
         self.assertEqual(compiled["high_rate"], Decimal("1"))
         self.assertEqual(compiled["low_rate"], Decimal("0.5"))
+
+    def test_price_sheet_compiles_increase_decrease_wording_for_price_deviation(self):
+        rule = {
+            "title": "价格部分-报价得分",
+            "check_rule": (
+                "评标基准价的计算方法：去掉采购成本价最高的20%和最低的20%后进行算术平均。"
+                "采购成本价等于评标基准价时得30分；采购成本价比评标基准价每增加1%扣0.5分，"
+                "采购成本价比评标基准价每减少1%扣0.3分。"
+            ),
+            "source_text": "价格分满分30分",
+            "scoring_json": json.dumps({"max_score": 30}),
+        }
+
+        compiled = price_sheet._compile_price_formula(rule)
+        self.assertEqual(compiled["kind"], "average_factor_deviation")
+        self.assertEqual(compiled["high_rate"], Decimal("0.5"))
+        self.assertEqual(compiled["low_rate"], Decimal("0.3"))
+
+    def test_price_sheet_compiles_long_average_basis_method_clause(self):
+        rule = {
+            "title": "价格部分-报价得分",
+            "check_rule": (
+                "通过初步评审的投标人报价为有效报价，依据采购成本价与评标基准价的差值百分比评分。"
+                "评标基准价的计算方法：当通过初步评审的投标人≥5家时，去掉采购成本价最高的20%家数"
+                "（取整数部分）和最低的20%家数（取整数部分）后的剩余家数的采购成本价进行算术平均。"
+                "当采购成本价等于评标基准价时得30分；采购成本价比评标基准价每增加1%（四舍五入），"
+                "扣0.5分，当采购成本价比评标基准价每减少1%（四舍五入），扣0.3分，扣至0分止。"
+            ),
+            "source_text": "价格部分报价得分，满分30分",
+            "scoring_json": json.dumps({"max_score": 30}),
+        }
+
+        compiled = price_sheet._compile_price_formula(rule)
+
+        self.assertEqual(compiled["kind"], "average_factor_deviation")
+        self.assertEqual(compiled["trim_mode"], "percent_20")
+        self.assertEqual(compiled["high_rate"], Decimal("0.5"))
+        self.assertEqual(compiled["low_rate"], Decimal("0.3"))
 
     def test_form_candidates_include_adjacent_continuation_pages(self):
         parsed = self.temp_dir / "statement.txt"

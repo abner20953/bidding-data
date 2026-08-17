@@ -290,7 +290,7 @@
     const seconds = elapsedSeconds % 60;
     return ` · 耗时 ${minutes ? `${minutes}分${seconds}秒` : `${seconds}秒`}`;
   }
-  function taskTypeLabel(type) { return {parse_documents:'文件解析',compare_documents:'文件查重',extract_rules:'规则提取',review_documents:'文件审查',score_objective:'客观评分',score_subjective:'主观评分',evaluate_all:'综合评审'}[type] || type || '任务'; }
+  function taskTypeLabel(type) { return {parse_documents:'文件解析',compare_documents:'文件查重',extract_rules:'规则提取',extract_price_rules:'价格规则提取',review_documents:'文件审查',score_objective:'客观评分',score_subjective:'主观评分',evaluate_all:'综合评审'}[type] || type || '任务'; }
   function queueDetail(context) {
     if (!context) return '';
     const waiting = Number(context.waiting_count || 0);
@@ -352,12 +352,9 @@
   }
   function priceDraftEntry(key) { return priceDraft?.entries.find((entry) => entry.draft_id === key) || null; }
   function renderPriceSheet() {
-    const badge = $('price-sheet-badge');
-    if (badge) {
-      const entries = currentPriceSheet?.entries || [];
-      badge.textContent = currentPriceSheet ? `${entries.length} 家 · ${currentPriceSheet.deferred ? '任务运行中' : '可试算'}` : '加载中';
-    }
-    if (document.querySelector('[data-pane="price"]')?.classList.contains('active') && priceDraft) renderPriceSheetPane();
+    if (!document.querySelector('[data-pane="price"]')?.classList.contains('active') || !currentPriceSheet) return;
+    if (!priceDraft) beginPriceDraft();
+    renderPriceSheetPane(); updatePriceSheetFooter();
   }
   function draftFieldHtml(entry, field, label, extra = '') {
     return `<label>${label}<input class="price-draft-field" data-key="${escapeHtml(entry.draft_id)}" data-field="${field}" ${extra} value="${escapeHtml(entry[field] ?? '')}"></label>`;
@@ -377,7 +374,8 @@
     const entries = priceDraft.entries; const included = entries.filter((entry) => entry.included).length;
     const rulePicker = rules.length ? `<label class="price-rule-picker">价格评分规则<select id="price-rule-select">${rules.map((item) => `<option value="${item.rule_id}" ${item.rule_id === selectedPriceRuleId ? 'selected' : ''}>${escapeHtml(item.title)} · 满分 ${item.max_score ?? '-'}</option>`).join('')}</select></label>` : '<p class="muted">尚未提取到价格评分规则；当前可先核对报价并补录。</p>';
     const ruleDetails = rule ? `<details class="price-rule-details"><summary>查看报价分规则</summary><p><strong>${escapeHtml(rule.title)}</strong> · ${escapeHtml(rule.formula_label)} · 满分 ${escapeHtml(rule.max_score ?? '-')}</p><p>${escapeHtml(rule.check_rule || '未提供明确计算说明。')}</p>${rule.formula_reason ? `<p class="muted">自动计算说明：${escapeHtml(rule.formula_reason)}</p>` : ''}${rule.source_text ? `<p class="muted">原文：${escapeHtml(rule.source_text)}</p>` : ''}</details>` : '';
-    const summary = `<div class="price-sheet-summary"><span class="price-summary-item">参与：<strong>${included} 家</strong></span><span class="price-summary-item">规则状态：<strong>${currentPriceSheet.rule_set?.status === 'confirmed' ? '已确认' : '按当前规则草稿试算'}</strong></span>${rule ? `<span class="price-summary-item">公式：<strong>${escapeHtml(rule.formula_label)}</strong></span><span class="price-summary-item">当前基准价：<strong>${rule.benchmark_price ? `${priceValue(rule.benchmark_price)} 元` : (rule.automatic ? '待补齐报价后计算' : '需手工价格分')}</strong></span>` : ''}</div>`;
+    const ruleStatus = currentPriceSheet.rule_set?.status === 'confirmed' ? '已确认' : (currentPriceSheet.rule_set?.status === 'price_only' ? '独立提取已就绪' : '按当前规则草稿试算');
+    const summary = `<div class="price-sheet-summary"><span class="price-summary-item">参与：<strong>${included} 家</strong></span><span class="price-summary-item">规则状态：<strong>${ruleStatus}</strong></span>${rule ? `<span class="price-summary-item">公式：<strong>${escapeHtml(rule.formula_label)}</strong></span><span class="price-summary-item">当前基准价：<strong>${rule.benchmark_price ? `${priceValue(rule.benchmark_price)} 元` : (rule.automatic ? '待补齐报价后计算' : '该规则暂不支持自动计算')}</strong></span>` : ''}</div>`;
     const rows = entries.map((entry) => {
       const saved = (currentPriceSheet.entries || []).find((item) => item.price_entry_id === entry.price_entry_id) || entry;
       const source = priceQuoteSource(saved); const score = rule ? saved.scores?.[rule.rule_id] : null;
@@ -385,9 +383,8 @@
       const name = entry.source_type === 'manual' ? draftFieldHtml(entry, 'bidder_name', '投标人名称', 'type="text"') : `<strong>${escapeHtml(entry.bidder_name)}</strong><small class="muted">已上传文件</small>`;
       const quote = `${draftFieldHtml(entry, 'manual_quote', '确认报价（元）', `type="number" min="0" step="0.01" placeholder="${escapeHtml(entry.extracted_quote || '请填写')}"`)}<small class="muted">自动识别：${escapeHtml(priceValue(entry.extracted_quote))}</small>${entry.source_type === 'document' && entry.manual_quote ? `<button class="price-use-extracted" data-key="${escapeHtml(entry.draft_id)}" type="button">恢复自动报价</button>` : ''}<details class="price-source-details"><summary>${escapeHtml(source[0])}</summary><span>${escapeHtml(source[1] || '无额外摘录')}</span></details>`;
       const scope = `<label class="inline-check price-participation-toggle"><input class="price-draft-field" data-key="${escapeHtml(entry.draft_id)}" data-field="included" type="checkbox" ${entry.included ? 'checked' : ''}><span>参与计算</span></label>${entry.included ? '<small class="muted">参与基准价与价格分计算</small>' : draftFieldHtml(entry, 'exclusion_reason', '不参与原因（可选）', 'type="text" placeholder="例如已否决"')}`;
-      const manualScore = rule && !rule.automatic ? `<label>手工价格分<input class="price-draft-field" data-key="${escapeHtml(entry.draft_id)}" data-field="manual_score:${rule.rule_id}" type="number" min="0" max="${rule.max_score ?? ''}" step="0.01" value="${escapeHtml(entry.manual_scores?.[rule.rule_id] ?? '')}" placeholder="可填写"></label>` : '';
       const remove = entry.source_type === 'manual' ? `<button class="delete-price-draft danger" data-key="${escapeHtml(entry.draft_id)}" type="button">删除补录</button>` : '';
-      return `<tr class="${entry.included ? '' : 'price-excluded'}"><td class="price-bidder-cell">${name}</td><td>${quote}</td><td class="price-adjustment-cell">${adjustmentControlHtml(entry)}</td><td>${scope}</td><td><span class="${score?.source === 'manual' ? 'price-score price-score-manual' : score ? 'price-score' : 'price-score price-score-unavailable'}" title="${escapeHtml(score?.calculation || '')}">${escapeHtml(scoreText)}</span>${manualScore}${remove}</td></tr>`;
+      return `<tr class="${entry.included ? '' : 'price-excluded'}"><td class="price-bidder-cell">${name}</td><td>${quote}</td><td class="price-adjustment-cell">${adjustmentControlHtml(entry)}</td><td>${scope}</td><td><span class="${score?.source === 'manual' ? 'price-score price-score-manual' : score ? 'price-score' : 'price-score price-score-unavailable'}" title="${escapeHtml(score?.calculation || '')}">${escapeHtml(scoreText)}</span>${remove}</td></tr>`;
     }).join('');
     const coverageWarning = rule?.automatic && !rule.calculation_ready && rule.calculation_block_reason ? `<p class="price-sheet-warning">${escapeHtml(rule.calculation_block_reason)}</p>` : '';
     target.innerHTML = `<div class="price-sheet-toolbar">${rulePicker}${ruleDetails}</div>${summary}${coverageWarning}<p class="price-sheet-note">${escapeHtml(currentPriceSheet.notice || '')} 价格优惠、税率差异等由人工选择并填写依据；系统只按明确输入统一计算，不自动判断政策资格。</p><div class="price-table-wrap"><table class="price-table price-workbench-table"><thead><tr><th>投标人</th><th>确认报价</th><th>计分价调整</th><th>参与范围</th><th>价格分</th></tr></thead><tbody>${rows}</tbody></table></div>`;
@@ -396,7 +393,6 @@
       const entry = priceDraftEntry(input.dataset.key); if (!entry) return;
       const field = input.dataset.field;
       if (field === 'included') entry.included = input.checked;
-      else if (field.startsWith('manual_score:')) { const ruleId = field.split(':')[1]; entry.manual_scores = entry.manual_scores || {}; entry.manual_scores[ruleId] = input.value; }
       else if (field.startsWith('adjustment_')) { entry.adjustment = entry.adjustment || {mode:'none'}; entry.adjustment[field.replace('adjustment_', '')] = input.value; }
       else entry[field] = input.value;
       priceDraft.dirty = true;
@@ -414,11 +410,9 @@
     $('price-sheet-dirty').textContent = priceDraft?.dirty ? '有未保存修改；保存后统一计算价格分。' : '报价、优惠和参与范围可先集中编辑，再统一保存计算。';
   }
   function batchPayload() {
-    const rule = priceSheetRule(); const cleanEntry = (entry) => {
+    const cleanEntry = (entry) => {
       const adjustment = entry.adjustment || {mode:'none'};
-      const raw = {price_entry_id:entry.price_entry_id, bidder_name:entry.bidder_name, manual_quote:entry.manual_quote, evaluation_price:entry.evaluation_price, included:Boolean(entry.included), exclusion_reason:entry.exclusion_reason, adjustment:{mode:adjustment.mode || 'none', base_amount:adjustment.base_amount || '', rate_percent:adjustment.rate_percent || '', note:adjustment.note || ''}};
-      if (rule && !rule.automatic) { raw.manual_score_rule_id = rule.rule_id; raw.manual_score = entry.manual_scores?.[rule.rule_id] ?? ''; }
-      return raw;
+      return {price_entry_id:entry.price_entry_id, bidder_name:entry.bidder_name, manual_quote:entry.manual_quote, evaluation_price:entry.evaluation_price, included:Boolean(entry.included), exclusion_reason:entry.exclusion_reason, adjustment:{mode:adjustment.mode || 'none', base_amount:adjustment.base_amount || '', rate_percent:adjustment.rate_percent || '', note:adjustment.note || ''}};
     };
     return {entries:priceDraft.entries.filter((entry) => entry.price_entry_id).map(cleanEntry), new_entries:priceDraft.entries.filter((entry) => !entry.price_entry_id).map(cleanEntry), delete_manual_entry_ids:priceDraft.deleted};
   }
@@ -436,17 +430,21 @@
   async function refreshPriceSheet(force = false, quiet = false) {
     if (!activeProject) return;
     if (priceDraft?.dirty && !force) return;
+    const projectId = activeProject;
     try {
-      let data = await request(`/projects/${activeProject}/price-sheet${force ? '/refresh' : ''}`, force ? {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({force:true})} : {});
+      let data = await request(`/projects/${projectId}/price-sheet${force ? '/refresh' : ''}`, force ? {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({force:true})} : {});
+      if (projectId !== activeProject) return;
       currentPriceSheet = data.price_sheet;
       renderPriceSheet();
       // GET 始终纯读取。只有检测到新文件或解析内容变更时，前端才发起一次明确的 POST 刷新。
       if (!force && currentPriceSheet.needs_refresh && !currentPriceSheet.deferred) {
-        data = await request(`/projects/${activeProject}/price-sheet/refresh`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({force:false})});
+        data = await request(`/projects/${projectId}/price-sheet/refresh`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({force:false})});
+        if (projectId !== activeProject) return;
         currentPriceSheet = data.price_sheet;
         renderPriceSheet();
       }
     } catch (error) {
+      if (projectId !== activeProject) return;
       if (!quiet) throw error;
       console.warn('报价工作表自动刷新失败：', error);
       if (currentPriceSheet) {
@@ -509,9 +507,9 @@
     const [data, visionData, ocrData] = await Promise.all([request('/model-profiles'), request('/vision-configuration'), request('/tencent-ocr-configuration')]); modelProfiles = data.profiles; visionConfiguration = visionData.configuration || visionConfiguration; ocrConfiguration = ocrData.configuration || ocrConfiguration; renderOcrConfiguration();
     const active = data.profiles.filter((p) => p.enabled);
     const options = active.map((p) => `<option value="${p.profile_id}">${escapeHtml(p.display_name)} · ${escapeHtml(p.model_name)}${p.api_key_configured ? '' : '（未配置密钥）'}</option>`).join('') || '<option value="">暂无可用模型档案</option>';
-    for (const id of ['rule-profile','all-profile']) $(id).innerHTML = options;
+    for (const id of ['rule-profile','compare-profile','all-profile','price-profile']) $(id).innerHTML = options;
     const defaultProfile = active.find((p) => p.is_default) || active[0];
-    if (defaultProfile) for (const id of ['rule-profile','all-profile']) $(id).value = defaultProfile.profile_id;
+    if (defaultProfile) for (const id of ['rule-profile','compare-profile','all-profile','price-profile']) $(id).value = defaultProfile.profile_id;
     const visionProfiles = active.filter((p) => p.capabilities?.vision);
     $('vision-default-profile').innerHTML = `<option value="">请选择多模态模型</option>${visionProfiles.map((p) => `<option value="${p.profile_id}">${escapeHtml(p.display_name)} · ${escapeHtml(p.model_name)}</option>`).join('')}`;
     $('vision-default-profile').value = visionProfiles.some((p) => p.profile_id === visionConfiguration.default_profile_id) ? visionConfiguration.default_profile_id : '';
@@ -930,7 +928,8 @@
   for (const eventName of ['dragleave', 'drop']) $('file-drop-zone').addEventListener(eventName, (event) => { event.preventDefault(); $('file-drop-zone').classList.remove('is-dragging'); });
   $('file-drop-zone').addEventListener('drop', (event) => { const files = event.dataTransfer?.files; if (!files?.length) return; if (files.length > 1) alert('请一次拖入一个文件，并分别选择对应的文件角色和投标人。'); setSelectedUploadFile(files[0]); });
   $('upload-file').onclick = async () => { const file = selectedUploadFile || $('file-input').files[0]; const role = $('file-role').value; const bidderName = $('bidder-name').value.trim(); if (!file) return alert('请选择或拖入文件'); if (role === 'bid' && !bidderName) { $('bidder-name').focus(); return alert('上传投标文件时必须填写投标人名称'); } const form = new FormData(); form.append('file', file); form.append('role', role); form.append('bidder_name', bidderName); const button = $('upload-file'); button.disabled = true; try { await uploadFileWithProgress(form, file); updateUploadProgress(100, '上传完成，正在刷新文件清单…', 'success'); clearSelectedUploadFile(); $('bidder-name').value = ''; await refreshProject(); await refreshPriceSheet(false, true); } catch (error) { updateUploadProgress(0, `上传失败：${error.message}`, 'error'); alert(error.message); } finally { button.disabled = false; } };
-  $('parse-documents').onclick = () => queue('parse_documents'); $('start-compare').onclick = () => queue('compare_documents', {force_rerun:true});
+  $('parse-documents').onclick = () => queue('parse_documents'); $('start-compare').onclick = () => queue('compare_documents', {profile_id:$('compare-profile').value, force_rerun:true});
+  $('extract-price-rules').onclick = () => queue('extract_price_rules', {profile_id:$('price-profile').value, force_rerun:true});
   const highlightToggle = $('highlights-high-only');
   if (highlightToggle) highlightToggle.onclick = () => { highlightToggle.classList.toggle('active'); renderEvaluationHighlights(cachedHighlights); };
   $('extract-rules').onclick = async () => { if (hasCurrentRules && !confirm('重新提取会按当前招标文件重新生成一套全新 AI 规则，并重新导入通用规则；人工补充规则会保留，上一轮 AI 规则、勾选、取证设置及综合评审结果将不再保留。是否继续？')) return; try { const profile_id = $('rule-profile').value; await request(`/projects/${activeProject}/tasks`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({task_type:'extract_rules', profile_id, force_rerun:true})}); await refreshProject(); } catch (error) { alert(error.message); } };

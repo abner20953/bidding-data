@@ -301,6 +301,10 @@ def task_prompt_template_fingerprint(app, task_type: str) -> str | None:
             "extract_rules_scoring_structure_repair_user",
             "json_repair", "json_repair_user",
         },
+        "extract_price_rules": {
+            "extract_rules", "extract_rules_guidance", "extract_rules_scoring_assembly_user",
+            "extract_rules_scoring_supplement_user", "json_repair", "json_repair_user",
+        },
         "review_documents": {"review_documents", "review_documents_user", "json_repair", "json_repair_user"},
         "score_objective": {"score_objective", "score_objective_user", "json_repair", "json_repair_user"},
         "score_subjective": {"score_subjective", "score_subjective_user", "json_repair", "json_repair_user"},
@@ -450,6 +454,17 @@ def init_database(app) -> None:
                 ON ew_price_entries(project_id, document_id) WHERE document_id IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_ew_price_entries_project
                 ON ew_price_entries(project_id, source_type, created_at);
+            CREATE TABLE IF NOT EXISTS ew_price_rule_sets (
+                price_rule_set_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES ew_projects(project_id) ON DELETE CASCADE,
+                task_id TEXT REFERENCES ew_tasks(task_id) ON DELETE SET NULL,
+                profile_id TEXT,
+                rules_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ew_price_rule_sets_project
+                ON ew_price_rule_sets(project_id, updated_at DESC);
             CREATE TABLE IF NOT EXISTS ew_tasks (
                 task_id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL REFERENCES ew_projects(project_id) ON DELETE CASCADE,
@@ -1462,6 +1477,36 @@ def list_price_entries(app, project_id: str) -> list[dict]:
         return _list_price_entries(conn, project_id)
 
 
+def save_price_rule_set(app, project_id: str, task_id: str | None, profile_id: str | None, rules: list[dict]) -> dict:
+    """保存独立价格规则提取结果，不改写项目的完整评审规则集。"""
+    timestamp = now_iso()
+    with connection(app) as conn:
+        conn.execute(
+            """INSERT INTO ew_price_rule_sets(price_rule_set_id, project_id, task_id, profile_id, rules_json, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (str(uuid.uuid4()), project_id, task_id or None, profile_id or None,
+             json.dumps(rules, ensure_ascii=False, separators=(",", ":")), timestamp, timestamp),
+        )
+    return current_price_rule_set(app, project_id) or {}
+
+
+def current_price_rule_set(app, project_id: str) -> dict | None:
+    with connection(app) as conn:
+        row = conn.execute(
+            "SELECT * FROM ew_price_rule_sets WHERE project_id=? ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+            (project_id,),
+        ).fetchone()
+    if not row:
+        return None
+    value = dict(row)
+    try:
+        rules = json.loads(value.get("rules_json") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        rules = []
+    value["rules"] = [item for item in rules if isinstance(item, dict)]
+    return value
+
+
 def sync_price_document_entries(app, project_id: str) -> list[dict]:
     """按需建立投标文件价格台账，仅供明确的刷新写操作调用。"""
     documents = [item for item in list_documents(app, project_id) if item.get("role") == "bid"]
@@ -1771,6 +1816,7 @@ def task_input_fingerprint(app, project_id: str, task_type: str, profile_id: str
     relevant_roles = {
         "compare_documents": {"tender", "bid"},
         "extract_rules": {"tender", "tender_attachment"},
+        "extract_price_rules": {"tender", "tender_attachment"},
         "review_documents": {"bid"},
         "score_objective": {"bid"},
         "score_subjective": {"bid"},
