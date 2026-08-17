@@ -292,6 +292,24 @@ def _report_compact_objective_ocr_text(value: object) -> str:
     ).strip()
 
 
+def _report_document_quote_label(document: dict) -> str:
+    """报告文件清单的报价展示：投标文件以万元显示，其余角色不适用。"""
+    if document.get("role") != "bid":
+        return "-"
+    status = document.get("quote_status") or "pending"
+    if status == "found":
+        try:
+            yuan = float(document.get("quote_value"))
+        except (TypeError, ValueError):
+            yuan = 0.0
+        if yuan > 0:
+            return f"{yuan / 10000:,.2f} 万元"
+    return {
+        "pending": "待解析后识别", "unavailable": "待解析后识别",
+        "ambiguous": "多个金额待核对", "missing": "未识别到报价",
+    }.get(status, "-")
+
+
 def _report_presentation(documents: list[dict], rule_set: dict | None, rules: list[dict],
                          compare_task: dict | None, compare_pairs: list[dict], reviews: list[dict],
                          objective_scores: list[dict], subjective_scores: list[dict],
@@ -301,6 +319,7 @@ def _report_presentation(documents: list[dict], rule_set: dict | None, rules: li
         **item,
         "role_label": _report_label(_REPORT_ROLE_LABELS, item.get("role")),
         "parse_status_label": _report_label(_REPORT_PARSE_STATUS_LABELS, item.get("parse_status")),
+        "quote_label": _report_document_quote_label(item),
     } for item in documents]
     displayed_rules = [{
         **item,

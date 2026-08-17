@@ -60,6 +60,21 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             self._pdf_upload(filename, text),
         )
 
+    def _add_cjk_pdf(self, filename, role, bidder_name, text):
+        # 默认字体无法嵌入中文（解析后变成占位符），报价提取测试需要内嵌 CJK 字形。
+        pdf = fitz.open()
+        page = pdf.new_page()
+        page.insert_text((72, 72), text, fontname="china-s")
+        content = pdf.tobytes()
+        pdf.close()
+        return storage.store_upload(
+            self.app,
+            self.project["project_id"],
+            role,
+            bidder_name,
+            FileStorage(stream=io.BytesIO(content), filename=filename),
+        )
+
     def _run_next_task(self):
         task = storage.next_queued_task(self.app)
         self.assertIsNotNone(task)
@@ -83,6 +98,23 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         documents = storage.list_documents(self.app, self.project["project_id"])
         self.assertTrue(all(item["parse_status"] == "success" for item in documents))
         self.assertTrue(all(item["text_length"] is not None for item in documents))
+
+    def test_parse_task_extracts_bid_quote_into_document_row(self):
+        self._add_cjk_pdf("tender.pdf", "tender", "", "采购需求：稳定运行。")
+        self._add_cjk_pdf("bid.pdf", "bid", "甲公司", "投标总报价：100000元。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+
+        finished = self._run_next_task()
+
+        self.assertEqual(finished["status"], "success")
+        documents = {item["role"]: item for item in storage.list_documents(self.app, self.project["project_id"])}
+        # 投标文件解析完成即提取报价并缓存到文件清单；非投标文件不提取。
+        self.assertEqual(documents["bid"]["quote_value"], "100000")
+        self.assertEqual(documents["bid"]["quote_status"], "found")
+        self.assertEqual(documents["bid"]["quote_source"], "parsed_text")
+        self.assertTrue(documents["bid"]["quote_fingerprint"])
+        self.assertEqual(documents["tender"]["quote_status"], "pending")
+        self.assertIsNone(documents["tender"]["quote_value"])
 
     def test_parse_and_comparison_share_2500_page_limit(self):
         self.assertEqual(worker.MAX_PARSE_PAGES, 2500)
@@ -5516,6 +5548,61 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertTrue(sheet["deferred"])
         self.assertEqual(sheet["entries"][0]["extracted_quote"], "100000")
         self.assertEqual(sheet["entries"][0]["extraction_status"], "found")
+
+    def test_refresh_price_sheet_reuses_document_quote_without_rescan(self):
+        self._add_cjk_pdf("bid.pdf", "bid", "甲公司", "投标总报价：100000元。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        # 解析完成时报价已缓存到文件清单；刷新必须直接复用，不得二次扫描文件。
+        with patch("dashboard.evaluation_workbench.price_sheet._quote_from_document",
+                   side_effect=AssertionError("不应再次扫描已缓存的报价")):
+            sheet = self.app.test_client().post(
+                f"/api/evaluation-workbench/projects/{self.project['project_id']}/price-sheet/refresh"
+            ).get_json()["price_sheet"]
+        entry = sheet["entries"][0]
+        self.assertEqual(entry["extracted_quote"], "100000")
+        self.assertEqual(entry["extraction_status"], "found")
+        self.assertEqual(entry["quote_source"], "parsed_text")
+
+    def test_refresh_price_sheet_extracts_and_writes_back_to_document_row(self):
+        bid = self._add_pdf("legacy-bid.pdf", "bid", "甲公司", "占位")
+        parsed = self.temp_dir / "legacy-bid.txt"
+        parsed.write_text("投标总报价：120000元。", encoding="utf-8")
+        with storage.connection(self.app) as conn:
+            conn.execute("UPDATE ew_documents SET parse_status='success', parsed_path=? WHERE document_id=?",
+                         (str(parsed), bid["document_id"]))
+        client = self.app.test_client()
+        path = f"/api/evaluation-workbench/projects/{self.project['project_id']}/price-sheet"
+        sheet = client.post(f"{path}/refresh").get_json()["price_sheet"]
+        entry = sheet["entries"][0]
+        self.assertEqual(entry["extracted_quote"], "120000")
+        # 旧文件（未在解析时缓存报价）由刷新补提取，并回写文件清单保持同源。
+        document = next(item for item in storage.list_documents(self.app, self.project["project_id"])
+                        if item["document_id"] == bid["document_id"])
+        stored_entry = storage.get_price_entry(self.app, self.project["project_id"], entry["price_entry_id"])
+        self.assertEqual(document["quote_value"], "120000")
+        self.assertEqual(document["quote_status"], "found")
+        self.assertEqual(document["quote_fingerprint"], stored_entry["extraction_fingerprint"])
+
+    def test_refresh_price_sheet_force_reextracts_despite_cached_quote(self):
+        bid = self._add_pdf("force-bid.pdf", "bid", "甲公司", "占位")
+        parsed = self.temp_dir / "force-bid.txt"
+        parsed.write_text("投标总报价：120000元。", encoding="utf-8")
+        with storage.connection(self.app) as conn:
+            conn.execute("UPDATE ew_documents SET parse_status='success', parsed_path=? WHERE document_id=?",
+                         (str(parsed), bid["document_id"]))
+        client = self.app.test_client()
+        path = f"/api/evaluation-workbench/projects/{self.project['project_id']}/price-sheet"
+        first = client.post(f"{path}/refresh").get_json()["price_sheet"]
+        self.assertEqual(first["entries"][0]["extracted_quote"], "120000")
+        # 文件内容已变化但解析任务未重跑：force 刷新必须重扫并同步回写文件清单。
+        parsed.write_text("投标总报价：150000元。", encoding="utf-8")
+        sheet = client.post(f"{path}/refresh", json={"force": True}).get_json()["price_sheet"]
+        self.assertEqual(sheet["entries"][0]["extracted_quote"], "150000")
+        document = next(item for item in storage.list_documents(self.app, self.project["project_id"])
+                        if item["document_id"] == bid["document_id"])
+        self.assertEqual(document["quote_value"], "150000")
+        self.assertEqual(document["quote_status"], "found")
 
     def test_price_sheet_manual_score_is_only_used_when_formula_is_not_automatic(self):
         storage.add_rule(self.app, self.project["project_id"], {

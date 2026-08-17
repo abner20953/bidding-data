@@ -1,4 +1,4 @@
-﻿"""工作台 SQLite 与文件存储。保持与现有业务模块隔离。"""
+"""工作台 SQLite 与文件存储。保持与现有业务模块隔离。"""
 
 from __future__ import annotations
 
@@ -839,6 +839,12 @@ def init_database(app) -> None:
         _ensure_column(conn, "ew_evidence_packs", "material_key", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "ew_price_entries", "adjustment_json", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_column(conn, "ew_projects", "price_profile_id", "TEXT")
+        # 文件清单报价缓存：解析完成时提取一次并落库，价格工作表直接复用同一结果。
+        _ensure_column(conn, "ew_documents", "quote_value", "TEXT")
+        _ensure_column(conn, "ew_documents", "quote_source", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "ew_documents", "quote_excerpt", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "ew_documents", "quote_status", "TEXT NOT NULL DEFAULT 'pending'")
+        _ensure_column(conn, "ew_documents", "quote_fingerprint", "TEXT NOT NULL DEFAULT ''")
         # 旧数据库先补列，再建索引；把索引放在 CREATE TABLE 脚本里会导致升级时
         # 因旧表尚无 material_key 而中断整个初始化。
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ew_evidence_packs_material ON ew_evidence_packs(document_id, material_key, updated_at)")
@@ -1478,6 +1484,23 @@ def list_documents(app, project_id: str) -> list[dict]:
             "SELECT * FROM ew_documents WHERE project_id = ? ORDER BY role, created_at", (project_id,)
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def update_document_quote(app, document_id: str, fields: dict) -> dict:
+    """保存文件清单报价提取结果；与价格工作表报价缓存共用同一份数据。"""
+    allowed = {"quote_value", "quote_source", "quote_excerpt", "quote_status", "quote_fingerprint"}
+    updates = {key: fields[key] for key in allowed if key in fields}
+    if not updates:
+        return {}
+    updates["updated_at"] = now_iso()
+    assignments = ", ".join(f"{key}=?" for key in updates)
+    with connection(app) as conn:
+        conn.execute(
+            f"UPDATE ew_documents SET {assignments} WHERE document_id=?",
+            [*updates.values(), document_id],
+        )
+        row = conn.execute("SELECT * FROM ew_documents WHERE document_id=?", (document_id,)).fetchone()
+    return dict(row) if row else {}
 
 
 def _list_price_entries(conn, project_id: str) -> list[dict]:

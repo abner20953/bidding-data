@@ -670,6 +670,23 @@ def build_price_sheet(app, project_id: str) -> dict:
     }
 
 
+def extract_document_quote(app, document: dict) -> dict:
+    """唯一报价提取入口：文件清单解析完成与价格工作表刷新共用。
+
+    返回可直接落库的报价字段（含输入指纹）。任一方先提取后，另一方都复用
+    已缓存结果，保证同一份文件只扫描一次。
+    """
+    merged = {**document, "document_sha256": str(document.get("sha256") or "")}
+    value, excerpt, status, source = _quote_from_document(app, merged)
+    return {
+        "quote_value": _decimal_text(value),
+        "quote_source": source,
+        "quote_excerpt": excerpt[:500],
+        "quote_status": status,
+        "quote_fingerprint": _extraction_fingerprint(merged),
+    }
+
+
 def refresh_price_sheet(app, project_id: str, *, force_refresh: bool = False,
                         ignore_task_id: str | None = None) -> dict:
     """明确刷新时才允许写入台账及报价缓存。"""
@@ -680,17 +697,32 @@ def refresh_price_sheet(app, project_id: str, *, force_refresh: bool = False,
     # 避免在 2 核 2 GB 服务器上与规则提取或综合评审争用 CPU、磁盘和 SQLite。
     if _task_active(app, project_id, ignore_task_id=ignore_task_id):
         return build_price_sheet(app, project_id)
+    documents = {item["document_id"]: item for item in storage.list_documents(app, project_id)}
     for entry in entries:
         if entry.get("source_type") != "document":
             continue
-        fingerprint = _extraction_fingerprint(entry)
-        if not force_refresh and entry.get("extraction_fingerprint") == fingerprint:
+        document = documents.get(entry.get("document_id"))
+        if document is None:
             continue
-        value, excerpt, status, source = _quote_from_document(app, entry)
+        fingerprint = _extraction_fingerprint({**entry, **document})
+        # 文件清单已提取过且文件未变：直接复用，避免二次扫描；缺失或过期时
+        # 才提取，并把结果回写到文件清单，保证两种视图始终同源。
+        if not force_refresh and document.get("quote_fingerprint") == fingerprint \
+                and document.get("quote_status") in {"found", "ambiguous", "missing", "unavailable"}:
+            quote_fields = {
+                "quote_value": document.get("quote_value"),
+                "quote_source": document.get("quote_source") or "",
+                "quote_excerpt": document.get("quote_excerpt") or "",
+                "quote_status": document.get("quote_status") or "missing",
+                "quote_fingerprint": document.get("quote_fingerprint") or fingerprint,
+            }
+        else:
+            quote_fields = extract_document_quote(app, document)
+            storage.update_document_quote(app, document["document_id"], quote_fields)
         storage.update_price_entry(app, project_id, entry["price_entry_id"], {
-            "extracted_quote": _decimal_text(value), "quote_source": source,
-            "quote_excerpt": excerpt[:500], "extraction_status": status,
-            "extraction_fingerprint": fingerprint,
+            "extracted_quote": quote_fields["quote_value"], "quote_source": quote_fields["quote_source"],
+            "quote_excerpt": quote_fields["quote_excerpt"], "extraction_status": quote_fields["quote_status"],
+            "extraction_fingerprint": quote_fields["quote_fingerprint"],
         })
     return build_price_sheet(app, project_id)
 

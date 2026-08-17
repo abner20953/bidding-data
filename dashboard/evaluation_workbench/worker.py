@@ -537,6 +537,16 @@ def _parse_document(app, task: dict) -> dict:
                     "UPDATE ew_documents SET page_count=?, text_length=?, parse_status='success', parse_error=NULL, parsed_path=?, updated_at=? WHERE document_id=?",
                     (page_count, len(text), str(parsed_path), storage.now_iso(), document["document_id"]),
                 )
+            # 投标文件解析完成时同步提取报价并落库到文件清单；价格工作表复用
+            # 同一缓存，避免同一份文件被扫描两次。提取失败不影响解析主流程，
+            # 价格工作表刷新时会再尝试。
+            if document["role"] == "bid":
+                try:
+                    merged = {**document, "parsed_path": str(parsed_path), "parse_status": "success"}
+                    quote_fields = price_sheet.extract_document_quote(app, merged)
+                    storage.update_document_quote(app, document["document_id"], quote_fields)
+                except Exception:
+                    pass
         except Exception as exc:
             errors.append(f"{document['original_name']}：{exc}")
             with storage.connection(app) as conn:

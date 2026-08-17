@@ -15,7 +15,7 @@
     <p class="muted">生成时间：{{ generated_at }}</p>
     <p class="notice">本报告为电子文件辅助审查和评分留痕，不替代评标委员会的人工判断、最终打分或废标认定。</p>
     <h2>文件清单</h2>
-    <table><tr><th>角色</th><th>文件</th><th>投标人</th><th>解析状态</th></tr>{% for item in documents %}<tr><td>{{ item.role_label }}</td><td>{{ item.original_name }}</td><td>{{ item.bidder_name or '-' }}</td><td>{{ item.parse_status_label }}</td></tr>{% endfor %}</table>
+    <table><tr><th>角色</th><th>文件</th><th>投标人</th><th>报价（万元）</th><th>解析状态</th></tr>{% for item in documents %}<tr><td>{{ item.role_label }}</td><td>{{ item.original_name }}</td><td>{{ item.bidder_name or '-' }}</td><td>{{ item.quote_label }}</td><td>{{ item.parse_status_label }}</td></tr>{% endfor %}</table>
     <h2>投标文件查重</h2>
     {% if cross_analysis %}
     <p class="notice">{{ cross_analysis.decision_boundary }}</p>
