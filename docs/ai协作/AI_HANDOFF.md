@@ -5,13 +5,13 @@ handoff_schema: 1
 updated_at: 2026-08-17
 module: evaluation-workbench
 status: deployed_validation_pending
-base_commit: 76c31e0
+base_commit: 7d18ac7
 branch: main
-working_tree: clean_after_empty_price_rule_set_fix_deploy
-remote_github: 76c31e0
-remote_gitee: 76c31e0
-production_commit: 76c31e0
-prompt_version: vision-evidence-contract-v62（已部署；价格分自洽性契约）
+working_tree: clean_after_v63_prompt_deploy
+remote_github: 7d18ac7
+remote_gitee: 7d18ac7
+production_commit: 7d18ac7
+prompt_version: vision-evidence-contract-v63（已部署；未填调整不套用规则优惠）
 database_change: ew_price_rule_sets、ew_price_score_runs 和 ew_projects.price_profile_id 已按 SQLite 兼容迁移部署；本轮无数据库变更
 user_approval: 已授权实施、提交、推送和部署
 ```
@@ -20,7 +20,7 @@ user_approval: 已授权实施、提交、推送和部署
 
 ## 下一位先做
 
-1. 本地已完成提示词 v63（未提交部署）：价格分契约中文通俗化，明确"规则提到的优惠/税率扣除仅在对应投标人调整已填写时生效；adjustment.mode=none 按原计分价计算、不替投标人套用，若规则要求而未填写则 needs_review 说明"；价格页在规则提到优惠/税率而存在未填写调整的参与投标人时显示核对提示。560 项测试通过，待提交部署。
+1. 提示词 v63 已提交并部署 `7d18ac7`：价格分契约中文通俗化，明确"规则提到的优惠/税率扣除仅在对应投标人调整已填写时生效；adjustment.mode=none 按原计分价计算、不替投标人套用，若规则要求而未填写则 needs_review 说明"；价格页在规则提到优惠/税率而存在未填写调整的参与投标人时显示核对提示。云端 build-info 确认 `version_consistent=true`、`prompt_version=vision-evidence-contract-v63`；560 项测试通过。下一步建议：重跑 sxyh2 核对（期望 4×30），并在 test3 人工复填调整后复跑核对提示与分数。
 2. 云端已部署 `76c31e0`（空专用集回退完整集）：test3 恢复正确（基准价 1652677.4737、43.63/44.13/36.14/37.01）；jc 回显修复已生效；sxyh2 复跑应为 4×30（待重跑核对）。
 
 ## 活跃记录（最多 10 条）
@@ -33,7 +33,7 @@ user_approval: 已授权实施、提交、推送和部署
 - 已清理旧链路：删除无调用方的跨投标人模型价格评分、公式复算、结果回写及对应提示词/测试；保留任务结果中的 `cross_bid_price` 空元数据仅为既有调用方兼容，保留本地报价事实提取供非评分报价审查使用。
 - 验证：定向价格公式/报价覆盖测试、完整工作台与 AI 网关回归、前端语法、文档和差异校验均通过；核心版本已部署至 `30674c2`。
 
-### 4. 价格分确定性算术（已部署 42ad0ff；修剪判定修复待部署）
+### 4. 价格分确定性算术（已部署 42ad0ff；修剪判定修复已部署 2fd6959）
 
 - sxyh2 与 test3 的 v62 重跑证明模型可让 score/final_score 同时错误；根因还包括公式编译器把平均值后的后续 100% 错认成基准价系数。
 - 已对完整编译的明确公式恢复确定性复算，但不使用宽松猜测：只支持最低价比例法和要素齐全的平均值偏差法；其余仍由 AI 建议。修改不触及综合评审链路。
