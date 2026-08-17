@@ -15,7 +15,7 @@ from flask import Blueprint, current_app, jsonify, render_template, request, sen
 from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.security import check_password_hash
 
-from dashboard.evaluation_workbench import storage
+from dashboard.evaluation_workbench import price_sheet, storage
 from dashboard.evaluation_workbench.ai_gateway import model_capabilities, test_connection
 from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION
 
@@ -665,6 +665,52 @@ def download_document_api(project_id, document_id):
     return send_file(
         path, as_attachment=True, download_name=document["original_name"]
     )
+
+
+@evaluation_workbench_bp.route("/api/evaluation-workbench/projects/<project_id>/price-sheet", methods=["GET", "POST"])
+def price_sheet_api(project_id):
+    """文件中心独立价格试算；不读写综合评审或评分结果。"""
+    _init()
+    _, error = _project_or_404(project_id)
+    if error:
+        return error
+    try:
+        if request.method == "POST":
+            price_sheet.add_manual_entry(current_app, project_id, _json_body())
+            return jsonify({"price_sheet": price_sheet.refresh_price_sheet(current_app, project_id)})
+        return jsonify({"price_sheet": price_sheet.build_price_sheet(current_app, project_id)})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@evaluation_workbench_bp.route("/api/evaluation-workbench/projects/<project_id>/price-sheet/refresh", methods=["POST"])
+def refresh_price_sheet_api(project_id):
+    """重新读取本地解析文字和已有 OCR 缓存，不触发任何识别或模型调用。"""
+    _init()
+    _, error = _project_or_404(project_id)
+    if error:
+        return error
+    force_refresh = bool(_json_body().get("force"))
+    return jsonify({"price_sheet": price_sheet.refresh_price_sheet(current_app, project_id, force_refresh=force_refresh)})
+
+
+@evaluation_workbench_bp.route(
+    "/api/evaluation-workbench/projects/<project_id>/price-sheet/entries/<price_entry_id>",
+    methods=["PATCH", "DELETE"],
+)
+def price_sheet_entry_api(project_id, price_entry_id):
+    _init()
+    _, error = _project_or_404(project_id)
+    if error:
+        return error
+    try:
+        if request.method == "DELETE":
+            storage.delete_manual_price_entry(current_app, project_id, price_entry_id)
+        else:
+            price_sheet.update_entry(current_app, project_id, price_entry_id, _json_body())
+        return jsonify({"price_sheet": price_sheet.build_price_sheet(current_app, project_id)})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
 
 @evaluation_workbench_bp.route("/api/evaluation-workbench/projects/<project_id>/tasks", methods=["POST"])

@@ -425,6 +425,30 @@ def init_database(app) -> None:
                 updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_ew_documents_project ON ew_documents(project_id, role, created_at);
+            CREATE TABLE IF NOT EXISTS ew_price_entries (
+                price_entry_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES ew_projects(project_id) ON DELETE CASCADE,
+                document_id TEXT REFERENCES ew_documents(document_id) ON DELETE CASCADE,
+                bidder_name TEXT NOT NULL,
+                source_type TEXT NOT NULL CHECK(source_type IN ('document', 'manual')),
+                extracted_quote TEXT,
+                manual_quote TEXT,
+                evaluation_price TEXT,
+                included INTEGER NOT NULL DEFAULT 1,
+                exclusion_reason TEXT NOT NULL DEFAULT '',
+                quote_source TEXT NOT NULL DEFAULT '',
+                quote_excerpt TEXT NOT NULL DEFAULT '',
+                extraction_status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(extraction_status IN ('pending', 'found', 'ambiguous', 'missing', 'unavailable')),
+                extraction_fingerprint TEXT NOT NULL DEFAULT '',
+                manual_scores_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_ew_price_entries_document
+                ON ew_price_entries(project_id, document_id) WHERE document_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_ew_price_entries_project
+                ON ew_price_entries(project_id, source_type, created_at);
             CREATE TABLE IF NOT EXISTS ew_tasks (
                 task_id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL REFERENCES ew_projects(project_id) ON DELETE CASCADE,
@@ -1414,6 +1438,124 @@ def list_documents(app, project_id: str) -> list[dict]:
             "SELECT * FROM ew_documents WHERE project_id = ? ORDER BY role, created_at", (project_id,)
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def _list_price_entries(conn, project_id: str) -> list[dict]:
+    rows = conn.execute(
+        """SELECT entry.*, document.sha256 AS document_sha256,
+                  document.parsed_path, document.parse_status, document.original_name
+           FROM ew_price_entries entry
+           LEFT JOIN ew_documents document ON document.document_id=entry.document_id
+           WHERE entry.project_id=?
+           ORDER BY CASE entry.source_type WHEN 'document' THEN 0 ELSE 1 END,
+                    entry.created_at, entry.bidder_name""",
+        (project_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_price_entries(app, project_id: str) -> list[dict]:
+    """纯读取价格台账；供 GET 使用，绝不创建或更新时间戳。"""
+    with connection(app) as conn:
+        return _list_price_entries(conn, project_id)
+
+
+def sync_price_document_entries(app, project_id: str) -> list[dict]:
+    """按需建立投标文件价格台账，仅供明确的刷新写操作调用。"""
+    documents = [item for item in list_documents(app, project_id) if item.get("role") == "bid"]
+    timestamp = now_iso()
+    with connection(app) as conn:
+        for document in documents:
+            bidder_name = document.get("bidder_name") or document.get("original_name") or "未命名投标人"
+            conn.execute(
+                """INSERT INTO ew_price_entries(
+                       price_entry_id, project_id, document_id, bidder_name, source_type,
+                       extraction_status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, 'document', 'pending', ?, ?)
+                   ON CONFLICT(project_id, document_id) WHERE document_id IS NOT NULL DO UPDATE SET
+                       bidder_name=excluded.bidder_name, updated_at=excluded.updated_at
+                   WHERE ew_price_entries.bidder_name IS NOT excluded.bidder_name""",
+                (str(uuid.uuid4()), project_id, document["document_id"], bidder_name, timestamp, timestamp),
+            )
+        return _list_price_entries(conn, project_id)
+
+
+def get_price_entry(app, project_id: str, price_entry_id: str) -> dict | None:
+    with connection(app) as conn:
+        row = conn.execute(
+            "SELECT * FROM ew_price_entries WHERE project_id=? AND price_entry_id=?",
+            (project_id, price_entry_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def create_manual_price_entry(app, project_id: str, bidder_name: str) -> dict:
+    bidder_name = str(bidder_name or "").strip()
+    if not bidder_name:
+        raise ValueError("请填写未上传文件投标人的名称")
+    timestamp = now_iso()
+    value = {
+        "price_entry_id": str(uuid.uuid4()), "project_id": project_id,
+        "bidder_name": bidder_name[:200], "created_at": timestamp, "updated_at": timestamp,
+    }
+    with connection(app) as conn:
+        duplicate = conn.execute(
+            "SELECT 1 FROM ew_price_entries WHERE project_id=? AND lower(trim(bidder_name))=lower(?) LIMIT 1",
+            (project_id, bidder_name),
+        ).fetchone()
+        if duplicate:
+            raise ValueError("价格工作表中已存在同名投标人")
+        conn.execute(
+            """INSERT INTO ew_price_entries(
+                   price_entry_id, project_id, document_id, bidder_name, source_type,
+                   extraction_status, created_at, updated_at)
+               VALUES (:price_entry_id, :project_id, NULL, :bidder_name, 'manual',
+                       'unavailable', :created_at, :updated_at)""",
+            value,
+        )
+    return get_price_entry(app, project_id, value["price_entry_id"])
+
+
+def update_price_entry(app, project_id: str, price_entry_id: str, fields: dict) -> dict:
+    entry = get_price_entry(app, project_id, price_entry_id)
+    if not entry:
+        raise ValueError("价格工作表中的投标人不存在")
+    allowed = {
+        "manual_quote", "evaluation_price", "included", "exclusion_reason",
+        "manual_scores_json", "extracted_quote", "quote_source", "quote_excerpt",
+        "extraction_status", "extraction_fingerprint",
+    }
+    updates = {key: fields[key] for key in allowed if key in fields}
+    if "bidder_name" in fields:
+        if entry.get("source_type") != "manual":
+            raise ValueError("已上传投标人的名称请在文件信息中维护")
+        bidder_name = str(fields.get("bidder_name") or "").strip()
+        if not bidder_name:
+            raise ValueError("投标人名称不能为空")
+        updates["bidder_name"] = bidder_name[:200]
+    if not updates:
+        return entry
+    updates["updated_at"] = now_iso()
+    assignments = ", ".join(f"{key}=?" for key in updates)
+    with connection(app) as conn:
+        conn.execute(
+            f"UPDATE ew_price_entries SET {assignments} WHERE project_id=? AND price_entry_id=?",
+            [*updates.values(), project_id, price_entry_id],
+        )
+    return get_price_entry(app, project_id, price_entry_id)
+
+
+def delete_manual_price_entry(app, project_id: str, price_entry_id: str) -> None:
+    entry = get_price_entry(app, project_id, price_entry_id)
+    if not entry:
+        raise ValueError("价格工作表中的投标人不存在")
+    if entry.get("source_type") != "manual":
+        raise ValueError("已上传投标人只能移出价格计算，不能在价格工作表中删除")
+    with connection(app) as conn:
+        conn.execute(
+            "DELETE FROM ew_price_entries WHERE project_id=? AND price_entry_id=?",
+            (project_id, price_entry_id),
+        )
 
 
 def document_path(app, document: dict) -> Path:

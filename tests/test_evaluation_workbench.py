@@ -19,7 +19,7 @@ from werkzeug.security import generate_password_hash
 
 from dashboard.blueprints import evaluation_workbench as evaluation_workbench_module
 from dashboard.blueprints.evaluation_workbench import create_worker_app, evaluation_workbench_bp
-from dashboard.evaluation_workbench import local_ocr_gateway, ocr_gateway, storage, worker
+from dashboard.evaluation_workbench import local_ocr_gateway, ocr_gateway, price_sheet, storage, worker
 from dashboard.evaluation_workbench.collusion_signals import build_cross_bid_analysis
 from dashboard.evaluation_workbench.prompt_context import (
     _anchors, build_rule_context, select_rule_chunk_evidence_map, select_rule_chunk_map, select_rule_chunks,
@@ -5249,6 +5249,143 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(request_json.call_count, 1)
         self.assertIn(bid_a["document_id"], request_json.call_args.args[2])
         self.assertIn(bid_b["document_id"], request_json.call_args.args[2])
+
+    def test_independent_price_sheet_extracts_adds_excludes_and_recalculates_without_tasks(self):
+        bid_a = self._add_pdf("price-a.pdf", "bid", "甲公司", "占位")
+        bid_b = self._add_pdf("price-b.pdf", "bid", "乙公司", "占位")
+        parsed_a = self.temp_dir / "price-sheet-a.txt"
+        parsed_b = self.temp_dir / "price-sheet-b.txt"
+        parsed_a.write_text("[第1页]\n投标总报价：100000元。\n", encoding="utf-8")
+        parsed_b.write_text("[第1页]\n开标一览表\n响应总报价：120000元。\n", encoding="utf-8")
+        with storage.connection(self.app) as conn:
+            conn.execute("UPDATE ew_documents SET parse_status='success', parsed_path=? WHERE document_id=?",
+                         (str(parsed_a), bid_a["document_id"]))
+            conn.execute("UPDATE ew_documents SET parse_status='success', parsed_path=? WHERE document_id=?",
+                         (str(parsed_b), bid_b["document_id"]))
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "最低价报价得分",
+            "check_rule": "满足要求且投标价格最低的报价为评标基准价，报价得分=（评标基准价／投标报价）×10。",
+            "source_text": "最低评审价得10分", "scoring": {"kind": "manual", "max_score": 10},
+        })
+        client = self.app.test_client()
+        path = f"/api/evaluation-workbench/projects/{self.project['project_id']}/price-sheet"
+
+        response = client.get(path)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["price_sheet"]["needs_refresh"])
+        self.assertEqual(response.get_json()["price_sheet"]["entries"], [])
+        with storage.connection(self.app) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM ew_price_entries").fetchone()[0], 0)
+
+        response = client.post(f"{path}/refresh")
+
+        self.assertEqual(response.status_code, 200)
+        sheet = response.get_json()["price_sheet"]
+        entries = {item["bidder_name"]: item for item in sheet["entries"]}
+        self.assertEqual(entries["甲公司"]["effective_quote"], "100000")
+        self.assertEqual(entries["乙公司"]["effective_quote"], "120000")
+        self.assertEqual(entries["甲公司"]["scores"][rule["rule_id"]]["score"], 10.0)
+        self.assertEqual(entries["乙公司"]["scores"][rule["rule_id"]]["score"], 8.33)
+        with storage.connection(self.app) as conn:
+            before_get = conn.execute(
+                "SELECT price_entry_id, updated_at FROM ew_price_entries ORDER BY price_entry_id"
+            ).fetchall()
+        self.assertEqual(client.get(path).status_code, 200)
+        with storage.connection(self.app) as conn:
+            after_get = conn.execute(
+                "SELECT price_entry_id, updated_at FROM ew_price_entries ORDER BY price_entry_id"
+            ).fetchall()
+        self.assertEqual(before_get, after_get)
+
+        response = client.post(path, json={"bidder_name": "丙公司", "manual_quote": "90000"})
+
+        self.assertEqual(response.status_code, 200)
+        sheet = response.get_json()["price_sheet"]
+        entries = {item["bidder_name"]: item for item in sheet["entries"]}
+        self.assertEqual(entries["丙公司"]["scores"][rule["rule_id"]]["score"], 10.0)
+        self.assertEqual(entries["甲公司"]["scores"][rule["rule_id"]]["score"], 9.0)
+        manual_id = entries["丙公司"]["price_entry_id"]
+
+        response = client.patch(f"{path}/entries/{manual_id}", json={
+            "included": False, "exclusion_reason": "资格审查未通过",
+        })
+
+        self.assertEqual(response.status_code, 200)
+        sheet = response.get_json()["price_sheet"]
+        entries = {item["bidder_name"]: item for item in sheet["entries"]}
+        self.assertFalse(entries["丙公司"]["included"])
+        self.assertEqual(entries["甲公司"]["scores"][rule["rule_id"]]["score"], 10.0)
+        self.assertEqual(entries["乙公司"]["scores"][rule["rule_id"]]["score"], 8.33)
+
+        uploaded_id = entries["甲公司"]["price_entry_id"]
+        self.assertEqual(client.delete(f"{path}/entries/{uploaded_id}").status_code, 400)
+        self.assertEqual(client.delete(f"{path}/entries/{manual_id}").status_code, 200)
+        with storage.connection(self.app) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM ew_tasks").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM ew_model_calls").fetchone()[0], 0)
+
+    def test_price_sheet_does_not_treat_table_number_as_quote(self):
+        value, _excerpt, status = price_sheet._quote_from_lines([
+            "开标一览表", "项目编号：20260817", "采购包：1",
+        ])
+
+        self.assertIsNone(value)
+        self.assertEqual(status, "missing")
+
+    def test_price_sheet_does_not_treat_identifier_or_date_as_unqualified_quote(self):
+        for lines in (
+            ["投标报价：统一社会信用代码：91110108"],
+            ["响应总报价：20260817"],
+        ):
+            value, _excerpt, status = price_sheet._quote_from_lines(lines)
+            self.assertIsNone(value)
+            self.assertEqual(status, "missing")
+        value, _excerpt, status = price_sheet._quote_from_lines(["投标报价：100000"])
+        self.assertEqual(value, Decimal("100000"))
+        self.assertEqual(status, "found")
+
+    def test_price_sheet_defers_file_scan_while_project_task_is_active(self):
+        bid = self._add_pdf("deferred-price.pdf", "bid", "甲公司", "占位")
+        parsed = self.temp_dir / "deferred-price.txt"
+        parsed.write_text("投标总报价：100000元。", encoding="utf-8")
+        with storage.connection(self.app) as conn:
+            conn.execute("UPDATE ew_documents SET parse_status='success', parsed_path=? WHERE document_id=?",
+                         (str(parsed), bid["document_id"]))
+        path = f"/api/evaluation-workbench/projects/{self.project['project_id']}/price-sheet"
+        self.assertEqual(self.app.test_client().post(f"{path}/refresh").status_code, 200)
+        parsed.write_text("投标总报价：120000元。", encoding="utf-8")
+        storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+
+        response = self.app.test_client().get(path)
+
+        self.assertEqual(response.status_code, 200)
+        sheet = response.get_json()["price_sheet"]
+        self.assertTrue(sheet["deferred"])
+        self.assertEqual(sheet["entries"][0]["extracted_quote"], "100000")
+        self.assertEqual(sheet["entries"][0]["extraction_status"], "found")
+
+    def test_price_sheet_manual_score_is_only_used_when_formula_is_not_automatic(self):
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "价格综合评分",
+            "check_rule": "由评审委员会结合报价合理性综合评分。",
+            "source_text": "价格分满分5分", "scoring": {"kind": "manual", "max_score": 5},
+        })
+        client = self.app.test_client()
+        path = f"/api/evaluation-workbench/projects/{self.project['project_id']}/price-sheet"
+        initial = client.get(path).get_json()["price_sheet"]
+        rule_id = initial["rules"][0]["rule_id"]
+
+        response = client.post(path, json={
+            "bidder_name": "未上传公司", "manual_score": 4.5, "rule_id": rule_id,
+        })
+
+        self.assertEqual(response.status_code, 200)
+        sheet = response.get_json()["price_sheet"]
+        entry = sheet["entries"][0]
+        self.assertFalse(sheet["rules"][0]["automatic"])
+        self.assertEqual(entry["scores"][rule_id]["score"], 4.5)
+        self.assertEqual(entry["scores"][rule_id]["source"], "manual")
 
     def test_cross_bid_price_uses_unique_local_total_quote_when_model_omits_one_price(self):
         bid_a = self._add_pdf("a.pdf", "bid", "甲公司", "总报价：￥100000元。")
