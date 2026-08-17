@@ -4779,8 +4779,9 @@ def _extract_price_rules(app, task: dict) -> dict:
     ]
     storage.update_task(app, task["task_id"], progress=20, message="正在定位价格评分原文")
     if not candidates:
-        storage.save_price_rule_set(app, task["project_id"], task["task_id"], profile["profile_id"], [])
-        return {"rule_count": 0, "mode": "price_only", "message": "未在评分原文中定位到价格评分条款"}
+        # 未定位到价格条款时不得保存空规则集：空集会被按“最新”优先采用并遮蔽
+        # 完整规则集中的价格规则，导致价格页失去可用规则。
+        return {"rule_count": 0, "mode": "price_only", "message": "未在评分原文中定位到价格评分条款，未覆盖已有规则集"}
     system_prompt = f"{_system_prompt(app, 'extract_rules')}\n\n【当前项目分包范围】\n{package_scope_instruction}"
     task["_evaluation_request_gate"] = _EvaluationRequestGate(
         limit=1, max_limit=_profile_parallel_limit(profile, len(candidates)),
@@ -4798,6 +4799,13 @@ def _extract_price_rules(app, task: dict) -> dict:
         value["rule_id"] = f"price-only-{task['task_id']}-{index}"
         value["enabled"] = True
         price_rules.append(value)
+    if not price_rules:
+        # 模型已组装但全部未通过价格规则契约时，同样不得用空集覆盖既有专用集；
+        # 保留上一次可用结果并明确提示，人工可重试提取。
+        return {
+            "rule_count": 0, "source_clause_count": len(candidates), "mode": "price_only",
+            "assembly": stats, "message": "已定位价格条款但未组装出可用的价格评分规则，未覆盖已有规则集",
+        }
     storage.save_price_rule_set(app, task["project_id"], task["task_id"], profile["profile_id"], price_rules)
     return {"rule_count": len(price_rules), "source_clause_count": len(candidates), "mode": "price_only", "assembly": stats}
 

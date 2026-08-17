@@ -5336,6 +5336,53 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIsNone(full_rule_set)
         self.assertIsNone(storage.list_rules(self.app, self.project["project_id"])[0])
 
+    def test_price_sheet_empty_dedicated_rule_set_falls_back_to_full_rule_set(self):
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "最低价报价得分",
+            "check_rule": "最低报价为基准价，报价得分=（评标基准价／投标报价）×10。",
+            "source_text": "最低评审价得10分", "scoring": {"kind": "manual", "max_score": 10},
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        # 一次失败的“提取价格评分规则”会留下空的专用规则集；它不得遮蔽完整规则集
+        # 中的价格规则，否则价格页会失去可用规则。
+        storage.save_price_rule_set(self.app, self.project["project_id"], None, "profile", [])
+
+        sheet = price_sheet.build_price_sheet(self.app, self.project["project_id"])
+
+        self.assertNotEqual(sheet["rule_set"]["status"], "price_only")
+        self.assertEqual([item["rule_id"] for item in sheet["rules"]], [rule["rule_id"]])
+
+    def test_extract_price_rules_zero_result_keeps_existing_dedicated_set(self):
+        self._add_pdf("tender.pdf", "tender", "", "占位")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        storage.save_price_rule_set(self.app, self.project["project_id"], None, "profile", [{
+            "rule_id": "price-only-keep", "enabled": True, "category": "objective",
+            "title": "报价得分", "check_rule": "最低报价为基准价，报价得分=（评标基准价／投标报价）×10。",
+            "source_text": "价格分满分10分", "scoring": {"kind": "manual", "max_score": 10},
+        }])
+        packet = {
+            "clause_id": "SC-1", "text": "评分-投标报价得分（45分）：投标报价等于基准价得满分；每高于基准价1%扣1分，扣至0分止。",
+            "score_section": {"section_id": "price", "label": "投标报价得分", "max_score": 45},
+            "is_section_summary": False, "page": 1, "document_key": "tender",
+        }
+        storage.create_task(self.app, self.project["project_id"], "extract_price_rules", {
+            "profile_id": None, "prompt_version": worker.PROMPT_VERSION, "force_rerun": True,
+        })
+
+        with patch("dashboard.evaluation_workbench.worker._score_clause_packets", return_value=[packet]), \
+             patch("dashboard.evaluation_workbench.worker._filter_score_packets_for_package", side_effect=lambda items, package_number: items), \
+             patch("dashboard.evaluation_workbench.worker._extract_scoring_rules_from_ledger", return_value=([], {
+                 "applied": True, "failure_count": 0, "supplement_count": 0, "strict_retry_count": 0,
+                 "uncovered_clause_ids": [], "group_count": 1, "mode": "direct_assembly",
+             })):
+            finished = self._run_next_task()
+
+        self.assertEqual(finished["status"], "success")
+        self.assertEqual(finished["result"]["rule_count"], 0)
+        current = storage.current_price_rule_set(self.app, self.project["project_id"])
+        self.assertEqual([item["rule_id"] for item in current["rules"]], ["price-only-keep"])
+
     def test_price_sheet_does_not_treat_identifier_or_date_as_unqualified_quote(self):
         for lines in (
             ["投标报价：统一社会信用代码：91110108"],

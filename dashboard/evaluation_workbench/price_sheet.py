@@ -327,14 +327,15 @@ def is_price_scoring_rule(rule: dict) -> bool:
 def _price_rules(app, project_id: str) -> tuple[dict | None, list[dict]]:
     rule_set, rules = storage.list_rules(app, project_id)
     dedicated = storage.current_price_rule_set(app, project_id)
-    # 用户在价格页主动提取的规则仅服务价格试算；若它晚于完整规则集，就优先采用，
-    # 既不会污染综合评审，也不会让完整规则集的旧价格条款覆盖用户的明确操作。
-    if dedicated and (not rule_set or str(dedicated.get("updated_at") or "") >= str(rule_set.get("updated_at") or "")):
+    dedicated_rules = dedicated.get("rules") if dedicated else []
+    # 只有包含实际规则时专用集才优先采用；空的专用集（提取失败留下的空结果）
+    # 不携带任何信息，必须回退到完整规则集中的价格规则，否则价格页会失去可用规则。
+    if dedicated_rules and (not rule_set or str(dedicated.get("updated_at") or "") >= str(rule_set.get("updated_at") or "")):
         rule_set = {
             "rule_set_id": dedicated.get("price_rule_set_id"), "status": "price_only",
             "version": "独立价格规则", "source": "price_only",
         }
-        rules = dedicated.get("rules") or []
+        rules = dedicated_rules
     values = []
     for rule in rules:
         if rule.get("enabled") is False or not is_price_scoring_rule(rule):
