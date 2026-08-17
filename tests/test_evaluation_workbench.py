@@ -5638,6 +5638,44 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(compiled["high_rate"], Decimal("1"))
         self.assertEqual(compiled["low_rate"], Decimal("0.5"))
 
+    def test_price_sheet_percent_before_removal_wording_trims_by_ratio_not_one_each(self):
+        rule = {
+            "rule_id": "trim-ratio", "category": "objective", "title": "评分-投标报价得分（45分）",
+            "check_rule": (
+                "评标基准价确定——当通过初步评审投标人数量≥5家时，先按其20%四舍五入取整去掉最高和最低投标报价，"
+                "再以剩余有效投标报价算术平均值×97%作为基准价；通过初步评审<5家时直接以全部有效投标报价算术平均值×97%作为基准价。"
+                "偏差率=|投标报价-评标基准价|/评标基准价×100%。投标报价等于基准价得满分45分，每高于基准价1%扣1分，"
+                "每低于基准价1%扣0.5分，扣至0分为止，不足1%按内插法保留两位小数。"
+            ),
+            "source_text": "按照通过初步评审投标人数量的20%（四舍五入取整）计算数量分别去掉最高和最低的投标报价的算术平均值×97%。",
+            "scoring_json": json.dumps({"max_score": 45}),
+        }
+
+        compiled = price_sheet._compile_price_formula(rule)
+        self.assertEqual(compiled["kind"], "average_factor_deviation")
+        self.assertEqual(compiled["trim_mode"], "percent_20")
+        self.assertEqual(compiled["trim_rounding"], "half_up")
+        self.assertEqual(compiled["deviation_rounding"], "none")
+        rule["_formula"] = compiled
+        rule["formula_kind"] = compiled["kind"]
+        rule["max_score"] = 45.0
+        entries = [
+            {"price_entry_id": "a", "bidder_name": "中矿", "included": True, "calculation_price": "1720000", "manual_scores": {}},
+            {"price_entry_id": "b", "bidder_name": "宝能", "included": True, "calculation_price": "1835000", "manual_scores": {}},
+            {"price_entry_id": "c", "bidder_name": "众合", "included": True, "calculation_price": "1909660", "manual_scores": {}},
+            {"price_entry_id": "d", "bidder_name": "山西中矿", "included": True, "calculation_price": "1925000", "manual_scores": {}},
+        ]
+
+        calculated = price_sheet._calculate_rule(rule, entries)
+
+        # 4 家 < 5 家：不得修剪；基准价 = 全部算术平均×97% = 1791992.55。
+        self.assertEqual(calculated["benchmark_price"], "1791992.55")
+        scores = {entry["bidder_name"]: value["score"] for entry, value in zip(entries, calculated["scores"].values())}
+        self.assertEqual(scores["中矿"], 42.99)
+        self.assertEqual(scores["宝能"], 42.60)
+        self.assertEqual(scores["众合"], 38.43)
+        self.assertEqual(scores["山西中矿"], 37.58)
+
     def test_price_sheet_compiles_increase_decrease_wording_for_price_deviation(self):
         rule = {
             "title": "价格部分-报价得分",
