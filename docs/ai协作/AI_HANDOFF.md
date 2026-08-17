@@ -5,14 +5,14 @@ handoff_schema: 1
 updated_at: 2026-08-17
 module: evaluation-workbench
 status: deployed_validation_pending
-base_commit: 809cff9
+base_commit: 9fe9b1f
 branch: main
-working_tree: clean_after_parse_quote_backfill_deploy
-remote_github: 809cff9
-remote_gitee: 809cff9
-production_commit: 809cff9
+working_tree: clean_after_quote_rule_v5_deploy
+remote_github: 9fe9b1f
+remote_gitee: 9fe9b1f
+production_commit: 9fe9b1f
 prompt_version: vision-evidence-contract-v63（已部署；未填调整不套用规则优惠）
-database_change: ew_documents 新增 quote_value/quote_source/quote_excerpt/quote_status/quote_fingerprint 报价缓存列（SQLite 兼容迁移，已部署）；ew_price_rule_sets、ew_price_score_runs、ew_projects.price_profile_id 此前已部署
+database_change: ew_documents 报价缓存列（v4 已部署）；本轮仅 PRICE_SHEET_VERSION 升 v5，无结构变更
 user_approval: 已授权实施、提交、推送和部署
 ```
 
@@ -20,8 +20,8 @@ user_approval: 已授权实施、提交、推送和部署
 
 ## 下一位先做
 
-1. 报价提取规则收紧已完成待提交部署：明确总报价标签白名单 + 不含税口径排除 + 泛化标题不取金额（详见活跃记录 5）。修复云端实例：太原税务 4 家误识别 1050 → 全部正确留空；sxyh 旧项目神州数码 699690.00、上海有光 670000.00 恢复提取；上海思方达为扫描件（仅页码文字）保持留空（需人工填写或 OCR 后重试）。全部 32 条既有报价用新规则复算零变化。部署后对 sxyh 旧项目与太原税务强制刷新验证。
-2. 建议验收：各项目文件中心应显示报价（万元，悬停精确元）；重新上传/解析文件后报价自动出现；价格页"重新识别文件报价"与文件清单始终同源。
+1. 报价提取规则收紧已部署 `47ff79b` + 版本升 v5 `9fe9b1f`（build-info `version_consistent=true`）：总报价标签白名单、不含税口径排除、泛化标题不取金额；旧版本指纹缓存全部失效自动重扫。云端全项目已验证：太原税务 3 家全部正确留空（1050 假阳性清除）；sxyh 旧项目神州数码 699690（69.97 万）、上海有光 670000（67.00 万）恢复提取；上海思方达为扫描件（仅页码文字）保持留空，需人工填写或 OCR 后重试；其余 26 条既有报价复算零变化。
+2. 建议验收：刷新页面查看各项目文件中心的"报价（万元）"列；"解析全部文件"或价格页"重新识别文件报价"均可触发重扫；sxyh 上海思方达可人工在价格页补录报价。
 
 ## 活跃记录（最多 10 条）
 
