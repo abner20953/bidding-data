@@ -5,12 +5,12 @@ handoff_schema: 1
 updated_at: 2026-08-17
 module: evaluation-workbench
 status: deployed_validation_pending
-base_commit: 42ad0ff
+base_commit: 2fd6959
 branch: main
-working_tree: clean_after_deterministic_price_math_deploy
-remote_github: 42ad0ff
-remote_gitee: 42ad0ff
-production_commit: 42ad0ff
+working_tree: clean_after_trim_classification_fix_deploy
+remote_github: 2fd6959
+remote_gitee: 2fd6959
+production_commit: 2fd6959
 prompt_version: vision-evidence-contract-v62（已部署；价格分自洽性契约）
 database_change: ew_price_rule_sets、ew_price_score_runs 和 ew_projects.price_profile_id 已按 SQLite 兼容迁移部署；本轮无数据库变更
 user_approval: 已授权实施、提交、推送和部署
@@ -20,7 +20,7 @@ user_approval: 已授权实施、提交、推送和部署
 
 ## 下一位先做
 
-1. 云端待部署 `修复修剪判定`：test3 核验发现"按其20%（四舍五入取整）去掉最高和最低"（20% 在"去掉"之前）被误判为固定数量修剪（one_each），4 家<5 家仍被砍头去尾，基准价错为 1816160.1。已通用修复（percent_20 增加 20% 前置表述分支，与既有后置表述并列）并补真实文本回归；本地复算基准价 1791992.55、分数 42.99/42.60/38.43/37.58。部署后请重跑 sxyh2（应为 4×30）与 test3 核对；不同税率换算仍须人工确认。
+1. 云端已部署 `2fd6959`（修剪判定修复）。**请重跑 test3 的 AI 价格分计算**：预期基准价 1791992.55、四家 42.99/42.60/38.43/37.58（sxyh2 复跑应仍为 4×30）。旧分数结果因输入指纹未变不会自动失效，需重新触发"保存全部修改并由 AI 重算"覆盖；不同税率换算仍须人工确认。
 
 ## 活跃记录（最多 10 条）
 
