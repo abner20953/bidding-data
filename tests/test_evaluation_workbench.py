@@ -5465,6 +5465,41 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(value, Decimal("100000"))
         self.assertEqual(status, "found")
 
+    def test_quote_field_ignores_document_title_and_clause_labels(self):
+        # “报价单”是文档标题、“报价不高于…”是最高限价从句、“报价均不接受…”是
+        # 声明条款，都不足以认定其后数字就是总报价。
+        for lines in (
+            ["三、报价单", "如工程造价最终低于1050.000元的，则以实际结算为准。"],
+            ["投标报价  不高于70 万元含税最高限价，分项报价完整。"],
+            ["1.本项目总价及分项报价均不接受任何形式的赠送、“零”报价和折扣报价。"],
+            ["开标一览表（总报价表）", "报价合计（小写）", "报价合计（大写）"],
+        ):
+            value, _excerpt, status = price_sheet._quote_from_lines(lines)
+            self.assertIsNone(value)
+            self.assertEqual(status, "missing")
+
+    def test_quote_prefers_total_over_tax_excluded_component(self):
+        # 投标函“（¥699690.00）的投标总报价（其中，不含税价为660084.91元…）”：
+        # 总价在前，不含税组件紧随其后，必须取总价而非留空。
+        value, _excerpt, status = price_sheet._quote_from_lines([
+            "招标文件的全部内容，愿意以人民币（大写）陆拾玖万玖仟陆佰玖拾元整"
+            "（¥699690.00）的投标总报价（其中，不含税价为660084.91元，增值税税率为6%"
+            "，发票类型为增值税专用发票），服务期限测试",
+        ])
+        self.assertEqual(value, Decimal("699690.00"))
+        self.assertEqual(status, "found")
+
+    def test_quote_ignores_tax_excluded_label_as_independent_field(self):
+        # 分项表“含税总报价”与“不含税报价”并列时，不含税口径不是总报价，不得
+        # 制造多值歧义。
+        value, _excerpt, status = price_sheet._quote_from_lines([
+            "含税总报价：699690.00元",
+            "不含税报价：660084.91元",
+            "增值税税率：6%",
+        ])
+        self.assertEqual(value, Decimal("699690.00"))
+        self.assertEqual(status, "found")
+
     def test_price_sheet_finds_currency_amount_before_explicit_total_quote_field(self):
         value, _excerpt, status = price_sheet._quote_from_lines([
             "人民币壹佰零伍万贰仟伍佰叁拾元整（¥1,052,530.00）的投标总报价（其中增值税税率为13%）。",

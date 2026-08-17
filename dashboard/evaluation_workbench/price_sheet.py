@@ -23,8 +23,16 @@ PRICE_SHEET_VERSION = "price-sheet-v4"
 _PRICE_RULE_PATTERN = re.compile(
     r"最低(?:投标)?价|评审价|评标价|基准价|价格分|报价得分|投标报价[^，。；]{0,20}得分"
 )
-_QUOTE_FIELD_PATTERN = re.compile(r"(?:投标|响应|磋商)?(?:总)?报价(?!\s*(?:表|栏|一览))")
-_TOTAL_QUOTE_LABEL_PATTERN = re.compile(r"(?:投标|响应|磋商)?(?:总)?报价|开标一览表")
+_QUOTE_FIELD_PATTERN = re.compile(
+    r"(?:投标|响应|磋商)(?:总)?报价(?!\s*(?:表|栏|一览|单|清单|明细|唯一|均|应|包含|不|中|内))"
+    r"|(?:含税)?总报价(?!\s*(?:表|栏|一览|单|清单|明细|唯一|均|应|包含|不|中|内))"
+    r"|(?<!不)(?<!未)含税报价(?!\s*(?:表|栏|一览|单|清单|明细|唯一|均|应|包含|不|中|内))"
+    r"|报价(?:合计|总额|金额|小写|大写)(?!\s*(?:表|栏|一览|单|清单|明细|唯一|均|应|包含|不|中|内))"
+)
+_TOTAL_QUOTE_LABEL_PATTERN = re.compile(
+    r"(?:投标|响应|磋商)(?:总)?报价|(?:含税)?总报价|(?<!不)(?<!未)含税报价|报价(?:合计|总额|金额|小写|大写)|开标一览表"
+)
+_TAX_EXCLUDED_QUALIFIER = re.compile(r"(?:不含税|未税|税前|除税|未含税)")
 _AMOUNT_WITH_UNIT_PATTERN = re.compile(
     r"(?:￥|¥|人民币)?\s*[:：]?\s*"
     r"(?P<amount>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*"
@@ -67,6 +75,18 @@ def _plain_amount_is_safe(tail: str, match: re.Match) -> bool:
     return not _IDENTIFIER_PREFIX_PATTERN.search(prefix)
 
 
+def _label_is_tax_excluded(context: str, label: re.Match) -> bool:
+    """标签本身属于不含税口径（如“不含税报价：…”）时不是总报价字段。"""
+    prefix = context[max(0, label.start() - 8):label.start()]
+    return bool(_TAX_EXCLUDED_QUALIFIER.search(prefix))
+
+
+def _amount_is_tax_excluded(context: str, match: re.Match) -> bool:
+    """金额紧邻“不含税价/未税/税前/除税”限定词时是口径组件而非总报价。"""
+    prefix = context[max(0, match.start() - 14):match.start()]
+    return bool(re.search(r"(?:不含税|未税|税前|除税|未含税)\D{0,10}$", prefix))
+
+
 def _amounts_near_quote_label(window: str) -> list[Decimal]:
     """从明确报价字段的最近邻域提取金额。
 
@@ -75,13 +95,17 @@ def _amounts_near_quote_label(window: str) -> list[Decimal]:
     的年份、税率、编号或分项金额混入。
     """
     quote_field = _QUOTE_FIELD_PATTERN.search(window)
-    label = quote_field or _TOTAL_QUOTE_LABEL_PATTERN.search(window)
-    if not label:
+    # 只接受明确的总报价字段（投标报价/总报价/报价合计等）；“报价单”“报价表”
+    # 等标题、“报价均/应/不…”等从句以及“开标一览表”泛化标题都不足以认定其后的
+    # 数字就是总报价。
+    if not quote_field:
         return []
-    start = max(0, label.start() - (180 if quote_field else 0))
-    end = min(len(window), label.end() + 180)
+    if _label_is_tax_excluded(window, quote_field):
+        return []
+    start = max(0, quote_field.start() - 180)
+    end = min(len(window), quote_field.end() + 180)
     context = window[start:end]
-    label_start, label_end = label.start() - start, label.end() - start
+    label_start, label_end = quote_field.start() - start, quote_field.end() - start
     candidates: list[tuple[int, Decimal]] = []
 
     def distance(match: re.Match) -> int:
@@ -95,6 +119,8 @@ def _amounts_near_quote_label(window: str) -> list[Decimal]:
         for match in pattern.finditer(context):
             if allow_plain and not _plain_amount_is_safe(context, match):
                 continue
+            if _amount_is_tax_excluded(context, match):
+                continue
             value = _decimal(match.group("amount"))
             if value is None:
                 continue
@@ -104,10 +130,8 @@ def _amounts_near_quote_label(window: str) -> list[Decimal]:
 
     collect(_AMOUNT_WITH_UNIT_PATTERN)
     collect(_CURRENCY_AMOUNT_PATTERN)
-    # 无单位数字只能紧邻明确报价字段采纳；“开标一览表”标题本身不足以判定其后的
-    # 数字就是总报价。
-    if quote_field:
-        collect(_PLAIN_AMOUNT_PATTERN, allow_plain=True)
+    # 无单位数字只能紧邻明确报价字段采纳。
+    collect(_PLAIN_AMOUNT_PATTERN, allow_plain=True)
     if not candidates:
         return []
     nearest = min(item[0] for item in candidates)
