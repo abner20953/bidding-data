@@ -4109,7 +4109,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("表格字段、填写格式", PROMPT_TEMPLATES["extract_rules_obligation_compile_user"]["content"])
         self.assertIn("系统仅能核验已上传文件", PROMPT_TEMPLATES["extract_rules_guidance"]["content"])
         self.assertIn("当一条候选仅概述同一表单、附件或材料的格式", PROMPT_TEMPLATES["extract_rules_dedupe_adjudication_user"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v62")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v63")
 
     def test_scope_chapter_and_text_error_guidance_present(self):
         from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
@@ -4127,7 +4127,20 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn(text_marker, PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("必须点名最具辨识度的偏离对象", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
         self.assertIn("risk_level 应为 high", PROMPT_TEMPLATES["evaluate_all_scope_anomaly_guidance"]["content"])
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v62")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v63")
+
+    def test_price_score_prompt_clarifies_unfilled_adjustment_uses_original_price(self):
+        from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
+        user = PROMPT_TEMPLATES["price_score_calculation_user"]["content"]
+        system = PROMPT_TEMPLATES["price_score_calculation"]["content"]
+        # 规则提到的优惠/税率扣除：只有人工调整已填写才生效；未填写的按原计分价计算，
+        # 不得替投标人套用，也不得重复扣除——避免 AI 对“规则提扣除但调整未填”的歧义。
+        self.assertIn("不能再扣一次", user)
+        self.assertIn("adjustment.mode=none", user)
+        self.assertIn("按计分价原值计算", user)
+        self.assertIn("未填写调整", user)
+        self.assertIn("不得替投标人套用", system)
+        self.assertIn("final_score", user)
 
     def test_ocr_visual_contracts_deduplicated_but_keep_hard_constraints(self):
         from dashboard.evaluation_workbench.prompt_templates import PROMPT_TEMPLATES
@@ -7362,7 +7375,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("不限定行业或采购类型", guidance)
         scan = PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"]
         self.assertIn("每 10 页最多 2 条，整块最多 12 条", scan)
-        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v62")
+        self.assertEqual(EVALUATION_PROMPT_VERSION, "vision-evidence-contract-v63")
 
     def test_full_scan_does_not_reinject_previous_scope_candidate(self):
         document = self._add_pdf("scope-rerun.pdf", "bid", "甲公司", "投标方案正文")
