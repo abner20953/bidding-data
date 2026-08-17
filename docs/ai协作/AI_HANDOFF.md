@@ -4,13 +4,13 @@
 handoff_schema: 1
 updated_at: 2026-08-17
 module: evaluation-workbench
-status: local_changes
-base_commit: 6b6449a
+status: deployed_validation_pending
+base_commit: 77c7d09
 branch: main
-working_tree: price_sheet_v3_uncommitted
-remote_github: 6b6449a
-remote_gitee: 6b6449a
-production_commit: 6b6449a
+working_tree: clean_after_price_sheet_v3_deploy
+remote_github: 77c7d09
+remote_gitee: 77c7d09
+production_commit: 77c7d09
 prompt_version: compare-evidence-ai-v5（本轮未修改）
 database_change: 无新增迁移；复用 ew_price_entries 与既有结果表
 user_approval: 已授权实施、提交、推送和部署
@@ -20,9 +20,8 @@ user_approval: 已授权实施、提交、推送和部署
 
 ## 下一位先做
 
-1. 当前本地待提交：价格工作表 V3 已改为同级页面；规则提取后即可使用，不依赖综合评审。待用户确认后提交、推送与部署。
-2. 部署后用一个最低价比例项目和一个平均值偏差项目验收：自动报价、手工补录、移出/恢复、缺报价阻止自动计分、价格优惠/税率调整与报告/CSV；确认不会产生任务、模型或 OCR 调用。
-3. 综合评审、规则提取、OCR/图片、查重主链仍受保护；本轮只将价格评分规则从综合评审和客观分展示中隔离，不改变其他审查规则。
+1. 云端已部署 `77c7d09` 并验证：price-sheet-v3 生效、sxyh2 价格规则编译器正确回退手工计分（“每增加1%”措辞不匹配“每高于1%”模式）、历史价格行 `price_managed_by_sheet` 标记正常。剩余动作：sxyh2 人工填写 4 家真实报价；以一个最低价比例项目和一个平均值偏差项目验收自动计分、补录、移出、缺价阻断与报告/CSV。
+2. 综合评审、规则提取、OCR/图片、查重主链仍受保护；本轮只将价格评分规则从综合评审和客观分展示中隔离，不改变其他审查规则。
 
 ## 活跃记录（最多 10 条）
 
