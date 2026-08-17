@@ -4,15 +4,15 @@
 handoff_schema: 1
 updated_at: 2026-08-17
 module: evaluation-workbench
-status: local_changes
-base_commit: 13b50e1
+status: deployed_validation_pending
+base_commit: 2337cc6
 branch: main
-working_tree: modified
-remote_github: 13b50e1
-remote_gitee: 13b50e1
-production_commit: 13b50e1
+working_tree: clean_after_price_sheet_deploy
+remote_github: 2337cc6
+remote_gitee: 2337cc6
+production_commit: 2337cc6
 prompt_version: compare-evidence-ai-v5（本轮未修改）
-database_change: 新增 ew_price_entries（仅独立价格试算，待部署）
+database_change: 新增 ew_price_entries（已部署；报价试算独立于评审主链）
 user_approval: 已授权实施、提交、推送和部署
 ```
 
@@ -20,7 +20,7 @@ user_approval: 已授权实施、提交、推送和部署
 
 ## 下一位先做
 
-1. 对本轮独立价格工作表做最终差异审查；如无问题，等待用户确认是否提交、推送和部署。
+1. 云端验收 sxyh2 时发现：报价提取把“投标报价表”章节标题后的年份（如 2026）误识别为报价（`_PLAIN_AMOUNT_PATTERN` 命中 4 位数字、`_QUOTE_FIELD_PATTERN` 命中“投标报价表”标题）。修复方向：报价字段标签收紧（排除“报价表/报价栏”类标题）、纯数字路径排除 20xx 年份或提高最低位数；修复后重跑 sxyh2 刷新并人工核对 4 家报价。
 2. 部署后以一个含最低价比例公式的项目验收：自动报价、手工补录、移出/恢复和重新计算；确认不会新增任务、模型或 OCR 调用。
 3. 综合评审、规则提取、OCR/图片、查重和既有评分结果仍保持冻结，本轮价格试算不得接入这些主链。
 
