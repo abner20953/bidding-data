@@ -4,12 +4,12 @@
 handoff_schema: 1
 updated_at: 2026-08-17
 module: evaluation-workbench
-status: deployed_validation_pending
-base_commit: 6e851e6
+status: local_changes
+base_commit: 19c03be
 branch: main
-working_tree: clean_after_price_score_contract_deploy
-remote_github: 6e851e6
-remote_gitee: 6e851e6
+working_tree: deterministic_price_math_pending_commit
+remote_github: 19c03be
+remote_gitee: 19c03be
 production_commit: 6e851e6
 prompt_version: vision-evidence-contract-v62（已部署；价格分自洽性契约）
 database_change: ew_price_rule_sets、ew_price_score_runs 和 ew_projects.price_profile_id 已按 SQLite 兼容迁移部署；本轮无数据库变更
@@ -20,7 +20,9 @@ user_approval: 已授权实施、提交、推送和部署
 
 ## 下一位先做
 
-1. 云端已部署 `6e851e6`（提示词 v62）。sxyh2 价格页仍显示旧 AI 结果（含 27.7、基准价 1053347，输入指纹未变不会自动失效）——**需在价格页重新触发"保存全部修改并由 AI 重算"**，新任务按 v62 契约返回 score+final_score 一致的结果并覆盖展示；核对四家应为 30 分（差值四舍五入后 0%）。
+1. 云端实际版本 `6e851e6` 的新任务仍暴露模型算术错误：sxyh2 基准价和四条分数错误；test3 把“平均值×97%”算错，且分数字段与 calculation 矛盾。`score/final_score` 只能校验字段一致，不能证明算术正确。
+2. 本地已改为“AI 理解规则、Decimal 执行明确算式”：修复平均值系数贪婪匹配（97% 被后续偏差率 100% 覆盖）、区分去高低家数的取整方式，并支持偏差率先四舍五入。已完整编译的公式强制采用本地精确复算；无法编译的复杂公式仍保留 AI 建议与 v62 自洽校验。
+3. 527 项工作台完整回归通过。获用户同意提交部署后，只需重跑 sxyh2 与 test3 的价格分：按当前报价，sxyh2 四家均应为 30 分；test3 基准价应为 1791992.55，四家分数依当前计分价分别为 42.99、42.60、38.43、37.58（仍须确认不同税率是否已人工换算）。
 
 ## 活跃记录（最多 10 条）
 
@@ -32,10 +34,10 @@ user_approval: 已授权实施、提交、推送和部署
 - 已清理旧链路：删除无调用方的跨投标人模型价格评分、公式复算、结果回写及对应提示词/测试；保留任务结果中的 `cross_bid_price` 空元数据仅为既有调用方兼容，保留本地报价事实提取供非评分报价审查使用。
 - 验证：定向价格公式/报价覆盖测试、完整工作台与 AI 网关回归、前端语法、文档和差异校验均通过；核心版本已部署至 `30674c2`。
 
-### 4. 价格分输出完整性（本地完成，待提交部署）
+### 4. 价格分确定性算术（本地完成，待提交部署）
 
-- 云端 sxyh2 最新成功任务证明：模型可给出完整 calculation 却把 score 全部写为 null；test3 证明模型可能让 JSON score 与同一条 calculation 的最终分矛盾。二者属于模型输出契约缺口，不是某项目公式特例。
-- 已要求完整输入时始终给出建议分；`needs_review` 仅表达待复核口径。新增 `final_score` 对模型自身输出作无公式语义的完整性校验；不重新引入本地公式复算或修改综合评审链路。
+- sxyh2 与 test3 的 v62 重跑证明模型可让 score/final_score 同时错误；根因还包括公式编译器把平均值后的后续 100% 错认成基准价系数。
+- 已对完整编译的明确公式恢复确定性复算，但不使用宽松猜测：只支持最低价比例法和要素齐全的平均值偏差法；其余仍由 AI 建议。修改不触及综合评审链路。
 
 ### 2. 报价误识别修复（已部署 6b6449a，云端已验证）
 

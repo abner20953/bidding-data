@@ -239,7 +239,9 @@ def _compile_price_formula(rule: dict) -> dict:
         r"|(?:评标|评审)?基准价.{0,48}(?:算术)?平均(?:值|价)?",
         text,
     )
-    factor_match = re.search(r"(?:算术平均值|平均值|平均价).{0,28}(?:[×x*]|的)\s*(0?\.\s*\d+|\d+\s*%)", text)
+    # 非贪婪地取平均值后的第一个系数；否则“平均值×97%……偏差率×100%”会把
+    # 后一个 100% 错当成基准价系数。
+    factor_match = re.search(r"(?:算术平均值|平均值|平均价).{0,28}?(?:[×x*]|的)\s*(0?\.\s*\d+|\d+\s*%)", text)
     factor = _decimal_factor(factor_match.group(1)) if factor_match else Decimal("1")
     # 不跨句寻找高低偏差项，且“每高/每低”必须与对应方向绑定；否则一条规则里
     # 的低于基准价扣分可能被贪婪地误读为高于基准价扣分。
@@ -249,12 +251,16 @@ def _compile_price_formula(rule: dict) -> dict:
     high = re.search(
         r"(?:高于[^。；;]{0,28}?基准价[^。；;]{0,28}?每(?:高于|高)?\s*1%?"
         r"|(?:报价|价格|价)[^。；;]{0,32}?基准价[^。；;]{0,32}?每(?:增加|高于|高)\s*1%?)"
+        r".{0,18}?扣\s*(\d+(?:\.\d+)?)\s*分"
+        r"|(?:报价|价格|价)[^。；;]{0,20}?每(?:高于|增加)[^。；;]{0,12}?基准价\s*1%?"
         r".{0,18}?扣\s*(\d+(?:\.\d+)?)\s*分",
         text,
     )
     low = re.search(
         r"(?:低于[^。；;]{0,28}?基准价[^。；;]{0,28}?每(?:低于|低)?\s*1%?"
         r"|(?:报价|价格|价)[^。；;]{0,32}?基准价[^。；;]{0,32}?每(?:减少|低于|低)\s*1%?)"
+        r".{0,18}?扣\s*(\d+(?:\.\d+)?)\s*分"
+        r"|(?:报价|价格|价)[^。；;]{0,20}?每(?:低于|减少)[^。；;]{0,12}?基准价\s*1%?"
         r".{0,18}?扣\s*(\d+(?:\.\d+)?)\s*分",
         text,
     )
@@ -262,20 +268,38 @@ def _compile_price_formula(rule: dict) -> dict:
         return {"kind": None, "reason": "公式要素不完整，需手工计分"}
 
     try:
-        high_rate, low_rate = Decimal(high.group(1)), Decimal(low.group(1))
+        high_rate = Decimal(next(value for value in high.groups() if value is not None))
+        low_rate = Decimal(next(value for value in low.groups() if value is not None))
     except InvalidOperation:
         return {"kind": None, "reason": "偏差扣分比例无法确定，需手工计分"}
     if high_rate < 0 or low_rate < 0:
         return {"kind": None, "reason": "偏差扣分比例无效，需手工计分"}
 
     trim_mode = "none"
+    trim_rounding = "floor"
     if re.search(r"(?:去掉|剔除).{0,28}(?:最高|最低).{0,28}(?:20%|百分之二十)", text):
         trim_mode = "percent_20"
+        if re.search(r"(?:20%|百分之二十).{0,16}四舍五入.{0,8}取整", text):
+            trim_rounding = "half_up"
+        elif re.search(r"(?:20%|百分之二十).{0,28}取整数部分", text):
+            trim_rounding = "floor"
     elif re.search(r"(?:去掉|剔除).{0,20}(?:一个|1个)?最高.{0,20}(?:一个|1个)?最低", text):
         trim_mode = "one_each"
+    # “差值百分比（四舍五入）”通常表示先把偏差率取整后再按每 1% 扣分；
+    # 与“20% 四舍五入取整”这种仅决定去高低家数的表述严格区分。
+    deviation_rounding = "integer" if re.search(
+        r"(?:差值百分比|偏差率)[^。；;]{0,120}?四舍五入", text
+    ) else "none"
+    # 原文仅写“算术平均（四舍五入）”而未写小数位时，按元取整；若规则明确
+    # 乘系数或保留小数，则保持 Decimal 精度到最终得分阶段。
+    benchmark_rounding = "integer" if re.search(
+        r"算术平均(?:值|价)?(?:得出)?[（(]?四舍五入[）)]?", text
+    ) else "none"
     return {
         "kind": "average_factor_deviation", "max_score": max_score, "factor": factor,
         "high_rate": high_rate, "low_rate": low_rate, "trim_mode": trim_mode,
+        "trim_rounding": trim_rounding, "deviation_rounding": deviation_rounding,
+        "benchmark_rounding": benchmark_rounding,
     }
 
 
@@ -353,14 +377,20 @@ def _calculate_rule(rule: dict, entries: list[dict]) -> dict:
             factor = formula["factor"]
             averaged = list(prices)
             if len(prices) >= 5 and formula.get("trim_mode") == "percent_20":
-                trim = max(1, int((Decimal(len(prices)) * Decimal("0.2")).quantize(Decimal("1"), rounding=ROUND_HALF_UP)))
+                raw_trim = Decimal(len(prices)) * Decimal("0.2")
+                trim = max(1, int(raw_trim.quantize(Decimal("1"), rounding=ROUND_HALF_UP))) \
+                    if formula.get("trim_rounding") == "half_up" else max(1, int(raw_trim))
                 if len(prices) > trim * 2:
                     averaged = sorted(prices)[trim:-trim]
             elif len(prices) > 2 and formula.get("trim_mode") == "one_each":
                 averaged = sorted(prices)[1:-1]
             benchmark = sum(averaged) / Decimal(len(averaged)) * factor
+            if formula.get("benchmark_rounding") == "integer":
+                benchmark = benchmark.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
             for entry, price in priced:
                 delta = abs(price - benchmark) / benchmark * Decimal("100")
+                if formula.get("deviation_rounding") == "integer":
+                    delta = delta.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
                 rate = formula["high_rate"] if price >= benchmark else formula["low_rate"]
                 score = min(max_score, max(Decimal("0"), (max_score - delta * rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)))
                 scores[entry["price_entry_id"]] = {
@@ -413,6 +443,31 @@ def price_calculation_input(app, project_id: str) -> dict:
     return {**stable, "fingerprint": fingerprint, "public_entries": entries, "internal_rules": rules}
 
 
+def _deterministic_price_results(calculation_input: dict) -> dict[str, dict]:
+    """对已被保守编译器完整识别的公式执行 Decimal 复算。
+
+    这里只处理最低价比例法和要素完整的平均值偏差法。无法完整编译的复杂规则仍交给
+    模型建议，避免本地代码猜测招标文件语义。
+    """
+    entries = calculation_input.get("public_entries")
+    rules = calculation_input.get("internal_rules")
+    if not isinstance(entries, list) or not isinstance(rules, list):
+        return {}
+    expected_entries = {
+        str(item.get("price_entry_id") or "")
+        for item in entries if isinstance(item, dict) and item.get("included")
+    }
+    verified: dict[str, dict] = {}
+    for rule in rules:
+        if not isinstance(rule, dict) or not rule.get("rule_id"):
+            continue
+        calculated = _calculate_rule(rule, entries)
+        score_ids = set((calculated.get("scores") or {}).keys())
+        if calculated.get("calculation_ready") and expected_entries and score_ids == expected_entries:
+            verified[str(rule["rule_id"])] = calculated
+    return verified
+
+
 def normalise_ai_price_calculation(raw: object, calculation_input: dict) -> tuple[dict, list[str]]:
     """校验 AI 计算结果的身份、覆盖与自身数值一致性。
 
@@ -423,6 +478,7 @@ def normalise_ai_price_calculation(raw: object, calculation_input: dict) -> tupl
     input_rules = {item["rule_id"]: item for item in calculation_input.get("rules", []) if isinstance(item, dict)}
     entries = {item["price_entry_id"]: item for item in calculation_input.get("entries", []) if isinstance(item, dict)}
     expected_entries = {key for key, item in entries.items() if item.get("included")}
+    deterministic = _deterministic_price_results(calculation_input)
     normalised: dict[str, dict] = {}
     errors: list[str] = []
     raw_rules = value.get("rules") if isinstance(value.get("rules"), list) else []
@@ -435,6 +491,7 @@ def normalise_ai_price_calculation(raw: object, calculation_input: dict) -> tupl
             errors.append("返回了未知或重复的价格规则")
             continue
         max_score = _decimal(rule.get("max_score"), allow_zero=True)
+        deterministic_rule = deterministic.get(rule_id)
         requires_numeric_score = bool(
             expected_entries
             and max_score is not None
@@ -442,6 +499,32 @@ def normalise_ai_price_calculation(raw: object, calculation_input: dict) -> tupl
         )
         rows: dict[str, dict] = {}
         raw_results = item.get("results") if isinstance(item.get("results"), list) else []
+        if deterministic_rule:
+            seen_entries: set[str] = set()
+            for result in raw_results:
+                if not isinstance(result, dict):
+                    continue
+                entry_id = str(result.get("price_entry_id") or "")
+                if entry_id not in expected_entries or entry_id in seen_entries:
+                    errors.append("返回了未知、未参与或重复的投标人")
+                    continue
+                seen_entries.add(entry_id)
+            rows = {
+                entry_id: {
+                    "score": value.get("score"),
+                    "source": "formula_verified",
+                    "calculation": str(value.get("calculation") or "").strip()[:500],
+                    "reason": "按明确价格公式和当前计分价进行十进制定点复算。",
+                }
+                for entry_id, value in (deterministic_rule.get("scores") or {}).items()
+            }
+            normalised[rule_id] = {
+                "benchmark_price": deterministic_rule.get("benchmark_price"),
+                "status": "completed",
+                "reason": "AI 负责读取规则口径；明确算式由程序复算，避免模型心算误差。",
+                "scores": rows,
+            }
+            continue
         for result in raw_results:
             if not isinstance(result, dict):
                 continue
@@ -573,7 +656,7 @@ def build_price_sheet(app, project_id: str) -> dict:
         "calculation_profile_id": (stored_run or {}).get("profile_id"),
         "notice": (
             "项目任务运行中，报价自动识别已暂缓；当前仅显示缓存和人工数据。"
-            if task_active else "报价由本地文字识别；价格分由所选 AI 模型计算，程序只校验可确定的公式。"
+            if task_active else "报价由本地文字识别；AI 负责读取价格规则，能完整编译的明确公式由程序精确复算，复杂规则保留 AI 建议。"
         ),
     }
 

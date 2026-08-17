@@ -5408,7 +5408,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             "profile_id": None, "prompt_version": worker.PROMPT_VERSION, "force_rerun": True,
         })
         ids = {item["bidder_name"]: item["price_entry_id"] for item in updated.values()}
-        # 最低价比例法：基准价 = min(90000, 106194.69) = 90000 → 甲 10 分、乙 8.47 分。
+        # 最低价比例法：基准价 = min(90000, 106194.69) = 90000 → 甲 10 分、乙按 Decimal 四舍五入为 8.48 分。
         ai_result = {"rules": [{
             "rule_id": rule["rule_id"], "benchmark_price": 90000, "status": "completed",
             "reason": "按最低价比例计算",
@@ -5432,7 +5432,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         by_name = {item["bidder_name"]: item for item in sheet["entries"]}
         self.assertTrue(sheet["calculation_ready"])
         self.assertEqual(by_name["甲公司"]["scores"][rule["rule_id"]]["score"], 10.0)
-        self.assertEqual(by_name["乙公司"]["scores"][rule["rule_id"]]["score"], 8.47)
+        self.assertEqual(by_name["乙公司"]["scores"][rule["rule_id"]]["score"], 8.48)
         self.assertIsNone(by_name["丙公司"]["scores"][rule["rule_id"]])
         with storage.connection(self.app) as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM ew_model_calls").fetchone()[0], 1)
@@ -5479,7 +5479,7 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(entry["scores"][rule_id]["score"], 4.5)
         self.assertEqual(entry["scores"][rule_id]["source"], "manual")
 
-    def test_price_sheet_accepts_ai_score_when_formula_rounding_requires_semantic_interpretation(self):
+    def test_price_sheet_uses_deterministic_math_when_formula_is_fully_compiled(self):
         rule = {
             "rule_id": "price-rule", "enabled": True, "category": "objective", "title": "最低价报价得分",
             "check_rule": "报价得分=（评标基准价／投标报价）×10。",
@@ -5505,7 +5505,71 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             ],
         }]}, payload)
         self.assertEqual(errors, [])
-        self.assertEqual(normalised["rules"]["price-rule"]["scores"]["a"]["score"], 8.0)
+        self.assertEqual(normalised["rules"]["price-rule"]["scores"]["a"]["score"], 10.0)
+        self.assertEqual(normalised["rules"]["price-rule"]["scores"]["b"]["score"], 5.0)
+        self.assertEqual(normalised["rules"]["price-rule"]["scores"]["a"]["source"], "formula_verified")
+
+    def test_price_sheet_rounds_deviation_percent_before_deduction_when_rule_requires_it(self):
+        rule_source = (
+            "通过初步评审的投标人报价为有效报价，依据采购成本价与评标基准价的差值百分比评分。"
+            "差值百分比=100%×（采购成本价-评标基准价）/评标基准价（四舍五入）。"
+            "评标基准价的计算方法：当通过初步评审的投标人≥5家时，去掉采购成本价最高的20%家数"
+            "（取整数部分）和最低的20%家数（取整数部分）后的剩余家数的采购成本价进行算术平均（四舍五入）。"
+            "当采购成本价等于评标基准价时得30分；采购成本价比评标基准价每增加1%（四舍五入），"
+            "扣0.5分，当采购成本价比评标基准价每减少1%（四舍五入），扣0.3分，扣至0分止。"
+        )
+        formula = price_sheet._compile_price_formula({
+            "title": "报价得分", "check_rule": rule_source, "source_text": rule_source,
+            "scoring_json": json.dumps({"max_score": 30}),
+        })
+        rule = {
+            "rule_id": "price", "title": "报价得分", "check_rule": rule_source,
+            "source_text": rule_source, "max_score": 30,
+            "formula_kind": formula["kind"], "_formula": formula,
+        }
+        entries = [
+            {"price_entry_id": "a", "bidder_name": "甲", "included": True, "calculation_price": "1054783", "manual_scores": {}},
+            {"price_entry_id": "b", "bidder_name": "乙", "included": True, "calculation_price": "1054191", "manual_scores": {}},
+            {"price_entry_id": "c", "bidder_name": "丙", "included": True, "calculation_price": "1052530", "manual_scores": {}},
+            {"price_entry_id": "d", "bidder_name": "丁", "included": True, "calculation_price": "1053809", "manual_scores": {}},
+        ]
+
+        calculated = price_sheet._calculate_rule(rule, entries)
+
+        self.assertEqual(formula["deviation_rounding"], "integer")
+        self.assertEqual(calculated["benchmark_price"], "1053828")
+        self.assertEqual({item["score"] for item in calculated["scores"].values()}, {30.0})
+
+    def test_price_sheet_average_factor_formula_uses_decimal_arithmetic(self):
+        rule_source = (
+            "评标基准价的确定：以所有有效投标报价的算术平均值×97%。"
+            "偏差率=|投标报价-评标基准价|/评标基准价×100%。投标报价等于评标基准价得满分；"
+            "投标报价每高于基准价1%扣1分，投标报价每低于基准价1%扣0.5分，"
+            "直至扣至0分止，不足1%按内插法保留两位小数。"
+        )
+        formula = price_sheet._compile_price_formula({
+            "title": "投标报价得分", "check_rule": rule_source, "source_text": rule_source,
+            "scoring_json": json.dumps({"max_score": 45}),
+        })
+        rule = {
+            "rule_id": "price", "title": "投标报价得分", "check_rule": rule_source,
+            "source_text": rule_source, "max_score": 45,
+            "formula_kind": formula["kind"], "_formula": formula,
+        }
+        entries = [
+            {"price_entry_id": "a", "bidder_name": "甲", "included": True, "calculation_price": "1720000", "manual_scores": {}},
+            {"price_entry_id": "b", "bidder_name": "乙", "included": True, "calculation_price": "1835000", "manual_scores": {}},
+            {"price_entry_id": "c", "bidder_name": "丙", "included": True, "calculation_price": "1909660", "manual_scores": {}},
+            {"price_entry_id": "d", "bidder_name": "丁", "included": True, "calculation_price": "1925000", "manual_scores": {}},
+        ]
+
+        calculated = price_sheet._calculate_rule(rule, entries)
+
+        self.assertEqual(calculated["benchmark_price"], "1791992.55")
+        self.assertEqual(calculated["scores"]["a"]["score"], 42.99)
+        self.assertEqual(calculated["scores"]["b"]["score"], 42.6)
+        self.assertEqual(calculated["scores"]["c"]["score"], 38.43)
+        self.assertEqual(calculated["scores"]["d"]["score"], 37.58)
 
     def test_price_sheet_rejects_blank_or_self_inconsistent_ai_score_when_inputs_complete(self):
         payload = {
