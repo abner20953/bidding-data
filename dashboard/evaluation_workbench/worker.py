@@ -14,13 +14,13 @@ import time
 import traceback
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from xml.etree import ElementTree
 
 import fitz
 
-from dashboard.evaluation_workbench import storage
+from dashboard.evaluation_workbench import price_sheet, storage
 from dashboard.evaluation_workbench.ai_gateway import (
     InvalidJsonResponse, ModelResponseEnvelopeError, _recover_complete_json_array, build_vision_user_content,
     model_capabilities, request_json,
@@ -5278,7 +5278,13 @@ def _review_documents(app, task: dict) -> dict:
 
 def _score_documents(app, task: dict, score_type: str) -> dict:
     rule_set, all_rules = storage.list_rules(app, task["project_id"])
-    rules = [item for item in all_rules if item["enabled"] and item["category"] == score_type]
+    rules = [
+        item for item in all_rules
+        if item["enabled"] and item["category"] == score_type
+        # 报价评分必须由独立工作表基于全部参与人的人工确认计分价计算；
+        # 兼容旧的单独客观评分任务时也不能再把它送给单文件模型猜测。
+        and not (score_type == "objective" and price_sheet.is_price_scoring_rule(item))
+    ]
     if not rules:
         raise ValueError(f"当前规则集内没有可执行的{'客观' if score_type == 'objective' else '主观'}评分项")
     documents = [item for item in storage.list_documents(app, task["project_id"]) if item["role"] == "bid"]
@@ -12441,40 +12447,6 @@ def _run_combined_batch(app, task: dict, profile: dict, document: dict, componen
             return _combined_manual_results(component, rules, payload, reason), 1, 0, len(rules), "manual_fallback"
 
 
-def _cross_bid_price_rules(rules: list[dict]) -> list[dict]:
-    """只有必须横向比较投标报价的规则才进入统一价格计算。"""
-    pattern = re.compile(r"最低(?:投标)?价|评审价|评标价|基准价|价格分|报价得分|投标报价[^，。；]{0,20}得分")
-    return [
-        rule for rule in rules
-        if str(rule.get("execution_strategy") or "") == "cross_bid"
-        or pattern.search(f"{rule.get('title', '')} {rule.get('check_rule', '')} {rule.get('source_text', '')}")
-    ]
-
-
-def _cross_bid_price_context(documents: list[dict], rules: list[dict]) -> str:
-    per_document_limit = min(24_000, max(10_000, 80_000 // max(1, len(documents))))
-    packets = []
-    for document in documents:
-        context = build_rule_context(document["parsed_path"], rules, per_document_limit)
-        packets.append({
-            "document_id": document["document_id"],
-            "bidder_name": document.get("bidder_name") or document.get("original_name"),
-            "filename": document.get("original_name"),
-            "text": context["text"],
-        })
-    return json.dumps(packets, ensure_ascii=False, separators=(",", ":"))
-
-
-def _decimal_price(value: object) -> Decimal | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
-        return None
-    try:
-        parsed = Decimal(str(value))
-    except (InvalidOperation, ValueError):
-        return None
-    return parsed if parsed.is_finite() and parsed > 0 else None
-
-
 _TOTAL_QUOTE_LABEL_PATTERN = re.compile(r"(?:投标|响应)?(?:总)?报价|开标一览表")
 _TOTAL_QUOTE_NUMBER_PATTERN = re.compile(
     r"(?:[￥¥]\s*[:：]?\s*|人民币\s*)?(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d{4,}(?:\.\d+)?)\s*元?"
@@ -12504,7 +12476,7 @@ def _total_quote_from_lines(lines: list) -> tuple[Decimal | None, str]:
 
 
 def _local_total_quote(document: dict) -> tuple[Decimal | None, str]:
-    """从本地已解析文本保守提取唯一总报价，作为横向价格模型漏项的回填兜底。
+    """从本地已解析文本保守提取唯一总报价，供报价合规审查共享事实使用。
 
     仅接受“总报价/投标报价/开标一览表”近邻窗口内唯一的数字金额；出现多个候选
     或无法确认口径时返回空，绝不猜测，更不会替代模型对资格扣除口径的判断。
@@ -12582,259 +12554,6 @@ def _document_shared_price_facts(app, project_id: str, document: dict, *,
         relation = "未超过" if quote <= limit else "超过"
         values.append(f"可比口径下：投标报价{relation}该限价；仍需按具体规则核对报价口径。")
     return "\n".join(values)
-
-
-_SME_DEDICATED_PURCHASE_PATTERN = re.compile(
-    r"专门面向.{0,24}中小企业.{0,90}(?:不再执行|不执行).{0,36}价格(?:评审|评价)?优惠",
-    re.DOTALL,
-)
-
-
-def _project_price_policy_context(app, project_id: str) -> str:
-    """从招标文件读取价格优惠的项目级例外，避免通用评分表覆盖明确政策前提。"""
-    try:
-        tenders = [item for item in storage.list_documents(app, project_id) if item.get("role") == "tender"]
-    except Exception:
-        return ""
-    for tender in tenders:
-        path = str(tender.get("parsed_path") or "")
-        if not path or not Path(path).is_file():
-            continue
-        text = Path(path).read_text(encoding="utf-8", errors="ignore")
-        compact = re.sub(r"\s+", "", text)
-        if _SME_DEDICATED_PURCHASE_PATTERN.search(compact):
-            return "本采购包明确专门面向中小企业，价格评分不执行中小微企业价格扣除。"
-    return ""
-
-
-def _strip_inapplicable_price_discount_text(value: object) -> str:
-    """移除模型沿用通用政策模板产生的价格扣除提示，保留其他报价核验事实。"""
-    text = _clean_model_text(value)
-    if not text:
-        return ""
-    pieces = re.split(r"(?<=[。；;])\s*|\n+", text)
-    retained = [piece for piece in pieces if not (
-        ("小微" in piece or "小型" in piece or "微型" in piece or "中小企业" in piece)
-        and ("扣除" in piece or "优惠" in piece or "声明函" in piece)
-    )]
-    return " ".join(piece.strip() for piece in retained if piece.strip())
-
-
-def _price_formula_kind(rule: dict) -> str | None:
-    """只识别原文完整写明的通用价格公式，避免把任意“基准价”误算成最低价法。"""
-    text = re.sub(r"\s+", "", " ".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text")))
-    # 最低价比例法必须同时有“最低价为基准”和“基准价/本投标报价”的方向证据。
-    lowest_base = re.search(r"最低[一-龥]{0,8}?(?:报价|价格|价).{0,40}(?:为|作为|确定为).{0,24}(?:评标|评审)?基准价", text)
-    lowest_ratio = re.search(r"(?:评标|评审)?基准价.{0,20}[／/].{0,20}(?:本|投标人)?(?:投标|响应)?报价", text)
-    if lowest_ratio and (lowest_base or re.search(r"价格最低|最低[一-龥]{0,8}?(?:报价|价格|价)", text)):
-        return "lowest_ratio"
-    # 算术平均值乘固定系数、并按高低偏离分别扣分的公式可以稳定复算；只有四个
-    # 关键要素都明确出现才接管模型结果，其他价格公式继续由模型给出建议。
-    average = "算术平均" in text and bool(re.search(r"(?:评标|评审)?基准价.{0,36}(?:算术平均|平均值)", text))
-    factor = re.search(r"(?:算术平均值|平均值).{0,28}(?:[×x*]|的)\s*(0?\.\s*\d+|\d+\s*%)", text)
-    high = re.search(r"高于.{0,24}基准价.{0,24}(?:每|每高).{0,12}1%?.{0,16}扣\s*(\d+(?:\.\d+)?)\s*分", text)
-    low = re.search(r"低于.{0,24}基准价.{0,24}(?:每|每低).{0,12}1%?.{0,16}扣\s*(\d+(?:\.\d+)?)\s*分", text)
-    if average and factor and high and low:
-        raw_factor = factor.group(1).replace(" ", "")
-        try:
-            value = Decimal(raw_factor[:-1]) / Decimal("100") if raw_factor.endswith("%") else Decimal(raw_factor)
-        except InvalidOperation:
-            value = Decimal("0")
-        if Decimal("0") < value <= Decimal("1"):
-            return "average_factor_deviation"
-    return None
-
-
-def _uses_lowest_price_ratio(rule: dict) -> bool:
-    """兼容既有调用方：只有明确最低价比例法才返回真。"""
-    return _price_formula_kind(rule) == "lowest_ratio"
-
-
-def _deterministic_price_score(rule: dict, quoted_price: object, quoted_prices: list[object], max_score: float) -> tuple[float | None, str]:
-    """复算明确的通用价格公式；信息不完整或公式不匹配时保留模型建议。"""
-    kind = _price_formula_kind(rule)
-    if not kind or max_score <= 0:
-        return None, ""
-    current = _decimal_price(quoted_price)
-    prices = [value for value in (_decimal_price(item) for item in quoted_prices) if value is not None]
-    if current is None or len(prices) < 2:
-        return None, ""
-    maximum = Decimal(str(max_score))
-    if kind == "lowest_ratio":
-        base = min(prices)
-        score = (base / current * maximum).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        bounded = min(maximum, max(Decimal("0"), score))
-        return float(bounded), f"系统复算：评标基准价{base}；{base}／{current}×{max_score}={bounded}（四舍五入保留两位小数）。"
-
-    text = re.sub(r"\s+", "", " ".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text")))
-    factor_match = re.search(r"(?:算术平均值|平均值).{0,28}(?:[×x*]|的)\s*(0?\.\s*\d+|\d+\s*%)", text)
-    high_match = re.search(r"高于.{0,24}基准价.{0,24}(?:每|每高).{0,12}1%?.{0,16}扣\s*(\d+(?:\.\d+)?)\s*分", text)
-    low_match = re.search(r"低于.{0,24}基准价.{0,24}(?:每|每低).{0,12}1%?.{0,16}扣\s*(\d+(?:\.\d+)?)\s*分", text)
-    if not (factor_match and high_match and low_match):
-        return None, ""
-    raw_factor = factor_match.group(1).replace(" ", "")
-    factor = Decimal(raw_factor[:-1]) / Decimal("100") if raw_factor.endswith("%") else Decimal(raw_factor)
-    # 常见规则在投标人不少于五家时去掉 20% 的最高、最低报价；原文未明确该条件时
-    # 不擅自剔除，直接使用全部可识别报价。
-    averaged = list(prices)
-    if len(prices) >= 5 and re.search(r"(?:去掉|剔除).{0,24}(?:最高|最低).{0,24}(?:20%|百分之二十)", text):
-        trim = max(1, int(len(prices) * 0.2))
-        if len(prices) > trim * 2:
-            averaged = sorted(prices)[trim:-trim]
-    base = (sum(averaged) / Decimal(len(averaged))) * factor
-    delta_percent = abs(current - base) / base * Decimal("100")
-    deduction_rate = Decimal(high_match.group(1)) if current >= base else Decimal(low_match.group(1))
-    score = (maximum - delta_percent * deduction_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    bounded = min(maximum, max(Decimal("0"), score))
-    side = "高于" if current >= base else "低于"
-    return float(bounded), (
-        f"系统复算：可识别报价算术平均值{sum(averaged) / Decimal(len(averaged))}×{factor}="
-        f"评标基准价{base.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}；本报价{side}基准价"
-        f"{delta_percent.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}%，按每1%扣{deduction_rate}分，建议{bounded}分。"
-    )
-
-
-def _run_cross_bid_price_scoring(app, task: dict, profile: dict, documents: list[dict], rules: list[dict],
-                                 score_run_id: str) -> dict:
-    """在单文件评审后统一计算最低价/基准价，补足跨文件公式无法单独判断的问题。"""
-    if len(documents) < 2 or not rules:
-        return {"rule_count": 0, "result_count": 0, "retry_count": 0, "missing_count": 0}
-    payload = _score_payload(rules)
-    price_policy_context = _project_price_policy_context(app, str(task.get("project_id") or ""))
-    document_packet = _cross_bid_price_context(documents, rules)
-    prompt = storage.render_prompt_template(
-        app, "evaluate_all_cross_bid_price_user",
-        rules=json.dumps(payload, ensure_ascii=False, separators=(",", ":")), documents=document_packet,
-        price_policy_context=price_policy_context or "未识别到项目级价格优惠例外，请仅按评分规则和已给证据判断。",
-    )
-    expected = {(document["document_id"], rule["rule_id"]) for document in documents for rule in rules}
-
-    def save_unavailable(keys: set[tuple[str, str]], reason: str) -> None:
-        for document_id, rule_id in keys:
-            rule_payload = rules_by_id[rule_id]
-            try:
-                max_score = float(rule_payload.get("scoring", {}).get("max_score") or 0)
-            except (TypeError, ValueError):
-                max_score = 0.0
-            result = _score_result_from_model(
-                rule_id, None, max_score,
-                {"reason": reason, "confidence": "low", "needs_ocr": bool(rule_payload.get("ocr_required"))},
-                force_needs_ocr=bool(rule_payload.get("ocr_required")),
-            )
-            storage.save_score_results(app, score_run_id, document_id, [result])
-
-    def request(phase: str) -> dict:
-        return _request_task_json(
-            app, task, profile, phase, _system_prompt(app, "evaluate_all"), prompt,
-            context_mode="cross_bid_price", max_tokens=_output_token_budget(
-                profile, max(3_000, 1_000 + len(expected) * 450),
-            ), thinking_mode="disabled",
-        )
-
-    retry_count = 0
-
-    def request_with_repair(phase: str) -> dict | None:
-        nonlocal retry_count
-        try:
-            return request(phase)
-        except InvalidJsonResponse as exc:
-            retry_count += 1
-            storage.update_task(app, task["task_id"], message="跨投标人价格评分结果正在规范化")
-            try:
-                return _repair_invalid_json(
-                    app, task, profile, f"{phase}_json_repair", exc, "results",
-                )
-            except ValueError as repair_exc:
-                if not _is_model_format_error(repair_exc):
-                    raise
-                return None
-
-    rules_by_id = {rule["rule_id"]: item for rule, item in zip(rules, payload)}
-    documents_by_id = {document["document_id"]: document for document in documents}
-    parsed = request_with_repair("evaluate_all_cross_bid_price")
-    if not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list):
-        retry_count += 1
-        parsed = request_with_repair("evaluate_all_cross_bid_price_retry")
-    if not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list):
-        # 比较型价格规则不能使用单文件暂定分兜底；明确保存“暂无法计算”，同时不让
-        # 已完成的其他审查结果整体失败。
-        save_unavailable(expected, "跨投标人价格比较未返回可靠结果，当前暂无法计算建议分，请人工核对全部报价后复核。")
-        return {"rule_count": len(rules), "result_count": 0, "retry_count": retry_count,
-                "missing_count": len(expected), "format_failure": True}
-
-    valid_rows = [dict(raw) for raw in parsed["results"] if isinstance(raw, dict) and
-                  (str(raw.get("document_id") or ""), str(raw.get("rule_id") or "")) in expected]
-    # 模型偶尔已返回该投标人行却遗漏 quoted_price，或直接漏掉一行。对每个横向
-    # 价格规则使用本地解析文本的“唯一总报价”作保守补位，避免一个明确报价被
-    # 静默保存为 null。价格扣除、资格有效性和非标准公式仍完全保留给模型/人工。
-    rows_by_key = {
-        (str(raw.get("document_id") or ""), str(raw.get("rule_id") or "")): raw
-        for raw in valid_rows
-    }
-    for document in documents:
-        local_price, excerpt = _local_total_quote_with_ocr(app, document)
-        if local_price is None:
-            continue
-        for rule in rules:
-            key = (document["document_id"], rule["rule_id"])
-            raw = rows_by_key.get(key)
-            if raw is None:
-                raw = {"document_id": key[0], "rule_id": key[1], "confidence": "medium"}
-                valid_rows.append(raw)
-                rows_by_key[key] = raw
-            if _decimal_price(raw.get("quoted_price")) is None:
-                raw["quoted_price"] = float(local_price)
-                # 本地唯一报价回填后，旧模型“未见总价/暂留空”已失效，不能继续混在
-                # 页面证据里。保留新的来源说明，使分数、证据和理由使用同一口径。
-                raw["_local_quote_recovered"] = True
-                raw["evidence"] = f"投标文件本地解析定位唯一总报价：{local_price}元。{excerpt[:220]}"
-                raw["reason"] = "模型报价字段缺失，已由投标文件中唯一总报价回填。"
-    prices_by_rule: dict[str, list[object]] = {}
-    for raw in valid_rows:
-        prices_by_rule.setdefault(str(raw.get("rule_id") or ""), []).append(raw.get("quoted_price"))
-
-    received: set[tuple[str, str]] = set()
-    for raw in valid_rows:
-        key = (str(raw.get("document_id") or ""), str(raw.get("rule_id") or ""))
-        rule_payload = rules_by_id[key[1]]
-        try:
-            max_score = float(rule_payload.get("scoring", {}).get("max_score") or 0)
-        except (TypeError, ValueError):
-            max_score = 0.0
-        deterministic_score, deterministic_calculation = _deterministic_price_score(
-            rule_payload, raw.get("quoted_price"), prices_by_rule.get(key[1], []), max_score,
-        )
-        if deterministic_score is not None:
-            previous_reason = _clean_model_text(raw.get("reason"))
-            if price_policy_context:
-                previous_reason = _strip_inapplicable_price_discount_text(previous_reason)
-            raw = {
-                **raw,
-                "suggested_score": deterministic_score,
-                "calculation": deterministic_calculation,
-                "reason": " ".join(value for value in (
-                    previous_reason,
-                    price_policy_context,
-                    "当前按全部可识别报价暂算，资格与符合性通过范围仍由人工最终确认。",
-                ) if value).strip(),
-            }
-        elif raw.get("_local_quote_recovered"):
-            raw["reason"] = " ".join(value for value in (
-                _clean_model_text(raw.get("reason")),
-                "本规则价格公式未达到自动复算条件，价格分需人工核对。",
-            ) if value).strip()
-        suggested = _suggested_score(rule_payload, raw, "objective", max_score)
-        result = _score_result_from_model(
-            key[1], suggested, max_score, raw,
-            force_needs_ocr=bool(rule_payload.get("ocr_required")),
-        )
-        storage.save_score_results(app, score_run_id, documents_by_id[key[0]]["document_id"], [result])
-        received.add(key)
-    missing = expected - received
-    if missing:
-        save_unavailable(missing, "跨投标人价格比较未返回本投标人的可靠结果，当前暂无法计算建议分，请人工复核报价口径和公式。")
-    return {"rule_count": len(rules), "result_count": len(received), "retry_count": retry_count,
-            "missing_count": len(missing)}
 
 
 def _cross_bid_subjective_shadow_enabled() -> bool:
@@ -13983,15 +13702,18 @@ def _evaluate_all(app, task: dict) -> dict:
     if not rule_set or rule_set["status"] != "confirmed":
         raise ValueError("请先确认当前评审规则集，再开始综合评审")
     review_rules = [item for item in all_rules if item["enabled"] and item["category"] in {"qualification", "compliance", "substantive", "rejection", "other"}]
-    objective_rules = [item for item in all_rules if item["enabled"] and item["category"] == "objective"]
+    price_scoring_rules = [
+        item for item in all_rules
+        if item["enabled"] and price_sheet.is_price_scoring_rule(item)
+    ]
+    objective_rules = [
+        item for item in all_rules
+        if item["enabled"] and item["category"] == "objective"
+        and not price_sheet.is_price_scoring_rule(item)
+    ]
     subjective_rules = [item for item in all_rules if item["enabled"] and item["category"] == "subjective"]
-    cross_bid_price_rules = _cross_bid_price_rules(objective_rules)
-    cross_bid_price_rule_ids = {item["rule_id"] for item in cross_bid_price_rules}
-    # 最低价、基准价等比较型规则不能在单份文件阶段独立计分。单文件阶段完全跳过，
-    # 最终统一比较成功后再写入结果，失败时写入明确的“暂无法计算”。
-    local_objective_rules = [item for item in objective_rules if item["rule_id"] not in cross_bid_price_rule_ids]
     if not (review_rules or objective_rules or subjective_rules):
-        raise ValueError("综合评审需要至少一条已确认的审查或评分规则")
+        raise ValueError("综合评审需要至少一条非价格的已确认审查或评分规则；报价请在“报价与价格分”中计算")
     all_documents = storage.list_documents(app, task["project_id"])
     documents = [item for item in all_documents if item["role"] == "bid"]
     if not documents or any(item["parse_status"] != "success" or not item["parsed_path"] for item in documents):
@@ -14040,19 +13762,18 @@ def _evaluate_all(app, task: dict) -> dict:
     local_ocr_seconds = 0.0
     groups_per_document = sum(
         len(_evaluation_rule_batches(component, component_rules))
-        for component, component_rules in (("review", review_rules), ("objective", local_objective_rules), ("subjective", subjective_rules))
+        for component, component_rules in (("review", review_rules), ("objective", objective_rules), ("subjective", subjective_rules))
     )
-    has_local_rules = bool(review_rules or local_objective_rules or subjective_rules)
+    has_local_rules = bool(review_rules or objective_rules or subjective_rules)
     visual_rule_count = sum(
-        1 for item in (review_rules + local_objective_rules + subjective_rules)
+        1 for item in (review_rules + objective_rules + subjective_rules)
         if _visual_advance_estimated(item)
     ) if (vision_features_enabled or ocr_features_enabled) else 0
     scan_units_by_document = {
         item["document_id"]: _full_scan_chunk_count(item) if has_local_rules else 0
         for item in documents
     }
-    cross_bid_units = 1 if objective_run and len(documents) >= 2 and cross_bid_price_rules else 0
-    total_work_units = max(1, sum(scan_units_by_document.values()) + len(documents) * (groups_per_document + visual_rule_count) + cross_bid_units)
+    total_work_units = max(1, sum(scan_units_by_document.values()) + len(documents) * (groups_per_document + visual_rule_count))
     # 首次仍以两路保守启动；连续成功后再按模型档案增加并行位。
     # 对 2 核 2GB 服务器而言这主要增加网络等待并行，不常驻加载额外模型。
     parallel_limit = _profile_parallel_limit(profile, len(documents))
@@ -14067,7 +13788,7 @@ def _evaluate_all(app, task: dict) -> dict:
     def run_document(document: dict) -> dict:
         return _evaluate_document(
             app, task, document, rule_set=rule_set, profile=profile, char_limit=char_limit,
-            expected_rule_ids=expected_rule_ids, review_rules=review_rules, objective_rules=local_objective_rules,
+            expected_rule_ids=expected_rule_ids, review_rules=review_rules, objective_rules=objective_rules,
             subjective_rules=subjective_rules, review_run=review_run, objective_run=objective_run,
             subjective_run=subjective_run, project_scope=project_scope, system_prompt=system_prompt,
             scan_units=scan_units_by_document[document["document_id"]], groups_per_document=groups_per_document,
@@ -14123,20 +13844,12 @@ def _evaluate_all(app, task: dict) -> dict:
         local_ocr_skipped_rule_count += value.get("local_ocr_skipped_rule_count", 0)
         local_ocr_seconds += float(value.get("local_ocr_seconds", 0) or 0)
         enhancement_rule_count += value.get("enhancement_rule_count", 0)
-    cross_bid_price = {"rule_count": 0, "result_count": 0, "retry_count": 0, "missing_count": 0}
-    price_review_reconciled_count = 0
-    if cross_bid_units and objective_run:
-        progress.message("正在统一比较全部投标人的报价并计算价格分")
-        cross_bid_price = _run_cross_bid_price_scoring(
-            app, task, profile, documents, cross_bid_price_rules, objective_run["score_run_id"],
-        )
-        # 单文件审查可能先把“报价未见”写入结果；跨投标人价格核验完成后，以同批
-        # 已定位的明确报价事实回收这类过时表述，避免摘要把已找到的报价误报为缺失。
-        if review_run and cross_bid_price.get("result_count"):
-            price_review_reconciled_count = storage.reconcile_price_review_results(
-                app, review_run["review_run_id"], objective_run["score_run_id"],
-            )
-        progress.advance("已完成全部投标人的报价比较与价格评分")
+    # 价格评分不进入综合评审：它依赖全部参与人的确认报价、价格扣除和参与范围，
+    # 这些是价格工作表的人工输入。保留计数供任务诊断，但不产生模型调用或结果写入。
+    cross_bid_price = {
+        "rule_count": len(price_scoring_rules), "result_count": 0, "retry_count": 0,
+        "missing_count": 0, "mode": "independent_price_sheet",
+    }
     # 横向主观分仍处于受控影子阶段：默认不调用模型，显式启用后也只把对照结果
     # 写入任务元数据，绝不回写 score_run 或改变页面中的正式建议分。
     cross_bid_subjective_shadow = {
@@ -14183,7 +13896,7 @@ def _evaluate_all(app, task: dict) -> dict:
             "full_scan_recovery_warning_count": full_scan_recovery_warning_count,
             "cross_bid_price": cross_bid_price,
             "cross_bid_subjective_shadow": cross_bid_subjective_shadow,
-            "price_review_reconciled_count": price_review_reconciled_count,
+            "price_review_reconciled_count": 0,
             "evidence_ledger_rule_count": evidence_ledger_rule_count,
             "evidence_ledger_empty_rule_count": evidence_ledger_empty_rule_count,
             "fact_ledger_mode": "shadow_only",

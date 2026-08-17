@@ -16,7 +16,7 @@ from pathlib import Path
 from dashboard.evaluation_workbench import storage
 
 
-PRICE_SHEET_VERSION = "price-sheet-v2"
+PRICE_SHEET_VERSION = "price-sheet-v3"
 
 _PRICE_RULE_PATTERN = re.compile(
     r"最低(?:投标)?价|评审价|评标价|基准价|价格分|报价得分|投标报价[^，。；]{0,20}得分"
@@ -174,44 +174,109 @@ def _rule_scoring(rule: dict) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _formula_text(rule: dict) -> str:
+    return re.sub(r"\s+", "", " ".join(
+        str(rule.get(key) or "") for key in ("title", "check_rule", "source_text")
+    ))
+
+
+def _decimal_factor(value: str) -> Decimal | None:
+    raw = str(value or "").replace(" ", "")
+    try:
+        factor = Decimal(raw[:-1]) / Decimal("100") if raw.endswith("%") else Decimal(raw)
+    except InvalidOperation:
+        return None
+    return factor if Decimal("0") < factor <= Decimal("1") else None
+
+
+def _compile_price_formula(rule: dict) -> dict:
+    """只编译可由确定性算式完整表达的价格规则。
+
+    价格规则文字通常同时描述基准价、修正范围和扣分方向。任何一个要素不明确时，
+    宁可回退为人工计分，也不能把“去高低价后取均值”错误当作最低价比例法。
+    """
+    text = _formula_text(rule)
+    max_score = _decimal(_rule_scoring(rule).get("max_score"))
+    if max_score is None:
+        return {"kind": None, "reason": "未识别到有效满分"}
+
+    average_terms = bool(re.search(r"(?:算术)?平均(?:值|价)?", text))
+    deviation_terms = bool(re.search(r"(?:高于|低于|偏离).{0,28}基准价|基准价.{0,28}(?:高于|低于|偏离|扣)", text))
+    lowest_base = re.search(
+        r"(?:最低(?:有效)?|价格最低的?)[一-龥0-9（）()、，,]{0,18}(?:投标|响应)?(?:报价|价格|价)"
+        r".{0,56}(?:为|作为|确定为).{0,24}(?:评标|评审)?基准价",
+        text,
+    )
+    lowest_ratio = re.search(
+        r"(?:评标|评审)?基准价[^。；;]{0,42}[／/]\s*(?:本|投标人)?(?:投标|响应)?报价",
+        text,
+    )
+    # 最低价比例法与平均值偏差法的口径互斥。出现均值、偏离或扣分结构时，
+    # 不允许以某个“最低报价”描述误判为最低价比例法。
+    if lowest_base and lowest_ratio and not average_terms and not deviation_terms:
+        return {"kind": "lowest_ratio", "max_score": max_score}
+
+    average_base = re.search(
+        r"(?:算术)?平均(?:值|价)?.{0,48}(?:为|作为|确定为).{0,24}(?:评标|评审)?基准价"
+        r"|(?:评标|评审)?基准价.{0,48}(?:算术)?平均(?:值|价)?",
+        text,
+    )
+    factor_match = re.search(r"(?:算术平均值|平均值|平均价).{0,28}(?:[×x*]|的)\s*(0?\.\s*\d+|\d+\s*%)", text)
+    factor = _decimal_factor(factor_match.group(1)) if factor_match else Decimal("1")
+    # 不跨句寻找高低偏差项，且“每高/每低”必须与对应方向绑定；否则一条规则里
+    # 的低于基准价扣分可能被贪婪地误读为高于基准价扣分。
+    high = re.search(r"高于[^。；;]{0,28}?基准价[^。；;]{0,28}?每(?:高于|高)?\s*1%?.{0,18}?扣\s*(\d+(?:\.\d+)?)\s*分", text)
+    low = re.search(r"低于[^。；;]{0,28}?基准价[^。；;]{0,28}?每(?:低于|低)?\s*1%?.{0,18}?扣\s*(\d+(?:\.\d+)?)\s*分", text)
+    if not (average_terms and average_base and factor and high and low):
+        return {"kind": None, "reason": "公式要素不完整，需手工计分"}
+
+    try:
+        high_rate, low_rate = Decimal(high.group(1)), Decimal(low.group(1))
+    except InvalidOperation:
+        return {"kind": None, "reason": "偏差扣分比例无法确定，需手工计分"}
+    if high_rate < 0 or low_rate < 0:
+        return {"kind": None, "reason": "偏差扣分比例无效，需手工计分"}
+
+    trim_mode = "none"
+    if re.search(r"(?:去掉|剔除).{0,28}(?:最高|最低).{0,28}(?:20%|百分之二十)", text):
+        trim_mode = "percent_20"
+    elif re.search(r"(?:去掉|剔除).{0,20}(?:一个|1个)?最高.{0,20}(?:一个|1个)?最低", text):
+        trim_mode = "one_each"
+    return {
+        "kind": "average_factor_deviation", "max_score": max_score, "factor": factor,
+        "high_rate": high_rate, "low_rate": low_rate, "trim_mode": trim_mode,
+    }
+
+
 def _price_formula_kind(rule: dict) -> str | None:
-    text = re.sub(r"\s+", "", " ".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text")))
-    lowest_base = re.search(r"最低[一-龥]{0,8}?(?:报价|价格|价).{0,40}(?:为|作为|确定为).{0,24}(?:评标|评审)?基准价", text)
-    lowest_ratio = re.search(r"(?:评标|评审)?基准价.{0,20}[／/].{0,20}(?:本|投标人)?(?:投标|响应)?报价", text)
-    if lowest_ratio and (lowest_base or re.search(r"价格最低|最低[一-龥]{0,8}?(?:报价|价格|价)", text)):
-        return "lowest_ratio"
-    average = "算术平均" in text and bool(re.search(r"(?:评标|评审)?基准价.{0,36}(?:算术平均|平均值)", text))
-    factor = re.search(r"(?:算术平均值|平均值).{0,28}(?:[×x*]|的)\s*(0?\.\s*\d+|\d+\s*%)", text)
-    high = re.search(r"高于.{0,24}基准价.{0,24}(?:每|每高).{0,12}1%?.{0,16}扣\s*(\d+(?:\.\d+)?)\s*分", text)
-    low = re.search(r"低于.{0,24}基准价.{0,24}(?:每|每低).{0,12}1%?.{0,16}扣\s*(\d+(?:\.\d+)?)\s*分", text)
-    if average and factor and high and low:
-        raw_factor = factor.group(1).replace(" ", "")
-        try:
-            value = Decimal(raw_factor[:-1]) / Decimal("100") if raw_factor.endswith("%") else Decimal(raw_factor)
-        except InvalidOperation:
-            value = Decimal("0")
-        if Decimal("0") < value <= Decimal("1"):
-            return "average_factor_deviation"
-    return None
+    """保留旧内部函数名，避免已有调用方依赖；实际逻辑统一由编译器承担。"""
+    return _compile_price_formula(rule).get("kind")
+
+
+def is_price_scoring_rule(rule: dict) -> bool:
+    """判断是否应由独立报价工作表负责的价格评分规则。"""
+    if str(rule.get("category") or "") != "objective":
+        return False
+    text = " ".join(str(rule.get(key) or "") for key in ("title", "check_rule", "source_text"))
+    return str(rule.get("execution_strategy") or "") == "cross_bid" or bool(_PRICE_RULE_PATTERN.search(text))
 
 
 def _price_rules(app, project_id: str) -> tuple[dict | None, list[dict]]:
     rule_set, rules = storage.list_rules(app, project_id)
     values = []
     for rule in rules:
-        if not rule.get("enabled") or rule.get("category") != "objective":
-            continue
-        text = f"{rule.get('title', '')} {rule.get('check_rule', '')} {rule.get('source_text', '')}"
-        if str(rule.get("execution_strategy") or "") != "cross_bid" and not _PRICE_RULE_PATTERN.search(text):
+        if not rule.get("enabled") or not is_price_scoring_rule(rule):
             continue
         scoring = _rule_scoring(rule)
         max_score = _decimal(scoring.get("max_score"))
+        formula = _compile_price_formula(rule)
         values.append({
             "rule_id": rule["rule_id"], "title": str(rule.get("title") or "价格评分"),
             "check_rule": str(rule.get("check_rule") or ""),
             "source_text": str(rule.get("source_text") or ""),
             "max_score": float(max_score) if max_score is not None else None,
-            "formula_kind": _price_formula_kind(rule), "_rule": rule,
+            "formula_kind": formula.get("kind"), "formula_reason": formula.get("reason") or "",
+            "_formula": formula, "_rule": rule,
         })
     return rule_set, values
 
@@ -226,14 +291,14 @@ def _formula_label(kind: str | None) -> str:
 def _calculate_rule(rule: dict, entries: list[dict]) -> dict:
     kind = rule.get("formula_kind")
     max_score = _decimal(rule.get("max_score"))
-    priced = [
-        (entry, _decimal(entry.get("calculation_price")))
-        for entry in entries if entry.get("included")
-    ]
+    included_entries = [entry for entry in entries if entry.get("included")]
+    priced = [(entry, _decimal(entry.get("calculation_price"))) for entry in included_entries]
+    missing_entries = [entry for entry, price in priced if price is None]
     priced = [(entry, price) for entry, price in priced if price is not None]
     scores: dict[str, dict] = {}
     benchmark: Decimal | None = None
-    if kind and max_score is not None and len(priced) >= 2:
+    calculation_ready = bool(kind and max_score is not None and not missing_entries and len(priced) >= 2)
+    if calculation_ready:
         prices = [price for _, price in priced]
         if kind == "lowest_ratio":
             benchmark = min(prices)
@@ -243,22 +308,20 @@ def _calculate_rule(rule: dict, entries: list[dict]) -> dict:
                     "score": float(score), "source": "system",
                     "calculation": f"{benchmark}／{price}×{max_score}={score}",
                 }
-        else:
-            text = re.sub(r"\s+", "", " ".join(str(rule["_rule"].get(key) or "") for key in ("title", "check_rule", "source_text")))
-            factor_match = re.search(r"(?:算术平均值|平均值).{0,28}(?:[×x*]|的)\s*(0?\.\s*\d+|\d+\s*%)", text)
-            high_match = re.search(r"高于.{0,24}基准价.{0,24}(?:每|每高).{0,12}1%?.{0,16}扣\s*(\d+(?:\.\d+)?)\s*分", text)
-            low_match = re.search(r"低于.{0,24}基准价.{0,24}(?:每|每低).{0,12}1%?.{0,16}扣\s*(\d+(?:\.\d+)?)\s*分", text)
-            raw_factor = factor_match.group(1).replace(" ", "")
-            factor = Decimal(raw_factor[:-1]) / Decimal("100") if raw_factor.endswith("%") else Decimal(raw_factor)
+        elif kind == "average_factor_deviation":
+            formula = rule.get("_formula") or {}
+            factor = formula["factor"]
             averaged = list(prices)
-            if len(prices) >= 5 and re.search(r"(?:去掉|剔除).{0,24}(?:最高|最低).{0,24}(?:20%|百分之二十)", text):
-                trim = max(1, int(len(prices) * 0.2))
+            if len(prices) >= 5 and formula.get("trim_mode") == "percent_20":
+                trim = max(1, int((Decimal(len(prices)) * Decimal("0.2")).quantize(Decimal("1"), rounding=ROUND_HALF_UP)))
                 if len(prices) > trim * 2:
                     averaged = sorted(prices)[trim:-trim]
+            elif len(prices) > 2 and formula.get("trim_mode") == "one_each":
+                averaged = sorted(prices)[1:-1]
             benchmark = sum(averaged) / Decimal(len(averaged)) * factor
             for entry, price in priced:
                 delta = abs(price - benchmark) / benchmark * Decimal("100")
-                rate = Decimal(high_match.group(1)) if price >= benchmark else Decimal(low_match.group(1))
+                rate = formula["high_rate"] if price >= benchmark else formula["low_rate"]
                 score = min(max_score, max(Decimal("0"), (max_score - delta * rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)))
                 scores[entry["price_entry_id"]] = {
                     "score": float(score), "source": "system",
@@ -274,9 +337,20 @@ def _calculate_rule(rule: dict, entries: list[dict]) -> dict:
                 "calculation": "手工填写的价格分；不参与评标基准价推导。",
             }
     return {
-        **{key: value for key, value in rule.items() if key != "_rule"},
+        **{key: value for key, value in rule.items() if key not in {"_rule", "_formula"}},
         "formula_label": _formula_label(kind), "automatic": bool(kind and max_score is not None),
         "benchmark_price": _decimal_text(benchmark), "priced_participant_count": len(priced),
+        "included_participant_count": len(included_entries), "calculation_ready": calculation_ready,
+        "missing_calculation_entries": [
+            {"price_entry_id": entry["price_entry_id"], "bidder_name": entry["bidder_name"]}
+            for entry in missing_entries
+        ],
+        "calculation_block_reason": (
+            "存在参与计算但未填写计分价的投标人，不能使用不完整报价自动计分。"
+            if kind and max_score is not None and missing_entries else
+            ("至少需要两家参与且计分价完整的投标人，才能自动计分。"
+             if kind and max_score is not None and len(priced) < 2 else "")
+        ),
         "scores": scores,
     }
 

@@ -4095,12 +4095,11 @@ class EvaluationWorkbenchTests(unittest.TestCase):
     def test_evidence_traceability_guidance_present_in_result_prompts(self):
         from dashboard.evaluation_workbench.prompt_templates import EVALUATION_PROMPT_VERSION, PROMPT_TEMPLATES
         marker = "文本层无法定位具体金额时"
-        for template_id in ("evaluate_all_review_user", "evaluate_all_objective_user",
-                            "evaluate_all_cross_bid_price_user"):
+        for template_id in ("evaluate_all_review_user", "evaluate_all_objective_user"):
             self.assertIn(marker, PROMPT_TEMPLATES[template_id]["content"])
         # v33 曾把该约束同时追加到系统叠加层 evaluate_all_guidance，导致 review/
-        # objective/cross_bid 收到两遍、full_scan/subjective/OCR/vision 白扛一遍；
-        # 修复后只保留在真正产生报价/声明函结论的三个用户模板中。
+        # objective 收到重复上下文、其他阶段白扛一遍；修复后只保留在实际产生
+        # 报价/声明函结论的用户模板中。
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_guidance"]["content"])
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_subjective_user"]["content"])
         self.assertNotIn(marker, PROMPT_TEMPLATES["evaluate_all_full_scan_user"]["content"])
@@ -5219,36 +5218,15 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIn("1项×3分=3分", calculation_layers)
         self.assertNotIn("计分过程", results[0]["reason"])
 
-    def test_cross_bid_price_rule_is_recalculated_with_all_bidders(self):
-        bid_a = self._add_pdf("a.pdf", "bid", "甲公司", "投标报价：100万元。")
-        bid_b = self._add_pdf("b.pdf", "bid", "乙公司", "投标报价：120万元。")
-        storage.create_task(self.app, self.project["project_id"], "parse_documents")
-        self._run_next_task()
-        rule = storage.add_rule(self.app, self.project["project_id"], {
+    def test_price_rule_is_owned_by_independent_price_sheet(self):
+        rule = {
             "category": "objective", "title": "最低价报价得分",
             "check_rule": "投标报价得分=（评标基准价／投标报价）×10，保留两位小数。",
-            "source_text": "最低评审价得10分", "scoring": {"kind": "manual", "max_score": 10},
-        })
-        storage.confirm_rule_set(self.app, self.project["project_id"])
-        storage.create_task(self.app, self.project["project_id"], "evaluate_all")
-        cross = {"results": [
-            {"document_id": bid_a["document_id"], "rule_id": rule["rule_id"], "quoted_price": 100,
-             "suggested_score": 10, "evidence": "投标报价100万元", "calculation": "100/100×10=10", "confidence": "high"},
-            {"document_id": bid_b["document_id"], "rule_id": rule["rule_id"], "quoted_price": 120,
-             "suggested_score": 8.32, "evidence": "投标报价120万元", "calculation": "100/120×10=8.32", "confidence": "high"},
-        ]}
-        with patch("dashboard.evaluation_workbench.worker.request_json", return_value=cross) as request_json:
-            finished = self._run_next_task()
+            "source_text": "最低投标报价作为评标基准价，最低评审价得10分", "scoring_json": json.dumps({"kind": "manual", "max_score": 10}),
+        }
 
-        _, results = storage.latest_score_results(self.app, self.project["project_id"], "objective")
-        scores = {item["bidder_name"]: item["suggested_score"] for item in results}
-        self.assertEqual(finished["status"], "success")
-        self.assertEqual(finished["result"]["cross_bid_price"]["result_count"], 2)
-        self.assertEqual(scores["甲公司"], 10.0)
-        self.assertEqual(scores["乙公司"], 8.33)
-        self.assertEqual(request_json.call_count, 1)
-        self.assertIn(bid_a["document_id"], request_json.call_args.args[2])
-        self.assertIn(bid_b["document_id"], request_json.call_args.args[2])
+        self.assertTrue(price_sheet.is_price_scoring_rule(rule))
+        self.assertEqual(price_sheet._price_formula_kind(rule), "lowest_ratio")
 
     def test_independent_price_sheet_extracts_adds_excludes_and_recalculates_without_tasks(self):
         bid_a = self._add_pdf("price-a.pdf", "bid", "甲公司", "占位")
@@ -5433,42 +5411,26 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(entry["scores"][rule_id]["score"], 4.5)
         self.assertEqual(entry["scores"][rule_id]["source"], "manual")
 
-    def test_cross_bid_price_uses_unique_local_total_quote_when_model_omits_one_price(self):
-        bid_a = self._add_pdf("a.pdf", "bid", "甲公司", "总报价：￥100000元。")
-        bid_b = self._add_pdf("b.pdf", "bid", "乙公司", "投标总报价（大写）壹拾贰万元整 ￥：120000元。")
-        storage.create_task(self.app, self.project["project_id"], "parse_documents")
-        self._run_next_task()
-        # PDF 测试夹具的默认字体不保证中文可提取；以解析完成后的真实文本缓存模拟
-        # 线上解析器输出，专门覆盖本地“唯一总报价”回填分支。
-        local_a = self.temp_dir / "quote-a.txt"
-        local_b = self.temp_dir / "quote-b.txt"
-        local_a.write_text("[第1页]\n投标总报价：￥100000元。\n", encoding="utf-8")
-        local_b.write_text("[第1页]\n投标总报价（大写）壹拾贰万元整 ￥：120000元。\n", encoding="utf-8")
-        with storage.connection(self.app) as conn:
-            conn.execute("UPDATE ew_documents SET parsed_path=? WHERE document_id=?", (str(local_a), bid_a["document_id"]))
-            conn.execute("UPDATE ew_documents SET parsed_path=? WHERE document_id=?", (str(local_b), bid_b["document_id"]))
-        rule = storage.add_rule(self.app, self.project["project_id"], {
-            "category": "objective", "title": "最低价报价得分",
-            "check_rule": "投标报价得分=（评标基准价／投标报价）×10，保留两位小数。",
-            "source_text": "最低评审价得10分", "scoring": {"kind": "manual", "max_score": 10},
-        })
-        storage.confirm_rule_set(self.app, self.project["project_id"])
-        storage.create_task(self.app, self.project["project_id"], "evaluate_all")
-        cross = {"results": [
-            {"document_id": bid_a["document_id"], "rule_id": rule["rule_id"], "quoted_price": 100000,
-             "suggested_score": 10, "evidence": "总报价100000元", "confidence": "high"},
-            {"document_id": bid_b["document_id"], "rule_id": rule["rule_id"], "quoted_price": None,
-             "suggested_score": None, "evidence": "已核对开标一览表", "confidence": "medium"},
-        ]}
+    def test_price_sheet_average_formula_is_not_misread_as_lowest_ratio(self):
+        rule = {
+            "title": "价格评分", "check_rule": "去掉最高和最低投标报价后取算术平均值，再按与基准价偏离程度扣分。",
+            "source_text": "价格分满分45分", "scoring_json": json.dumps({"max_score": 45}),
+        }
 
-        with patch("dashboard.evaluation_workbench.worker.request_json", return_value=cross):
-            finished = self._run_next_task()
+        self.assertIsNone(price_sheet._price_formula_kind(rule))
 
-        _, results = storage.latest_score_results(self.app, self.project["project_id"], "objective")
-        scores = {item["bidder_name"]: item["suggested_score"] for item in results}
-        self.assertEqual(finished["status"], "success")
-        self.assertEqual(scores["甲公司"], 10.0)
-        self.assertEqual(scores["乙公司"], 8.33)
+    def test_price_sheet_average_formula_keeps_each_directional_deduction_rate(self):
+        rule = {
+            "title": "价格评分",
+            "check_rule": "投标报价高于基准价的，每高于1%扣1分；低于基准价的，每低于1%扣0.5分。",
+            "source_text": "评标基准价为有效报价算术平均值的97%。",
+            "scoring_json": json.dumps({"max_score": 45}),
+        }
+
+        compiled = price_sheet._compile_price_formula(rule)
+        self.assertEqual(compiled["kind"], "average_factor_deviation")
+        self.assertEqual(compiled["high_rate"], Decimal("1"))
+        self.assertEqual(compiled["low_rate"], Decimal("0.5"))
 
     def test_form_candidates_include_adjacent_continuation_pages(self):
         parsed = self.temp_dir / "statement.txt"
@@ -5523,31 +5485,21 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertNotIn("OCR", results[0]["reason"])
         self.assertIn("复核", results[0]["review_reason"])
 
-    def test_cross_bid_price_failure_never_leaves_local_provisional_score(self):
-        bid_a = self._add_pdf("price-a.pdf", "bid", "甲公司", "投标报价：100万元。")
-        bid_b = self._add_pdf("price-b.pdf", "bid", "乙公司", "投标报价：120万元。")
-        storage.create_task(self.app, self.project["project_id"], "parse_documents")
-        self._run_next_task()
-        rule = storage.add_rule(self.app, self.project["project_id"], {
-            "category": "objective", "title": "最低价报价得分",
-            "check_rule": "最低评审价得10分，其他报价按最低价比例得分。",
-            "source_text": "最低评审价得10分", "scoring": {"kind": "manual", "max_score": 10},
-        })
-        storage.confirm_rule_set(self.app, self.project["project_id"])
-        storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+    def test_price_sheet_blocks_automatic_score_when_any_participant_lacks_price(self):
+        rule = {
+            "rule_id": "price", "title": "最低价报价得分", "check_rule": "最低投标报价为评标基准价，得分=基准价／投标报价×10。",
+            "source_text": "", "max_score": 10,
+            "formula_kind": "lowest_ratio", "_formula": {"kind": "lowest_ratio"}, "_rule": {},
+        }
+        entries = [
+            {"price_entry_id": "a", "bidder_name": "甲", "included": True, "calculation_price": "100000", "manual_scores": {}},
+            {"price_entry_id": "b", "bidder_name": "乙", "included": True, "calculation_price": None, "manual_scores": {}},
+        ]
 
-        with patch("dashboard.evaluation_workbench.worker.request_json", side_effect=[
-            worker.InvalidJsonResponse("{\"results\":[", "length"),
-            worker.InvalidJsonResponse("{\"results\":[", "length"),
-        ]) as request_json:
-            finished = self._run_next_task()
-
-        _, results = storage.latest_score_results(self.app, self.project["project_id"], "objective")
-        self.assertEqual(finished["status"], "success")
-        self.assertEqual(request_json.call_count, 2)
-        self.assertEqual({item["document_id"] for item in results}, {bid_a["document_id"], bid_b["document_id"]})
-        self.assertTrue(all(item["suggested_score"] is None for item in results))
-        self.assertTrue(all("暂无法计算" in item["reason"] for item in results))
+        calculated = price_sheet._calculate_rule(rule, entries)
+        self.assertFalse(calculated["calculation_ready"])
+        self.assertEqual(calculated["scores"], {})
+        self.assertEqual(calculated["missing_calculation_entries"][0]["bidder_name"], "乙")
 
     def test_scope_anomaly_keeps_any_late_off_topic_content_for_final_review(self):
         chunks = [
@@ -6604,82 +6556,6 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             rule, parsed, 6, 9, checked_pages=[12], evidence_gated=True,
         ), 3)
 
-    def test_cross_bid_price_fact_retracts_stale_price_absence_review(self):
-        document = self._add_pdf("bid.pdf", "bid", "甲公司", "报价文件")
-        rule = storage.add_rule(self.app, self.project["project_id"], {
-            "category": "compliance", "title": "投标报价核验", "check_rule": "核验投标报价是否符合最高限价",
-        })
-        storage.confirm_rule_set(self.app, self.project["project_id"])
-        task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
-        review_run = storage.create_review_run(self.app, self.project["project_id"], task["task_id"], None)
-        score_run = storage.create_score_run(self.app, self.project["project_id"], task["task_id"], "objective", None)
-        storage.save_review_results(self.app, review_run["review_run_id"], document["document_id"], [{
-            "rule_id": rule["rule_id"], "status": "not_found", "evidence": "未见总报价金额", "reason": "报价总价未直接呈现。",
-            "risk_level": "high", "confidence": "high", "evidence_quality": "sufficient",
-        }])
-        storage.save_score_results(self.app, score_run["score_run_id"], document["document_id"], [{
-            "rule_id": rule["rule_id"], "suggested_score": 0, "max_score": 10,
-            "evidence": "投标总报价（大写）：人民币陆拾贰万柒仟元整；¥627,000元。", "reason": "已定位报价。",
-        }])
-
-        self.assertEqual(storage.reconcile_price_review_results(self.app, review_run["review_run_id"], score_run["score_run_id"]), 1)
-        with storage.connection(self.app) as conn:
-            row = conn.execute("SELECT status, risk_level, reason FROM ew_review_results WHERE review_run_id=?", (review_run["review_run_id"],)).fetchone()
-        self.assertEqual(row["status"], "partial")
-        self.assertEqual(row["risk_level"], "low")
-        self.assertIn("已定位报价金额", row["reason"])
-
-    def test_price_fact_retraction_matches_amount_without_thousands_separator(self):
-        document = self._add_pdf("bid.pdf", "bid", "乙公司", "报价文件")
-        rule = storage.add_rule(self.app, self.project["project_id"], {
-            "category": "compliance", "title": "投标报价核验", "check_rule": "核验投标报价是否符合最高限价",
-        })
-        storage.confirm_rule_set(self.app, self.project["project_id"])
-        task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
-        review_run = storage.create_review_run(self.app, self.project["project_id"], task["task_id"], None)
-        score_run = storage.create_score_run(self.app, self.project["project_id"], task["task_id"], "objective", None)
-        storage.save_review_results(self.app, review_run["review_run_id"], document["document_id"], [{
-            "rule_id": rule["rule_id"], "status": "not_found", "evidence": "未见总报价金额", "reason": "报价总价未直接呈现。",
-            "risk_level": "high", "confidence": "high", "evidence_quality": "sufficient",
-        }])
-        storage.save_score_results(self.app, score_run["score_run_id"], document["document_id"], [{
-            "rule_id": rule["rule_id"], "suggested_score": 0, "max_score": 10,
-            "evidence": "投标总报价￥：632836 元", "reason": "已定位报价，另核实174.6762万元口径。",
-        }])
-
-        self.assertEqual(storage.reconcile_price_review_results(self.app, review_run["review_run_id"], score_run["score_run_id"]), 1)
-        with storage.connection(self.app) as conn:
-            row = conn.execute("SELECT status FROM ew_review_results WHERE review_run_id=?", (review_run["review_run_id"],)).fetchone()
-        self.assertEqual(row["status"], "partial")
-
-    def test_non_price_rule_amount_does_not_count_as_located_bid_price(self):
-        document = self._add_pdf("bid.pdf", "bid", "丙公司", "投标文件")
-        price_rule = storage.add_rule(self.app, self.project["project_id"], {
-            "category": "compliance", "title": "投标报价核验", "check_rule": "核验投标报价是否符合最高限价",
-        })
-        perf_rule = storage.add_rule(self.app, self.project["project_id"], {
-            "category": "objective", "title": "近三年同类业绩", "check_rule": "核验同类项目业绩合同",
-            "scoring": {"max_score": 6},
-        })
-        storage.confirm_rule_set(self.app, self.project["project_id"])
-        task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
-        review_run = storage.create_review_run(self.app, self.project["project_id"], task["task_id"], None)
-        score_run = storage.create_score_run(self.app, self.project["project_id"], task["task_id"], "objective", None)
-        storage.save_review_results(self.app, review_run["review_run_id"], document["document_id"], [{
-            "rule_id": price_rule["rule_id"], "status": "not_found", "evidence": "未见总报价金额", "reason": "报价总价未直接呈现。",
-            "risk_level": "high", "confidence": "high", "evidence_quality": "sufficient",
-        }])
-        storage.save_score_results(self.app, score_run["score_run_id"], document["document_id"], [{
-            "rule_id": perf_rule["rule_id"], "suggested_score": 2, "max_score": 6,
-            "evidence": "合同金额2163180元", "reason": "已定位同类业绩合同。",
-        }])
-
-        self.assertEqual(storage.reconcile_price_review_results(self.app, review_run["review_run_id"], score_run["score_run_id"]), 0)
-        with storage.connection(self.app) as conn:
-            row = conn.execute("SELECT status, risk_level FROM ew_review_results WHERE review_run_id=?", (review_run["review_run_id"],)).fetchone()
-        self.assertEqual(row["status"], "not_found")
-        self.assertEqual(row["risk_level"], "high")
-
     def test_irrelevant_visual_pages_cannot_become_evidence_pages(self):
         merged, _, checked, evidence = worker._merge_usable_visual_responses([(
             [118, 144], {
@@ -6938,26 +6814,6 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(result["status"], "satisfied")
         self.assertEqual(result["risk_level"], "low")
 
-    def test_lowest_price_formula_is_recalculated_with_decimal_rounding(self):
-        rule = {
-            "title": "投标报价得分", "check_rule": "投标报价得分=（评标基准价／投标报价）×20，保留两位小数。",
-            "source_text": "以最低评标价为评标基准价。",
-        }
-        score, calculation = worker._deterministic_price_score(rule, 835680, [833800, 835680, 838500], 20)
-        self.assertEqual(score, 19.96)
-        self.assertIn("19.96", calculation)
-
-    def test_average_factor_price_formula_is_recalculated_only_when_all_terms_are_explicit(self):
-        rule = {
-            "title": "价格评分", "check_rule": "评标基准价为有效报价算术平均值的97%。投标报价高于基准价的，每高于1%扣1分；低于基准价的，每低于1%扣0.5分。",
-            "source_text": "价格分满分45分。",
-        }
-        score, calculation = worker._deterministic_price_score(rule, 1_720_000, [1_720_000, 1_835_000, 1_925_000, 1_909_660], 45)
-        self.assertEqual(score, 42.99)
-        self.assertIn("评标基准价", calculation)
-        ambiguous = {"title": "价格评分", "check_rule": "按评标基准价计算价格得分", "source_text": "满分45分"}
-        self.assertIsNone(worker._deterministic_price_score(ambiguous, 100, [100, 120], 45)[0])
-
     def test_suggested_score_recovered_from_reason_text(self):
         rule = {"rule_id": "r1", "scoring": {"max_score": 14, "kind": "quantity"}}
         raw = {"reason": "逐项复制招标条款并标符合要求，未发现负偏离；按规则每项不扣分，结果=14分，封顶14分。建议14分。需人工核验证明材料。"}
@@ -6971,16 +6827,6 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertIsNone(worker._suggested_score(rule, overflow, "objective", 14.0))
         subjective = {"reason": "方案完整、针对性强，建议得7.5分。"}
         self.assertEqual(worker._suggested_score(rule, subjective, "subjective", 14.0), 7.5)
-
-    def test_lowest_price_formula_matches_common_chinese_phrasing(self):
-        rule = {
-            "title": "投标报价评分（10分）", "check_rule": "",
-            "source_text": "投标价格最低的投标报价为评标基准价，其价格分为满分。其他投标人的价格分统一按照下列公式计算：投标报价得分=（评标基准价/投标报价）×10。（1）最低报价不作为中标的唯一保证。",
-        }
-        self.assertEqual(worker._price_formula_kind(rule), "lowest_ratio")
-        score, calculation = worker._deterministic_price_score(rule, 550000, [500000, 550000, 580000], 10)
-        self.assertEqual(score, 9.09)
-        self.assertIn("评标基准价", calculation)
 
     def test_visual_advance_estimated_covers_baseline_ocr_rules(self):
         enhancement = {"title": "证书图片核验", "vision_trigger": "text_fallback", "vision_level": "standard"}

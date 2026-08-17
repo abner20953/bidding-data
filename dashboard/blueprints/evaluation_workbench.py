@@ -294,7 +294,8 @@ def _report_compact_objective_ocr_text(value: object) -> str:
 
 def _report_presentation(documents: list[dict], rule_set: dict | None, rules: list[dict],
                          compare_task: dict | None, compare_pairs: list[dict], reviews: list[dict],
-                         objective_scores: list[dict], subjective_scores: list[dict]) -> dict:
+                         objective_scores: list[dict], subjective_scores: list[dict],
+                         price_sheet_data: dict | None = None) -> dict:
     """生成仅用于打印的中文摘要视图，所有判断仍直接来自已保存结果。"""
     displayed_documents = [{
         **item,
@@ -395,6 +396,28 @@ def _report_presentation(documents: list[dict], rule_set: dict | None, rules: li
             "shared_error": summary.get("shared_error") or 0, "entity": summary.get("entity") or 0,
             "ratio_a": summary.get("matched_ratio_a") or 0, "ratio_b": summary.get("matched_ratio_b") or 0,
         })
+    price_rules = list((price_sheet_data or {}).get("rules") or [])
+    price_rows = []
+    for entry in (price_sheet_data or {}).get("entries") or []:
+        if not isinstance(entry, dict):
+            continue
+        scores = entry.get("scores") if isinstance(entry.get("scores"), dict) else {}
+        price_rows.append({
+            "bidder_name": entry.get("bidder_name") or "未命名投标人",
+            "effective_quote": entry.get("effective_quote") or "-",
+            "calculation_price": entry.get("calculation_price") or "-",
+            "included": bool(entry.get("included")),
+            "exclusion_reason": entry.get("exclusion_reason") or "",
+            "scores": [
+                {
+                    "title": rule.get("title") or "价格评分",
+                    "score": (scores.get(rule.get("rule_id")) or {}).get("score"),
+                    "source": (scores.get(rule.get("rule_id")) or {}).get("source"),
+                    "calculation": (scores.get(rule.get("rule_id")) or {}).get("calculation") or "",
+                }
+                for rule in price_rules
+            ],
+        })
     return {
         "documents": displayed_documents,
         "rule_set_status_label": _report_label(_REPORT_RULE_SET_STATUS_LABELS, (rule_set or {}).get("status")),
@@ -402,6 +425,11 @@ def _report_presentation(documents: list[dict], rule_set: dict | None, rules: li
         "reviews": [present_result(item) for item in reviews],
         "objective_scores": [present_result(item, score=True, objective=True) for item in objective_scores],
         "subjective_scores": [present_result(item, score=True) for item in subjective_scores],
+        "price_sheet": {
+            "rules": price_rules, "rows": price_rows,
+            "notice": (price_sheet_data or {}).get("notice") or "",
+            "needs_refresh": bool((price_sheet_data or {}).get("needs_refresh")),
+        },
         "cross_analysis": cross_analysis if isinstance(cross_analysis, dict) else None,
         "compare_summary_rows": compare_summary_rows,
         "compare_signal_rows": compare_signal_rows,
@@ -747,14 +775,22 @@ def tasks_api(project_id):
     if task_type in {"score_objective", "score_subjective"}:
         score_category = "objective" if task_type == "score_objective" else "subjective"
         rule_set, rules = storage.list_rules(current_app, project_id)
-        if not rule_set or rule_set["status"] != "confirmed" or not any(item["category"] == score_category for item in rules):
+        executable_rules = [
+            item for item in rules
+            if item.get("enabled") and item.get("category") == score_category
+            and not (score_category == "objective" and price_sheet.is_price_scoring_rule(item))
+        ]
+        if not rule_set or rule_set["status"] != "confirmed" or not executable_rules:
             return jsonify({"error": "请先确认对应的评分规则"}), 400
     if task_type == "evaluate_all":
         rule_set, rules = storage.list_rules(current_app, project_id)
-        categories = {item["category"] for item in rules if item["enabled"]}
+        categories = {
+            item["category"] for item in rules
+            if item.get("enabled") and not price_sheet.is_price_scoring_rule(item)
+        }
         executable = categories & {"qualification", "compliance", "substantive", "rejection", "other", "objective", "subjective"}
         if not rule_set or rule_set["status"] != "confirmed" or not executable:
-            return jsonify({"error": "请先确认至少一条可执行的审查或评分规则"}), 400
+            return jsonify({"error": "请先确认至少一条非价格的可执行审查或评分规则；报价请在“报价与价格分”中计算"}), 400
         # OCR 文字取证与多模态图片取证已解耦。这里不再因某条规则选择了图片
         # 强度就拒绝整个任务：非多模态主模型仍可正常完成 OCR；真正需要外观
         # 判断但没有可用图片模型的规则会在 worker 内逐条标记，不能拖垮整任务。
@@ -1137,6 +1173,14 @@ def score_results_api(project_id, score_type):
     if score_type not in {"objective", "subjective"}:
         return jsonify({"error": "不支持的评分类型"}), 400
     score_run, results = storage.latest_score_results(current_app, project_id, score_type)
+    # 历史综合评审可能仍保存过旧版价格分。保留原字段以兼容外部读取，
+    # 仅新增归属标记，让新页面和报告避免与独立价格工作表重复展示。
+    _, rules = storage.list_rules(current_app, project_id)
+    price_rule_ids = {item["rule_id"] for item in rules if price_sheet.is_price_scoring_rule(item)}
+    results = [
+        {**item, "price_managed_by_sheet": bool(score_type == "objective" and item.get("rule_id") in price_rule_ids)}
+        for item in results
+    ]
     return jsonify({"score_run": score_run, "results": results})
 
 
@@ -1177,9 +1221,14 @@ def evaluation_report_view(project_id):
     review_run, reviews = storage.latest_review_results(current_app, project_id)
     _, objective_scores = storage.latest_score_results(current_app, project_id, "objective")
     _, subjective_scores = storage.latest_score_results(current_app, project_id, "subjective")
+    price_rule_ids = {item["rule_id"] for item in rules if price_sheet.is_price_scoring_rule(item)}
+    # 报告与新版页面只展示独立工作表的价格分；旧综合评审中的同规则历史行仍保留在库中，
+    # 但不再与人工确认的计分价结果并列造成误读。
+    objective_scores = [item for item in objective_scores if item.get("rule_id") not in price_rule_ids]
+    price_sheet_data = price_sheet.build_price_sheet(current_app, project_id)
     presentation = _report_presentation(
         storage.list_documents(current_app, project_id), rule_set, rules, compare_task, compare_pairs,
-        reviews, objective_scores, subjective_scores,
+        reviews, objective_scores, subjective_scores, price_sheet_data,
     )
     report_project = {**project, "display_name": _project_display_name(project)}
     return render_template(

@@ -307,7 +307,7 @@ def task_prompt_template_fingerprint(app, task_type: str) -> str | None:
         "evaluate_all": {
             "evaluate_all", "evaluate_all_guidance", "evaluate_all_highlights", "evaluate_all_scope_profile", "evaluate_all_scope_profile_user",
             "evaluate_all_scope_anomaly_guidance", "evaluate_all_full_scan_user", "evaluate_all_review_user", "evaluate_all_objective_user",
-            "evaluate_all_subjective_user", "evaluate_all_cross_bid_price_user", "evaluate_all_cross_bid_subjective_shadow_user", "evaluate_all_highlights_user",
+            "evaluate_all_subjective_user", "evaluate_all_cross_bid_subjective_shadow_user", "evaluate_all_highlights_user",
             "evaluate_all_visual_user", "evaluate_all_ocr_user", "evaluate_all_visual_contract", "evaluate_all_ocr_contract",
             "evaluate_all_ocr_batch_user",
             "evaluate_all_visual_locator_user",
@@ -5091,72 +5091,9 @@ def score_results_for_run(app, score_run_id: str) -> list[dict]:
 
 
 _PRICE_RULE_MARKERS = re.compile(r"(?:报价|投标价|评标价|评审价|最高限价|预算金额|总价)")
-_PRICE_ABSENCE_MARKERS = re.compile(r"(?:未见|未提供|未直接呈现|缺失|未核)[^。；;\n]{0,36}(?:报价|总价|金额)|(?:报价|总价|金额)[^。；;\n]{0,36}(?:未见|未提供|未直接呈现|缺失|未核)")
-# 真实评分证据的金额写法多样：千分位“¥627,000元”、无分隔“￥：632836 元”、
-# “628120.00元”、万元小数“174.6762万元”和中文大写“…元整”都必须命中，
-# 否则价格核验已定位的事实会被静默漏掉，陈旧“报价未见”结论无法回收。
-_CONCRETE_PRICE_MARKERS = re.compile(
-    r"(?:￥|¥|人民币)?\s*\d{1,3}(?:,\d{3})+(?:\.\d+)?\s*元?"
-    r"|[￥¥]\s*[:：]?\s*\d{4,}(?:\.\d+)?"
-    r"|\d{4,}(?:\.\d+)?\s*元"
-    r"|\d+(?:\.\d+)?\s*万元"
-    r"|(?:人民币)?[零壹贰叁肆伍陆柒捌玖拾佰仟万亿两]+元整"
-)
-
-
 def is_price_rule(value: object) -> bool:
-    """统一判断规则是否涉及报价，供存储回收和工作进程共享。"""
+    """统一判断规则是否涉及报价，供工作进程补充本地价格事实。"""
     return bool(_PRICE_RULE_MARKERS.search(str(value or "")))
-
-
-def reconcile_price_review_results(app, review_run_id: str, objective_run_id: str) -> int:
-    """用同批跨投标人报价事实撤销“报价未见”的旧文字结论。
-
-    单文件审查先完成、跨投标人价格核验后完成。若后者已在同一投标文件中定位到
-    明确金额，前者不能继续以“未见报价”为高风险依据。这里仅把该类结论降为
-    ``partial`` 并保留限价/口径待核验，不自动认定报价合规或改写任何价格分。
-    """
-    with connection(app) as conn:
-        score_rows = conn.execute(
-            """SELECT item.document_id, item.evidence, item.reason, rule.title, rule.check_rule
-               FROM ew_score_results item JOIN ew_rules rule ON rule.rule_id=item.rule_id
-               WHERE item.score_run_id=?""", (objective_run_id,)
-        ).fetchall()
-        price_documents = {
-            str(row["document_id"])
-            for row in score_rows
-            if is_price_rule(f"{row['title'] or ''} {row['check_rule'] or ''}")
-            and _CONCRETE_PRICE_MARKERS.search(f"{row['evidence'] or ''} {row['reason'] or ''}")
-        }
-        if not price_documents:
-            return 0
-        rows = conn.execute(
-            """SELECT item.review_result_id, item.document_id, item.status, item.evidence, item.reason,
-                      rule.title, rule.check_rule
-               FROM ew_review_results item JOIN ew_rules rule ON rule.rule_id=item.rule_id
-               WHERE item.review_run_id=?""", (review_run_id,)
-        ).fetchall()
-        updated = 0
-        for row in rows:
-            if str(row["document_id"]) not in price_documents:
-                continue
-            rule_text = f"{row['title'] or ''} {row['check_rule'] or ''}"
-            current_text = f"{row['evidence'] or ''}\n{row['reason'] or ''}"
-            if not is_price_rule(rule_text) or not _PRICE_ABSENCE_MARKERS.search(current_text):
-                continue
-            pieces = re.split(r"(?<=[。；;])\s*|\n+", str(row["reason"] or ""))
-            retained = [piece.strip() for piece in pieces if piece.strip() and not _PRICE_ABSENCE_MARKERS.search(piece)]
-            retained.append("同批价格核验已定位报价金额；是否符合限价、报价口径及本规则仍需结合原文复核。")
-            conn.execute(
-                """UPDATE ew_review_results
-                   SET status='partial', reason=?, risk_level='low', confidence='medium',
-                       evidence_quality='limited', automation_status='needs_review', requires_review=1,
-                       review_reason='同批价格核验已定位报价金额，原“报价未见”表述已撤销，仍需人工核对限价和口径。'
-                   WHERE review_result_id=?""",
-                (" ".join(dict.fromkeys(retained))[:2000], row["review_result_id"]),
-            )
-            updated += 1
-    return updated
 
 
 _NON_FILE_SCORING_PROCESS_PATTERN = re.compile(

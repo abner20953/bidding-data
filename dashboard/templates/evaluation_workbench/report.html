@@ -33,6 +33,13 @@
     {% for summary in review_run.highlights %}{% if summary.highlights %}<section class="highlight-group"><strong>{{ summary.bidder_name }}</strong>{% if summary.headline %}<div>{{ summary.headline }}</div>{% endif %}<ul>{% for item in summary.highlights %}<li><strong>{{ item.keyword }}</strong>：{{ item.conclusion }}{% if item.basis %}<br><span class="muted">{{ item.basis }}</span>{% endif %}</li>{% endfor %}</ul></section>{% endif %}{% endfor %}
     {% endif %}
     <table><tr><th>投标人</th><th>审查项</th><th>AI 建议</th><th>风险</th><th>证据与理由</th></tr>{% for item in reviews %}<tr><td>{{ item.bidder_name or item.original_name }}</td><td>{{ item.title_brief }}</td><td>{{ item.status_label }}<br><span class="muted">置信度：{{ item.confidence_label }}；证据：{{ item.evidence_quality_label }}</span></td><td>{{ item.risk_label }}</td><td>{{ item.evidence_brief or '-' }}{% if item.reason_brief %}<br><span class="muted">{{ item.reason_brief }}</span>{% endif %}{% if item.vision_summary %}<br><strong class="vision-note vision-note-{{ item.vision_status }}">{{ item.vision_summary }}</strong>{% endif %}</td></tr>{% endfor %}</table>
+    <h2>报价与价格分</h2>
+    {% if price_sheet.rules %}
+    <p class="muted">{{ price_sheet.notice }}{% if price_sheet.needs_refresh %} 文件解析内容已变化，建议回到工作台刷新报价。{% endif %}</p>
+    <table><tr><th>投标人</th><th>确认报价</th><th>计分价</th><th>参与计算</th><th>价格分</th></tr>{% for item in price_sheet.rows %}<tr><td>{{ item.bidder_name }}</td><td>{{ item.effective_quote }}</td><td>{{ item.calculation_price }}</td><td>{% if item.included %}是{% else %}否{% if item.exclusion_reason %}<br><span class="muted">{{ item.exclusion_reason }}</span>{% endif %}{% endif %}</td><td>{% for score in item.scores %}<strong>{{ score.title }}：{{ score.score if score.score is not none else '待计算' }} 分</strong>{% if score.calculation %}<br><span class="muted">{{ score.calculation }}</span>{% endif %}{% if not loop.last %}<br>{% endif %}{% endfor %}</td></tr>{% endfor %}</table>
+    {% else %}
+    <p class="muted">当前规则集中未识别到价格评分规则；可在“报价与价格分”中核对报价。</p>
+    {% endif %}
     <h2>客观分</h2>
     <table><tr><th>投标人</th><th>评分项</th><th>AI 建议得分</th><th>满分</th><th>置信度</th><th>证据与理由</th></tr>{% for item in objective_scores %}<tr><td>{{ item.bidder_name or item.original_name }}</td><td>{{ item.title_brief }}</td><td>{{ item.suggested_score_label }}</td><td>{{ item.max_score or '-' }}</td><td>{{ item.confidence_label }}</td><td>{{ item.evidence_brief or '-' }}{% if item.reason_brief %}<br><span class="muted">{{ item.reason_brief }}</span>{% endif %}{% if item.vision_summary %}<br><strong class="vision-note vision-note-{{ item.vision_status }}">{{ item.vision_summary }}</strong>{% endif %}</td></tr>{% endfor %}</table>
     <h2>主观分</h2>
