@@ -4,25 +4,23 @@
 handoff_schema: 1
 updated_at: 2026-08-17
 module: evaluation-workbench
-status: local_changes
-base_commit: 30674c2
+status: deployed_validation_pending
+base_commit: 6e851e6
 branch: main
-working_tree: price_score_output_contract_pending_commit
-remote_github: 30674c2
-remote_gitee: 30674c2
-production_commit: 30674c2
-prompt_version: local=vision-evidence-contract-v62; production=vision-evidence-contract-v61
+working_tree: clean_after_price_score_contract_deploy
+remote_github: 6e851e6
+remote_gitee: 6e851e6
+production_commit: 6e851e6
+prompt_version: vision-evidence-contract-v62（已部署；价格分自洽性契约）
 database_change: ew_price_rule_sets、ew_price_score_runs 和 ew_projects.price_profile_id 已按 SQLite 兼容迁移部署；本轮无数据库变更
-user_approval: 已授权本轮代码修改；尚未授权提交、推送或部署
+user_approval: 已授权实施、提交、推送和部署
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
 
 ## 下一位先做
 
-1. 云端实际版本为 `30674c2`。已核对 sxyh2、三原县、jc、test3 的最新 AI 价格分任务；sxyh2 因模型把全部 `score` 留空而无数值，test3 有 JSON 分数与自身 calculation 不一致。三原县、jc 已有数值。
-2. 本地待提交修改：完整规则、参与范围及计分价时，模型不得因 `needs_review` 留空；新增 `final_score` 作为模型自身最终分的结构化回读字段，代码只校验 `score/final_score` 一致、ID、覆盖和满分，不重启本地公式否决。云端旧自定义提示词也会由系统必需协议补齐该字段。
-3. 已通过 6 项定向价格/提示词回归、`py_compile`、文档校验和差异校验。获用户同意提交部署后，仅重跑 sxyh2 和 test3 的“AI 价格分计算”：前者应出数值，后者若模型再次自相矛盾将触发一次紧凑重试而不保存错误分数。
+1. 云端已部署 `6e851e6`（提示词 v62）。sxyh2 价格页仍显示旧 AI 结果（含 27.7、基准价 1053347，输入指纹未变不会自动失效）——**需在价格页重新触发"保存全部修改并由 AI 重算"**，新任务按 v62 契约返回 score+final_score 一致的结果并覆盖展示；核对四家应为 30 分（差值四舍五入后 0%）。
 
 ## 活跃记录（最多 10 条）
 
