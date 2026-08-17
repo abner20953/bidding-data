@@ -5643,6 +5643,30 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(document["quote_status"], "found")
         self.assertEqual(document["quote_fingerprint"], stored_entry["extraction_fingerprint"])
 
+    def test_refresh_price_sheet_reextracts_when_cached_fingerprint_is_stale(self):
+        # 提取规则升级（PRICE_SHEET_VERSION 递增）后，旧版本指纹的缓存必须被
+        # 普通刷新重扫，而不是当作“新鲜”复用。
+        bid = self._add_pdf("stale-bid.pdf", "bid", "甲公司", "占位")
+        parsed = self.temp_dir / "stale-bid.txt"
+        parsed.write_text("投标总报价：140000元。", encoding="utf-8")
+        with storage.connection(self.app) as conn:
+            conn.execute(
+                "UPDATE ew_documents SET parse_status='success', parsed_path=?, quote_value='999999', "
+                "quote_status='found', quote_source='parsed_text', quote_fingerprint='old-rule-version' "
+                "WHERE document_id=?",
+                (str(parsed), bid["document_id"]),
+            )
+        client = self.app.test_client()
+        path = f"/api/evaluation-workbench/projects/{self.project['project_id']}/price-sheet"
+        sheet = client.post(f"{path}/refresh").get_json()["price_sheet"]
+        entry = sheet["entries"][0]
+        self.assertEqual(entry["extracted_quote"], "140000")
+        self.assertEqual(entry["extraction_status"], "found")
+        document = next(item for item in storage.list_documents(self.app, self.project["project_id"])
+                        if item["document_id"] == bid["document_id"])
+        self.assertEqual(document["quote_value"], "140000")
+        self.assertNotEqual(document["quote_fingerprint"], "old-rule-version")
+
     def test_refresh_price_sheet_force_reextracts_despite_cached_quote(self):
         bid = self._add_pdf("force-bid.pdf", "bid", "甲公司", "占位")
         parsed = self.temp_dir / "force-bid.txt"

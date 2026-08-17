@@ -18,7 +18,7 @@ from dashboard.evaluation_workbench import storage
 
 # 报价定位算法变更时递增此版本，使已落库的旧识别结果自动进入刷新判定，
 # 避免历史项目继续沿用旧定位器留下的空报价或误识别结果。
-PRICE_SHEET_VERSION = "price-sheet-v4"
+PRICE_SHEET_VERSION = "price-sheet-v5"
 
 _PRICE_RULE_PATTERN = re.compile(
     r"最低(?:投标)?价|评审价|评标价|基准价|价格分|报价得分|投标报价[^，。；]{0,20}得分"
