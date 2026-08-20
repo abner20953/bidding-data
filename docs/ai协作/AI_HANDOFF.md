@@ -4,31 +4,31 @@
 handoff_schema: 1
 updated_at: 2026-08-20
 module: evaluation-workbench
-status: ready_for_commit
-base_commit: f8a0d5b
+status: clean_no_active_work
+base_commit: 8764c95
 branch: main
-working_tree: local_changes_evaluation_selection_history
-remote_github: f8a0d5b
-remote_gitee: f8a0d5b
-production_commit: fe7d894
+working_tree: local_docs_deploy_status_update
+remote_github: 8764c95
+remote_gitee: 8764c95
+production_commit: 8764c95
 prompt_version: vision-evidence-contract-v63（已部署；未填调整不套用规则优惠）
 database_change: ew_documents 报价缓存列（v4 已部署）；本轮仅 PRICE_SHEET_VERSION 升 v5，无结构变更
-user_approval: 已授权投标人评审历史提示的提交、推送和部署
+user_approval: 本轮投标人评审历史提示已完成提交、推送和部署
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
 
 ## 下一位先做
 
-1. 提交、推送并部署投标人选择弹窗的评审历史提示；云端手工验证已评审、未评审、任务安全终止后三种状态。MiMo V2.5 图片测试仍建议禁用思考模式。
+1. 当前无待办。后续如调整综合评审选择弹窗，应保持“当前文件哈希 + 当前结果来源索引”作为评审历史状态的唯一来源；MiMo V2.5 图片测试仍建议禁用思考模式。
 
 ## 活跃记录（最多 10 条）
 
-### 8. 投标人选择弹窗的评审历史提示（本地完成，待提交部署）
+### 8. 投标人选择弹窗的评审历史提示（已部署 8764c95）
 
 - 项目详情新增只读 `evaluation_document_states`：以“当前投标文件哈希 + 当前结果来源索引”为准，返回最近已发布任务的状态与完成时间，不把旧文件、旧规则或未发布中间结果误报为已评审。
 - 开始综合评审弹窗在每家投标人的“已解析，可评审”下方显示最近综合评审状态和时间；从未有当前结果的文件显示“尚未进行综合评审”。不改勾选、队列、模型、OCR、结果或报告逻辑。
-- 验证：项目 API 状态来源回归、局部重评与安全终止保护测试，以及完整工作台和 AI 网关 576 项通过。
+- 验证：项目 API 状态来源回归、局部重评与安全终止保护测试，以及完整工作台和 AI 网关 576 项通过；云端 `jc` 弹窗实测 4 家已完成显示时间、4 家未评审显示明确状态。
 
 ### 7. 综合评审安全终止（已部署 fe7d894）
 
