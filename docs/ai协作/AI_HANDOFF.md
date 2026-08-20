@@ -4,13 +4,13 @@
 handoff_schema: 1
 updated_at: 2026-08-20
 module: evaluation-workbench
-status: ready_for_commit
-base_commit: 17caf39
+status: deployed_validation_pending
+base_commit: e269e54
 branch: main
-working_tree: local_changes_selected_evaluation_and_mimo_fix
-remote_github: unknown
-remote_gitee: unknown
-production_commit: unknown
+working_tree: clean_after_selected_evaluation_deploy
+remote_github: e269e54
+remote_gitee: e269e54
+production_commit: e269e54
 prompt_version: vision-evidence-contract-v63（已部署；未填调整不套用规则优惠）
 database_change: ew_documents 报价缓存列（v4 已部署）；本轮仅 PRICE_SHEET_VERSION 升 v5，无结构变更
 user_approval: 已授权实施、提交、推送和部署
