@@ -7,9 +7,9 @@ module: evaluation-workbench
 status: deployed_validation_pending
 base_commit: fe7d894
 branch: main
-working_tree: local_docs_hash_sync
-remote_github: 6902a4f
-remote_gitee: 6902a4f
+working_tree: clean_after_deploy_docs_sync
+remote_github: fe7d894
+remote_gitee: fe7d894
 production_commit: fe7d894
 prompt_version: vision-evidence-contract-v63（已部署；未填调整不套用规则优惠）
 database_change: ew_documents 报价缓存列（v4 已部署）；本轮仅 PRICE_SHEET_VERSION 升 v5，无结构变更
