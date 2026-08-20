@@ -5209,6 +5209,37 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(context["waiting_count"], 1)
         self.assertEqual(context["active_task"]["project_name"], "评标测试项目")
 
+    def test_project_status_exposes_current_evaluation_state_per_bid_document(self):
+        assessed = self._add_pdf("bid-a.pdf", "bid", "甲公司", "甲公司具备有效资质。")
+        unassessed = self._add_pdf("bid-b.pdf", "bid", "乙公司", "乙公司具备有效资质。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "有效资质", "source_text": "具备有效资质",
+        })
+        rule_set = storage.confirm_rule_set(self.app, self.project["project_id"])
+        task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        storage.next_queued_task(self.app)
+        profile = storage.get_model_profile(self.app, None)
+        review_run = storage.create_review_run(
+            self.app, self.project["project_id"], task["task_id"], profile["profile_id"],
+        )
+        storage.publish_current_evaluation_document(
+            self.app, self.project["project_id"], assessed, rule_set["rule_set_id"], task["task_id"],
+            profile["profile_id"], "test-fingerprint", review_run["review_run_id"], None, None,
+        )
+        storage.update_task(self.app, task["task_id"], status="success")
+
+        with patch.object(evaluation_workbench_module, "_start_worker_if_needed"):
+            response = self.app.test_client().get(f"/api/evaluation-workbench/projects/{self.project['project_id']}")
+
+        self.assertEqual(response.status_code, 200)
+        states = response.get_json()["evaluation_document_states"]
+        self.assertEqual(states[assessed["document_id"]]["task_id"], task["task_id"])
+        self.assertEqual(states[assessed["document_id"]]["task_status"], "success")
+        self.assertTrue(states[assessed["document_id"]]["last_run_at"])
+        self.assertNotIn(unassessed["document_id"], states)
+
     def test_create_task_enforces_per_project_queue_limit(self):
         """排队上限按项目独立计数：同项目第 4 个排队任务被拒，其他项目仍可排队。"""
         second_project = storage.create_project(self.app, "同项目排队项目", "TEST-02", "包1")

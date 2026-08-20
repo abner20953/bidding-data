@@ -5247,6 +5247,35 @@ def publish_current_evaluation_document(app, project_id: str, document: dict, ru
         )
 
 
+def current_evaluation_document_states(app, project_id: str) -> dict[str, dict]:
+    """返回每份当前投标文件最近已发布综合评审的轻量状态，供选择弹窗提示。"""
+    with connection(app) as conn:
+        rows = conn.execute(
+            """SELECT current.document_id, current.task_id, current.updated_at AS published_at,
+                      task.status AS task_status, task.started_at AS task_started_at,
+                      task.finished_at AS task_finished_at, task.updated_at AS task_updated_at
+                 FROM ew_evaluation_current_documents current
+                 JOIN ew_documents document ON document.document_id=current.document_id
+                 JOIN ew_tasks task ON task.task_id=current.task_id
+                WHERE current.project_id=? AND document.role='bid'
+                  AND current.document_sha256=document.sha256
+                ORDER BY current.updated_at DESC, task.rowid DESC""",
+            (project_id,),
+        ).fetchall()
+    values: dict[str, dict] = {}
+    for row in rows:
+        value = dict(row)
+        document_id = str(value.pop("document_id") or "")
+        if not document_id or document_id in values:
+            continue
+        value["last_run_at"] = (
+            value.get("task_finished_at") or value.get("published_at")
+            or value.get("task_updated_at") or value.get("task_started_at")
+        )
+        values[document_id] = value
+    return values
+
+
 def save_current_evaluation_highlights(app, project_id: str, task_id: str,
                                        document_ids: list[str], highlights: list[dict]) -> None:
     """保存本次实际重评文件的重点结论，未选投标人的既有摘要保持不变。"""

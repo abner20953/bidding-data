@@ -4,27 +4,33 @@
 handoff_schema: 1
 updated_at: 2026-08-20
 module: evaluation-workbench
-status: deployed_validation_pending
-base_commit: fe7d894
+status: ready_for_commit
+base_commit: f8a0d5b
 branch: main
-working_tree: clean_after_deploy_docs_sync
-remote_github: fe7d894
-remote_gitee: fe7d894
+working_tree: local_changes_evaluation_selection_history
+remote_github: f8a0d5b
+remote_gitee: f8a0d5b
 production_commit: fe7d894
 prompt_version: vision-evidence-contract-v63（已部署；未填调整不套用规则优惠）
 database_change: ew_documents 报价缓存列（v4 已部署）；本轮仅 PRICE_SHEET_VERSION 升 v5，无结构变更
-user_approval: 已授权本轮提交、推送和部署
+user_approval: 已授权投标人评审历史提示的提交、推送和部署
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
 
 ## 下一位先做
 
-1. 待用户确认后提交、推送并部署安全终止批次；云端手工验证排队取消、运行中安全终止、已完成投标人保留和后续重新发起。MiMo V2.5 图片测试仍建议禁用思考模式。
+1. 提交、推送并部署投标人选择弹窗的评审历史提示；云端手工验证已评审、未评审、任务安全终止后三种状态。MiMo V2.5 图片测试仍建议禁用思考模式。
 
 ## 活跃记录（最多 10 条）
 
-### 7. 综合评审安全终止（本地完成，待提交部署）
+### 8. 投标人选择弹窗的评审历史提示（本地完成，待提交部署）
+
+- 项目详情新增只读 `evaluation_document_states`：以“当前投标文件哈希 + 当前结果来源索引”为准，返回最近已发布任务的状态与完成时间，不把旧文件、旧规则或未发布中间结果误报为已评审。
+- 开始综合评审弹窗在每家投标人的“已解析，可评审”下方显示最近综合评审状态和时间；从未有当前结果的文件显示“尚未进行综合评审”。不改勾选、队列、模型、OCR、结果或报告逻辑。
+- 验证：项目 API 状态来源回归、局部重评与安全终止保护测试，以及完整工作台和 AI 网关 576 项通过。
+
+### 7. 综合评审安全终止（已部署 fe7d894）
 
 - 状态区仅对排队/运行中的综合评审显示“取消排队/安全终止”。运行任务采用协作式终止，不强杀线程、worker、本地 OCR 或当前外部请求；模型/OCR、退避、进度与单文件发布均设自然检查点。
 - 已完整发布的投标人结果保留，正在处理的文件不发布半成品；全量重评不再入队即删除旧结果，而是逐文件原子替换，成功完成后再安全清理旧运行产物。终止与正常完成竞态由原子收尾保证终止优先，后续可正常重跑。

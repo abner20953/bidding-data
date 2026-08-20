@@ -1004,6 +1004,20 @@
   $('add-manual-rule').onclick = async () => { try { const category = $('manual-rule-category').value; const isScoring = ['objective', 'subjective'].includes(category); const rawMaxScore = $('manual-rule-max-score').value; const maxScore = Number(rawMaxScore); if (isScoring && (!Number.isFinite(maxScore) || maxScore <= 0)) { alert('客观分和主观分规则必须填写大于 0 的满分。'); return; } const payload = {category, title:$('manual-rule-title').value, check_rule:$('manual-rule-check').value, source_text:$('manual-rule-source').value, ocr_required:$('manual-rule-ocr').checked}; if (isScoring) payload.scoring = {max_score:maxScore, kind:category === 'objective' ? $('manual-rule-score-kind').value : 'manual'}; await request(`/projects/${activeProject}/rules`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}); $('manual-rule-title').value = ''; $('manual-rule-check').value = ''; $('manual-rule-source').value = ''; $('manual-rule-max-score').value = ''; $('manual-rule-ocr').checked = false; updateManualRuleScoringFields(); await refreshRules(); await refreshPriceSheet(false, true); } catch (error) { alert(error.message); } };
   $('confirm-rules').onclick = async () => { try { const validation = await request(`/projects/${activeProject}/rules/acquisition-validation`); const issues = Array.isArray(validation.issues) ? validation.issues : []; if (issues.length) { const brief = issues.slice(0, 6).map((item) => `• ${item.title}：${item.message}`).join('\n'); const extra = issues.length > 6 ? `\n另有 ${issues.length - 6} 条提示。` : ''; if (!confirm(`增强核验预检发现 ${issues.length} 条提示：\n${brief}${extra}\n\n仍要确认当前规则集吗？`)) return; } await request(`/projects/${activeProject}/rules/confirm`, {method:'POST'}); await refreshRules(); await refreshPriceSheet(false, true); } catch (error) { alert(error.message); } };
   function closeEvaluationSelection() { $('evaluation-selection-panel').classList.add('hidden'); document.body.classList.remove('modal-open'); evaluationSelectionProject = null; }
+  function evaluationDocumentRunStatus(value) {
+    if (!value) return '尚未进行综合评审';
+    const labels = {
+      success:'已完成',
+      running:'本次任务仍在运行',
+      queued:'已排队等待执行',
+      cancelled:'结果已保留（任务已安全终止）',
+      interrupted:'结果已保留（任务已中断）',
+      error:'结果已保留（任务异常）',
+    };
+    const label = labels[value.task_status] || String(value.task_status || '状态未知');
+    const time = value.last_run_at ? formatLocalTime(value.last_run_at) : '';
+    return `最近综合评审：${label}${time ? ` · ${time}` : ''}`;
+  }
   function renderEvaluationSelection() {
     const documents = (evaluationSelectionProject?.documents || []).filter((item) => item.role === 'bid');
     const selectable = documents.filter((item) => item.parse_status === 'success' && item.parsed_path);
@@ -1015,6 +1029,7 @@
     evaluationSelectionProject = projectData;
     const documents = (projectData.documents || []).filter((item) => item.role === 'bid');
     const selectable = documents.filter((item) => item.parse_status === 'success' && item.parsed_path);
+    const evaluationStates = projectData.evaluation_document_states || {};
     const evaluated = (projectData.tasks || []).some((task) => task.task_type === 'evaluate_all' && task.status === 'success');
     $('evaluation-selection-description').textContent = evaluated
       ? '默认全选。全选会完整重评并替换全部结果；只选择部分投标人时，仅替换所选投标人的结果，其他结果保持不变。'
@@ -1023,7 +1038,8 @@
       const ready = item.parse_status === 'success' && item.parsed_path;
       const name = item.bidder_name || item.original_name;
       const status = ready ? '已解析，可评审' : `暂不可评审：${parseStatusLabel(item.parse_status)}`;
-      return `<label class="evaluation-document-choice ${ready ? '' : 'is-unavailable'}"><input class="evaluation-document-checkbox" type="checkbox" value="${escapeHtml(item.document_id)}" ${ready ? 'checked' : 'disabled'}><span><strong>${escapeHtml(name)}</strong><small>${escapeHtml(item.original_name)}${item.page_count ? ` · ${item.page_count} 页` : ''}</small></span><span class="evaluation-document-status">${escapeHtml(status)}</span></label>`;
+      const evaluationStatus = evaluationDocumentRunStatus(evaluationStates[item.document_id]);
+      return `<label class="evaluation-document-choice ${ready ? '' : 'is-unavailable'}"><input class="evaluation-document-checkbox" type="checkbox" value="${escapeHtml(item.document_id)}" ${ready ? 'checked' : 'disabled'}><span><strong>${escapeHtml(name)}</strong><small>${escapeHtml(item.original_name)}${item.page_count ? ` · ${item.page_count} 页` : ''}</small></span><span class="evaluation-document-status"><span>${escapeHtml(status)}</span><small>${escapeHtml(evaluationStatus)}</small></span></label>`;
     }).join('') : '<p class="muted">尚未上传投标文件。</p>';
     $('evaluation-document-selection').querySelectorAll('.evaluation-document-checkbox').forEach((input) => { input.onchange = renderEvaluationSelection; });
     $('select-all-evaluation-documents').onclick = () => { $('evaluation-document-selection').querySelectorAll('.evaluation-document-checkbox:not(:disabled)').forEach((input) => { input.checked = true; }); renderEvaluationSelection(); };
