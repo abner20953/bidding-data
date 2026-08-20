@@ -19,6 +19,7 @@
   let lastObservedPriceTaskId = null;
   let selectedPriceRuleId = '';
   let priceDraft = null;
+  let evaluationSelectionProject = null;
   const $ = (id) => document.getElementById(id);
   const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
   // 展示层统一清洗：去掉内部编号（SI-1/SI-2）、JSON 字段名记法（status=、suggested_score=）、
@@ -881,7 +882,26 @@
     const version = currentRuleSet.version ? ` v${currentRuleSet.version}` : '';
     return `<p class="hint"><strong>版本提示：</strong>以下结果基于此前已确认的规则集；当前页面已是待确认规则集${escapeHtml(version)}。确认新规则后请重新运行综合评审，避免将两版规则的结果混作比较。</p>`;
   }
-  function partialResultNotice(run) { const versionNotice = ruleSetVersionNotice(run); if (run?.task_status === 'running') return `${versionNotice}<p class="hint">综合评审仍在运行，以下仅展示已完整完成投标人的 AI 建议。</p>`; return `${versionNotice}${run?.task_status === 'error' ? `<p class="hint">本次综合评审未全部完成，以下为已成功保存的部分 AI 建议（进度 ${run.task_progress ?? 0}%）：${escapeHtml(run.task_error || '请修正模型配置后重新运行。')}</p>` : ''}`; }
+  function currentResultSourceNotice(run) {
+    if (!run) return '';
+    const notices = [];
+    const sourceTaskIds = Array.isArray(run.source_task_ids) ? run.source_task_ids : [];
+    if (run.mixed_sources && sourceTaskIds.length > 1) {
+      const publishedAt = run.published_at || run.updated_at || run.created_at;
+      notices.push(`当前结果由 ${sourceTaskIds.length} 次综合评审组成，部分投标人保留此前结果${publishedAt ? `；最近一次结果发布于 ${formatLocalTime(publishedAt)}` : ''}。`);
+    }
+    const unassessedCount = Number(run.unassessed_document_count || 0);
+    if (unassessedCount > 0) {
+      const prefix = run.selection_mode === 'selected' && !run.mixed_sources ? '当前仅显示已选择投标人的结果；' : '';
+      notices.push(`${prefix}另有 ${unassessedCount} 家投标人尚未完成综合评审，可在“开始综合评审”中单独选择。`);
+    }
+    return notices.length ? `<p class="hint">${escapeHtml(notices.join(' '))}</p>` : '';
+  }
+  function partialResultNotice(run) {
+    const baseNotice = `${ruleSetVersionNotice(run)}${currentResultSourceNotice(run)}`;
+    if (run?.task_status === 'running') return `${baseNotice}<p class="hint">综合评审仍在运行，以下仅展示已完整完成投标人的 AI 建议。</p>`;
+    return `${baseNotice}${run?.task_status === 'error' ? `<p class="hint">本次综合评审未全部完成，以下为已成功保存的部分 AI 建议（进度 ${run.task_progress ?? 0}%）：${escapeHtml(run.task_error || '请修正模型配置后重新运行。')}</p>` : ''}`;
+  }
   function visibleCompletedResults(run, results) { if (run?.task_status !== 'running') return results; const completed = new Set(run.completed_document_ids || []); return results.filter((item) => completed.has(item.document_id)); }
   function renderEvaluationHighlights(summaries) {
     const values = (summaries || []).filter((summary) => Array.isArray(summary.highlights) && summary.highlights.length);
@@ -960,7 +980,45 @@
   updateManualRuleScoringFields();
   $('add-manual-rule').onclick = async () => { try { const category = $('manual-rule-category').value; const isScoring = ['objective', 'subjective'].includes(category); const rawMaxScore = $('manual-rule-max-score').value; const maxScore = Number(rawMaxScore); if (isScoring && (!Number.isFinite(maxScore) || maxScore <= 0)) { alert('客观分和主观分规则必须填写大于 0 的满分。'); return; } const payload = {category, title:$('manual-rule-title').value, check_rule:$('manual-rule-check').value, source_text:$('manual-rule-source').value, ocr_required:$('manual-rule-ocr').checked}; if (isScoring) payload.scoring = {max_score:maxScore, kind:category === 'objective' ? $('manual-rule-score-kind').value : 'manual'}; await request(`/projects/${activeProject}/rules`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}); $('manual-rule-title').value = ''; $('manual-rule-check').value = ''; $('manual-rule-source').value = ''; $('manual-rule-max-score').value = ''; $('manual-rule-ocr').checked = false; updateManualRuleScoringFields(); await refreshRules(); await refreshPriceSheet(false, true); } catch (error) { alert(error.message); } };
   $('confirm-rules').onclick = async () => { try { const validation = await request(`/projects/${activeProject}/rules/acquisition-validation`); const issues = Array.isArray(validation.issues) ? validation.issues : []; if (issues.length) { const brief = issues.slice(0, 6).map((item) => `• ${item.title}：${item.message}`).join('\n'); const extra = issues.length > 6 ? `\n另有 ${issues.length - 6} 条提示。` : ''; if (!confirm(`增强核验预检发现 ${issues.length} 条提示：\n${brief}${extra}\n\n仍要确认当前规则集吗？`)) return; } await request(`/projects/${activeProject}/rules/confirm`, {method:'POST'}); await refreshRules(); await refreshPriceSheet(false, true); } catch (error) { alert(error.message); } };
-  $('start-evaluate-all').onclick = async () => { try { const profile_id = $('all-profile').value; const rulesData = await request(`/projects/${activeProject}/rules`); const visionRules = rulesData.rules.filter((rule) => rule.enabled && rule.vision_trigger !== 'off' && rule.vision_level !== 'off' && !['ocr_only', 'off'].includes(rule.image_mode || 'auto')); if (visionConfiguration.enabled && visionRules.length) { const selected = modelProfiles.find((item) => item.profile_id === profile_id); const fallback = modelProfiles.find((item) => item.profile_id === visionConfiguration.default_profile_id && item.enabled && item.capabilities?.vision); if (!selected?.capabilities?.vision && fallback && !confirm(`当前评审模型“${selected?.display_name || '所选模型'}”不是多模态模型；仅需要图片外观核验的规则将改用“${fallback.display_name}”，文字评审与 OCR 仍使用当前模型。是否继续？`)) return; } const projectData = await request(`/projects/${activeProject}`); const lastSuccessfulEvaluation = (projectData.tasks || []).find((task) => task.task_type === 'evaluate_all' && task.status === 'success'); if (lastSuccessfulEvaluation && !confirm('该项目已完成过综合评审。重新评审将从当前文件、规则和模型完整开始，旧综合评审结果不会保留或复用。是否继续？')) return; await request(`/projects/${activeProject}/tasks`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({task_type:'evaluate_all', profile_id, calculate_price:true, ...(lastSuccessfulEvaluation ? {force_rerun:true} : {})})}); await refreshProject(); await Promise.all([refreshReview(), refreshScores(), refreshUsage()]); } catch (error) { alert(error.message); } };
+  function closeEvaluationSelection() { $('evaluation-selection-panel').classList.add('hidden'); document.body.classList.remove('modal-open'); evaluationSelectionProject = null; }
+  function renderEvaluationSelection() {
+    const documents = (evaluationSelectionProject?.documents || []).filter((item) => item.role === 'bid');
+    const selectable = documents.filter((item) => item.parse_status === 'success' && item.parsed_path);
+    const selected = $('evaluation-document-selection').querySelectorAll('input[type="checkbox"]:checked').length;
+    $('evaluation-selection-count').textContent = `已选择 ${selected}/${selectable.length} 份可评审投标文件`;
+    $('submit-evaluation-selection').disabled = selected === 0;
+  }
+  function showEvaluationSelection(projectData) {
+    evaluationSelectionProject = projectData;
+    const documents = (projectData.documents || []).filter((item) => item.role === 'bid');
+    const selectable = documents.filter((item) => item.parse_status === 'success' && item.parsed_path);
+    const evaluated = (projectData.tasks || []).some((task) => task.task_type === 'evaluate_all' && task.status === 'success');
+    $('evaluation-selection-description').textContent = evaluated
+      ? '默认全选。全选会完整重评并替换全部结果；只选择部分投标人时，仅替换所选投标人的结果，其他结果保持不变。'
+      : '默认全选。可只评审其中几家；未选择投标人会显示为尚未评审，后续可单独补评。';
+    $('evaluation-document-selection').innerHTML = documents.length ? documents.map((item) => {
+      const ready = item.parse_status === 'success' && item.parsed_path;
+      const name = item.bidder_name || item.original_name;
+      const status = ready ? '已解析，可评审' : `暂不可评审：${parseStatusLabel(item.parse_status)}`;
+      return `<label class="evaluation-document-choice ${ready ? '' : 'is-unavailable'}"><input class="evaluation-document-checkbox" type="checkbox" value="${escapeHtml(item.document_id)}" ${ready ? 'checked' : 'disabled'}><span><strong>${escapeHtml(name)}</strong><small>${escapeHtml(item.original_name)}${item.page_count ? ` · ${item.page_count} 页` : ''}</small></span><span class="evaluation-document-status">${escapeHtml(status)}</span></label>`;
+    }).join('') : '<p class="muted">尚未上传投标文件。</p>';
+    $('evaluation-document-selection').querySelectorAll('.evaluation-document-checkbox').forEach((input) => { input.onchange = renderEvaluationSelection; });
+    $('select-all-evaluation-documents').onclick = () => { $('evaluation-document-selection').querySelectorAll('.evaluation-document-checkbox:not(:disabled)').forEach((input) => { input.checked = true; }); renderEvaluationSelection(); };
+    $('clear-evaluation-documents').onclick = () => { $('evaluation-document-selection').querySelectorAll('.evaluation-document-checkbox').forEach((input) => { input.checked = false; }); renderEvaluationSelection(); };
+    $('evaluation-selection-panel').classList.remove('hidden'); document.body.classList.add('modal-open'); renderEvaluationSelection();
+  }
+  async function verifyEvaluationVisionConfiguration(profileId) {
+    const rulesData = await request(`/projects/${activeProject}/rules`);
+    const visionRules = rulesData.rules.filter((rule) => rule.enabled && rule.vision_trigger !== 'off' && rule.vision_level !== 'off' && !['ocr_only', 'off'].includes(rule.image_mode || 'auto'));
+    if (!visionConfiguration.enabled || !visionRules.length) return true;
+    const selected = modelProfiles.find((item) => item.profile_id === profileId);
+    const fallback = modelProfiles.find((item) => item.profile_id === visionConfiguration.default_profile_id && item.enabled && item.capabilities?.vision);
+    return !(!selected?.capabilities?.vision && fallback && !confirm(`当前评审模型“${selected?.display_name || '所选模型'}”不是多模态模型；仅需要图片外观核验的规则将改用“${fallback.display_name}”，文字评审与 OCR 仍使用当前模型。是否继续？`));
+  }
+  $('start-evaluate-all').onclick = async () => { try { showEvaluationSelection(await request(`/projects/${activeProject}`)); } catch (error) { alert(error.message); } };
+  $('close-evaluation-selection').onclick = closeEvaluationSelection;
+  $('cancel-evaluation-selection').onclick = closeEvaluationSelection;
+  $('submit-evaluation-selection').onclick = async () => { try { const projectData = evaluationSelectionProject; const selectedDocumentIds = [...$('evaluation-document-selection').querySelectorAll('.evaluation-document-checkbox:checked')].map((input) => input.value); const bidDocuments = (projectData?.documents || []).filter((item) => item.role === 'bid'); if (!selectedDocumentIds.length) return alert('请至少选择一份已解析的投标文件'); const allSelected = selectedDocumentIds.length === bidDocuments.length; const lastSuccessfulEvaluation = (projectData.tasks || []).find((task) => task.task_type === 'evaluate_all' && task.status === 'success'); if (lastSuccessfulEvaluation && !confirm(allSelected ? '将使用当前文件、规则和模型完整重评全部投标人，并替换当前综合评审结果。是否继续？' : `将只重新评审所选 ${selectedDocumentIds.length} 家投标人；未选择投标人的当前结果会保留。是否继续？`)) return; const profile_id = $('all-profile').value; if (!await verifyEvaluationVisionConfiguration(profile_id)) return; await request(`/projects/${activeProject}/tasks`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({task_type:'evaluate_all', profile_id, document_ids:selectedDocumentIds, calculate_price:allSelected, ...(lastSuccessfulEvaluation ? {force_rerun:true} : {})})}); closeEvaluationSelection(); await refreshProject(); await Promise.all([refreshReview(), refreshScores(), refreshUsage()]); } catch (error) { alert(error.message); } };
   function closeModels() { $('models-panel').classList.add('hidden'); document.body.classList.remove('modal-open'); resetModelForm(); }
   function closePrompts() { $('prompts-panel').classList.add('hidden'); document.body.classList.remove('modal-open'); }
   function syncGlobalRuleAcquisitionControls() { const choice = $('global-rule-acquisition').value; const active = ['smart', 'always'].includes(choice); $('global-rule-coverage-field').classList.toggle('is-hidden', !active); $('global-rule-ocr').disabled = choice === 'text_only'; if (choice === 'text_only') $('global-rule-ocr').checked = false; }

@@ -12909,6 +12909,7 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
     # 扫描型文件需要重新应用当前 OCR/图片覆盖策略；不得复用早期仅凭稀疏文本得出的结论。
     reusable = None if (
         task.get("payload", {}).get("force_rerun")
+        or task.get("payload", {}).get("rerun_selected")
         or task.get("payload", {}).get("retry_failed_task_id")
         or _document_text_coverage_status(document) == "uncovered"
     ) else storage.reusable_evaluation_document_results(
@@ -12923,7 +12924,6 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
         if subjective_run:
             storage.save_score_results(app, subjective_run["score_run_id"], document["document_id"], reusable["subjective"])
         progress.advance(f"已复用 {bidder_name} 的完整评审结果", scan_units + groups_per_document + visual_units)
-        progress.document_completed(document, reused=True)
         return {"reused_document_count": 1}
 
     price_fact_cache = task.setdefault("_shared_price_fact_packets", {})
@@ -12972,7 +12972,6 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
     ]
     if resume_failed_only and not pending_rules:
         progress.advance(f"已复用 {bidder_name} 的全部成功规则", scan_units + groups_per_document + visual_units)
-        progress.document_completed(document, reused=True)
         return {"reused_document_count": 1, "reused_unit_count": sum(len(values) for values in completed_results.values()), "failed_units": []}
 
     scan_unavailable = False
@@ -13333,11 +13332,10 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
     except Exception:
         # 断点缓存只用于加速重跑；保存失败不影响本轮已落库的正式结果。
         traceback.print_exc()
-    progress.document_completed(document)
     return values
 
 
-def _evaluation_highlight_candidates(app, project_id: str) -> tuple[list[dict], dict[tuple[str, str], dict]]:
+def _evaluation_highlight_candidates(app, project_id: str, document_ids: set[str] | None = None) -> tuple[list[dict], dict[tuple[str, str], dict]]:
     """只向收尾提炼发送已有的重要候选，不重发全文或普通满足项。"""
     _, review_results = storage.latest_review_results(app, project_id)
     _, objective_results = storage.latest_score_results(app, project_id, "objective")
@@ -13347,11 +13345,14 @@ def _evaluation_highlight_candidates(app, project_id: str) -> tuple[list[dict], 
     review_rank = {"not_satisfied": 4, "partial": 3, "not_found": 2}
     category_rank = {"rejection": 4, "substantive": 4, "qualification": 3, "compliance": 3, "other": 1}
     risk_rank = {"high": 3, "medium": 2, "low": 1}
+    allowed_document_ids = {str(value) for value in document_ids or set() if str(value)}
     for item in review_results:
         if item.get("status") not in review_rank or item.get("risk_level") not in {"high", "medium"}:
             continue
         document_id = str(item.get("document_id") or "")
         rule_id = str(item.get("rule_id") or "")
+        if allowed_document_ids and document_id not in allowed_document_ids:
+            continue
         if not document_id or not rule_id:
             continue
         decision_impact = _rule_decision_impact(item)
@@ -13407,6 +13408,8 @@ def _evaluation_highlight_candidates(app, project_id: str) -> tuple[list[dict], 
             continue
         document_id = str(item.get("document_id") or "")
         rule_id = str(item.get("rule_id") or "")
+        if allowed_document_ids and document_id not in allowed_document_ids:
+            continue
         if not document_id or not rule_id:
             continue
         candidate = {
@@ -13782,8 +13785,8 @@ def _normalise_evaluation_highlights(parsed: dict, candidates: list[dict],
     return values
 
 
-def _summarise_evaluation_highlights(app, task: dict, profile: dict) -> list[dict]:
-    candidates, allowed = _evaluation_highlight_candidates(app, task["project_id"])
+def _summarise_evaluation_highlights(app, task: dict, profile: dict, document_ids: set[str] | None = None) -> list[dict]:
+    candidates, allowed = _evaluation_highlight_candidates(app, task["project_id"], document_ids)
     if not candidates:
         return []
     storage.update_task(app, task["task_id"], message="正在提炼极其重要的评审结论")
@@ -13856,9 +13859,22 @@ def _evaluate_all(app, task: dict) -> dict:
     if not (review_rules or objective_rules or subjective_rules):
         raise ValueError("综合评审需要至少一条非价格的已确认审查或评分规则；报价请在“报价与价格分”中计算")
     all_documents = storage.list_documents(app, task["project_id"])
-    documents = [item for item in all_documents if item["role"] == "bid"]
+    all_bid_documents = [item for item in all_documents if item["role"] == "bid"]
+    requested_document_ids = [
+        str(value) for value in (task.get("payload", {}).get("document_ids") or []) if str(value)
+    ]
+    requested_document_ids = list(dict.fromkeys(requested_document_ids))
+    requested_document_id_set = set(requested_document_ids)
+    if requested_document_ids:
+        documents = [item for item in all_bid_documents if item["document_id"] in requested_document_id_set]
+        if len(documents) != len(requested_document_id_set):
+            raise ValueError("所选投标文件已删除或不属于当前项目，请刷新页面后重新选择")
+    else:
+        # 兼容历史任务：没有选择范围时仍按全部投标文件执行。
+        documents = all_bid_documents
     if not documents or any(item["parse_status"] != "success" or not item["parsed_path"] for item in documents):
-        raise ValueError("请先成功解析全部投标文件")
+        raise ValueError("请先成功解析所选投标文件")
+    partial_selection = bool(requested_document_ids) and len(documents) < len(all_bid_documents)
     profile = storage.get_model_profile(app, task.get("payload", {}).get("profile_id"), "deepseek-v4-flash")
     # 两项图片能力独立读取：文字模型可在没有多模态档案时继续完成 OCR 取证。
     vision_features_enabled = bool(storage.vision_configuration(app).get("enabled"))
@@ -13927,7 +13943,7 @@ def _evaluate_all(app, task: dict) -> dict:
     progress = _EvaluationProgress(app, task, total_work_units, len(documents))
 
     def run_document(document: dict) -> dict:
-        return _evaluate_document(
+        value = _evaluate_document(
             app, task, document, rule_set=rule_set, profile=profile, char_limit=char_limit,
             expected_rule_ids=expected_rule_ids, review_rules=review_rules, objective_rules=objective_rules,
             subjective_rules=subjective_rules, review_run=review_run, objective_run=objective_run,
@@ -13936,6 +13952,17 @@ def _evaluate_all(app, task: dict) -> dict:
             vision_profile=vision_profile, ocr_features_enabled=ocr_features_enabled,
             visual_units=visual_rule_count, progress=progress,
         )
+        # 单份文件的所有规则组已完整落库后，才原子切换“当前结果”索引。这样局部
+        # 重评失败不会覆盖旧结果，未选择投标人也不会因新任务而从页面或报告消失。
+        storage.publish_current_evaluation_document(
+            app, task["project_id"], document, rule_set["rule_set_id"], task["task_id"],
+            profile["profile_id"], str(task.get("payload", {}).get("input_fingerprint") or ""),
+            review_run["review_run_id"] if review_run else None,
+            objective_run["score_run_id"] if objective_run else None,
+            subjective_run["score_run_id"] if subjective_run else None,
+        )
+        progress.document_completed(document, reused=bool(value.get("reused_document_count")))
+        return value
 
     # 只有投标人之间的文件审查并行；单份文件仍保持页块、规则组的先后顺序。
     # 模型请求默认两路、稳定后按档案动态升档，触发服务商限流后会自动逐级降路重试。
@@ -13997,7 +14024,7 @@ def _evaluate_all(app, task: dict) -> dict:
         "decision_participation": False, "candidate_rule_count": 0,
         "comparison_count": 0, "status": "not_applicable",
     }
-    if subjective_run:
+    if subjective_run and not partial_selection:
         try:
             cross_bid_subjective_shadow = _run_cross_bid_subjective_shadow(
                 app, task, profile, documents, subjective_rules, subjective_run["score_run_id"],
@@ -14011,7 +14038,12 @@ def _evaluate_all(app, task: dict) -> dict:
             }
     highlight_failure_count = 0
     try:
-        highlights = _summarise_evaluation_highlights(app, task, profile)
+        highlights = _summarise_evaluation_highlights(
+            app, task, profile, {item["document_id"] for item in documents},
+        )
+        storage.save_current_evaluation_highlights(
+            app, task["project_id"], task["task_id"], [item["document_id"] for item in documents], highlights,
+        )
     except Exception as exc:
         # 重要结论只是既有结果的展示层，不得因为该附加调用异常而丢失已落库的评审和评分结果。
         highlights = []
@@ -14038,6 +14070,8 @@ def _evaluate_all(app, task: dict) -> dict:
             "full_scan_recovery_warning_count": full_scan_recovery_warning_count,
             "cross_bid_price": cross_bid_price,
             "cross_bid_subjective_shadow": cross_bid_subjective_shadow,
+            "selected_document_ids": [item["document_id"] for item in documents],
+            "selection_mode": "selected" if partial_selection else "all",
             "price_review_reconciled_count": 0,
             "evidence_ledger_rule_count": evidence_ledger_rule_count,
             "evidence_ledger_empty_rule_count": evidence_ledger_empty_rule_count,

@@ -8108,6 +8108,135 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(request_json.call_count, 1)
         self.assertEqual(len(reviews), 2)
 
+    def test_selected_evaluation_replaces_only_selected_bidder_current_results(self):
+        first = self._add_pdf("bid-a.pdf", "bid", "甲公司", "甲公司具备有效资质。")
+        second = self._add_pdf("bid-b.pdf", "bid", "乙公司", "乙公司具备有效资质。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "有效资质", "source_text": "具备有效资质",
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        initial = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value={
+            "results": [{"rule_id": rule["rule_id"], "status": "satisfied", "evidence": "初次结论", "reason": "已提供", "risk_level": "low"}],
+        }):
+            self._run_next_task()
+
+        partial = storage.create_task(self.app, self.project["project_id"], "evaluate_all", {
+            "document_ids": [first["document_id"]], "rerun_selected": True,
+        })
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value={
+            "results": [{"rule_id": rule["rule_id"], "status": "satisfied", "evidence": "甲公司重评结论", "reason": "重新确认", "risk_level": "low"}],
+        }) as request_json:
+            finished = self._run_next_task()
+
+        review_run, reviews = storage.latest_review_results(self.app, self.project["project_id"])
+        by_bidder = {item["bidder_name"]: item for item in reviews}
+        self.assertEqual(finished["task_id"], partial["task_id"])
+        self.assertEqual(request_json.call_count, 1)
+        self.assertEqual(len(reviews), 2)
+        self.assertEqual(by_bidder["甲公司"]["evidence"], "甲公司重评结论")
+        self.assertEqual(by_bidder["乙公司"]["evidence"], "初次结论")
+        self.assertTrue(review_run["mixed_sources"])
+        self.assertEqual(set(review_run["completed_document_ids"]), {first["document_id"], second["document_id"]})
+        report = self.app.test_client().get(f"/pingbiao/projects/{self.project['project_id']}/report")
+        self.assertEqual(report.status_code, 200)
+        self.assertIn("甲公司", report.get_data(as_text=True))
+        self.assertIn("乙公司", report.get_data(as_text=True))
+
+    def test_selected_evaluation_api_keeps_project_results_and_binds_selection_fingerprint(self):
+        first = self._add_pdf("bid-a.pdf", "bid", "甲公司", "甲公司具备有效资质。")
+        self._add_pdf("bid-b.pdf", "bid", "乙公司", "乙公司具备有效资质。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        storage.add_rule(self.app, self.project["project_id"], {"category": "qualification", "title": "有效资质"})
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        previous = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        storage.update_task(self.app, previous["task_id"], status="success")
+
+        with patch("dashboard.blueprints.evaluation_workbench._start_worker_if_needed"):
+            response = self.app.test_client().post(
+                f"/api/evaluation-workbench/projects/{self.project['project_id']}/tasks",
+                json={"task_type": "evaluate_all", "document_ids": [first["document_id"]], "force_rerun": True},
+            )
+
+        self.assertEqual(response.status_code, 202)
+        payload = response.get_json()["task"]["payload"]
+        self.assertFalse(payload["force_rerun"])
+        self.assertTrue(payload["rerun_selected"])
+        self.assertEqual(payload["document_ids"], [first["document_id"]])
+        self.assertFalse(payload["calculate_price"])
+        full_fingerprint = storage.task_input_fingerprint(
+            self.app, self.project["project_id"], "evaluate_all", None, worker.PROMPT_VERSION,
+        )
+        self.assertNotEqual(payload["input_fingerprint"], full_fingerprint)
+
+    def test_selected_evaluation_document_failure_keeps_previous_current_result(self):
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "甲公司具备有效资质。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "有效资质", "source_text": "具备有效资质",
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value={
+            "results": [{"rule_id": rule["rule_id"], "status": "satisfied", "evidence": "上次成功结论", "reason": "已提供"}],
+        }):
+            self._run_next_task()
+
+        storage.create_task(self.app, self.project["project_id"], "evaluate_all", {
+            "document_ids": [document["document_id"]], "rerun_selected": True,
+        })
+        with patch("dashboard.evaluation_workbench.worker._evaluate_document", side_effect=RuntimeError("模拟文件级异常")):
+            finished = self._run_next_task()
+
+        _, reviews = storage.latest_review_results(self.app, self.project["project_id"])
+        self.assertEqual(finished["status"], "success")
+        self.assertEqual(len(reviews), 1)
+        self.assertEqual(reviews[0]["evidence"], "上次成功结论")
+
+    def test_multiple_selected_evaluation_rounds_merge_each_bidder_current_result(self):
+        first = self._add_pdf("bid-a.pdf", "bid", "甲公司", "甲公司具备有效资质。")
+        second = self._add_pdf("bid-b.pdf", "bid", "乙公司", "乙公司具备有效资质。")
+        third = self._add_pdf("bid-c.pdf", "bid", "丙公司", "丙公司具备有效资质。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "有效资质", "source_text": "具备有效资质",
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+
+        first_round = storage.create_task(self.app, self.project["project_id"], "evaluate_all", {
+            "document_ids": [first["document_id"], second["document_id"]], "rerun_selected": True,
+        })
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value={
+            "results": [{"rule_id": rule["rule_id"], "status": "satisfied", "evidence": "前两家结论", "reason": "已提供", "risk_level": "low"}],
+        }):
+            self._run_next_task()
+
+        second_round = storage.create_task(self.app, self.project["project_id"], "evaluate_all", {
+            "document_ids": [third["document_id"]], "rerun_selected": True,
+        })
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value={
+            "results": [{"rule_id": rule["rule_id"], "status": "satisfied", "evidence": "丙公司结论", "reason": "已提供", "risk_level": "low"}],
+        }):
+            finished = self._run_next_task()
+
+        review_run, reviews = storage.latest_review_results(self.app, self.project["project_id"])
+        by_bidder = {item["bidder_name"]: item for item in reviews}
+        self.assertEqual(finished["task_id"], second_round["task_id"])
+        self.assertEqual(len(reviews), 3)
+        self.assertEqual(by_bidder["甲公司"]["evidence"], "前两家结论")
+        self.assertEqual(by_bidder["乙公司"]["evidence"], "前两家结论")
+        self.assertEqual(by_bidder["丙公司"]["evidence"], "丙公司结论")
+        self.assertTrue(review_run["mixed_sources"])
+        self.assertEqual(set(review_run["source_task_ids"]), {first_round["task_id"], second_round["task_id"]})
+        self.assertEqual(review_run["selection_mode"], "mixed")
+        self.assertEqual(review_run["unassessed_document_count"], 0)
+        self.assertIn("published_at", review_run)
+
     def test_combined_evaluation_does_not_reuse_results_from_old_prompt_version(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "甲公司具备有效资质。")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")

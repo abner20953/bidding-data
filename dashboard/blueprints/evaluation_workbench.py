@@ -813,6 +813,25 @@ def tasks_api(project_id):
         # OCR 文字取证与多模态图片取证已解耦。这里不再因某条规则选择了图片
         # 强度就拒绝整个任务：非多模态主模型仍可正常完成 OCR；真正需要外观
         # 判断但没有可用图片模型的规则会在 worker 内逐条标记，不能拖垮整任务。
+        bid_documents = [item for item in storage.list_documents(current_app, project_id) if item.get("role") == "bid"]
+        requested_document_ids = data.get("document_ids")
+        if requested_document_ids is None:
+            selected_document_ids = [item["document_id"] for item in bid_documents]
+        elif not isinstance(requested_document_ids, list):
+            return jsonify({"error": "投标文件选择格式不正确"}), 400
+        else:
+            selected_document_ids = list(dict.fromkeys(str(value).strip() for value in requested_document_ids if str(value).strip()))
+        if not selected_document_ids:
+            return jsonify({"error": "请至少选择一份投标文件进行综合评审"}), 400
+        bid_by_id = {item["document_id"]: item for item in bid_documents}
+        invalid_document_ids = [value for value in selected_document_ids if value not in bid_by_id]
+        if invalid_document_ids:
+            return jsonify({"error": "所选投标文件不存在或不属于当前项目，请刷新页面后重试"}), 400
+        unparsed = [bid_by_id[value] for value in selected_document_ids if bid_by_id[value].get("parse_status") != "success" or not bid_by_id[value].get("parsed_path")]
+        if unparsed:
+            return jsonify({"error": "请先成功解析所选投标文件"}), 400
+        selected_document_ids = sorted(selected_document_ids)
+        is_partial_evaluation = len(selected_document_ids) < len(bid_documents)
     try:
         requested_profile_id = data.get("profile_id") or storage.default_model_profile_id(current_app)
         if task_type in {"extract_price_rules", "calculate_price_scores"}:
@@ -833,6 +852,11 @@ def tasks_api(project_id):
         # 也必须随综合评审进入后台：仅在 API 层跳过整任务复用还不够，内部还有
         # 按投标文件复用的增量缓存。
         force_rerun = task_type in {"extract_rules", "extract_price_rules", "calculate_price_scores"} or data.get("force_rerun") is True
+        rerun_selected = bool(task_type == "evaluate_all" and is_partial_evaluation and force_rerun and not retry_failed_task_id)
+        # 局部重评只绕过所选文件的模型结论复用，不能沿用全量重评的“清空整个项目”
+        # 语义；项目范围画像和确定性页缓存仍可复用，未选文件结果也必须保留。
+        if rerun_selected:
+            force_rerun = False
         if task_type == "evaluate_all" and force_rerun and not retry_failed_task_id:
             storage.clear_evaluation_results(current_app, project_id)
         payload = {
@@ -841,11 +865,18 @@ def tasks_api(project_id):
             "deploy_commit": _current_deploy_commit(),
             "force_rerun": force_rerun,
         }
+        if task_type == "evaluate_all":
+            payload["document_ids"] = selected_document_ids
+            payload["selection_mode"] = "selected" if is_partial_evaluation else "all"
+            payload["rerun_selected"] = rerun_selected
+            # 价格分是独立的全体投标人计分；局部综合评审不应隐式触发全项目价格重算。
+            payload["calculate_price"] = bool(data.get("calculate_price")) and not is_partial_evaluation
         if retry_failed_task_id:
             payload["retry_failed_task_id"] = retry_failed_task_id
         if task_type in {"compare_documents", "extract_rules", "extract_price_rules", "calculate_price_scores", "review_documents", "score_objective", "score_subjective", "evaluate_all"}:
             payload["input_fingerprint"] = storage.task_input_fingerprint(
                 current_app, project_id, task_type, requested_profile_id, TASK_PROMPT_VERSION,
+                document_ids=selected_document_ids if task_type == "evaluate_all" else None,
             )
             if task_type == "compare_documents":
                 # 供排队任务与运行结果追溯；worker 会再保存实际运行时指纹，避免
@@ -853,7 +884,7 @@ def tasks_api(project_id):
                 payload["compare_pipeline"] = storage.compare_pipeline_metadata(
                     current_app, requested_profile_id, payload["input_fingerprint"],
                 )
-            if not force_rerun and not retry_failed_task_id:
+            if not force_rerun and not rerun_selected and not retry_failed_task_id:
                 reusable = storage.find_reusable_task(current_app, project_id, task_type, payload["input_fingerprint"])
                 if reusable:
                     return jsonify({"task": reusable, "reused": True})

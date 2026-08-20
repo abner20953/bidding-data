@@ -769,6 +769,23 @@ def init_database(app) -> None:
                 UNIQUE(score_run_id, document_id, rule_id)
             );
             CREATE INDEX IF NOT EXISTS idx_ew_score_results_run ON ew_score_results(score_run_id, document_id);
+            CREATE TABLE IF NOT EXISTS ew_evaluation_current_documents (
+                project_id TEXT NOT NULL REFERENCES ew_projects(project_id) ON DELETE CASCADE,
+                document_id TEXT NOT NULL REFERENCES ew_documents(document_id) ON DELETE CASCADE,
+                rule_set_id TEXT NOT NULL REFERENCES ew_rule_sets(rule_set_id) ON DELETE CASCADE,
+                task_id TEXT NOT NULL REFERENCES ew_tasks(task_id) ON DELETE CASCADE,
+                profile_id TEXT,
+                document_sha256 TEXT NOT NULL,
+                input_fingerprint TEXT NOT NULL DEFAULT '',
+                review_run_id TEXT,
+                objective_score_run_id TEXT,
+                subjective_score_run_id TEXT,
+                highlights_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(project_id, document_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_ew_current_evaluation_rule_set
+                ON ew_evaluation_current_documents(project_id, rule_set_id, updated_at DESC);
             CREATE TABLE IF NOT EXISTS ew_ocr_page_cache (
                 cache_id TEXT PRIMARY KEY,
                 document_id TEXT NOT NULL REFERENCES ew_documents(document_id) ON DELETE CASCADE,
@@ -1889,7 +1906,8 @@ def create_task(app, project_id: str, task_type: str, payload: dict | None = Non
     return get_task(app, task_id)
 
 
-def task_input_fingerprint(app, project_id: str, task_type: str, profile_id: str | None, prompt_version: str) -> str:
+def task_input_fingerprint(app, project_id: str, task_type: str, profile_id: str | None, prompt_version: str,
+                           document_ids: list[str] | None = None) -> str:
     """仅由文件指纹、规则版本和公开模型配置构成；不包含正文或 API Key。"""
     documents = list_documents(app, project_id)
     rule_set = current_rule_set(app, project_id)
@@ -1909,6 +1927,13 @@ def task_input_fingerprint(app, project_id: str, task_type: str, profile_id: str
         "evaluate_all": {"tender", "tender_attachment", "bid"},
     }.get(task_type, {"tender", "tender_attachment", "bid"})
     uses_rules = task_type in {"review_documents", "score_objective", "score_subjective", "evaluate_all"}
+    selected_document_ids = {str(value) for value in document_ids or [] if str(value)}
+    # 全选与历史“未传 document_ids”的评审输入完全等价，保持其严格复用能力；
+    # 仅局部选择才进入指纹，避免把一次 UI 升级误判为所有全量结果均需重跑。
+    if task_type == "evaluate_all":
+        all_bid_document_ids = {str(item["document_id"]) for item in documents if item["role"] == "bid"}
+        if selected_document_ids == all_bid_document_ids:
+            selected_document_ids = set()
     value = {
         "task_type": task_type,
         # 代码逻辑变更同样会改变结果。此前只有提示词版本参与键，导致未改提示词的
@@ -1916,7 +1941,13 @@ def task_input_fingerprint(app, project_id: str, task_type: str, profile_id: str
         "runtime_release": runtime_release_fingerprint(),
         "runtime_code": runtime_code_fingerprint(),
         "prompt_version": prompt_version,
-        "documents": sorted((item["document_id"], item["sha256"], item.get("updated_at"), item.get("parse_status")) for item in documents if item["role"] in relevant_roles),
+        "documents": sorted(
+            (item["document_id"], item["sha256"], item.get("updated_at"), item.get("parse_status"))
+            for item in documents
+            if item["role"] in relevant_roles
+            and not (task_type == "evaluate_all" and item["role"] == "bid" and selected_document_ids and item["document_id"] not in selected_document_ids)
+        ),
+        "selected_document_ids": sorted(selected_document_ids) if task_type == "evaluate_all" else None,
         "rule_set": (rule_set or {}).get("rule_set_id") if uses_rules else None,
         "rule_set_updated_at": (rule_set or {}).get("updated_at") if uses_rules else None,
         "profile": (profile.get("profile_id"), profile.get("model_name"), profile.get("base_url"), profile.get("updated_at"), profile.get("json_mode"), profile.get("thinking_mode")),
@@ -2512,6 +2543,7 @@ def clear_evaluation_results(app, project_id: str) -> None:
     全部清空，确保新的综合评审从规则到结论完全独立。
     """
     with connection(app) as conn:
+        conn.execute("DELETE FROM ew_evaluation_current_documents WHERE project_id=?", (project_id,))
         conn.execute("DELETE FROM ew_review_runs WHERE project_id=?", (project_id,))
         conn.execute("DELETE FROM ew_score_runs WHERE project_id=?", (project_id,))
         conn.execute("DELETE FROM ew_evidence_packs WHERE project_id=?", (project_id,))
@@ -5031,7 +5063,186 @@ def save_review_results(app, review_run_id: str, document_id: str, results: list
             )
 
 
+def publish_current_evaluation_document(app, project_id: str, document: dict, rule_set_id: str,
+                                        task_id: str, profile_id: str | None, input_fingerprint: str,
+                                        review_run_id: str | None, objective_score_run_id: str | None,
+                                        subjective_score_run_id: str | None) -> None:
+    """原子切换一份投标文件当前可展示的综合评审结果。
+
+    运行明细仍保留在各自的 run 中；此索引只决定页面、报告读取哪一次成功完成的
+    单文件结果。局部重评失败时不会调用本函数，因此旧结果天然保留。
+    """
+    document_id = str(document.get("document_id") or "")
+    if not document_id:
+        raise ValueError("投标文件标识不能为空")
+    value = {
+        "project_id": project_id,
+        "document_id": document_id,
+        "rule_set_id": rule_set_id,
+        "task_id": task_id,
+        "profile_id": profile_id,
+        "document_sha256": str(document.get("sha256") or ""),
+        "input_fingerprint": str(input_fingerprint or ""),
+        "review_run_id": review_run_id,
+        "objective_score_run_id": objective_score_run_id,
+        "subjective_score_run_id": subjective_score_run_id,
+        "highlights_json": "{}",
+        "updated_at": now_iso(),
+    }
+    with connection(app) as conn:
+        conn.execute(
+            """INSERT INTO ew_evaluation_current_documents(
+                   project_id, document_id, rule_set_id, task_id, profile_id, document_sha256,
+                   input_fingerprint, review_run_id, objective_score_run_id, subjective_score_run_id,
+                   highlights_json, updated_at)
+               VALUES (:project_id, :document_id, :rule_set_id, :task_id, :profile_id, :document_sha256,
+                       :input_fingerprint, :review_run_id, :objective_score_run_id, :subjective_score_run_id,
+                       :highlights_json, :updated_at)
+               ON CONFLICT(project_id, document_id) DO UPDATE SET
+                   rule_set_id=excluded.rule_set_id, task_id=excluded.task_id, profile_id=excluded.profile_id,
+                   document_sha256=excluded.document_sha256, input_fingerprint=excluded.input_fingerprint,
+                   review_run_id=excluded.review_run_id, objective_score_run_id=excluded.objective_score_run_id,
+                   subjective_score_run_id=excluded.subjective_score_run_id, highlights_json=excluded.highlights_json,
+                   updated_at=excluded.updated_at""",
+            value,
+        )
+
+
+def save_current_evaluation_highlights(app, project_id: str, task_id: str,
+                                       document_ids: list[str], highlights: list[dict]) -> None:
+    """保存本次实际重评文件的重点结论，未选投标人的既有摘要保持不变。"""
+    allowed = {str(value) for value in document_ids if str(value)}
+    if not allowed:
+        return
+    by_document = {
+        str(item.get("document_id") or ""): item
+        for item in highlights if isinstance(item, dict) and str(item.get("document_id") or "") in allowed
+    }
+    timestamp = now_iso()
+    with connection(app) as conn:
+        for document_id in allowed:
+            conn.execute(
+                """UPDATE ew_evaluation_current_documents
+                   SET highlights_json=?, updated_at=?
+                   WHERE project_id=? AND document_id=? AND task_id=?""",
+                (json.dumps(by_document.get(document_id) or {}, ensure_ascii=False, separators=(",", ":")),
+                 timestamp, project_id, document_id, task_id),
+            )
+
+
+def _current_evaluation_sources(app, project_id: str, component: str) -> list[dict]:
+    """读取当前规则集下每份投标文件已发布的结果来源；无索引时保持旧查询路径。"""
+    config = {
+        "review": ("review_run_id", "ew_review_runs", "review_run_id"),
+        "objective": ("objective_score_run_id", "ew_score_runs", "score_run_id"),
+        "subjective": ("subjective_score_run_id", "ew_score_runs", "score_run_id"),
+    }.get(component)
+    if not config:
+        return []
+    rule_set = current_rule_set(app, project_id)
+    if not rule_set:
+        return []
+    pointer_field, run_table, run_id_field = config
+    score_type_filter = "" if component == "review" else " AND run.score_type=?"
+    values: list[object] = [project_id, rule_set["rule_set_id"], rule_set["rule_set_id"]]
+    if component != "review":
+        values.append(component)
+    with connection(app) as conn:
+        rows = conn.execute(
+            f"""SELECT current.project_id, current.document_id, current.rule_set_id, current.task_id,
+                       current.profile_id, current.document_sha256, current.input_fingerprint,
+                       current.review_run_id, current.objective_score_run_id, current.subjective_score_run_id,
+                       current.highlights_json, current.updated_at AS published_at,
+                       run.created_at AS source_run_created_at,
+                       task.status AS task_status, task.error AS task_error,
+                       task.progress AS task_progress, task.result_json AS task_result_json,
+                       task.payload_json AS task_payload_json
+                FROM ew_evaluation_current_documents current
+                JOIN {run_table} run ON run.{run_id_field}=current.{pointer_field}
+                JOIN ew_tasks task ON task.task_id=current.task_id
+                JOIN ew_documents document ON document.document_id=current.document_id
+                WHERE current.project_id=? AND current.rule_set_id=? AND current.{pointer_field} IS NOT NULL
+                  AND run.rule_set_id=? AND current.document_sha256=document.sha256{score_type_filter}
+                ORDER BY current.updated_at DESC""",
+            values,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _current_evaluation_highlights(sources: list[dict]) -> list[dict]:
+    values: list[dict] = []
+    seen: set[str] = set()
+    for source in sources:
+        document_id = str(source.get("document_id") or "")
+        if not document_id or document_id in seen:
+            continue
+        seen.add(document_id)
+        try:
+            item = json.loads(source.get("highlights_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            item = {}
+        if isinstance(item, dict) and item.get("document_id") == document_id:
+            values.append(item)
+    return values
+
+
+def _current_evaluation_run_value(app, project_id: str, sources: list[dict]) -> dict | None:
+    if not sources:
+        return None
+    value = dict(sources[0])
+    # 当前结果由不同文件的独立运行组成，不能把某一来源任务的部分完成清单用于
+    # 前端过滤其他投标人；全部已发布文件均可展示，任务状态仍保留供提示使用。
+    value["completed_document_ids"] = sorted({str(item.get("document_id")) for item in sources if item.get("document_id")})
+    value["mixed_sources"] = len({str(item.get("task_id") or "") for item in sources}) > 1
+    value["source_task_ids"] = sorted({str(item.get("task_id") or "") for item in sources if item.get("task_id")})
+    source_selection_modes: set[str] = set()
+    for source in sources:
+        try:
+            payload = json.loads(source.get("task_payload_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        mode = str(payload.get("selection_mode") or "") if isinstance(payload, dict) else ""
+        if mode in {"all", "selected"}:
+            source_selection_modes.add(mode)
+    value["selection_mode"] = "mixed" if len(source_selection_modes) > 1 or value["mixed_sources"] else next(iter(source_selection_modes), "all")
+    value["highlights"] = _current_evaluation_highlights(sources)
+    value["created_at"] = value.get("published_at") or value.get("source_run_created_at")
+    value["updated_at"] = value.get("published_at") or value.get("source_run_created_at")
+    # 未选择或尚未完成的投标文件不应被“有部分结果”掩盖；该统计只用于页面提示，
+    # 不参与任务调度、模型调用或结果判断。
+    current_document_ids = {
+        str(item["document_id"]) for item in list_documents(app, project_id)
+        if item.get("role") == "bid" and str(item.get("sha256") or "")
+    }
+    published_document_ids = set(value["completed_document_ids"])
+    value["unassessed_document_ids"] = sorted(current_document_ids - published_document_ids)
+    value["unassessed_document_count"] = len(value["unassessed_document_ids"])
+    return value
+
+
 def latest_review_results(app, project_id: str) -> tuple[dict | None, list[dict]]:
+    current_sources = _current_evaluation_sources(app, project_id, "review")
+    if current_sources:
+        with connection(app) as conn:
+            rows = conn.execute(
+                """SELECT r.*, d.bidder_name, d.original_name, rule.category, rule.title, rule.check_rule
+                   FROM ew_review_results r
+                   JOIN ew_evaluation_current_documents current
+                     ON current.review_run_id=r.review_run_id AND current.document_id=r.document_id
+                   JOIN ew_documents d ON d.document_id=r.document_id
+                   JOIN ew_rules rule ON rule.rule_id=r.rule_id
+                   WHERE current.project_id=? AND current.rule_set_id=? AND current.document_sha256=d.sha256
+                   ORDER BY d.bidder_name,
+                       CASE WHEN r.status = 'ocr_required' THEN 1 ELSE 0 END,
+                       CASE r.risk_level WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC,
+                       rule.category, rule.sort_order""",
+                (project_id, current_sources[0]["rule_set_id"]),
+            ).fetchall()
+        results = [_public_vision_result(dict(row)) for row in rows]
+        for result in results:
+            if result.get("status") == "ocr_required":
+                result["risk_level"] = "low"
+        return _current_evaluation_run_value(app, project_id, current_sources), results
     with connection(app) as conn:
         run = conn.execute(
             """SELECT r.*, t.status AS task_status, t.error AS task_error, t.progress AS task_progress, t.result_json AS task_result_json
@@ -5257,6 +5468,22 @@ def disable_non_file_scoring_process_rules(app, rule_set_id: str) -> int:
 
 
 def latest_score_results(app, project_id: str, score_type: str) -> tuple[dict | None, list[dict]]:
+    current_sources = _current_evaluation_sources(app, project_id, score_type)
+    if current_sources:
+        with connection(app) as conn:
+            field = "objective_score_run_id" if score_type == "objective" else "subjective_score_run_id"
+            rows = conn.execute(
+                f"""SELECT s.*, d.bidder_name, d.original_name, rule.title, rule.check_rule, rule.check_mode
+                    FROM ew_score_results s
+                    JOIN ew_evaluation_current_documents current
+                      ON current.{field}=s.score_run_id AND current.document_id=s.document_id
+                    JOIN ew_documents d ON d.document_id=s.document_id
+                    JOIN ew_rules rule ON rule.rule_id=s.rule_id
+                    WHERE current.project_id=? AND current.rule_set_id=? AND current.document_sha256=d.sha256
+                    ORDER BY d.bidder_name, rule.sort_order""",
+                (project_id, current_sources[0]["rule_set_id"]),
+            ).fetchall()
+        return _current_evaluation_run_value(app, project_id, current_sources), [_public_vision_result(dict(row)) for row in rows]
     with connection(app) as conn:
         run = conn.execute(
             """SELECT r.*, t.status AS task_status, t.error AS task_error, t.progress AS task_progress, t.result_json AS task_result_json

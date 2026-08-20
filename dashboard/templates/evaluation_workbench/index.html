@@ -40,6 +40,13 @@
                 </div>
             </section>
         </div>
+        <div id="evaluation-selection-panel" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="evaluation-selection-title">
+            <section class="panel evaluation-selection-modal">
+                <div class="workspace-title model-modal-header"><div><h2 id="evaluation-selection-title">选择投标人进行综合评审</h2><p id="evaluation-selection-description" class="muted">默认全选。所选投标人会重新执行完整评审；未选择投标人的当前结果保持不变。</p></div><button id="close-evaluation-selection" class="link">关闭 ×</button></div>
+                <div class="evaluation-selection-body"><div class="actions evaluation-selection-toolbar"><button id="select-all-evaluation-documents" type="button">全选</button><button id="clear-evaluation-documents" type="button">取消全选</button><span id="evaluation-selection-count" class="hint"></span></div><div id="evaluation-document-selection" class="evaluation-document-selection muted">正在读取投标文件…</div></div>
+                <div class="modal-actions"><button id="cancel-evaluation-selection" type="button">取消</button><button id="submit-evaluation-selection" class="primary" type="button">开始综合评审</button></div>
+            </section>
+        </div>
         <section id="project-form" class="panel hidden">
             <h2>新建评标项目</h2>
             <div class="form-grid"><label>项目名称<input id="project-name" required></label><label>项目编号<input id="project-number"></label><label>标段名称<input id="section-name"></label><label>新建项目口令<input id="project-password" type="password" autocomplete="off" required></label></div>
