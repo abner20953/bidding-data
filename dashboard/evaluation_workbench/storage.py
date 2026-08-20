@@ -2000,7 +2000,8 @@ def list_task_summaries(app, project_id: str) -> list[dict]:
     with connection(app) as conn:
         rows = conn.execute(
             """SELECT task_id, project_id, task_type, status, progress, message, error, created_at, started_at, finished_at, updated_at,
-                      CASE WHEN task_type = 'evaluate_all' OR status = 'running' THEN result_json ELSE NULL END AS result_json
+                      CASE WHEN task_type = 'evaluate_all' OR status = 'running' THEN result_json ELSE NULL END AS result_json,
+                      CASE WHEN task_type = 'evaluate_all' AND status = 'running' THEN payload_json ELSE NULL END AS payload_json
                FROM ew_tasks WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 50""",
             (project_id,),
         ).fetchall()
@@ -2019,6 +2020,13 @@ def list_task_summaries(app, project_id: str) -> list[dict]:
                     item for item in completed
                     if isinstance(item, dict) and item.get("document_id")
                 ]
+        raw_payload = value.pop("payload_json", None)
+        if raw_payload:
+            try:
+                payload = json.loads(raw_payload)
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            value["cancel_requested"] = bool(payload.get("cancel_requested")) if isinstance(payload, dict) else False
         values.append(value)
     return values
 
@@ -2127,6 +2135,106 @@ def update_task(app, task_id: str, *, progress: int | None = None, message: str 
     values.append(task_id)
     with connection(app) as conn:
         conn.execute(f"UPDATE ew_tasks SET {', '.join(fields)} WHERE task_id = ?", values)
+
+
+def request_task_cancellation(app, project_id: str, task_id: str) -> dict:
+    """对综合评审发出协作式终止请求；不强杀进程或正在进行的外部请求。"""
+    timestamp = now_iso()
+    with connection(app, immediate=True) as conn:
+        row = conn.execute(
+            "SELECT * FROM ew_tasks WHERE task_id=? AND project_id=?",
+            (task_id, project_id),
+        ).fetchone()
+        if not row:
+            raise ValueError("任务不存在或不属于当前项目")
+        if row["task_type"] != "evaluate_all":
+            raise ValueError("当前仅支持安全终止综合评审任务")
+        if row["status"] == "queued":
+            conn.execute(
+                """UPDATE ew_tasks SET status='cancelled', message='已取消排队', error=NULL,
+                          finished_at=?, updated_at=? WHERE task_id=? AND status='queued'""",
+                (timestamp, timestamp, task_id),
+            )
+        elif row["status"] == "running":
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            payload["cancel_requested"] = True
+            payload["cancel_requested_at"] = timestamp
+            conn.execute(
+                """UPDATE ew_tasks SET payload_json=?, message='已收到终止请求，正在等待当前调用结束后安全停止…',
+                          updated_at=? WHERE task_id=? AND status='running'""",
+                (json.dumps(payload, ensure_ascii=False), timestamp, task_id),
+            )
+        elif row["status"] not in {"cancelled", "interrupted"}:
+            raise ValueError("任务已经结束，无需终止")
+    return get_task(app, task_id)
+
+
+def task_cancellation_requested(app, task_id: str) -> bool:
+    """读取综合评审的协作式终止标记；高频调用方只在自然检查点使用。"""
+    with connection(app) as conn:
+        row = conn.execute(
+            "SELECT status, payload_json FROM ew_tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+    if not row or row["status"] in {"cancelled", "interrupted"}:
+        return True
+    try:
+        payload = json.loads(row["payload_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        payload = {}
+    return bool(payload.get("cancel_requested")) if isinstance(payload, dict) else False
+
+
+def finalize_task(app, task_id: str, *, status: str, progress: int | None = None,
+                  message: str = "", result: dict | None = None, error: str | None = None) -> dict | None:
+    """原子完成任务；若终止请求与正常完成竞态，终止优先且保留已发布清单。"""
+    if status not in {"success", "error", "cancelled", "interrupted"}:
+        raise ValueError("任务最终状态不正确")
+    timestamp = now_iso()
+    with connection(app, immediate=True) as conn:
+        row = conn.execute("SELECT * FROM ew_tasks WHERE task_id=?", (task_id,)).fetchone()
+        if not row:
+            return None
+        if row["status"] in {"success", "error", "cancelled", "interrupted"}:
+            return task_to_dict(row)
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        cancellation_requested = isinstance(payload, dict) and bool(payload.get("cancel_requested"))
+        final_status = "cancelled" if cancellation_requested or status == "cancelled" else status
+        if final_status == "cancelled":
+            try:
+                final_result = json.loads(row["result_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                final_result = {}
+            if not isinstance(final_result, dict):
+                final_result = {}
+            final_result["completion_state"] = "cancelled"
+            final_result["cancelled_at"] = timestamp
+            final_message = "任务已安全终止；已完整完成的投标人结果已保留"
+            final_error = None
+            final_progress = int(row["progress"] or 0)
+        else:
+            final_result = result
+            final_message = message
+            final_error = error
+            final_progress = max(0, min(100, int(progress if progress is not None else row["progress"] or 0)))
+        conn.execute(
+            """UPDATE ew_tasks SET status=?, progress=?, message=?, result_json=?, error=?,
+                      finished_at=?, updated_at=? WHERE task_id=? AND status='running'""",
+            (
+                final_status, final_progress, final_message,
+                json.dumps(final_result, ensure_ascii=False) if final_result is not None else row["result_json"],
+                final_error, timestamp, timestamp, task_id,
+            ),
+        )
+    return get_task(app, task_id)
 
 
 def _safe_positive_int(value: object) -> int | None:
@@ -2548,6 +2656,37 @@ def clear_evaluation_results(app, project_id: str) -> None:
         conn.execute("DELETE FROM ew_score_runs WHERE project_id=?", (project_id,))
         conn.execute("DELETE FROM ew_evidence_packs WHERE project_id=?", (project_id,))
         conn.execute("DELETE FROM ew_evaluation_unit_checkpoints WHERE project_id=?", (project_id,))
+
+
+def prune_superseded_evaluation_runs(app, project_id: str, rule_set_id: str, keep_task_id: str) -> bool:
+    """全量评审成功后清理旧运行产物；当前文件未全部指向新任务时拒绝清理。"""
+    with connection(app, immediate=True) as conn:
+        expected = conn.execute(
+            "SELECT COUNT(*) FROM ew_documents WHERE project_id=? AND role='bid'",
+            (project_id,),
+        ).fetchone()[0]
+        published = conn.execute(
+            """SELECT COUNT(*) FROM ew_evaluation_current_documents current
+               JOIN ew_documents document ON document.document_id=current.document_id
+               WHERE current.project_id=? AND current.rule_set_id=? AND current.task_id=?
+                 AND document.role='bid' AND current.document_sha256=document.sha256""",
+            (project_id, rule_set_id, keep_task_id),
+        ).fetchone()[0]
+        if expected <= 0 or published != expected:
+            return False
+        conn.execute(
+            "DELETE FROM ew_review_runs WHERE project_id=? AND task_id<>?",
+            (project_id, keep_task_id),
+        )
+        conn.execute(
+            "DELETE FROM ew_score_runs WHERE project_id=? AND task_id<>?",
+            (project_id, keep_task_id),
+        )
+        conn.execute(
+            "DELETE FROM ew_evidence_packs WHERE project_id=? AND task_id<>?",
+            (project_id, keep_task_id),
+        )
+    return True
 
 
 def get_project_scope_checkpoint(app, project_id: str, scope_key: str) -> dict | None:
@@ -5156,14 +5295,14 @@ def _current_evaluation_sources(app, project_id: str, component: str) -> list[di
                        run.created_at AS source_run_created_at,
                        task.status AS task_status, task.error AS task_error,
                        task.progress AS task_progress, task.result_json AS task_result_json,
-                       task.payload_json AS task_payload_json
+                       task.payload_json AS task_payload_json, task.rowid AS task_rowid
                 FROM ew_evaluation_current_documents current
                 JOIN {run_table} run ON run.{run_id_field}=current.{pointer_field}
                 JOIN ew_tasks task ON task.task_id=current.task_id
                 JOIN ew_documents document ON document.document_id=current.document_id
                 WHERE current.project_id=? AND current.rule_set_id=? AND current.{pointer_field} IS NOT NULL
                   AND run.rule_set_id=? AND current.document_sha256=document.sha256{score_type_filter}
-                ORDER BY current.updated_at DESC""",
+                ORDER BY current.updated_at DESC, task.rowid DESC""",
             values,
         ).fetchall()
     return [dict(row) for row in rows]

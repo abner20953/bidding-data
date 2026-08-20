@@ -51,6 +51,10 @@ COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v5"
 COMPARE_AI_BATCH_SIZE = 8
 
 
+class TaskCancellationRequested(BaseException):
+    """综合评审在自然检查点收到终止请求；使用 BaseException 避免被业务兜底吞掉。"""
+
+
 def _task_execution_metadata(app, task: dict, profile: dict | None = None) -> dict:
     """记录足以解释一次结果差异的公开运行指纹，不记录提示正文或任何密钥。"""
     active_profile = profile or {}
@@ -83,10 +87,14 @@ class _EvaluationRequestGate:
         self.success_count = 0
         self.condition = threading.Condition()
 
-    def acquire(self) -> None:
+    def acquire(self, cancellation_check=None) -> None:
         with self.condition:
             while self.active >= self.limit:
-                self.condition.wait()
+                if cancellation_check:
+                    cancellation_check()
+                self.condition.wait(timeout=0.5)
+            if cancellation_check:
+                cancellation_check()
             self.active += 1
 
     def release(self) -> None:
@@ -363,6 +371,28 @@ def _task_request_profile(profile: dict, phase: str, thinking_mode: str | None =
     return effective
 
 
+def _raise_if_task_cancelled(app, task: dict) -> None:
+    """只对综合评审查询终止标记，其他任务不增加数据库读取。"""
+    if task and task.get("task_type") == "evaluate_all" and storage.task_cancellation_requested(app, task["task_id"]):
+        raise TaskCancellationRequested()
+
+
+def _cancellable_backoff(app, task: dict, seconds: float) -> None:
+    """模型重试退避期间也能及时响应终止请求。"""
+    duration = max(0.0, float(seconds or 0))
+    if not task or task.get("task_type") != "evaluate_all":
+        time.sleep(duration)
+        return
+    # 只把综合评审的退避拆成短等待。使用显式剩余量而不是依赖 monotonic，
+    # 可避免测试或运行时替换 sleep 后形成不会推进时钟的忙循环。
+    remaining = duration
+    while remaining > 0:
+        _raise_if_task_cancelled(app, task)
+        interval = min(0.5, remaining)
+        time.sleep(interval)
+        remaining -= interval
+
+
 def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt: str, user_prompt: object,
                        *, document_id: str | None = None, context_mode: str = "full_prefix",
                        max_tokens: int | None = None, thinking_mode: str | None = None) -> dict:
@@ -370,6 +400,7 @@ def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt
     gate = task.get("_evaluation_request_gate")
     effective_profile = _task_request_profile(profile, phase, thinking_mode)
     for attempt in range(len(_REQUEST_RETRY_BACKOFF_SECONDS) + 1):
+        _raise_if_task_cancelled(app, task)
         # 每一次真实请求单独落一行用量。此前重试会覆盖上一轮 usage，导致 token
         # 统计偏低，也难以区分服务暂时繁忙与模型输出触顶。
         usage: dict = {}
@@ -383,7 +414,7 @@ def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt
 
         retry_after_failure = False
         if gate:
-            gate.acquire()
+            gate.acquire(lambda: _raise_if_task_cancelled(app, task))
         try:
             try:
                 request_started_at = time.monotonic()
@@ -398,6 +429,7 @@ def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt
                     )
                 if gate:
                     gate.record_success()
+                _raise_if_task_cancelled(app, task)
                 return result
             except ValueError as exc:
                 # 规则提取和综合评审共用该闸门。服务商限流时让后续请求
@@ -433,7 +465,7 @@ def _request_task_json(app, task: dict, profile: dict, phase: str, system_prompt
                 gate.release()
         if retry_after_failure:
             # 必须先释放并发位；否则失败请求在退避期间会无谓阻塞另一家投标人的收尾。
-            time.sleep(_REQUEST_RETRY_BACKOFF_SECONDS[attempt])
+            _cancellable_backoff(app, task, _REQUEST_RETRY_BACKOFF_SECONDS[attempt])
             continue
 
 
@@ -9964,6 +9996,7 @@ def _local_ocr_page_texts(app, document: dict, pages: list[int], *, rule: dict |
         pending: list[dict] = []
         hashes: dict[int, str] = {}
         for index, page in enumerate(_normalise_result_pages(pages), start=1):
+            _raise_if_task_cancelled(app, task)
             # 本地没有腾讯的专项接口，但仍按规则强度与页面角色选择渲染质量：
             # 普通正文保持快速档，证照/表格/精细核验才使用高精度渲染。
             render_service = _ocr_service_candidates_for_page(rule or {}, level, page_texts.get(page, ""))[0]
@@ -10072,6 +10105,7 @@ def _tencent_ocr_page_texts(app, task: dict, document: dict, rule: dict, result:
     preferred_service = ""
     page_texts = _document_page_texts(document)
     for page in pages:
+        _raise_if_task_cancelled(app, task)
         page_candidates = [
             service for service in _ocr_service_candidates_for_page(rule, level, page_texts.get(page, ""))
             if service_configs.get(service, {}).get("enabled") and service_configs[service].get("remaining", 0) > 0
@@ -10084,6 +10118,7 @@ def _tencent_ocr_page_texts(app, task: dict, document: dict, rule: dict, result:
         page_completed = False
         page_empty = False
         for service in ordered:
+            _raise_if_task_cancelled(app, task)
             rendered = _render_ocr_page(app, document, page, service, task=task)
             if not rendered:
                 continue
@@ -10111,6 +10146,7 @@ def _tencent_ocr_page_texts(app, task: dict, document: dict, rule: dict, result:
             error_info = error if isinstance(error, dict) else {"kind": "unknown", "message": str(error or "")}
             # 临时网络/负载错误只在当前页做一次受控重试；不把整项服务永久排除。
             if response is None and error_info.get("retryable"):
+                _raise_if_task_cancelled(app, task)
                 request_started_at = time.monotonic()
                 try:
                     response, error = request_tencent_ocr(app, task, service, image)
@@ -12871,6 +12907,7 @@ class _EvaluationProgress:
             and now - self.last_persisted_at < self._PERSIST_INTERVAL_SECONDS
         ):
             return
+        _raise_if_task_cancelled(self.app, self.task)
         storage.update_task(
             self.app, self.task["task_id"], progress=self._progress(), message=self.pending_message, result=result,
         )
@@ -12904,6 +12941,7 @@ def _evaluate_document(app, task: dict, document: dict, *, rule_set: dict, profi
                        scan_units: int, groups_per_document: int, vision_profile: dict | None,
                        ocr_features_enabled: bool, visual_units: int, progress: _EvaluationProgress) -> dict:
     """处理一份投标文件；不同投标人可并行，单份文件内仍严格顺序执行。"""
+    _raise_if_task_cancelled(app, task)
     bidder_name = document["bidder_name"] or document["original_name"]
     progress.message(f"正在综合评审：{bidder_name}")
     # 扫描型文件需要重新应用当前 OCR/图片覆盖策略；不得复用早期仅凭稀疏文本得出的结论。
@@ -13842,6 +13880,7 @@ def _summarise_evaluation_highlights(app, task: dict, profile: dict, document_id
 
 def _evaluate_all(app, task: dict) -> dict:
     """综合评审按规则小组运行并立即落库，避免单次混合 JSON 过大。"""
+    _raise_if_task_cancelled(app, task)
     rule_set, all_rules = storage.list_rules(app, task["project_id"])
     if not rule_set or rule_set["status"] != "confirmed":
         raise ValueError("请先确认当前评审规则集，再开始综合评审")
@@ -13894,6 +13933,7 @@ def _evaluate_all(app, task: dict) -> dict:
     project_scope = _project_scope_profile(
         app, task, profile, all_documents, review_rules + objective_rules + subjective_rules,
     )
+    _raise_if_task_cancelled(app, task)
     # 范围画像供模型理解项目；完整招标文本只供本地校验“该对象是否已列入采购范围”，
     # 不进入任何提示词，既避免长清单抽样遗漏，也不增加模型输入 token。
     project_scope["_tender_scope_baseline"] = _tender_scope_baseline(all_documents)
@@ -13943,6 +13983,7 @@ def _evaluate_all(app, task: dict) -> dict:
     progress = _EvaluationProgress(app, task, total_work_units, len(documents))
 
     def run_document(document: dict) -> dict:
+        _raise_if_task_cancelled(app, task)
         value = _evaluate_document(
             app, task, document, rule_set=rule_set, profile=profile, char_limit=char_limit,
             expected_rule_ids=expected_rule_ids, review_rules=review_rules, objective_rules=objective_rules,
@@ -13954,6 +13995,7 @@ def _evaluate_all(app, task: dict) -> dict:
         )
         # 单份文件的所有规则组已完整落库后，才原子切换“当前结果”索引。这样局部
         # 重评失败不会覆盖旧结果，未选择投标人也不会因新任务而从页面或报告消失。
+        _raise_if_task_cancelled(app, task)
         storage.publish_current_evaluation_document(
             app, task["project_id"], document, rule_set["rule_set_id"], task["task_id"],
             profile["profile_id"], str(task.get("payload", {}).get("input_fingerprint") or ""),
@@ -14025,6 +14067,7 @@ def _evaluate_all(app, task: dict) -> dict:
         "comparison_count": 0, "status": "not_applicable",
     }
     if subjective_run and not partial_selection:
+        _raise_if_task_cancelled(app, task)
         try:
             cross_bid_subjective_shadow = _run_cross_bid_subjective_shadow(
                 app, task, profile, documents, subjective_rules, subjective_run["score_run_id"],
@@ -14037,6 +14080,7 @@ def _evaluate_all(app, task: dict) -> dict:
                 "comparison_count": 0, "status": "unavailable", "reason": str(exc)[:180],
             }
     highlight_failure_count = 0
+    _raise_if_task_cancelled(app, task)
     try:
         highlights = _summarise_evaluation_highlights(
             app, task, profile, {item["document_id"] for item in documents},
@@ -14050,10 +14094,11 @@ def _evaluate_all(app, task: dict) -> dict:
         highlight_failure_count = 1
         storage.update_task(app, task["task_id"], message=f"重要结论提炼未完成，原始评审结果已完整保留：{exc}")
     recovery = storage.task_recovery_summary(app, task["task_id"])
+    _raise_if_task_cancelled(app, task)
     return {"review_run_id": review_run["review_run_id"] if review_run else None, "objective_run_id": objective_run["score_run_id"] if objective_run else None,
             "subjective_run_id": subjective_run["score_run_id"] if subjective_run else None, "document_count": len(documents),
             "reused_document_count": reused_document_count, "model_document_count": len(documents) - reused_document_count,
-            "rule_count": len(all_rules), "profile": profile["display_name"],
+            "rule_count": len(all_rules), "rule_set_id": rule_set["rule_set_id"], "profile": profile["display_name"],
             "price_sheet_refresh": "after_task_completion",
             "vision_profile": vision_profile.get("display_name") if vision_profile and visual_rule_count else None,
             "vision_rule_count": visual_rule_count,
@@ -14102,6 +14147,7 @@ def _evaluate_all(app, task: dict) -> dict:
 
 def run_task(app, task: dict) -> None:
     try:
+        _raise_if_task_cancelled(app, task)
         if task["task_type"] == "parse_documents":
             result = _parse_document(app, task)
         elif task["task_type"] == "compare_documents":
@@ -14122,13 +14168,24 @@ def run_task(app, task: dict) -> None:
             result = _evaluate_all(app, task)
         else:
             raise ValueError(f"暂不支持的任务类型：{task['task_type']}")
+        _raise_if_task_cancelled(app, task)
         partial = isinstance(result, dict) and result.get("completion_state") == "partial_success"
-        storage.update_task(
+        finished = storage.finalize_task(
             app, task["task_id"], progress=100,
             message=(result.get("completion_message") or "任务部分完成，可仅重跑失败项") if partial else "任务完成",
             status="success", result=result,
         )
+        if not finished or finished.get("status") != "success":
+            return
         if task["task_type"] == "evaluate_all":
+            if isinstance(result, dict) and result.get("selection_mode") == "all" and result.get("rule_set_id"):
+                try:
+                    storage.prune_superseded_evaluation_runs(
+                        app, task["project_id"], str(result["rule_set_id"]), task["task_id"],
+                    )
+                except Exception:
+                    # 旧运行清理只负责磁盘卫生；任何清理失败都不能破坏已原子发布的结果。
+                    traceback.print_exc()
             # 必须在任务状态切为 success 后才刷新；刷新器在运行任务存在时会主动
             # 只读返回，以避免 2 核服务器和主任务争用资源。
             try:
@@ -14154,11 +14211,13 @@ def run_task(app, task: dict) -> None:
                 # 没有价格规则或已有同类计算排队时，不应影响已完成的主任务；计算
                 # 任务会自行显示“无规则/无参与投标人”，无需预先复制业务判断。
                 pass
+    except TaskCancellationRequested:
+        storage.finalize_task(app, task["task_id"], status="cancelled")
     except (ComparisonLimitError, ValueError) as exc:
-        storage.update_task(app, task["task_id"], status="error", error=str(exc), message="任务失败")
+        storage.finalize_task(app, task["task_id"], status="error", error=str(exc), message="任务失败")
     except Exception as exc:
         traceback.print_exc()
-        storage.update_task(app, task["task_id"], status="error", error=f"任务执行异常：{exc}", message="任务失败")
+        storage.finalize_task(app, task["task_id"], status="error", error=f"任务执行异常：{exc}", message="任务失败")
 
 
 def main() -> int:

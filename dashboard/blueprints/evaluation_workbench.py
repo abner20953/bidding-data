@@ -857,8 +857,9 @@ def tasks_api(project_id):
         # 语义；项目范围画像和确定性页缓存仍可复用，未选文件结果也必须保留。
         if rerun_selected:
             force_rerun = False
-        if task_type == "evaluate_all" and force_rerun and not retry_failed_task_id:
-            storage.clear_evaluation_results(current_app, project_id)
+        # 全量强制重评也采用“完成一份、原子替换一份”的发布方式。旧结果不再在
+        # 入队时提前删除：任务正常完成后全部文件自然换成新结果；若用户安全终止，
+        # 未完成文件仍保留上一轮成功结果，不会因一次中止造成不可逆的数据空洞。
         payload = {
             "profile_id": requested_profile_id,
             "prompt_version": TASK_PROMPT_VERSION,
@@ -893,6 +894,23 @@ def tasks_api(project_id):
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify({"task": task}), 202
+
+
+@evaluation_workbench_bp.route(
+    "/api/evaluation-workbench/projects/<project_id>/tasks/<task_id>/cancel",
+    methods=["POST"],
+)
+def cancel_task_api(project_id, task_id):
+    """请求安全终止综合评审；不强杀 worker 或正在执行的模型/OCR 调用。"""
+    _init()
+    _, error = _project_or_404(project_id)
+    if error:
+        return error
+    try:
+        task = storage.request_task_cancellation(current_app, project_id, task_id)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"task": task})
 
 
 @evaluation_workbench_bp.route("/api/evaluation-workbench/projects/<project_id>/token-usage")

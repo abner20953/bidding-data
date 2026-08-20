@@ -8237,6 +8237,155 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(review_run["unassessed_document_count"], 0)
         self.assertIn("published_at", review_run)
 
+    def test_queued_evaluation_can_be_cancelled_and_started_again(self):
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "甲公司具备有效资质。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "有效资质", "source_text": "具备有效资质",
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        with patch("dashboard.blueprints.evaluation_workbench._start_worker_if_needed"):
+            created = self.app.test_client().post(
+                f"/api/evaluation-workbench/projects/{self.project['project_id']}/tasks",
+                json={"task_type": "evaluate_all", "document_ids": [document["document_id"]]},
+            )
+            task_id = created.get_json()["task"]["task_id"]
+            cancelled = self.app.test_client().post(
+                f"/api/evaluation-workbench/projects/{self.project['project_id']}/tasks/{task_id}/cancel",
+            )
+            restarted = self.app.test_client().post(
+                f"/api/evaluation-workbench/projects/{self.project['project_id']}/tasks",
+                json={"task_type": "evaluate_all", "document_ids": [document["document_id"]]},
+            )
+
+        self.assertEqual(cancelled.status_code, 200)
+        self.assertEqual(cancelled.get_json()["task"]["status"], "cancelled")
+        self.assertEqual(storage.get_task(self.app, task_id)["message"], "已取消排队")
+        self.assertEqual(restarted.status_code, 202)
+
+    def test_running_evaluation_cancellation_stops_before_new_model_call(self):
+        self._add_pdf("bid.pdf", "bid", "甲公司", "甲公司具备有效资质。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "有效资质", "source_text": "具备有效资质",
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        queued = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        running = storage.next_queued_task(self.app)
+        storage.request_task_cancellation(self.app, self.project["project_id"], queued["task_id"])
+
+        with patch("dashboard.evaluation_workbench.worker.request_json") as request_json:
+            worker.run_task(self.app, running)
+
+        finished = storage.get_task(self.app, queued["task_id"])
+        self.assertEqual(request_json.call_count, 0)
+        self.assertEqual(finished["status"], "cancelled")
+        self.assertEqual(finished["result"]["completion_state"], "cancelled")
+        self.assertIn("已完整完成的投标人结果已保留", finished["message"])
+
+    def test_cancelled_full_rerun_preserves_previous_current_results(self):
+        first = self._add_pdf("bid-a.pdf", "bid", "甲公司", "甲公司具备有效资质。")
+        second = self._add_pdf("bid-b.pdf", "bid", "乙公司", "乙公司具备有效资质。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "有效资质", "source_text": "具备有效资质",
+        })
+        rule_set = storage.confirm_rule_set(self.app, self.project["project_id"])
+        storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        with patch("dashboard.evaluation_workbench.worker.request_json", return_value={
+            "results": [{"rule_id": rule["rule_id"], "status": "satisfied", "evidence": "上一轮结论", "reason": "已提供", "risk_level": "low"}],
+        }):
+            self._run_next_task()
+
+        with patch("dashboard.blueprints.evaluation_workbench._start_worker_if_needed"):
+            response = self.app.test_client().post(
+                f"/api/evaluation-workbench/projects/{self.project['project_id']}/tasks",
+                json={
+                    "task_type": "evaluate_all", "force_rerun": True,
+                    "document_ids": [first["document_id"], second["document_id"]],
+                },
+            )
+        task_id = response.get_json()["task"]["task_id"]
+        _, before_cancel = storage.latest_review_results(self.app, self.project["project_id"])
+        self.assertEqual(len(before_cancel), 2)
+        self.assertTrue(all(item["evidence"] == "上一轮结论" for item in before_cancel))
+
+        running = storage.next_queued_task(self.app)
+        profile = storage.get_model_profile(self.app, None)
+        new_run = storage.create_review_run(
+            self.app, self.project["project_id"], task_id, profile["profile_id"],
+        )
+        storage.save_review_results(self.app, new_run["review_run_id"], first["document_id"], [{
+            "rule_id": rule["rule_id"], "status": "satisfied", "evidence": "甲公司新结论", "reason": "重新确认",
+        }])
+        storage.publish_current_evaluation_document(
+            self.app, self.project["project_id"], first, rule_set["rule_set_id"], task_id,
+            profile["profile_id"], "rerun", new_run["review_run_id"], None, None,
+        )
+        storage.update_task(self.app, task_id, progress=50, result={
+            "partial": True,
+            "completed_documents": [{"document_id": first["document_id"], "bidder_name": "甲公司"}],
+        })
+        storage.request_task_cancellation(self.app, self.project["project_id"], task_id)
+        # 模拟 worker 恰好在终止请求后完成计算；原子收尾必须让终止优先，且不能
+        # 用“正常完成”的结果覆盖已经发布的部分进度台账。
+        storage.finalize_task(
+            self.app, task_id, status="success", progress=100,
+            message="任务完成", result={"completion_state": "complete"},
+        )
+
+        finished = storage.get_task(self.app, task_id)
+        review_run, after_cancel = storage.latest_review_results(self.app, self.project["project_id"])
+        by_bidder = {item["bidder_name"]: item for item in after_cancel}
+        self.assertEqual(running["task_id"], task_id)
+        self.assertEqual(finished["status"], "cancelled")
+        self.assertEqual(finished["progress"], 50)
+        self.assertEqual(finished["result"]["completed_documents"][0]["document_id"], first["document_id"])
+        self.assertEqual(by_bidder["甲公司"]["evidence"], "甲公司新结论")
+        self.assertEqual(by_bidder["乙公司"]["evidence"], "上一轮结论")
+        self.assertEqual(review_run["task_status"], "cancelled")
+
+    def test_old_evaluation_runs_are_pruned_only_after_full_publish(self):
+        first = self._add_pdf("bid-a.pdf", "bid", "甲公司", "甲公司具备有效资质。")
+        second = self._add_pdf("bid-b.pdf", "bid", "乙公司", "乙公司具备有效资质。")
+        storage.create_task(self.app, self.project["project_id"], "parse_documents")
+        self._run_next_task()
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "有效资质", "source_text": "具备有效资质",
+        })
+        rule_set = storage.confirm_rule_set(self.app, self.project["project_id"])
+
+        old_task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        storage.update_task(self.app, old_task["task_id"], status="success")
+        old_run = storage.create_review_run(self.app, self.project["project_id"], old_task["task_id"], "profile-1")
+
+        new_task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        storage.next_queued_task(self.app)
+        new_run = storage.create_review_run(self.app, self.project["project_id"], new_task["task_id"], "profile-1")
+        for document in (first, second):
+            storage.publish_current_evaluation_document(
+                self.app, self.project["project_id"], document, rule_set["rule_set_id"], new_task["task_id"],
+                "profile-1", "full-rerun", new_run["review_run_id"], None, None,
+            )
+            if document is first:
+                self.assertFalse(storage.prune_superseded_evaluation_runs(
+                    self.app, self.project["project_id"], rule_set["rule_set_id"], new_task["task_id"],
+                ))
+
+        self.assertTrue(storage.prune_superseded_evaluation_runs(
+            self.app, self.project["project_id"], rule_set["rule_set_id"], new_task["task_id"],
+        ))
+        with storage.connection(self.app) as conn:
+            remaining = conn.execute(
+                "SELECT review_run_id FROM ew_review_runs WHERE project_id=? ORDER BY rowid",
+                (self.project["project_id"],),
+            ).fetchall()
+        self.assertEqual([row["review_run_id"] for row in remaining], [new_run["review_run_id"]])
+        self.assertNotEqual(old_run["review_run_id"], new_run["review_run_id"])
+
     def test_combined_evaluation_does_not_reuse_results_from_old_prompt_version(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "甲公司具备有效资质。")
         storage.create_task(self.app, self.project["project_id"], "parse_documents")
@@ -8539,7 +8688,11 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
         self.assertTrue(response.get_json()["task"]["payload"]["force_rerun"])
         self.assertTrue(response.get_json()["task"]["payload"]["input_fingerprint"])
-        self.assertEqual(storage.latest_review_results(self.app, self.project["project_id"]), (None, []))
+        # 安全重跑不在入队时销毁上一轮结果；新一轮按投标人完整产出后原子替换，
+        # 因而排队、失败或主动终止都不会造成不可逆的数据空窗。
+        current_run, current_results = storage.latest_review_results(self.app, self.project["project_id"])
+        self.assertEqual(current_run["review_run_id"], review_run["review_run_id"])
+        self.assertEqual(current_results[0]["evidence"], "旧结论")
 
     def test_printable_report_is_generated_on_demand(self):
         self._add_pdf("bid.pdf", "bid", "甲公司", "技术方案。")
