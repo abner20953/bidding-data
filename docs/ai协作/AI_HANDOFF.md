@@ -4,16 +4,16 @@
 handoff_schema: 1
 updated_at: 2026-08-20
 module: evaluation-workbench
-status: ready_for_commit
-base_commit: 12e8760
+status: deployed_validation_pending
+base_commit: fe7d894
 branch: main
-working_tree: local_changes_safe_evaluation_cancellation
-remote_github: 12e8760
-remote_gitee: 12e8760
-production_commit: e269e54
+working_tree: local_docs_deploy_status_update
+remote_github: pending_docs_sync
+remote_gitee: pending_docs_sync
+production_commit: fe7d894
 prompt_version: vision-evidence-contract-v63（已部署；未填调整不套用规则优惠）
 database_change: ew_documents 报价缓存列（v4 已部署）；本轮仅 PRICE_SHEET_VERSION 升 v5，无结构变更
-user_approval: 已授权实施安全终止；尚未授权本轮提交、推送或部署
+user_approval: 已授权本轮提交、推送和部署
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
