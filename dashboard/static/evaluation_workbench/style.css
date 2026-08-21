@@ -60,3 +60,7 @@ table { width:100%; border-collapse:collapse; } th,td { text-align:left; padding
 @media(max-width:760px){.price-table-wrap{overflow-x:auto;}.price-workbench-table{min-width:720px;}}
 /* “模型选择 + 主按钮”表单行：按钮与下拉底部对齐，避免被 label 高度拉伸 */
 [data-pane="compare"] .actions, [data-pane="rules"] .actions { align-items:end; }
+.price-quote-candidates { margin-top:7px; padding:7px; border:1px solid #fcd34d; border-radius:7px; background:#fffbeb; color:#78350f; font-size:12px; line-height:1.45; }
+.price-quote-candidates>div { display:grid; gap:5px; margin-top:5px; }
+.price-quote-candidates button { width:max-content; max-width:100%; margin:0; color:#92400e; border-color:#f59e0b; background:#fff; font-weight:700; }
+.price-quote-candidates small { display:block; color:#92400e; overflow-wrap:anywhere; }

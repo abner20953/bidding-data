@@ -372,6 +372,17 @@
     const status = {pending:'等待识别',found:'已识别唯一报价',ambiguous:'发现多个金额，待核对',missing:'未识别到唯一报价',unavailable:'文件尚未解析'}[entry.extraction_status] || '待核对';
     return [labels[entry.quote_source] || status, entry.quote_excerpt || status];
   }
+  function quoteCandidatePickerHtml(entry) {
+    const candidates = Array.isArray(entry.quote_candidates) ? entry.quote_candidates : [];
+    if (entry.extraction_status !== 'ambiguous' || candidates.length < 2) return '';
+    const options = candidates.map((candidate) => {
+      const page = candidate.page ? `第 ${candidate.page} 页` : '页码未取得';
+      const source = candidate.source === 'ocr_cache' ? '已有 OCR 缓存' : '文件文字';
+      const title = candidate.excerpt || '未取得原文摘录';
+      return `<button class="price-use-quote-candidate" data-key="${escapeHtml(entry.draft_id)}" data-value="${escapeHtml(candidate.amount)}" type="button" title="${escapeHtml(title)}">采用 ${escapeHtml(priceValue(candidate.amount))} 元</button><small>${escapeHtml(page)} · ${escapeHtml(source)}<br>${escapeHtml(title)}</small>`;
+    }).join('');
+    return `<div class="price-quote-candidates"><strong>识别到多个报价，请确认：</strong><div>${options}</div></div>`;
+  }
   function priceSheetRule() {
     const rules = Array.isArray(currentPriceSheet?.rules) ? currentPriceSheet.rules : [];
     if (!rules.some((rule) => rule.rule_id === selectedPriceRuleId)) selectedPriceRuleId = rules[0]?.rule_id || '';
@@ -423,7 +434,7 @@
       const source = priceQuoteSource(saved); const score = rule ? saved.scores?.[rule.rule_id] : null;
       const scoreText = priceDraft.dirty ? '保存后统一重算' : (score ? `${priceValue(score.score)} 分` : (entry.included ? '待计算' : '不参与'));
       const name = entry.source_type === 'manual' ? draftFieldHtml(entry, 'bidder_name', '投标人名称', 'type="text"') : `<strong>${escapeHtml(entry.bidder_name)}</strong><small class="muted">已上传文件</small>`;
-      const quote = `${draftFieldHtml(entry, 'manual_quote', '确认报价（元）', `type="number" min="0" step="0.01" placeholder="${escapeHtml(entry.extracted_quote || '请填写')}"`)}<small class="muted">自动识别：${escapeHtml(priceValue(entry.extracted_quote))}</small>${entry.source_type === 'document' && entry.manual_quote ? `<button class="price-use-extracted" data-key="${escapeHtml(entry.draft_id)}" type="button">恢复自动报价</button>` : ''}<details class="price-source-details"><summary>${escapeHtml(source[0])}</summary><span>${escapeHtml(source[1] || '无额外摘录')}</span></details>`;
+      const quote = `${draftFieldHtml(entry, 'manual_quote', '确认报价（元）', `type="number" min="0" step="0.01" placeholder="${escapeHtml(entry.extracted_quote || '请填写')}"`)}<small class="muted">自动识别：${escapeHtml(priceValue(entry.extracted_quote))}</small>${quoteCandidatePickerHtml(entry)}${entry.source_type === 'document' && entry.manual_quote ? `<button class="price-use-extracted" data-key="${escapeHtml(entry.draft_id)}" type="button">恢复自动报价</button>` : ''}<details class="price-source-details"><summary>${escapeHtml(source[0])}</summary><span>${escapeHtml(source[1] || '无额外摘录')}</span></details>`;
       const scope = `<label class="inline-check price-participation-toggle"><input class="price-draft-field" data-key="${escapeHtml(entry.draft_id)}" data-field="included" type="checkbox" ${entry.included ? 'checked' : ''}><span>参与计算</span></label>${entry.included ? '<small class="muted">参与基准价与价格分计算</small>' : draftFieldHtml(entry, 'exclusion_reason', '不参与原因（可选）', 'type="text" placeholder="例如已否决"')}`;
       const remove = entry.source_type === 'manual' ? `<button class="delete-price-draft danger" data-key="${escapeHtml(entry.draft_id)}" type="button">删除补录</button>` : '';
       return `<tr class="${entry.included ? '' : 'price-excluded'}"><td class="price-bidder-cell">${name}</td><td>${quote}</td><td class="price-adjustment-cell">${adjustmentControlHtml(entry)}</td><td>${scope}</td><td><span class="${score?.source === 'manual' ? 'price-score price-score-manual' : score ? 'price-score' : 'price-score price-score-unavailable'}" title="${escapeHtml(score?.calculation || '')}">${escapeHtml(scoreText)}</span>${remove}</td></tr>`;
@@ -446,6 +457,7 @@
     }));
     target.querySelectorAll('.price-adjustment-mode').forEach((input) => input.addEventListener('change', () => { const entry = priceDraftEntry(input.dataset.key); if (!entry) return; entry.adjustment = {...(entry.adjustment || {}), mode:input.value}; priceDraft.dirty = true; renderPriceSheetPane(); updatePriceSheetFooter(); }));
     target.querySelectorAll('.price-use-extracted').forEach((button) => button.onclick = () => { const entry = priceDraftEntry(button.dataset.key); if (!entry) return; entry.manual_quote = ''; priceDraft.dirty = true; renderPriceSheetPane(); updatePriceSheetFooter(); });
+    target.querySelectorAll('.price-use-quote-candidate').forEach((button) => button.onclick = () => { const entry = priceDraftEntry(button.dataset.key); if (!entry) return; entry.manual_quote = button.dataset.value || ''; priceDraft.dirty = true; renderPriceSheetPane(); updatePriceSheetFooter(); });
     target.querySelectorAll('.delete-price-draft').forEach((button) => button.onclick = () => { const entry = priceDraftEntry(button.dataset.key); if (!entry || !confirm('删除这条未上传投标人的补录记录吗？')) return; if (entry.price_entry_id) priceDraft.deleted.push(entry.price_entry_id); priceDraft.entries = priceDraft.entries.filter((item) => item.draft_id !== entry.draft_id); priceDraft.dirty = true; renderPriceSheetPane(); updatePriceSheetFooter(); });
   }
   function updatePriceSheetFooter() {

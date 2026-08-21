@@ -10,7 +10,7 @@ import re
 import uuid
 
 
-ANALYSIS_VERSION = "cross-bid-signals-v5"
+ANALYSIS_VERSION = "cross-bid-signals-v6"
 DECISION_BOUNDARY = (
     "本结果仅表示投标文件之间存在需要复核的横向异常线索，不构成串通投标认定、"
     "法定情形认定、废标依据或自动扣分依据。最终结论须由评标委员会结合原件、"
@@ -74,6 +74,10 @@ def _page_evidence(item: dict) -> dict:
         evidence["tender_coverage_b"] = item["tender_coverage_b"]
     if item.get("segment_count") is not None:
         evidence["segment_count"] = item["segment_count"]
+    if item.get("tender_text"):
+        # 共同改动必须让后续 AI 同时看到实际匹配的招标原文，不能只相信
+        # 本地差异摘要；这也是发现表格行错配的最后一道可解释校验。
+        evidence["tender_text"] = _clip(item["tender_text"], 240)
     if item.get("shared_edits"):
         evidence["shared_edits"] = item["shared_edits"]
     if item.get("error_kind"):

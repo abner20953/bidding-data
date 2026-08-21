@@ -705,6 +705,59 @@ class ComparatorTests(unittest.TestCase):
 
         self.assertIsNone(evidence)
 
+    def test_better_tender_row_alignment_suppresses_table_row_false_edit(self):
+        """相邻评审表行被误配时，应优先使用无需实质修改的正确原文行。"""
+        detector = CollusionDetector()
+        mismatched_source = detector.normalize(
+            "投标有效期符合第二章投标人须知第3.3.1项规定"
+        )
+        matching_source = detector.normalize(
+            "投标报价符合第二章投标人须知第3.2款规定"
+        )
+        # PDF 表格单元恰好在条款号中间断开；完整内容仍存在于同页全文。
+        bid_fragment = detector.normalize("1投标报价符合第二章投标人须知第3")
+        detector.tender_full_text = mismatched_source + matching_source
+        detector._fulltext_haystacks = (matching_source, matching_source)
+        detector.tender_units = [
+            {"text": mismatched_source, "page": 1},
+            {"text": matching_source, "page": 1},
+        ]
+        detector.tender_unit_index = detector._build_unit_index(detector.tender_units)
+
+        evidence = detector._shared_tender_edit_evidence(
+            mismatched_source, bid_fragment, bid_fragment
+        )
+
+        self.assertIsNone(evidence)
+
+    def test_better_tender_row_alignment_does_not_hide_genuine_deletion(self):
+        """替代来源只有文本相似、仍含实质差异时，不得掩盖真实共同删除。"""
+        detector = CollusionDetector()
+        tender_text = detector.normalize(
+            "供应商应提供五年质量保证服务并提交维护方案"
+        )
+        similar_other_row = detector.normalize(
+            "供应商应提供五年服务期限说明并提交维护方案"
+        )
+        bid_text = detector.normalize("供应商应提供五年质量保证服务")
+        detector.tender_full_text = tender_text + similar_other_row
+        detector._fulltext_haystacks = (bid_text, bid_text)
+        detector.tender_units = [
+            {"text": tender_text, "page": 1},
+            {"text": similar_other_row, "page": 2},
+        ]
+        detector.tender_unit_index = detector._build_unit_index(detector.tender_units)
+
+        evidence = detector._shared_tender_edit_evidence(
+            tender_text, bid_text, bid_text
+        )
+
+        self.assertIsNotNone(evidence)
+        self.assertIn(
+            {"original": "并提交维护方案", "modified": "（删除）"},
+            evidence["changes"],
+        )
+
     def test_numeric_only_tender_change_is_preserved(self):
         detector = CollusionDetector()
         tender_text = detector.normalize(

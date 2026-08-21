@@ -18,7 +18,7 @@ from dashboard.evaluation_workbench import storage
 
 # 报价定位算法变更时递增此版本，使已落库的旧识别结果自动进入刷新判定，
 # 避免历史项目继续沿用旧定位器留下的空报价或误识别结果。
-PRICE_SHEET_VERSION = "price-sheet-v5"
+PRICE_SHEET_VERSION = "price-sheet-v6"
 
 _PRICE_RULE_PATTERN = re.compile(
     r"最低(?:投标)?价|评审价|评标价|基准价|价格分|报价得分|投标报价[^，。；]{0,20}得分"
@@ -46,6 +46,7 @@ _PLAIN_AMOUNT_PATTERN = re.compile(r"(?<![0-9A-Za-z])(?P<amount>\d{5,}(?:\.\d+)?
 _IDENTIFIER_PREFIX_PATTERN = re.compile(r"(?:统一社会信用代码|信用代码|项目编号|采购编号|招标编号|合同编号|编号|税号)\s*[:：]?\s*$")
 _COMPACT_DATE_PATTERN = re.compile(r"(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])$")
 _YEAR_PATTERN = re.compile(r"(?:19|20)\d{2}$")
+_PARSED_PAGE_MARKER = re.compile(r"^\s*\[第(?P<page>\d+)页\]\s*$")
 
 
 def _decimal(value: object, *, allow_zero: bool = False) -> Decimal | None:
@@ -138,55 +139,101 @@ def _amounts_near_quote_label(window: str) -> list[Decimal]:
     return [value for item_distance, value in candidates if item_distance == nearest]
 
 
-def _quote_from_lines(lines) -> tuple[Decimal | None, str, str]:
-    candidates: list[tuple[Decimal, str]] = []
-    buffer: deque[str] = deque(maxlen=3)
+def _quote_candidates_from_lines(lines, *, source: str = "") -> list[dict]:
+    """从明确总报价字段附近收集去重候选，保留短摘录供人工选择。
 
-    def inspect(values: list[str]) -> None:
-        if not values or not _TOTAL_QUOTE_LABEL_PATTERN.search(values[0]):
+    输入仍兼容纯字符串迭代器；内部 OCR 缓存可额外传入 ``(文字, 页码)``。
+    候选只承担人工确认展示，绝不直接替代现有唯一报价判定。
+    """
+    candidates: list[dict] = []
+    buffer: deque[tuple[str, int | None]] = deque(maxlen=3)
+    current_page: int | None = None
+
+    def inspect(values: list[tuple[str, int | None]]) -> None:
+        if not values or not _TOTAL_QUOTE_LABEL_PATTERN.search(values[0][0]):
             return
-        window = " ".join(values)
-        candidates.extend((amount, window[:260]) for amount in _amounts_near_quote_label(window))
+        window = " ".join(value for value, _ in values)
+        # 当前窗口以首行的明确报价标签为锚点；窗口可跨页拼接金额，不能把
+        # 后续页的页码反写到前页报价上。
+        page = values[0][1]
+        for amount in _amounts_near_quote_label(window):
+            candidates.append({
+                "amount": _decimal_text(amount), "excerpt": window[:260],
+                "page": page, "source": source,
+            })
 
     for raw in lines:
-        buffer.append(str(raw or "").strip())
+        if isinstance(raw, tuple):
+            line, page = raw[0], raw[1] if len(raw) > 1 else None
+            try:
+                current_page = int(page) if page is not None else current_page
+            except (TypeError, ValueError):
+                pass
+        else:
+            line = raw
+        text = str(line or "").strip()
+        page_marker = _PARSED_PAGE_MARKER.fullmatch(text)
+        if page_marker:
+            current_page = int(page_marker.group("page"))
+            continue
+        if not text:
+            continue
+        buffer.append((text, current_page))
         if len(buffer) == 3:
             inspect(list(buffer))
     while buffer:
         inspect(list(buffer))
         buffer.popleft()
-    unique = {value for value, _ in candidates}
-    if len(unique) == 1:
-        value = next(iter(unique))
-        excerpt = next(source for candidate, source in candidates if candidate == value)
-        return value, excerpt, "found"
-    if len(unique) > 1:
-        return None, "识别到多个不同报价金额，请人工核对报价口径。", "ambiguous"
+    unique: dict[Decimal, dict] = {}
+    for candidate in candidates:
+        value = _decimal(candidate.get("amount"))
+        if value is not None:
+            unique.setdefault(value, candidate)
+    return list(unique.values())[:8]
+
+
+def _quote_from_candidates(candidates: list[dict]) -> tuple[Decimal | None, str, str]:
+    values = [
+        (value, candidate)
+        for candidate in candidates
+        if (value := _decimal(candidate.get("amount"))) is not None
+    ]
+    if len(values) == 1:
+        value, candidate = values[0]
+        return value, str(candidate.get("excerpt") or ""), "found"
+    if len(values) > 1:
+        return None, f"识别到 {len(values)} 个不同报价金额，请人工核对报价口径。", "ambiguous"
     return None, "未从明确总报价字段附近识别到唯一金额。", "missing"
 
 
-def _quote_from_document(app, entry: dict) -> tuple[Decimal | None, str, str, str]:
+def _quote_from_lines(lines) -> tuple[Decimal | None, str, str]:
+    return _quote_from_candidates(_quote_candidates_from_lines(lines))
+
+
+def _quote_from_document(app, entry: dict) -> tuple[Decimal | None, str, str, str, list[dict]]:
     parsed_path = str(entry.get("parsed_path") or "")
     if entry.get("parse_status") != "success" or not parsed_path or not Path(parsed_path).is_file():
-        return None, "文件尚未成功解析。", "unavailable", ""
+        return None, "文件尚未成功解析。", "unavailable", "", []
     with Path(parsed_path).open("r", encoding="utf-8", errors="ignore") as handle:
-        value, excerpt, status = _quote_from_lines(handle)
+        parsed_candidates = _quote_candidates_from_lines(handle, source="parsed_text")
+    value, excerpt, status = _quote_from_candidates(parsed_candidates)
     if value is not None:
-        return value, excerpt, status, "parsed_text"
+        return value, excerpt, status, "parsed_text", parsed_candidates
     # 只复用已经存在的 OCR 页缓存；这里绝不触发 RapidOCR、腾讯 OCR 或图片模型。
     cached_pages = storage.list_ocr_cached_page_texts(app, str(entry.get("document_id") or ""))
     if cached_pages:
         cached_lines = (
-            line
+            (line, page.get("page"))
             for page in cached_pages
             for line in str(page.get("text") or "").splitlines()
         )
-        ocr_value, ocr_excerpt, ocr_status = _quote_from_lines(cached_lines)
+        ocr_candidates = _quote_candidates_from_lines(cached_lines, source="ocr_cache")
+        ocr_value, ocr_excerpt, ocr_status = _quote_from_candidates(ocr_candidates)
         if ocr_value is not None:
-            return ocr_value, ocr_excerpt, ocr_status, "ocr_cache"
+            return ocr_value, ocr_excerpt, ocr_status, "ocr_cache", ocr_candidates
         if status == "missing" and ocr_status == "ambiguous":
-            return None, ocr_excerpt, ocr_status, "ocr_cache"
-    return None, excerpt, status, "parsed_text"
+            return None, ocr_excerpt, ocr_status, "ocr_cache", ocr_candidates
+    return None, excerpt, status, "parsed_text", parsed_candidates
 
 
 def _extraction_fingerprint(entry: dict) -> str:
@@ -612,6 +659,26 @@ def _public_entry(entry: dict) -> dict:
         adjustment = {}
     if not isinstance(adjustment, dict):
         adjustment = {}
+    try:
+        raw_candidates = json.loads(entry.get("document_quote_candidates_json") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        raw_candidates = []
+    quote_candidates = []
+    for candidate in raw_candidates if isinstance(raw_candidates, list) else []:
+        if not isinstance(candidate, dict):
+            continue
+        amount = _decimal(candidate.get("amount"))
+        if amount is None:
+            continue
+        page = candidate.get("page")
+        quote_candidates.append({
+            "amount": _decimal_text(amount),
+            "excerpt": str(candidate.get("excerpt") or "")[:260],
+            "page": page if isinstance(page, int) and page > 0 else None,
+            "source": str(candidate.get("source") or "")[:40],
+        })
+        if len(quote_candidates) == 8:
+            break
     extracted = _decimal(entry.get("extracted_quote"))
     manual = _decimal(entry.get("manual_quote"))
     effective = manual if manual is not None else extracted
@@ -624,6 +691,7 @@ def _public_entry(entry: dict) -> dict:
         "calculation_price": _decimal_text(evaluation if evaluation is not None else effective),
         "included": bool(entry.get("included")), "exclusion_reason": entry.get("exclusion_reason") or "",
         "quote_source": entry.get("quote_source") or "", "quote_excerpt": entry.get("quote_excerpt") or "",
+        "quote_candidates": quote_candidates,
         "extraction_status": entry.get("extraction_status") or "pending", "manual_scores": manual_scores,
         "adjustment": adjustment,
     }
@@ -714,11 +782,12 @@ def extract_document_quote(app, document: dict) -> dict:
     已缓存结果，保证同一份文件只扫描一次。
     """
     merged = {**document, "document_sha256": str(document.get("sha256") or "")}
-    value, excerpt, status, source = _quote_from_document(app, merged)
+    value, excerpt, status, source, candidates = _quote_from_document(app, merged)
     return {
         "quote_value": _decimal_text(value),
         "quote_source": source,
         "quote_excerpt": excerpt[:500],
+        "quote_candidates_json": json.dumps(candidates, ensure_ascii=False, separators=(",", ":")),
         "quote_status": status,
         "quote_fingerprint": _extraction_fingerprint(merged),
     }

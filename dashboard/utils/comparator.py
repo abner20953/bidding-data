@@ -13,7 +13,7 @@ import fitz  # PyMuPDF
 
 # 共同删改的全文锚点校验与义务主体改写簇识别已改变查重结论；同步失效旧解析
 # 缓存，避免历史结果与当前算法混用。
-ALGORITHM_VERSION = 11
+ALGORITHM_VERSION = 12
 MIN_EXACT_LENGTH = 9
 MIN_EXACT_DISPLAY_LENGTH = 30
 MAX_EXACT_BLOCK_LENGTH = 1200
@@ -1079,6 +1079,15 @@ class CollusionDetector:
         if "中小企业声明函" in tender_text:
             return None
 
+        # PDF 表格在抽取时可能把相邻行拆开、错序。此时“最相似”的单一
+        # 招标片段未必是真正来源：例如投标文件中的“投标报价”行被误配到
+        # 招标文件的“投标有效期”行，就会伪造出“有效期→报价”的共同改动。
+        # 只有存在一个更贴近、且两份投标文本均无需实质修改即可对应的替代
+        # 原文片段时才排除；真实的共同删除、数值调整或新增内容不会满足该
+        # 条件，仍由后续原有逻辑保留。
+        if self._has_equivalent_tender_alternative(tender_text, text_a, text_b):
+            return None
+
         edits_a = self._edit_operations(tender_text, text_a)
         edits_b = self._edit_operations(tender_text, text_b)
         edits_a = {
@@ -1134,6 +1143,70 @@ class CollusionDetector:
                 bool(edits_a[key].get("voice_adaptation")) for key in shared_signatures
             ),
         }
+
+    def _has_equivalent_tender_alternative(self, tender_text, text_a, text_b):
+        """判断当前招标来源是否被更准确的无实质差异来源替代。
+
+        这是共同改动的来源校验，不是按项目词汇过滤。只在现有招标比较单元
+        中寻找 A、B 共同可对应的候选，并要求替代来源明显更贴近且两侧都只
+        存在已知的版式/分段伪差异；因此不会用一段无关招标文字掩盖真实删除。
+        """
+        if not self.tender_unit_index:
+            return False
+
+        selected_score = min(
+            SequenceMatcher(None, tender_text, text_a, autojunk=False).ratio(),
+            SequenceMatcher(None, tender_text, text_b, autojunk=False).ratio(),
+        )
+        candidates_a = {
+            int(item["index"]): item
+            for item in self._best_candidates(
+                text_a, self.tender_unit_index, minimum_ratio=0.55,
+                minimum_jaccard=0.10,
+            )
+        }
+        candidates_b = {
+            int(item["index"]): item
+            for item in self._best_candidates(
+                text_b, self.tender_unit_index, minimum_ratio=0.55,
+                minimum_jaccard=0.10,
+            )
+        }
+        for index in set(candidates_a) & set(candidates_b):
+            candidate = str(candidates_a[index]["unit"].get("text") or "")
+            if not candidate or candidate == tender_text:
+                continue
+            alternative_score = min(
+                float(candidates_a[index]["ratio"]),
+                float(candidates_b[index]["ratio"]),
+            )
+            # 只接受明显更贴近的替代来源，避免相似的相邻条款互相覆盖。
+            if alternative_score < max(0.72, selected_score + 0.02):
+                continue
+            if self._has_substantive_tender_side_edit(candidate, text_a):
+                continue
+            if self._has_substantive_tender_side_edit(candidate, text_b):
+                continue
+            return True
+        return False
+
+    def _has_substantive_tender_side_edit(self, tender_text, target_text):
+        """单侧相对来源仍是否存在实质删改，复用共同改动的既有伪差异规则。"""
+        edits = self._edit_operations(tender_text, target_text)
+        retained = []
+        for edit in edits.values():
+            if self._is_low_value_tender_edit(edit, tender_text):
+                continue
+            if self._is_form_field_completion(edit, tender_text):
+                continue
+            if self._is_leading_table_title_insertion(edit, tender_text):
+                continue
+            if self._is_segment_artifact_deletion(edit, tender_text):
+                continue
+            if self._is_segment_artifact_insertion(edit, tender_text):
+                continue
+            retained.append(edit)
+        return self._has_substantive_tender_change(retained)
 
     def _add_error_issue(self, issues, kind, label, detail, text, page):
         normalized = self.normalize(text)

@@ -426,6 +426,12 @@ def init_database(app) -> None:
                 parse_status TEXT NOT NULL DEFAULT 'pending',
                 parse_error TEXT,
                 parsed_path TEXT,
+                quote_value TEXT,
+                quote_source TEXT NOT NULL DEFAULT '',
+                quote_excerpt TEXT NOT NULL DEFAULT '',
+                quote_candidates_json TEXT NOT NULL DEFAULT '[]',
+                quote_status TEXT NOT NULL DEFAULT 'pending',
+                quote_fingerprint TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -860,6 +866,7 @@ def init_database(app) -> None:
         _ensure_column(conn, "ew_documents", "quote_value", "TEXT")
         _ensure_column(conn, "ew_documents", "quote_source", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "ew_documents", "quote_excerpt", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "ew_documents", "quote_candidates_json", "TEXT NOT NULL DEFAULT '[]'")
         _ensure_column(conn, "ew_documents", "quote_status", "TEXT NOT NULL DEFAULT 'pending'")
         _ensure_column(conn, "ew_documents", "quote_fingerprint", "TEXT NOT NULL DEFAULT ''")
         # 旧数据库先补列，再建索引；把索引放在 CREATE TABLE 脚本里会导致升级时
@@ -1505,7 +1512,7 @@ def list_documents(app, project_id: str) -> list[dict]:
 
 def update_document_quote(app, document_id: str, fields: dict) -> dict:
     """保存文件清单报价提取结果；与价格工作表报价缓存共用同一份数据。"""
-    allowed = {"quote_value", "quote_source", "quote_excerpt", "quote_status", "quote_fingerprint"}
+    allowed = {"quote_value", "quote_source", "quote_excerpt", "quote_candidates_json", "quote_status", "quote_fingerprint"}
     updates = {key: fields[key] for key in allowed if key in fields}
     if not updates:
         return {}
@@ -1523,7 +1530,8 @@ def update_document_quote(app, document_id: str, fields: dict) -> dict:
 def _list_price_entries(conn, project_id: str) -> list[dict]:
     rows = conn.execute(
         """SELECT entry.*, document.sha256 AS document_sha256,
-                  document.parsed_path, document.parse_status, document.original_name
+                  document.parsed_path, document.parse_status, document.original_name,
+                  document.quote_candidates_json AS document_quote_candidates_json
            FROM ew_price_entries entry
            LEFT JOIN ew_documents document ON document.document_id=entry.document_id
            WHERE entry.project_id=?

@@ -4,25 +4,32 @@
 handoff_schema: 1
 updated_at: 2026-08-21
 module: evaluation-workbench
-status: clean_no_active_work
+status: ready_for_commit
 base_commit: ed064e3
 branch: main
-working_tree: clean_after_lifecycle_fix_deployment
+working_tree: compare_source_alignment_and_quote_candidates_verified_locally
 remote_github: ed064e3
 remote_gitee: ed064e3
 production_commit: ed064e3
 prompt_version: vision-evidence-contract-v63（已部署；未填调整不套用规则优惠）
-database_change: ew_documents 报价缓存列（v4 已部署）；本轮仅 PRICE_SHEET_VERSION 升 v5，无结构变更
-user_approval: 本轮综合评审生命周期修复已完成提交、推送和部署
+database_change: ew_documents 新增 quote_candidates_json（待部署）；PRICE_SHEET_VERSION 升 v6，历史报价缓存将按原有刷新机制重提取
+user_approval: 查重原文来源校验与多报价候选选择均已完成本地验证，待用户确认提交、推送与部署
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
 
 ## 下一位先做
 
-1. 当前无待办。后续如调整选择弹窗，仍须以“当前规则集 + 当前文件哈希 + 当前结果来源索引”为唯一来源；MiMo V2.5 图片测试仍建议禁用思考模式。
+1. 查重原文来源校验与多报价候选选择已通过本地回归，待用户确认是否提交、推送与部署；部署后需重跑“山西银行软测”查重验证该历史伪线索不再生成，并在“报价与价格分”确认深圳市网新新思的多个报价候选可见且选择后须经原有批量保存才重算。后续如调整选择弹窗，仍须以“当前规则集 + 当前文件哈希 + 当前结果来源索引”为唯一来源；MiMo V2.5 图片测试仍建议禁用思考模式。
 
 ## 活跃记录（最多 10 条）
+
+### 10. 查重共同改动的原文来源校验与多报价候选（本地已验证，待提交部署）
+
+- 修复表格相邻行或分段错位时，“最相似”招标片段被误作来源、从而伪造共同改动的问题：仅当存在明显更贴近且两份投标文本均无实质删改的替代招标来源时，才排除该候选。真实共同删除、数值调整和新增仍沿用原有锚点校验与保留逻辑。
+- 查重 AI 证据包新增实际匹配的 `tender_text`，并要求共同改动逐字核对原文、两份投标文本和表格重排可能性；比较器/信号/提示词版本升级，历史结果将提示重跑而不被静默改写。
+- 报价缓存新增结构化候选：当明确总报价字段出现不同金额时，保留每项金额、标签所在页、短原文摘录与文字/OCR缓存来源，页面可一键带入报价草稿；点击候选不写库、不重算，仍由原有批量保存统一提交。唯一金额、人工报价、OCR/模型调用与综合评审链路不变；缓存版本升至 v6，仅触发既有本地文字刷新。
+- 验证：比较器 90 项、工作台 554 项、AI 网关 27 项通过；新增多页多报价候选和 API 回写回归，前端语法、文档与差异校验通过。主要文件：`comparator.py`、`collusion_signals.py`、`worker.py`、`prompt_templates.py`、`price_sheet.py`、`storage.py`、前端及相关测试；未影响综合评审、OCR 或多模态链路。
 
 ### 9. 综合评审结果生命周期收口（已部署 ed064e3）
 

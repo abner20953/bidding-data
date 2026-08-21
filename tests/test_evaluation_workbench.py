@@ -1256,13 +1256,14 @@ class EvaluationWorkbenchTests(unittest.TestCase):
                 {"page_a": 1, "page_b": 2, "text_a": "重复页一", "text_b": "重复页一"},
                 {"page_a": 1, "page_b": 2, "text_a": "同页第二段", "text_b": "同页第二段"},
                 {"page_a": 5, "page_b": 8, "text_a": "不同页", "text_b": "不同页",
-                 "shared_edits": [{"original": "原要求", "modified": "共同改写"}]},
+                 "tender_text": "招标原文要求", "shared_edits": [{"original": "原要求", "modified": "共同改写"}]},
             ],
         })
 
         self.assertEqual(len(packet["evidence"]), 3)
         self.assertEqual(packet["evidence"][0]["page_a"], "5")
         self.assertEqual(packet["evidence"][0]["shared_edits"][0]["original"], "原要求")
+        self.assertEqual(packet["evidence"][0]["tender_text"], "招标原文要求")
         self.assertGreaterEqual(len({(item.get("page_a"), item.get("page_b")) for item in packet["evidence"]}), 2)
 
     def test_compare_ai_recovers_complete_assessments_then_retries_only_missing_signals(self):
@@ -5563,6 +5564,19 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(value, Decimal("699690.00"))
         self.assertEqual(status, "found")
 
+    def test_quote_candidates_keep_page_and_excerpt_when_multiple_total_quotes_exist(self):
+        candidates = price_sheet._quote_candidates_from_lines([
+            "[第15页]", "投标总报价：696000元。",
+            "[第17页]", "含税总报价：700000元。",
+        ], source="parsed_text")
+
+        self.assertEqual([item["amount"] for item in candidates], ["696000", "700000"])
+        self.assertEqual([item["page"] for item in candidates], [15, 17])
+        self.assertTrue(all("报价" in item["excerpt"] for item in candidates))
+        value, _excerpt, status = price_sheet._quote_from_candidates(candidates)
+        self.assertIsNone(value)
+        self.assertEqual(status, "ambiguous")
+
     def test_price_sheet_finds_currency_amount_before_explicit_total_quote_field(self):
         value, _excerpt, status = price_sheet._quote_from_lines([
             "人民币壹佰零伍万贰仟伍佰叁拾元整（¥1,052,530.00）的投标总报价（其中增值税税率为13%）。",
@@ -5705,6 +5719,26 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(document["quote_value"], "120000")
         self.assertEqual(document["quote_status"], "found")
         self.assertEqual(document["quote_fingerprint"], stored_entry["extraction_fingerprint"])
+
+    def test_price_sheet_returns_selectable_candidates_for_ambiguous_document_quote(self):
+        bid = self._add_pdf("ambiguous-bid.pdf", "bid", "甲公司", "占位")
+        parsed = self.temp_dir / "ambiguous-bid.txt"
+        parsed.write_text("[第15页]\n投标总报价：696000元。\n[第17页]\n含税总报价：700000元。", encoding="utf-8")
+        with storage.connection(self.app) as conn:
+            conn.execute("UPDATE ew_documents SET parse_status='success', parsed_path=? WHERE document_id=?",
+                         (str(parsed), bid["document_id"]))
+
+        sheet = self.app.test_client().post(
+            f"/api/evaluation-workbench/projects/{self.project['project_id']}/price-sheet/refresh"
+        ).get_json()["price_sheet"]
+        entry = sheet["entries"][0]
+        document = next(item for item in storage.list_documents(self.app, self.project["project_id"])
+                        if item["document_id"] == bid["document_id"])
+
+        self.assertEqual(entry["extraction_status"], "ambiguous")
+        self.assertEqual([item["amount"] for item in entry["quote_candidates"]], ["696000", "700000"])
+        self.assertEqual([item["page"] for item in entry["quote_candidates"]], [15, 17])
+        self.assertEqual(json.loads(document["quote_candidates_json"])[0]["amount"], "696000")
 
     def test_refresh_price_sheet_reextracts_when_cached_fingerprint_is_stale(self):
         # 提取规则升级（PRICE_SHEET_VERSION 递增）后，旧版本指纹的缓存必须被

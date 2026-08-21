@@ -45,7 +45,7 @@ MAX_PARSE_PAGES = MAX_PDF_PAGES
 MAX_PARSED_CHARS = 2_500_000
 MAX_DOCX_XML_BYTES = 50 * 1024 * 1024
 PROMPT_VERSION = EVALUATION_PROMPT_VERSION
-COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v5"
+COMPARE_AI_PROMPT_VERSION = "compare-evidence-ai-v6"
 # 单条线索的证据包虽小，但查重往往同时命中多种维度；以较小批次起步，并在
 # 截断时继续局部拆分，避免某一批过长导致整批线索都只能降级为人工核验。
 COMPARE_AI_BATCH_SIZE = 8
@@ -690,7 +690,7 @@ def _compare_evidence_packet(signal: dict) -> dict:
                 "page_a", "page_b", "text_a", "text_b", "similarity",
                 "tender_similarity", "tender_coverage_a", "tender_coverage_b",
                 "segment_count", "error_kind", "entity_kind", "field", "value",
-                "strength", "context_a", "context_b",
+                "strength", "context_a", "context_b", "tender_text",
             }
         }
         edits = item.get("shared_edits")
