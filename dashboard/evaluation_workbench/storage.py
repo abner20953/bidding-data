@@ -5248,7 +5248,10 @@ def publish_current_evaluation_document(app, project_id: str, document: dict, ru
 
 
 def current_evaluation_document_states(app, project_id: str) -> dict[str, dict]:
-    """返回每份当前投标文件最近已发布综合评审的轻量状态，供选择弹窗提示。"""
+    """返回当前规则集下每份投标文件最近已发布综合评审的轻量状态。"""
+    rule_set = current_rule_set(app, project_id)
+    if not rule_set:
+        return {}
     with connection(app) as conn:
         rows = conn.execute(
             """SELECT current.document_id, current.task_id, current.updated_at AS published_at,
@@ -5257,10 +5260,10 @@ def current_evaluation_document_states(app, project_id: str) -> dict[str, dict]:
                  FROM ew_evaluation_current_documents current
                  JOIN ew_documents document ON document.document_id=current.document_id
                  JOIN ew_tasks task ON task.task_id=current.task_id
-                WHERE current.project_id=? AND document.role='bid'
+                WHERE current.project_id=? AND current.rule_set_id=? AND document.role='bid'
                   AND current.document_sha256=document.sha256
                 ORDER BY current.updated_at DESC, task.rowid DESC""",
-            (project_id,),
+            (project_id, rule_set["rule_set_id"]),
         ).fetchall()
     values: dict[str, dict] = {}
     for row in rows:

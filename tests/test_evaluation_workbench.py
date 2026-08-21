@@ -5240,6 +5240,38 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertTrue(states[assessed["document_id"]]["last_run_at"])
         self.assertNotIn(unassessed["document_id"], states)
 
+    def test_project_status_hides_evaluation_state_from_historical_rule_set(self):
+        """规则集变更后，选择弹窗不得把旧规则的评审误报为当前已评审。"""
+        assessed = self._add_pdf("bid-a.pdf", "bid", "甲公司", "甲公司具备有效资质。")
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "有效资质", "source_text": "具备有效资质",
+        })
+        rule_set = storage.confirm_rule_set(self.app, self.project["project_id"])
+        task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        storage.next_queued_task(self.app)
+        profile = storage.get_model_profile(self.app, None)
+        review_run = storage.create_review_run(
+            self.app, self.project["project_id"], task["task_id"], profile["profile_id"],
+        )
+        storage.publish_current_evaluation_document(
+            self.app, self.project["project_id"], assessed, rule_set["rule_set_id"], task["task_id"],
+            profile["profile_id"], "test-fingerprint", review_run["review_run_id"], None, None,
+        )
+        storage.update_task(self.app, task["task_id"], status="success")
+
+        # 在已确认规则集上人工补充规则会克隆新的草稿规则集；旧结果不能再作为
+        # 新规则集的“最近评审”状态展示。
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "other", "title": "人工补充核验", "source_text": "人工补充",
+        })
+        with patch.object(evaluation_workbench_module, "_start_worker_if_needed"):
+            response = self.app.test_client().get(
+                f"/api/evaluation-workbench/projects/{self.project['project_id']}"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(assessed["document_id"], response.get_json()["evaluation_document_states"])
+
     def test_create_task_enforces_per_project_queue_limit(self):
         """排队上限按项目独立计数：同项目第 4 个排队任务被拒，其他项目仍可排队。"""
         second_project = storage.create_project(self.app, "同项目排队项目", "TEST-02", "包1")
@@ -8379,6 +8411,22 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(by_bidder["乙公司"]["evidence"], "上一轮结论")
         self.assertEqual(review_run["task_status"], "cancelled")
 
+    def test_cancel_after_document_publish_keeps_task_completed_document_summary(self):
+        """终止恰好发生在发布索引后，任务摘要仍须如实记录已发布的投标人。"""
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "甲公司具备有效资质。")
+        queued = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        running = storage.next_queued_task(self.app)
+        progress = worker._EvaluationProgress(self.app, running, total_units=1, document_count=1)
+
+        storage.request_task_cancellation(self.app, self.project["project_id"], queued["task_id"])
+        progress.document_completed(document)
+
+        pending = storage.get_task(self.app, queued["task_id"])
+        self.assertEqual(pending["status"], "running")
+        self.assertEqual(pending["result"]["completed_documents"][0]["document_id"], document["document_id"])
+        with self.assertRaises(worker.TaskCancellationRequested):
+            worker._raise_if_task_cancelled(self.app, running)
+
     def test_old_evaluation_runs_are_pruned_only_after_full_publish(self):
         first = self._add_pdf("bid-a.pdf", "bid", "甲公司", "甲公司具备有效资质。")
         second = self._add_pdf("bid-b.pdf", "bid", "乙公司", "乙公司具备有效资质。")
@@ -8416,6 +8464,48 @@ class EvaluationWorkbenchTests(unittest.TestCase):
             ).fetchall()
         self.assertEqual([row["review_run_id"] for row in remaining], [new_run["review_run_id"]])
         self.assertNotEqual(old_run["review_run_id"], new_run["review_run_id"])
+
+    def test_partial_full_evaluation_does_not_prune_previous_runs(self):
+        """全量任务存在失败单元时，旧运行保留，避免丢失可恢复的完整历史结果。"""
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "甲公司具备有效资质。")
+        storage.add_rule(self.app, self.project["project_id"], {
+            "category": "qualification", "title": "有效资质", "source_text": "具备有效资质",
+        })
+        rule_set = storage.confirm_rule_set(self.app, self.project["project_id"])
+        profile = storage.get_model_profile(self.app, None)
+
+        old_task = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        storage.update_task(self.app, old_task["task_id"], status="success")
+        old_run = storage.create_review_run(
+            self.app, self.project["project_id"], old_task["task_id"], profile["profile_id"],
+        )
+
+        queued = storage.create_task(self.app, self.project["project_id"], "evaluate_all")
+        running = storage.next_queued_task(self.app)
+        new_run = storage.create_review_run(
+            self.app, self.project["project_id"], running["task_id"], profile["profile_id"],
+        )
+        storage.publish_current_evaluation_document(
+            self.app, self.project["project_id"], document, rule_set["rule_set_id"], running["task_id"],
+            profile["profile_id"], "partial-run", new_run["review_run_id"], None, None,
+        )
+        partial_result = {
+            "selection_mode": "all", "rule_set_id": rule_set["rule_set_id"],
+            "completion_state": "partial_success",
+            "failed_units": [{"document_id": document["document_id"], "component": "review"}],
+        }
+        with patch("dashboard.evaluation_workbench.worker._evaluate_all", return_value=partial_result):
+            worker.run_task(self.app, running)
+
+        with storage.connection(self.app) as conn:
+            remaining = conn.execute(
+                "SELECT review_run_id FROM ew_review_runs WHERE project_id=? ORDER BY rowid",
+                (self.project["project_id"],),
+            ).fetchall()
+        self.assertEqual(storage.get_task(self.app, queued["task_id"])["status"], "success")
+        self.assertEqual(
+            [row["review_run_id"] for row in remaining], [old_run["review_run_id"], new_run["review_run_id"]],
+        )
 
     def test_combined_evaluation_does_not_reuse_results_from_old_prompt_version(self):
         document = self._add_pdf("bid.pdf", "bid", "甲公司", "甲公司具备有效资质。")

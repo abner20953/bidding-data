@@ -12898,7 +12898,8 @@ class _EvaluationProgress:
     def _progress(self) -> int:
         return int(self.completed_units * 100 / self.total_units)
 
-    def _persist(self, message: str, *, force: bool = False, result: dict | None = None) -> None:
+    def _persist(self, message: str, *, force: bool = False, result: dict | None = None,
+                 check_cancellation: bool = True) -> None:
         self.pending_message = str(message or self.pending_message)
         now = time.monotonic()
         if (
@@ -12907,7 +12908,8 @@ class _EvaluationProgress:
             and now - self.last_persisted_at < self._PERSIST_INTERVAL_SECONDS
         ):
             return
-        _raise_if_task_cancelled(self.app, self.task)
+        if check_cancellation:
+            _raise_if_task_cancelled(self.app, self.task)
         storage.update_task(
             self.app, self.task["task_id"], progress=self._progress(), message=self.pending_message, result=result,
         )
@@ -12931,6 +12933,10 @@ class _EvaluationProgress:
             self._persist(
                 f"{status} {bidder_name} 的综合评审（{len(self.completed_documents)}/{self.document_count}）",
                 force=True, result={"partial": True, "completed_documents": list(self.completed_documents)},
+                # 当前结果索引已经在调用本方法前原子切换。即使终止请求恰好在两步
+                # 之间到达，也必须如实记录这份已完整发布的结果；下一自然检查点仍会
+                # 安全终止，不会启动任何后续评审调用。
+                check_cancellation=False,
             )
 
 
@@ -14178,7 +14184,9 @@ def run_task(app, task: dict) -> None:
         if not finished or finished.get("status") != "success":
             return
         if task["task_type"] == "evaluate_all":
-            if isinstance(result, dict) and result.get("selection_mode") == "all" and result.get("rule_set_id"):
+            if (isinstance(result, dict) and result.get("selection_mode") == "all"
+                    and result.get("rule_set_id") and result.get("completion_state") == "complete"
+                    and not result.get("failed_units")):
                 try:
                     storage.prune_superseded_evaluation_runs(
                         app, task["project_id"], str(result["rule_set_id"]), task["task_id"],

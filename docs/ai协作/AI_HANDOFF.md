@@ -2,31 +2,37 @@
 
 ```yaml
 handoff_schema: 1
-updated_at: 2026-08-20
+updated_at: 2026-08-21
 module: evaluation-workbench
-status: clean_no_active_work
+status: ready_for_commit
 base_commit: 8764c95
 branch: main
-working_tree: local_docs_deploy_status_update
+working_tree: safe_termination_and_current_evaluation_state_fixes
 remote_github: 8764c95
 remote_gitee: 8764c95
 production_commit: 8764c95
 prompt_version: vision-evidence-contract-v63（已部署；未填调整不套用规则优惠）
 database_change: ew_documents 报价缓存列（v4 已部署）；本轮仅 PRICE_SHEET_VERSION 升 v5，无结构变更
-user_approval: 本轮投标人评审历史提示已完成提交、推送和部署
+user_approval: 已授权本轮综合评审生命周期修复提交、推送和部署
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
 
 ## 下一位先做
 
-1. 当前无待办。后续如调整综合评审选择弹窗，应保持“当前文件哈希 + 当前结果来源索引”作为评审历史状态的唯一来源；MiMo V2.5 图片测试仍建议禁用思考模式。
+1. 提交、推送并部署本轮修复后，核验云端 build-info 与实际容器版本；无需重跑综合评审。后续如调整选择弹窗，仍须以“当前规则集 + 当前文件哈希 + 当前结果来源索引”为唯一来源；MiMo V2.5 图片测试仍建议禁用思考模式。
 
 ## 活跃记录（最多 10 条）
 
+### 9. 综合评审结果生命周期收口（本地待提交）
+
+- 修复选择弹窗状态查询漏校验规则集：仅当前规则集、当前文件哈希匹配的已发布结果才显示“最近综合评审”，历史规则集不再误报为当前已评审。
+- 全量评审只有 `completion_state=complete` 且没有失败单元时才清理旧运行；`partial_success` 与安全终止均保留旧产物，避免丢失可恢复历史。已发布索引后若恰好收到终止请求，任务摘要仍记录该投标人完成，不增加后续模型/OCR 调用。
+- 验证：新增三项通用回归，加既有安全终止/局部评审状态共 8 项通过；完整工作台 552 项与 AI 网关 27 项、合计 579 项通过；文档、语法和差异校验通过。主要文件：`storage.py`、`worker.py`、`tests/test_evaluation_workbench.py`；回退点 `8764c95`。
+
 ### 8. 投标人选择弹窗的评审历史提示（已部署 8764c95）
 
-- 项目详情新增只读 `evaluation_document_states`：以“当前投标文件哈希 + 当前结果来源索引”为准，返回最近已发布任务的状态与完成时间，不把旧文件、旧规则或未发布中间结果误报为已评审。
+- 项目详情新增只读 `evaluation_document_states`：部署版已按当前投标文件哈希和当前结果来源索引返回最近已发布任务的状态与完成时间；规则集匹配遗漏已由本轮第 9 条修正，待部署后才可保证不误报旧规则结果。
 - 开始综合评审弹窗在每家投标人的“已解析，可评审”下方显示最近综合评审状态和时间；从未有当前结果的文件显示“尚未进行综合评审”。不改勾选、队列、模型、OCR、结果或报告逻辑。
 - 验证：项目 API 状态来源回归、局部重评与安全终止保护测试，以及完整工作台和 AI 网关 576 项通过；云端 `jc` 弹窗实测 4 家已完成显示时间、4 家未评审显示明确状态。
 
