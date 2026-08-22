@@ -2,25 +2,25 @@
 
 ```yaml
 handoff_schema: 1
-updated_at: 2026-08-21
+updated_at: 2026-08-22
 module: evaluation-workbench
-status: deployed_validation_pending
+status: ready_for_commit
 base_commit: b2bd5e7
 branch: main
-working_tree: clean_after_b2bd5e7
+working_tree: dirty_local_score_comparison
 remote_github: b2bd5e7
 remote_gitee: b2bd5e7
 production_commit: b2bd5e7
 prompt_version: vision-evidence-contract-v63（已部署；未填调整不套用规则优惠）
 database_change: ew_documents 新增 quote_candidates_json（待部署）；PRICE_SHEET_VERSION 升 v6，历史报价缓存将按原有刷新机制重提取
-user_approval: 查重原文来源校验与多报价候选选择已提交、推送并部署；云端版本一致，山西银行软测报价刷新已核验
+user_approval: 评分对比视图已获提交、推送与腾讯云部署授权；此前查重原文来源校验与多报价候选选择已提交、推送并部署
 ```
 
 元数据不是部署事实的替代品。`production_commit` 只能来自云端 build-info、任务运行时版本或服务器核验；不知道时必须保持 `unknown`。
 
 ## 下一位先做
 
-1. 查重原文来源校验与多报价候选选择已部署；后续需重跑“山西银行软测”查重验证该历史伪线索不再生成，并在“报价与价格分”继续观察多候选文件的页面选择和批量重算。后续如调整选择弹窗，仍须以“当前规则集 + 当前文件哈希 + 当前结果来源索引”为唯一来源；MiMo V2.5 图片测试仍建议禁用思考模式。
+1. 本轮评分对比视图已完成：它是只读全屏展示，不创建任务、不调用模型/OCR、不改评分结果；本地工作台与前端矩阵回归已通过，下一步为提交、双远程推送和腾讯云部署验证。此前查重原文来源校验与多报价候选选择已部署，后续仍需重跑“山西银行软测”查重验证该历史伪线索不再生成，并在“报价与价格分”继续观察多候选文件的页面选择和批量重算。后续如调整选择弹窗，仍须以“当前规则集 + 当前文件哈希 + 当前结果来源索引”为唯一来源；MiMo V2.5 图片测试仍建议禁用思考模式。
 
 ## 活跃记录（最多 10 条）
 

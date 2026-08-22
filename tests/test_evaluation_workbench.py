@@ -8624,6 +8624,27 @@ class EvaluationWorkbenchTests(unittest.TestCase):
         self.assertEqual(performance_rule["category"], "objective")
         self.assertEqual(performance_rule["scoring_json"], '{"max_score": 9, "kind": "manual"}')
 
+    def test_score_results_expose_read_only_score_section_metadata_for_comparison(self):
+        document = self._add_pdf("bid.pdf", "bid", "甲公司", "已提供评分材料。")
+        rule = storage.add_rule(self.app, self.project["project_id"], {
+            "category": "objective", "title": "商务业绩评分", "source_text": "企业业绩评分",
+            "scoring": {"kind": "boolean", "max_score": 5},
+            "score_sections": [{"section_id": "SS-business", "label": "商务部分", "max_score": 20, "source_page": 8}],
+        })
+        storage.confirm_rule_set(self.app, self.project["project_id"])
+        task = storage.create_task(self.app, self.project["project_id"], "score_objective")
+        run = storage.create_score_run(self.app, self.project["project_id"], task["task_id"], "objective", None)
+        storage.save_score_results(self.app, run["score_run_id"], document["document_id"], [{
+            "rule_id": rule["rule_id"], "suggested_score": 4, "max_score": 5,
+            "evidence": "已提供", "reason": "符合", "confidence": "high",
+        }])
+        storage.update_task(self.app, task["task_id"], status="success", progress=100)
+
+        _, rows = storage.latest_score_results(self.app, self.project["project_id"], "objective")
+        self.assertEqual(rows[0]["rule_category"], "objective")
+        self.assertEqual(rows[0]["score_sections"][0]["label"], "商务部分")
+        self.assertEqual(rows[0]["rule_sort_order"], 0)
+
     def test_objective_score_calculates_confirmed_boolean_rule(self):
         self._add_pdf("tender.pdf", "tender", "", "具备有效资质得5分。")
         self._add_pdf("bid.pdf", "bid", "甲公司", "本公司具备有效资质。")

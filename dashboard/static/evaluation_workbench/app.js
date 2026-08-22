@@ -20,6 +20,8 @@
   let selectedPriceRuleId = '';
   let priceDraft = null;
   let evaluationSelectionProject = null;
+  let scoreComparisonState = {objective:null, subjective:null};
+  let scoreComparisonDragIndex = null;
   const $ = (id) => document.getElementById(id);
   const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
   // 展示层统一清洗：去掉内部编号（SI-1/SI-2）、JSON 字段名记法（status=、suggested_score=）、
@@ -333,7 +335,7 @@
   async function loadProjects() { const data = await request('/projects'); $('projects').innerHTML = data.projects.length ? data.projects.map((p) => `<article class="card" data-project="${p.project_id}"><h3>${escapeHtml(projectDisplayName(p))}</h3><p>${escapeHtml(projectMeta(p))}</p><p>${p.document_count || 0} 份文件 · ${p.bid_count || 0} 份投标文件</p></article>`).join('') : '<p class="muted">尚未创建评标项目。</p>'; document.querySelectorAll('[data-project]').forEach((node) => node.onclick = () => openProject(node.dataset.project)); }
   function stopPolling() { if (poller) clearInterval(poller); poller = null; }
   function startPolling() { if (!poller) poller = setInterval(() => refreshProject().catch((error) => { stopPolling(); $('task-status').textContent = error.message; }), 2500); }
-  function resetProjectPanels() { ['documents','rules','price-sheet-content','review-results','objective-results','subjective-results'].forEach((id) => { const node = $(id); if (node) node.innerHTML = '<p class="muted">正在加载当前项目…</p>'; }); $('token-usage').textContent = '正在加载当前项目…'; $('latest-run-usage').textContent = '正在加载当前项目…'; $('task-status').textContent = '正在加载当前项目…'; lastPartialDocumentsKey = ''; currentPriceSheet = null; selectedPriceRuleId = ''; priceDraft = null; lastObservedPriceTaskId = null; }
+  function resetProjectPanels() { ['documents','rules','price-sheet-content','review-results','objective-results','subjective-results'].forEach((id) => { const node = $(id); if (node) node.innerHTML = '<p class="muted">正在加载当前项目…</p>'; }); $('token-usage').textContent = '正在加载当前项目…'; $('latest-run-usage').textContent = '正在加载当前项目…'; $('task-status').textContent = '正在加载当前项目…'; lastPartialDocumentsKey = ''; currentPriceSheet = null; selectedPriceRuleId = ''; priceDraft = null; lastObservedPriceTaskId = null; scoreComparisonState = {objective:null, subjective:null}; closeScoreComparison(); updateScoreComparisonButton(); }
   async function openProject(id) { activeProject = id; wasTaskActive = false; lastActiveTaskId = null; lastCompareTask = null; resetProjectPanels(); stopCompletionTicker(); $('projects-panel').classList.add('hidden'); $('project-form').classList.add('hidden'); $('workspace').classList.remove('hidden'); await refreshProject(); await loadProfiles(); await refreshRules(); await refreshPriceSheet(false, true); await refreshReview(); await refreshScores(); await refreshUsage(); }
   async function refreshUsage() { if (!activeProject) return; const data = await request(`/projects/${activeProject}/token-usage`); const u = data.usage; const localPerf = u.local_ocr_performance || {}; if (!u.call_count && !u.ocr_requests && !u.local_ocr_pages && !localPerf.run_count) { $('token-usage').textContent = '尚无调用记录'; } else { const detail = u.metered_calls ? `输入 ${u.prompt_tokens.toLocaleString()} / 输出 ${u.completion_tokens.toLocaleString()} / 合计 ${u.total_tokens.toLocaleString()} Token` : `模型接口未返回 Token；已发送 ${u.input_chars.toLocaleString()} 字符`; const families = u.families || {}; const extras = []; if (families.vision && families.vision.call_count) extras.push(`图片识别 ${families.vision.call_count} 次`); if (u.ocr_requests) extras.push(`腾讯 OCR ${u.ocr_requests} 页`); if (u.local_ocr_pages || localPerf.run_count) { let localLabel = `本地 OCR ${u.local_ocr_pages || 0} 页`; if (localPerf.average_ms_per_page) localLabel += `，平均 ${(localPerf.average_ms_per_page / 1000).toFixed(1)} 秒/页`; if (localPerf.peak_rss_kb) localLabel += `，峰值约 ${Math.ceil(localPerf.peak_rss_kb / 1024)} MB`; extras.push(localLabel); } const cache = u.prompt_tokens ? `；缓存命中 ${Math.round((u.cache_hit_tokens || 0) * 100 / u.prompt_tokens)}%` : ''; $('token-usage').textContent = `${detail}（${u.call_count} 次调用${extras.length ? '；其中' + extras.join('、') : ''}${cache}）`; } renderLatestRunUsage(data.latest_run); }
   async function cancelEvaluationTask(taskId, status) {
@@ -982,7 +984,82 @@
     }).join('') || '<p class="muted">当前筛选下没有高风险或重点关注事项。</p>';
   }
   async function refreshReview() { if (!activeProject) return; const data = await request(`/projects/${activeProject}/review-results`); renderEvaluationHighlights(data.review_run?.highlights || []); const groups = groupByBidder(visibleCompletedResults(data.review_run, data.results)); $('review-results').innerHTML = groups.length ? `${partialResultNotice(data.review_run)}<p class="hint">以下为 AI 基于电子文件生成的审查建议；主表展示结论摘要，完整文字和取证过程可展开查看。</p>${groups.map(([bidder, results]) => { const ordered = [...results].sort((left, right) => { const leftOcr = left.status === 'ocr_required' ? 1 : 0; const rightOcr = right.status === 'ocr_required' ? 1 : 0; return leftOcr - rightOcr || riskRank(right.risk_level) - riskRank(left.risk_level); }); return `<details class="result-group"><summary>投标人：${escapeHtml(bidder)}（${ordered.length} 项）</summary><div class="review-result-table-wrap"><table class="review-result-table"><colgroup><col class="review-col-category"><col class="review-col-rule"><col class="review-col-advice"><col class="review-col-risk"><col class="review-col-evidence"></colgroup><thead><tr><th>分类</th><th>检查规则</th><th>AI建议</th><th>风险</th><th>关键证据与理由</th></tr></thead><tbody>${ordered.map((r) => `<tr><td><span class="tag">${categoryLabel(r.category)}</span></td><td>${ruleCellHtml(r)}</td><td>${escapeHtml(statusLabel(r.status))}<br><small>置信度：${escapeHtml(confidenceLabel(r.confidence))}；证据：${escapeHtml(evidenceQualityLabel(r.evidence_quality))}</small>${visionBadgeHtml(r)}</td><td>${escapeHtml(riskLabel(r.status === 'ocr_required' ? 'low' : r.risk_level))}</td><td><div class="result-evidence result-summary">${escapeHtml(resultExplanation(conciseResultSummary(r), r) || '-')}</div><small class="result-evidence result-verification">${escapeHtml(verificationLineHtml(r))}</small>${conflictBadgeHtml(r)}${evidenceChainHtml(r)}${rawResultDetailHtml(r)}</td></tr>`).join('')}</tbody></table></div></details>`; }).join('')}` : `<p class="muted">${data.review_run ? '正在生成审查结果。' : '本项目没有审查规则。'}</p>`; }
-  async function refreshScores() { for (const type of ['objective','subjective']) { const data = await request(`/projects/${activeProject}/score-results/${type}`); const target = $(`${type}-results`); const visible = (data.results || []).filter((item) => !item.price_managed_by_sheet); const groups = groupByBidder(visibleCompletedResults(data.score_run, visible)); const priceNotice = type === 'objective' && (data.results || []).some((item) => item.price_managed_by_sheet) ? '<p class="hint">价格分已移至“报价与价格分”，按确认报价、价格调整和参与范围统一计算。</p>' : ''; target.innerHTML = groups.length ? `${partialResultNotice(data.score_run)}${priceNotice}<p class="hint">以下为 AI 基于电子文件生成的评分建议；扫描件证据未覆盖时不会将“未找到”误作 0 分，主表会提示待 OCR 后评分。</p>${groups.map(([bidder, results]) => `<details class="result-group"><summary>投标人：${escapeHtml(bidder)}（${results.length} 项）</summary><table><thead><tr><th>检查规则</th><th>AI 建议得分</th><th>满分</th><th>置信度</th><th>关键证据与理由</th></tr></thead><tbody>${results.map((r) => `<tr><td>${ruleCellHtml(r)}${scoreOcrHint(r)}</td><td>${escapeHtml(scoreSuggestionLabel(r))}</td><td>${r.max_score ?? '-'}</td><td>${escapeHtml(confidenceLabel(r.confidence))}${visionBadgeHtml(r)}</td><td><div class="result-evidence result-summary">${escapeHtml(resultExplanation(conciseResultSummary(r), r) || '-')}</div><small class="result-evidence result-verification">${escapeHtml(verificationLineHtml(r))}</small>${conflictBadgeHtml(r)}${evidenceChainHtml(r)}${rawResultDetailHtml(r)}</td></tr>`).join('')}</tbody></table></details>`).join('')}` : `<p class="muted">${priceNotice || (data.score_run ? '正在生成评分结果。' : `本项目没有${type === 'objective' ? '客观分' : '主观分'}规则。`)}</p>`; } }
+  function scoreComparisonStorageKey() { return activeProject ? `evaluation-workbench:score-comparison-order:${activeProject}` : ''; }
+  function readScoreComparisonOrder() { try { const value = JSON.parse(localStorage.getItem(scoreComparisonStorageKey()) || '[]'); return Array.isArray(value) ? value.filter((item) => typeof item === 'string' && item) : []; } catch (_) { return []; } }
+  function writeScoreComparisonOrder(order) { try { localStorage.setItem(scoreComparisonStorageKey(), JSON.stringify(order)); } catch (_) {} }
+  function scoreComparisonBidderName(item) { return String(item?.bidder_name || item?.original_name || '未填写投标人'); }
+  function scoreComparisonBidderKey(item) {
+    const documentId = String(item?.document_id || '').trim();
+    return documentId ? `document:${documentId}` : `legacy:${scoreComparisonBidderName(item)}`;
+  }
+  function comparisonSectionLabel(item) {
+    const sections = Array.isArray(item?.score_sections) ? item.score_sections : [];
+    const labels = [...new Set(sections.map((section) => String(section?.label || '').trim()).filter(Boolean))];
+    if (labels.length !== 1) return labels.length > 1 ? '跨分部/其他' : '未归类';
+    if (/商务/.test(labels[0])) return '商务分';
+    if (/技术/.test(labels[0])) return '技术分';
+    return labels[0];
+  }
+  function comparisonSectionRank(label) { return label === '商务分' ? 0 : label === '技术分' ? 1 : 2; }
+  function comparisonScoreLabel(item) {
+    if (!item) return '尚未评审';
+    if (item.suggested_score != null && item.suggested_score !== '') return `${item.suggested_score} 分`;
+    if (item.coverage_status === 'uncovered' || item.check_mode === 'ocr') return '待核验评分';
+    return '待评分';
+  }
+  function comparisonNumericScore(item) {
+    if (!item || item.suggested_score == null || String(item.suggested_score).trim() === '') return null;
+    const value = Number(item.suggested_score);
+    return Number.isFinite(value) ? value : null;
+  }
+  function comparisonTotalLabel(items) {
+    const values = items.map(comparisonNumericScore).filter((value) => value != null);
+    if (!values.length) return '待评分';
+    const total = values.reduce((sum, value) => sum + value, 0);
+    const formatted = Number.isInteger(total) ? String(total) : total.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+    return `${formatted}${items.some((item) => comparisonNumericScore(item) == null) ? '（部分待评分）' : ''}`;
+  }
+  function scoreComparisonMatrix() {
+    const rowsByKey = new Map(); const biddersByKey = new Map(); const resultsByBidder = new Map();
+    for (const type of ['objective', 'subjective']) for (const item of (scoreComparisonState[type]?.results || [])) {
+      const bidderKey = scoreComparisonBidderKey(item); const rowKey = `${type}:${item.rule_id}`;
+      if (!biddersByKey.has(bidderKey)) biddersByKey.set(bidderKey, {key:bidderKey, label:scoreComparisonBidderName(item), original_name:String(item?.original_name || '').trim()});
+      if (!resultsByBidder.has(bidderKey)) resultsByBidder.set(bidderKey, new Map());
+      resultsByBidder.get(bidderKey).set(rowKey, item);
+      if (!rowsByKey.has(rowKey)) rowsByKey.set(rowKey, {key:rowKey, type, item, section:comparisonSectionLabel(item), order:Number(item.rule_sort_order) || 0});
+    }
+    const rows = [...rowsByKey.values()].sort((left, right) => comparisonSectionRank(left.section) - comparisonSectionRank(right.section) || left.section.localeCompare(right.section, 'zh-CN') || left.order - right.order || String(left.item.title || '').localeCompare(String(right.item.title || ''), 'zh-CN'));
+    const labels = new Map();
+    for (const bidder of biddersByKey.values()) labels.set(bidder.label, (labels.get(bidder.label) || 0) + 1);
+    const bidders = [...biddersByKey.values()].map((bidder) => ({...bidder, display_name:labels.get(bidder.label) > 1 ? `${bidder.label}（${bidder.original_name || '投标文件'}）` : bidder.label}));
+    return {rows, bidders, resultsByBidder};
+  }
+  function scoreComparisonOrder(bidders) {
+    const byKey = new Map(bidders.map((bidder) => [bidder.key, bidder])); const stored = readScoreComparisonOrder();
+    return [...stored.filter((key) => byKey.has(key)).map((key) => byKey.get(key)), ...bidders.filter((bidder) => !stored.includes(bidder.key))];
+  }
+  function updateScoreComparisonButton() { const button = $('open-score-comparison'); if (button) button.disabled = scoreComparisonMatrix().rows.length === 0; }
+  function renderScoreComparison() {
+    const matrix = scoreComparisonMatrix(); const rows = matrix.rows; const button = $('open-score-comparison'); if (!button) return;
+    button.disabled = rows.length === 0;
+    if (!rows.length) { $('score-comparison-summary').textContent = '当前没有可对比的评分结果。'; $('score-comparison-content').innerHTML = '<p class="muted">尚未生成客观分或主观分结果。</p>'; return; }
+    const bidders = scoreComparisonOrder(matrix.bidders); const byBidder = matrix.resultsByBidder;
+    const sections = [];
+    for (const row of rows) { let section = sections.find((item) => item.label === row.section); if (!section) { section = {label:row.section, rows:[]}; sections.push(section); } section.rows.push(row); }
+    const bidderItems = (bidder) => rows.map((row) => byBidder.get(bidder.key)?.get(row.key));
+    const header = `<tr><th class="score-comparison-rule-head">评分点</th>${bidders.map((bidder, index) => `<th class="score-comparison-bidder-head" draggable="true" data-comparison-bidder-index="${index}"><span class="score-comparison-drag-handle" aria-hidden="true">☷</span>${escapeHtml(bidder.display_name)}<small>AI建议合计：${escapeHtml(comparisonTotalLabel(bidderItems(bidder)))}</small></th>`).join('')}</tr>`;
+    const body = sections.map((section) => `<tr class="score-comparison-section-row"><th colspan="${bidders.length + 1}">${escapeHtml(section.label)}</th></tr>${section.rows.map((row) => `<tr><th class="score-comparison-rule-cell"><span>${escapeHtml(ruleTitle(row.item))}</span><small>${escapeHtml(row.type === 'objective' ? '客观分' : '主观分')}${row.item.max_score != null ? ` · 满分 ${row.item.max_score}` : ''}</small></th>${bidders.map((bidder) => `<td class="score-comparison-score-cell">${escapeHtml(comparisonScoreLabel(byBidder.get(bidder.key)?.get(row.key)))}</td>`).join('')}</tr>`).join('')}`).join('');
+    $('score-comparison-summary').textContent = `${bidders.length} 家投标人 · ${rows.length} 个评分点（不含价格分）`;
+    $('score-comparison-content').innerHTML = `<div class="score-comparison-table-wrap"><table class="score-comparison-table"><thead>${header}</thead><tbody>${body}<tr class="score-comparison-total-row"><th>AI建议合计（不含价格分）</th>${bidders.map((bidder) => `<td>${escapeHtml(comparisonTotalLabel(bidderItems(bidder)))}</td>`).join('')}</tr></tbody></table></div>`;
+    $('score-comparison-content').querySelectorAll('[data-comparison-bidder-index]').forEach((headerCell) => {
+      headerCell.ondragstart = (event) => { scoreComparisonDragIndex = Number(headerCell.dataset.comparisonBidderIndex); headerCell.classList.add('is-dragging'); event.dataTransfer.effectAllowed = 'move'; };
+      headerCell.ondragend = () => { scoreComparisonDragIndex = null; headerCell.classList.remove('is-dragging'); };
+      headerCell.ondragover = (event) => { event.preventDefault(); headerCell.classList.add('is-drag-over'); };
+      headerCell.ondragleave = () => headerCell.classList.remove('is-drag-over');
+      headerCell.ondrop = (event) => { event.preventDefault(); headerCell.classList.remove('is-drag-over'); const targetIndex = Number(headerCell.dataset.comparisonBidderIndex); if (scoreComparisonDragIndex == null || scoreComparisonDragIndex === targetIndex) return; const next = bidders.slice(); const [moved] = next.splice(scoreComparisonDragIndex, 1); next.splice(targetIndex, 0, moved); writeScoreComparisonOrder(next.map((bidder) => bidder.key)); renderScoreComparison(); };
+    });
+  }
+  async function refreshScores() { scoreComparisonState = {objective:null, subjective:null}; for (const type of ['objective','subjective']) { const data = await request(`/projects/${activeProject}/score-results/${type}`); const target = $(`${type}-results`); const visible = (data.results || []).filter((item) => !item.price_managed_by_sheet); const completed = visibleCompletedResults(data.score_run, visible); scoreComparisonState[type] = {run:data.score_run, results:completed}; const groups = groupByBidder(completed); const priceNotice = type === 'objective' && (data.results || []).some((item) => item.price_managed_by_sheet) ? '<p class="hint">价格分已移至“报价与价格分”，按确认报价、价格调整和参与范围统一计算。</p>' : ''; target.innerHTML = groups.length ? `${partialResultNotice(data.score_run)}${priceNotice}<p class="hint">以下为 AI 基于电子文件生成的评分建议；扫描件证据未覆盖时不会将“未找到”误作 0 分，主表会提示待 OCR 后评分。</p>${groups.map(([bidder, results]) => `<details class="result-group"><summary>投标人：${escapeHtml(bidder)}（${results.length} 项）</summary><table><thead><tr><th>检查规则</th><th>AI 建议得分</th><th>满分</th><th>置信度</th><th>关键证据与理由</th></tr></thead><tbody>${results.map((r) => `<tr><td>${ruleCellHtml(r)}${scoreOcrHint(r)}</td><td>${escapeHtml(scoreSuggestionLabel(r))}</td><td>${r.max_score ?? '-'}</td><td>${escapeHtml(confidenceLabel(r.confidence))}${visionBadgeHtml(r)}</td><td><div class="result-evidence result-summary">${escapeHtml(resultExplanation(conciseResultSummary(r), r) || '-')}</div><small class="result-evidence result-verification">${escapeHtml(verificationLineHtml(r))}</small>${conflictBadgeHtml(r)}${evidenceChainHtml(r)}${rawResultDetailHtml(r)}</td></tr>`).join('')}</tbody></table></details>`).join('')}` : `<p class="muted">${priceNotice || (data.score_run ? '正在生成评分结果。' : `本项目没有${type === 'objective' ? '客观分' : '主观分'}规则。`)}</p>`; } renderScoreComparison(); }
   $('create-project').onclick = () => $('project-form').classList.remove('hidden'); $('cancel-project').onclick = () => $('project-form').classList.add('hidden');
   $('save-project').onclick = async () => { try { const data = await request('/projects', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name:$('project-name').value, project_number:$('project-number').value, section_name:$('section-name').value, password:$('project-password').value})}); $('project-password').value = ''; await loadProjects(); openProject(data.project.project_id); } catch (error) { alert(error.message); } };
   $('back-projects').onclick = () => { activeProject = null; stopPolling(); $('workspace').classList.add('hidden'); $('projects-panel').classList.remove('hidden'); loadProjects(); };
@@ -1016,6 +1093,7 @@
   $('add-manual-rule').onclick = async () => { try { const category = $('manual-rule-category').value; const isScoring = ['objective', 'subjective'].includes(category); const rawMaxScore = $('manual-rule-max-score').value; const maxScore = Number(rawMaxScore); if (isScoring && (!Number.isFinite(maxScore) || maxScore <= 0)) { alert('客观分和主观分规则必须填写大于 0 的满分。'); return; } const payload = {category, title:$('manual-rule-title').value, check_rule:$('manual-rule-check').value, source_text:$('manual-rule-source').value, ocr_required:$('manual-rule-ocr').checked}; if (isScoring) payload.scoring = {max_score:maxScore, kind:category === 'objective' ? $('manual-rule-score-kind').value : 'manual'}; await request(`/projects/${activeProject}/rules`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}); $('manual-rule-title').value = ''; $('manual-rule-check').value = ''; $('manual-rule-source').value = ''; $('manual-rule-max-score').value = ''; $('manual-rule-ocr').checked = false; updateManualRuleScoringFields(); await refreshRules(); await refreshPriceSheet(false, true); } catch (error) { alert(error.message); } };
   $('confirm-rules').onclick = async () => { try { const validation = await request(`/projects/${activeProject}/rules/acquisition-validation`); const issues = Array.isArray(validation.issues) ? validation.issues : []; if (issues.length) { const brief = issues.slice(0, 6).map((item) => `• ${item.title}：${item.message}`).join('\n'); const extra = issues.length > 6 ? `\n另有 ${issues.length - 6} 条提示。` : ''; if (!confirm(`增强核验预检发现 ${issues.length} 条提示：\n${brief}${extra}\n\n仍要确认当前规则集吗？`)) return; } await request(`/projects/${activeProject}/rules/confirm`, {method:'POST'}); await refreshRules(); await refreshPriceSheet(false, true); } catch (error) { alert(error.message); } };
   function closeEvaluationSelection() { $('evaluation-selection-panel').classList.add('hidden'); document.body.classList.remove('modal-open'); evaluationSelectionProject = null; }
+  function closeScoreComparison() { const panel = $('score-comparison-panel'); if (panel) panel.classList.add('hidden'); document.body.classList.remove('modal-open'); scoreComparisonDragIndex = null; }
   function evaluationDocumentRunStatus(value) {
     if (!value) return '尚未进行综合评审';
     const labels = {
@@ -1069,6 +1147,9 @@
   $('start-evaluate-all').onclick = async () => { try { showEvaluationSelection(await request(`/projects/${activeProject}`)); } catch (error) { alert(error.message); } };
   $('close-evaluation-selection').onclick = closeEvaluationSelection;
   $('cancel-evaluation-selection').onclick = closeEvaluationSelection;
+  $('open-score-comparison').onclick = () => { if ($('open-score-comparison').disabled) return; renderScoreComparison(); $('score-comparison-panel').classList.remove('hidden'); document.body.classList.add('modal-open'); };
+  $('close-score-comparison').onclick = closeScoreComparison;
+  $('reset-score-comparison-order').onclick = () => { writeScoreComparisonOrder([]); renderScoreComparison(); };
   $('submit-evaluation-selection').onclick = async () => { try { const projectData = evaluationSelectionProject; const selectedDocumentIds = [...$('evaluation-document-selection').querySelectorAll('.evaluation-document-checkbox:checked')].map((input) => input.value); const bidDocuments = (projectData?.documents || []).filter((item) => item.role === 'bid'); if (!selectedDocumentIds.length) return alert('请至少选择一份已解析的投标文件'); const allSelected = selectedDocumentIds.length === bidDocuments.length; const lastSuccessfulEvaluation = (projectData.tasks || []).find((task) => task.task_type === 'evaluate_all' && task.status === 'success'); if (lastSuccessfulEvaluation && !confirm(allSelected ? '将使用当前文件、规则和模型完整重评全部投标人，并替换当前综合评审结果。是否继续？' : `将只重新评审所选 ${selectedDocumentIds.length} 家投标人；未选择投标人的当前结果会保留。是否继续？`)) return; const profile_id = $('all-profile').value; if (!await verifyEvaluationVisionConfiguration(profile_id)) return; await request(`/projects/${activeProject}/tasks`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({task_type:'evaluate_all', profile_id, document_ids:selectedDocumentIds, calculate_price:allSelected, ...(lastSuccessfulEvaluation ? {force_rerun:true} : {})})}); closeEvaluationSelection(); await refreshProject(); await Promise.all([refreshReview(), refreshScores(), refreshUsage()]); } catch (error) { alert(error.message); } };
   function closeModels() { $('models-panel').classList.add('hidden'); document.body.classList.remove('modal-open'); resetModelForm(); }
   function closePrompts() { $('prompts-panel').classList.add('hidden'); document.body.classList.remove('modal-open'); }

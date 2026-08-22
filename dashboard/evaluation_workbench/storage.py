@@ -5182,6 +5182,31 @@ def _public_vision_result(value: dict) -> dict:
     return value
 
 
+def _public_score_result(value: dict) -> dict:
+    """为评分结果补充只读的评分分部元数据。
+
+    评分对比视图只需要知道规则属于哪个原文评分分部，不应重新推断业务/技术
+    归属，也不应读取或修改评分结论。旧结果没有 ``execution_meta_json`` 时返回
+    空列表，前端会明确显示为“未归类”，保持向后兼容。
+    """
+    value = _public_vision_result(value)
+    raw_meta = value.pop("execution_meta_json", None)
+    try:
+        meta = json.loads(raw_meta or "{}") if isinstance(raw_meta, str) else (raw_meta or {})
+    except (TypeError, json.JSONDecodeError):
+        meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    sections = meta.get("score_sections")
+    value["score_sections"] = sections if isinstance(sections, list) else []
+    value["rule_category"] = str(value.pop("rule_category", "") or "")
+    try:
+        value["rule_sort_order"] = int(value.pop("rule_sort_order", 0) or 0)
+    except (TypeError, ValueError):
+        value["rule_sort_order"] = 0
+    return value
+
+
 def save_review_results(app, review_run_id: str, document_id: str, results: list[dict]) -> None:
     timestamp = now_iso()
     with connection(app) as conn:
@@ -5652,7 +5677,9 @@ def latest_score_results(app, project_id: str, score_type: str) -> tuple[dict | 
         with connection(app) as conn:
             field = "objective_score_run_id" if score_type == "objective" else "subjective_score_run_id"
             rows = conn.execute(
-                f"""SELECT s.*, d.bidder_name, d.original_name, rule.title, rule.check_rule, rule.check_mode
+                f"""SELECT s.*, d.bidder_name, d.original_name, rule.title, rule.check_rule, rule.check_mode,
+                           rule.category AS rule_category, rule.sort_order AS rule_sort_order,
+                           rule.execution_meta_json
                     FROM ew_score_results s
                     JOIN ew_evaluation_current_documents current
                       ON current.{field}=s.score_run_id AND current.document_id=s.document_id
@@ -5662,7 +5689,7 @@ def latest_score_results(app, project_id: str, score_type: str) -> tuple[dict | 
                     ORDER BY d.bidder_name, rule.sort_order""",
                 (project_id, current_sources[0]["rule_set_id"]),
             ).fetchall()
-        return _current_evaluation_run_value(app, project_id, current_sources), [_public_vision_result(dict(row)) for row in rows]
+        return _current_evaluation_run_value(app, project_id, current_sources), [_public_score_result(dict(row)) for row in rows]
     with connection(app) as conn:
         run = conn.execute(
             """SELECT r.*, t.status AS task_status, t.error AS task_error, t.progress AS task_progress, t.result_json AS task_result_json
@@ -5675,7 +5702,9 @@ def latest_score_results(app, project_id: str, score_type: str) -> tuple[dict | 
         if not run:
             return None, []
         rows = conn.execute(
-            """SELECT s.*, d.bidder_name, d.original_name, rule.title, rule.check_rule, rule.check_mode
+            """SELECT s.*, d.bidder_name, d.original_name, rule.title, rule.check_rule, rule.check_mode,
+                      rule.category AS rule_category, rule.sort_order AS rule_sort_order,
+                      rule.execution_meta_json
             FROM ew_score_results s JOIN ew_documents d ON d.document_id=s.document_id
             JOIN ew_rules rule ON rule.rule_id=s.rule_id
             WHERE s.score_run_id=? ORDER BY d.bidder_name, rule.sort_order""", (run["score_run_id"],)
@@ -5690,4 +5719,4 @@ def latest_score_results(app, project_id: str, score_type: str) -> tuple[dict | 
             item["document_id"] for item in partial["completed_documents"]
             if isinstance(item, dict) and item.get("document_id")
         ]
-    return value, [_public_vision_result(dict(row)) for row in rows]
+    return value, [_public_score_result(dict(row)) for row in rows]
